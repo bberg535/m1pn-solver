@@ -50,6 +50,18 @@ das Solverlog daneben. Nach dem Lauf werden die gespeicherten Felder auf den
 M1-Kegel und die globale Bilanz geprüft. `Strg+C` beendet den lokalen Lauf und
 behält die bisherigen Daten. Die Clusterjobs werden davon nicht beeinflusst.
 
+Den zuletzt abgeschlossenen lokalen Crossing-Lauf mit kinetischer Referenz,
+signiertem Dichtefehler und Mittelschnitt plotten:
+
+```bash
+python3 scripts/plot_local_run.py
+# Oder einen bestimmten Lauf auswählen:
+python3 scripts/plot_local_run.py --run tmp/local_B_<Zeitstempel>
+```
+
+PNG, PDF, Schnittdaten und Herkunftsnachweis landen in einem neuen Ordner unter
+`results/local_plots/`. Laufende oder abgebrochene Läufe werden übersprungen.
+
 Ein bereits vorhandener anderer kompatibler Stack kann über `MFEM_CONFIG`
 ausgewählt werden. Builds und große Rohfelder bleiben unter `tmp/`.
 
