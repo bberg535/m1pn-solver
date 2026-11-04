@@ -73,3 +73,13 @@ enthalten gegenüber dem endlichen PN-Modell Modellfehler. Lattice verwendet
 die unveränderten Material- und Quelldefinitionen aus dem ursprünglichen
 Studien-Einstiegspunkt. Erfolgreiche endliche Läufe belegen keine allgemeine
 Energie- oder Gleitkomma-Realisierbarkeitsgarantie.
+
+## Einreichung am 04.11.2026
+
+Die angeforderte Standard-B-Studie ist eingereicht: Vorbereitung **156673**,
+Produktionsarray **156674** (48 Aufgaben, maximal zwei gleichzeitig) und
+Auswertung **156675**. Beim Statuscheck wartete die Vorbereitung auf verfügbare
+NX-Knoten; Array und Auswertung warteten auf ihre Abhängigkeiten.
+Der [Einreichungsnachweis](results/launch_20261104_161438_760701.json) enthält
+die Befehle, Job-IDs, Methode und den zuletzt beobachteten Zustand.
+Lokal sind vier Tests der Cluster-Pipeline und alle 15 Smoke-Aufgaben bestanden.
