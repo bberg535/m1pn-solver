@@ -1,0 +1,14 @@
+-- The CXX compiler identification is GNU 13.2.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /home/warehouse15/bberg/spack/opt/spack/linux-zen3/openmpi-5.0.10-y3kaeguuqknrs5uhcky2pxvf7aeqajy7/bin/mpic++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found MPI_CXX: /home/warehouse15/bberg/spack/opt/spack/linux-zen3/openmpi-5.0.10-y3kaeguuqknrs5uhcky2pxvf7aeqajy7/bin/mpic++ (found version "3.1")
+-- Found MPI: TRUE (found version "3.1") found components: CXX
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5")
+-- Found Python3: /usr/bin/python3.9 (found version "3.9.25") found components: Interpreter
+-- Configuring done (2.9s)
+-- Generating done (3.1s)
+-- Build files have been written to: /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build

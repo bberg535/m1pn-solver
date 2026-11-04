@@ -4,6 +4,24 @@
 #include <Eigen/SVD>
 #include <complex>
 namespace m1pn {
+namespace {
+double mass_correction_fourier_amplification(const Angular &pn,int cells,double dt,int rk,double scale) {
+    Eigen::SelfAdjointEigenSolver<Mat> eig(pn.normal(V3::UnitX()));
+    const double h=1./cells; double maximum=1.;
+    for(int k=0;k<cells;++k) {
+        const double theta=2*pi*k/cells, c=std::cos(theta), s=std::sin(theta);
+        const double real=-scale*pn.speed*(1-c)*(1-c)/(3*h);
+        const double adv=s*(1.+(1.-c)/3.)/h;
+        for(double lambda:eig.eigenvalues()) {
+            const std::complex<double> z(dt*real,-dt*lambda*adv);
+            std::complex<double> r=1.+z+z*z/2.;
+            if(rk==3)r+=z*z*z/6.;
+            maximum=std::max(maximum,std::abs(r));
+        }
+    }
+    return maximum;
+}
+}
 double fourier_amplification(const Angular &pn, int cells, int dim, double gamma, double dt,
                              int rk, bool gradient_defect, int correction_degree) {
     Eigen::SelfAdjointEigenSolver<Mat> eig(pn.normal(V3::UnitZ()));
@@ -68,7 +86,18 @@ TimeControl::TimeControl(Transport &tr, const MeshSpec &mesh, int rk, int max_do
         require(step_limit > 0 && std::isfinite(step_limit), "No finite positive IMEX explicit step restriction");
         return;
     }
-    if (mesh.periodic && mesh.file.empty() && !mesh.tetrahedra) {
+    if(mesh.periodic&&mesh.file.empty()&&!mesh.tetrahedra&&
+       tr.options.stabilization=="m1pn_mass_correction"&&mesh.dimension==1) {
+        method="periodic-q1-pn-mass-correction-fourier";
+        double hi=tr.fe.cfl_step,lo=0.;
+        for(int i=0;i<50;++i){const double mid=.5*(lo+hi);
+            if(mass_correction_fourier_amplification(tr.pn,mesh.elements,mid,rk,tr.options.pn_viscosity_scale)<=1.+2e-14)lo=mid;
+            else hi=mid;
+        }
+        step_limit=.95*lo;
+        contraction=mass_correction_fourier_amplification(tr.pn,mesh.elements,step_limit,rk,tr.options.pn_viscosity_scale);
+    } else if (mesh.periodic && mesh.file.empty() && !mesh.tetrahedra &&
+        tr.options.stabilization != "m1pn_mass_correction") {
         const int correction_degree = tr.options.mass_mode == "consistent" ? -1 :
                                       tr.options.mass_mode == "lumped" ? 0 : tr.options.mass_corrections;
         const bool kv = tr.options.r2 && tr.options.stabilization == "gradient-defect";

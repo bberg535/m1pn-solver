@@ -20,6 +20,7 @@ struct Numerics {
     int implicit_max_iterations = 300;
     std::string stabilization = "gradient-defect";
     double kv_gamma = .5;
+    double pn_viscosity_scale = 1.;
     Budget budget;
 };
 struct Diagnostics {
@@ -66,6 +67,11 @@ struct Transport {
     Field gather_pairs(const Field &) const;
     Field linear_target(const Field &) const;
     Field mass_target(const Field &rhs, double &residual, Field *predictor = nullptr) const;
+    // boundary_rhs is the signed, integrated numerical PN boundary load (-H).
+    Field pn_low_order_rate(const Field &u, const Field &assembled_pn_boundary_rhs = Field(),
+                            const Field &source = Field()) const;
+    Field mass_correction(const Field &rate) const;
+    Field mass_correction_target(const Field &consistent_rhs, const Field &low_rate) const;
     void check_state(const Field &) const;
 };
 } // namespace m1pn

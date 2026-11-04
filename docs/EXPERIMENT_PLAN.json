@@ -1,0 +1,21 @@
+{
+  "revision": 1,
+  "date": "2026-11-04",
+  "baseline": "baseline/src: frozen current native solver; hashes baseline_manifest.json",
+  "execution": "local workstation, no dependency installation or Slurm submission",
+  "sequence": ["standard implementation", "independent standard algebra tests", "optional scoped boundary variant", "regression", "patches and spectra", "convergence", "crossing and performance", "independent audit"],
+  "variants": {
+    "A": {"stabilization": "biharmonic-corrected", "gamma": 0.004, "mass": "consistent"},
+    "B": {"stabilization": "m1pn_mass_correction", "PN_viscosity_scale": 1, "mass": "lumped"},
+    "C": {"conditional": "only after standard tests pass", "proposal": "constant extension of the predictor from nearest fully interior Cartesian node; scoped and separately selected"},
+    "PN": {"stabilization": "biharmonic-corrected", "gamma": 0, "mass": "consistent"}
+  },
+  "common": {"integrator": "SSPRK3", "M1_reference": "unchanged", "MCL": "active", "PN_boundary": "existing Onsager exterior with LLF flux", "boundary_quadrature": "consistent for smooth patches, unchanged lumped default for existing crossing", "clipping": false, "density_floor": false},
+  "algebra": {"grids": "periodic/open 1D P1,2D Q1,3D Q1", "seed": "fixed deterministic", "checks": ["all-component target identity", "pair antisymmetry", "boundary signs and Bij", "source identity", "projection", "high-rate invariance", "vacuum", "zero mass solves", "zero extra graph edges", "baseline source hashes"]},
+  "patches": {"data": ["constant", "affine", "quadratic", "smooth sine"], "dimensions": [1,2,3], "regions": ["interior", "face", "edge", "corner"], "metrics": ["max abs ML^-1 Z", "analytic derivative error"]},
+  "convergence": {"PN_order": 3, "cells": [16,32,64], "end_time": 0.05, "dt_max": 0.0001, "domains": ["periodic", "open"], "reference": "exact smooth PN streaming eigenwave", "metrics": ["PN and density L1,L2,Linf", "observed rates", "limiter activity", "balance"]},
+  "scalar_analysis": {"Fourier": "independent FE assembly vs requested symbol", "energy": "symmetric part and explicit open plus nonuniform periodic counterexamples", "viscosity_scales": [0.5,1,2], "time": "SSPRK3 amplification; no nonlinear IDP stability theorem"},
+  "crossing": {"PN_order": 7, "elements_per_axis": 64, "end_time": 0.32, "dt": 0.0001, "CFL_definition": "same unchanged M1 graph and same dt", "variants": ["A","B","C if implemented"], "screen": "8x8 and 16x16 short runs before main", "reference": "existing analytic kinetic crossing density (contains PN model error); method difference separately", "metrics": ["density L1,L2,Linf", "explicit relative-error denominator", "cone", "negative density", "high moments", "active pairs", "all-Q balance", "walltime", "RSS"]},
+  "performance": {"small": "8x8 P3 crossing", "medium": "16x16 P7 crossing", "repeats": 3, "threads": 1, "ordering": "alternating", "same_dt": true, "same_hardware": true, "timing": "solver plus process separately"},
+  "acceptance": {"new_identity_tolerance": "scaled 5e-11 existing solver criterion plus independent component checks", "regression": "old CTest suite unchanged plus bytewise final PN fields and diagnostics against frozen baseline", "scientific": "no method selected on appearance or implementation simplicity; retain negative evidence and failed runs; conservation is not energy dissipation"}
+}

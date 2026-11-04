@@ -17,7 +17,7 @@ struct Options {
     int order = 3, rk = 3, max_steps = 100000, norm_max = 512, threads = 1, checkpoint_stride = 0;
     double final_time = .01, dt = 0, cfl = .8, sigma_a = 0, sigma_s = 0, anisotropy = 0, source = 0;
     double pulse_width = .07, background = .001;
-    bool jump = false, deterministic = false;
+    bool jump = false, deterministic = false, mass_mode_explicit = false;
     std::string exterior_policy = "kinetic";
     double exterior_density = 1, pulse_duration = .06;
     std::optional<V3> vacuum_velocity;
@@ -40,6 +40,7 @@ Options parse(int argc, char **argv) {
                    "lattice|smooth-beam|vacuum-beam|oblique-beam|crossing-three\n"
                    " --model r2|legacy --stabilization gradient-defect|biharmonic-original|biharmonic-corrected\n"
                    " --stabilization m1pn_ghost_local_projected_p4 --ghost-gamma G (open Cartesian Q1 only)\n"
+                   " --stabilization m1pn_mass_correction --pn-viscosity-scale L (SSPRK3, lumped mass)\n"
                    " --kv-gamma G --pair-limiter scalar|density-vector (legacy only)\n"
                    " --inflow vacuum|isotropic|time-dependent|beam|crossing|matching|"
                    "smooth-transport|crossing-transport|crossing-three-transport\n"
@@ -111,10 +112,12 @@ Options parse(int argc, char **argv) {
             o.num.r2 = v == "r2";
         } else if (key == "--stabilization") {
             require(v == "gradient-defect" || v == "biharmonic-original" ||
-                    v == "biharmonic-corrected" || v == "m1pn_ghost_local_projected_p4", "Invalid stabilization");
+                    v == "biharmonic-corrected" || v == "m1pn_ghost_local_projected_p4" ||
+                    v == "m1pn_mass_correction", "Invalid stabilization");
             o.num.stabilization = v;
         } else if (key == "--kv-gamma")
             o.num.kv_gamma = real();
+        else if (key == "--pn-viscosity-scale") o.num.pn_viscosity_scale=real();
         else if (key == "--method") {
             require(v == "m1pn-r2" || v == "m1pn-biharmonic-c1" ||
                     v == "m1pn_ghost_local_projected_p4", "Invalid method");
@@ -167,6 +170,7 @@ Options parse(int argc, char **argv) {
         else if (key == "--mass-mode") {
             require(v == "consistent" || v == "lumped" || v == "lumped_afc", "Invalid mass mode");
             o.num.mass_mode = v;
+            o.mass_mode_explicit = true;
         } else if (key == "--mass-corrections")
             o.num.mass_corrections = integer();
         else if (key == "--sigma-a")
@@ -206,6 +210,14 @@ Options parse(int argc, char **argv) {
     require(o.num.kv_gamma >= 0 && o.num.gamma >= 0, "Negative stabilization coefficient");
     require(o.num.mass_corrections >= 1 && o.num.mass_corrections <= 32,
             "Mass corrections must lie in [1,32]");
+    if(o.num.stabilization=="m1pn_mass_correction") {
+        require(o.num.r2,"m1pn_mass_correction requires --model r2");
+        require(o.rk==3,"m1pn_mass_correction requires --time-integrator ssprk3");
+        require(!o.mass_mode_explicit || o.num.mass_mode=="lumped",
+                "m1pn_mass_correction requires --mass-mode lumped; conflicting explicit mass mode rejected");
+        o.num.mass_mode="lumped";
+        require(o.num.pn_viscosity_scale>=1&&std::isfinite(o.num.pn_viscosity_scale),"PN viscosity scale must be finite and at least one");
+    }
     require(o.num.r2 || o.num.mass_mode == "consistent", "Lumped modes require --model r2");
     require(o.num.r2 || !(o.num.lazy || o.num.geometry_cache), "Lazy and geometry cache require --model r2");
     require(o.rk != 1 || o.num.mass_mode == "consistent", "IMEX uses --implicit-solver; select --mass-mode consistent");
@@ -458,7 +470,8 @@ int main(int argc, char **argv) {
             config << std::setprecision(17)
                    << "{\n\"method\":" << std::quoted(o.num.r2 ?
                        (o.num.stabilization == "m1pn_ghost_local_projected_p4" ?
-                        "m1pn_ghost_local_projected_p4" : "m1pn-r2") : "m1pn-biharmonic-c1")
+                        "m1pn_ghost_local_projected_p4" :
+                        o.num.stabilization == "m1pn_mass_correction" ? "m1pn_mass_correction" : "m1pn-r2") : "m1pn-biharmonic-c1")
                    << ",\"pn_order\":" << pn.order
                    << ",\"Q\":" << pn.q << ",\"dimension\":" << fe.dimension
                    << ",\"elements_per_axis\":" << o.mesh.elements << ",\"nodes\":" << fe.nodes
@@ -472,6 +485,8 @@ int main(int argc, char **argv) {
                    << std::quoted(o.num.r2 ? o.num.stabilization :
                                   (o.num.masked ? "biharmonic-masked" : "biharmonic-natural"))
                    << ",\"kv_gamma\":" << o.num.kv_gamma
+                   << ",\"pn_viscosity_scale\":" << o.num.pn_viscosity_scale
+                   << ",\"pn_mass_correction_applications\":1"
                    << ",\"boundary_flux\":" << std::quoted(o.num.r2 ? "LLF_lambda_1" : "characteristic_PN_kinetic_M1")
                    << ",\"m1_exterior_policy\":" << std::quoted(o.exterior_policy)
                    << ",\"m1_exterior_rounding\":" << std::quoted(o.num.r2 ? (o.exterior_policy == "kinetic" ? "outward_density_ulp_until_exact_cone" : "reject_invalid_prescribed_state") : "unused")
@@ -700,6 +715,8 @@ int main(int argc, char **argv) {
                    << ",\"assembly_seconds\":" << assembly
                    << ",\"initialization_seconds\":" << initialization
                    << ",\"mass_seconds\":" << tr.timings.mass
+                   << ",\"pn_predictor_seconds\":" << tr.timings.pn_predictor
+                   << ",\"pn_mass_correction_seconds\":" << tr.timings.pn_mass_correction
                    << ",\"biharmonic_seconds\":" << tr.timings.biharmonic
                    << ",\"boundary_seconds\":" << tr.timings.boundary
                    << ",\"mcl_seconds\":" << tr.timings.mcl

@@ -63,5 +63,6 @@ struct Budget {
 };
 struct Timings {
     double mass = 0, biharmonic = 0, boundary = 0, mcl = 0, communication = 0;
+    double pn_predictor = 0, pn_mass_correction = 0;
 };
 } // namespace m1pn

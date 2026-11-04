@@ -19,7 +19,12 @@ Transport::Transport(const Angular &a, Spatial &f, const Numerics &n, Inflow g, 
             "Unknown PN boundary quadrature mode");
     require(n.r2 || n.stabilization != "m1pn_ghost_local_projected_p4",
             "Local projected ghost stabilization requires the R2 transfer");
-    if (n.r2) stabilization_operator = std::make_unique<SpatialStabilization>(f,n.stabilization,n.stabilization=="gradient-defect"?n.kv_gamma:n.gamma,pn.speed);
+    const bool pn_mass_correction = n.stabilization == "m1pn_mass_correction";
+    require(!pn_mass_correction || (n.r2 && n.mass_mode == "lumped"),
+            "m1pn_mass_correction requires R2 and lumped mass mode");
+    require(n.pn_viscosity_scale >= 1 && std::isfinite(n.pn_viscosity_scale),
+            "PN viscosity scale must be finite and at least one");
+    if (n.r2 && !pn_mass_correction) stabilization_operator = std::make_unique<SpatialStabilization>(f,n.stabilization,n.stabilization=="gradient-defect"?n.kv_gamma:n.gamma,pn.speed);
     if (n.geometry_cache) {
         pair_geometry.resize(f.pairs.size());
         for (std::size_t e=0;e<f.pairs.size();++e) for (int d=0;d<3;++d) {
@@ -82,7 +87,7 @@ Transport::Transport(const Angular &a, Spatial &f, const Numerics &n, Inflow g, 
     // M >= c ML; tensor/submultiplicative bound in the consistent M norm.
     for (int d = 0; d < 3; ++d)
         generator_norm_bound += pn.speed * f.norm_bound(f.C[d]);
-    generator_norm_bound += n.r2 ? stabilization_operator->norm_bound :
+    generator_norm_bound += n.r2 ? (pn_mass_correction ? 0. : stabilization_operator->norm_bound) :
                             beta.maxCoeff() * std::pow(f.norm_bound(f.K), 2);
     Vec bound = Vec::Zero(f.nodes);
     for (const auto &face : f.faces)
@@ -95,8 +100,33 @@ Transport::Transport(const Angular &a, Spatial &f, const Numerics &n, Inflow g, 
                                         (n.r2 ? boundaries[p.normal_id]->llf_norm : boundaries[p.normal_id]->norm) /
                                         std::sqrt(f.mass[face.nodes[i]]);
         }
-    generator_norm_bound =
-        (generator_norm_bound + bound.maxCoeff()) / f.mass_equivalence * (1 + 1e-11);
+    if(pn_mass_correction) {
+        const double weak_advection=generator_norm_bound;
+        Vec graph_degree=Vec::Zero(f.nodes), boundary_diagonal=Vec::Zero(f.nodes);
+        double numerical_boundary_bound=bound.maxCoeff();
+        if(n.pn_boundary_quadrature=="lumped") {
+            Vec lumped_boundary=Vec::Zero(f.nodes);
+            for(const auto &face:f.faces)for(const auto &p:face.points)
+                for(size_t j=0;j<face.nodes.size();++j)
+                    lumped_boundary[face.nodes[j]]+=p.weight*p.shape[j]*boundaries[p.normal_id]->llf_norm/f.mass[face.nodes[j]];
+            numerical_boundary_bound=lumped_boundary.maxCoeff();
+        }
+        for(const auto &p:f.pairs) {
+            V3 cij=V3::Zero(),cji=V3::Zero();
+            for(int d=0;d<3;++d){cij[d]=f.C[d].coeff(p.i,p.j);cji[d]=f.C[d].coeff(p.j,p.i);}
+            const double dN=n.pn_viscosity_scale*pn.speed*std::max(cij.norm(),cji.norm());
+            graph_degree[p.i]+=dN; graph_degree[p.j]+=dN;
+        }
+        for(const auto &face:f.faces)for(const auto &p:face.points)
+            for(size_t j=0;j<face.nodes.size();++j)
+                boundary_diagonal[face.nodes[j]]+=p.weight*p.shape[j]*pn.speed/f.mass[face.nodes[j]];
+        const double low_order_bound=weak_advection+2.*(graph_degree.array()/f.mass.array()).maxCoeff()+boundary_diagonal.maxCoeff()+numerical_boundary_bound;
+        // In the lumped-mass norm, ||I-M_L^{-1/2} M M_L^{-1/2}|| <= 1.
+        // This bounds R_C plus the mass correction composed with the PN LO rate.
+        generator_norm_bound=(weak_advection+numerical_boundary_bound+low_order_bound)*(1+1e-11);
+    } else {
+        generator_norm_bound=(generator_norm_bound+bound.maxCoeff())/f.mass_equivalence*(1+1e-11);
+    }
 }
 Field Transport::biharmonic(const Field &u, Field *output) const {
     Field w = fe.K * u;
@@ -118,6 +148,23 @@ Field Transport::gather_pairs(const Field &a) const {
     return g;
 }
 Field Transport::linear_target(const Field &u) const {
+    if(options.r2 && options.stabilization=="m1pn_mass_correction") {
+        Field rhs=Field::Zero(fe.nodes,pn.q),boundary_rhs=Field::Zero(fe.nodes,pn.q);
+        for(int d=0;d<3;++d)rhs.noalias()+=fe.C[d].transpose()*(u*pn.A[d].transpose());
+        for(const auto &face:fe.faces)for(const auto &p:face.points){
+            if(options.pn_boundary_quadrature=="consistent") {
+                Vec trace=Vec::Zero(pn.q);
+                for(size_t j=0;j<face.nodes.size();++j)trace.noalias()+=p.shape[j]*u.row(face.nodes[j]).transpose();
+                const Vec flux=boundaries[p.normal_id]->llf_homogeneous*trace;
+                for(size_t j=0;j<face.nodes.size();++j)boundary_rhs.row(face.nodes[j])-=p.weight*p.shape[j]*flux.transpose();
+            } else for(size_t j=0;j<face.nodes.size();++j) {
+                const Vec flux=boundaries[p.normal_id]->llf_homogeneous*u.row(face.nodes[j]).transpose();
+                boundary_rhs.row(face.nodes[j])-=p.weight*p.shape[j]*flux.transpose();
+            }
+        }
+        rhs+=boundary_rhs;
+        return mass_correction_target(rhs,pn_low_order_rate(u,boundary_rhs));
+    }
     if(options.r2){
         Field rhs=stabilization_operator->apply(u);
         for(int k=0;k<3;++k) rhs.noalias()+=fe.C[k].transpose()*(u*pn.A[k].transpose());
@@ -170,6 +217,44 @@ Field Transport::mass_target(const Field &rhs, double &residual, Field *predicto
     Field target = degree == 0 ? inverse_lumped(rhs)
                                : inverse_lumped(rhs + fe.mass.asDiagonal() * p - fe.M * p);
     residual = maxabs(fe.M * target - rhs);
+    return target;
+}
+Field Transport::pn_low_order_rate(const Field &u, const Field &boundary_rhs, const Field &source) const {
+    require(options.stabilization == "m1pn_mass_correction", "PN low-order rate is only available for m1pn_mass_correction");
+    require(u.rows()==fe.nodes&&u.cols()==pn.q&&u.allFinite(),"Invalid PN field for low-order predictor");
+    Field rhs=Field::Zero(fe.nodes,pn.q);
+    for(const auto &p:fe.pairs) {
+        V3 cij=V3::Zero(),cji=V3::Zero();
+        for(int d=0;d<3;++d){cij[d]=fe.C[d].coeff(p.i,p.j);cji[d]=fe.C[d].coeff(p.j,p.i);}
+        const double dN=options.pn_viscosity_scale*pn.speed*std::max(cij.norm(),cji.norm());
+        const Vec ai=u.row(p.i).transpose(),aj=u.row(p.j).transpose();
+        const Vec di=aj-ai,dj=ai-aj;
+        const Vec flux_i=dN*di-pn.apply(cij,di);
+        const Vec flux_j=dN*dj-pn.apply(cji,dj);
+        rhs.row(p.i)+=flux_i.transpose(); rhs.row(p.j)+=flux_j.transpose();
+    }
+    if(boundary_rhs.size()){require(boundary_rhs.rows()==fe.nodes&&boundary_rhs.cols()==pn.q&&boundary_rhs.allFinite(),"Invalid assembled PN boundary load");rhs+=boundary_rhs;}
+    // Convert the weak interior transport to its strong graph form. The
+    // corresponding physical trace restores the integration-by-parts term;
+    // boundary_rhs contains minus the actual numerical PN boundary flux.
+    for(const auto &face:fe.faces)for(const auto &p:face.points) {
+        for(size_t j=0;j<face.nodes.size();++j) {
+            const Vec physical=pn.apply(p.normal,u.row(face.nodes[j]).transpose());
+            rhs.row(face.nodes[j])+=p.weight*p.shape[j]*physical.transpose();
+        }
+    }
+    if(source.size()){require(source.rows()==fe.nodes&&source.cols()==pn.q&&source.allFinite(),"Invalid PN low-order source load");rhs+=source;}
+    for(int i=0;i<fe.nodes;++i)rhs.row(i)/=fe.mass[i];
+    return rhs;
+}
+Field Transport::mass_correction(const Field &rate) const {
+    require(rate.rows()==fe.nodes&&rate.cols()==pn.q&&rate.allFinite(),"Invalid PN rate for mass correction");
+    return fe.mass.asDiagonal()*rate-fe.M*rate;
+}
+Field Transport::mass_correction_target(const Field &consistent_rhs,const Field &low_rate) const {
+    require(consistent_rhs.rows()==fe.nodes&&consistent_rhs.cols()==pn.q&&consistent_rhs.allFinite(),"Invalid consistent PN residual");
+    Field target=consistent_rhs+mass_correction(low_rate);
+    for(int i=0;i<fe.nodes;++i)target.row(i)/=fe.mass[i];
     return target;
 }
 void Transport::check_state(const Field &u) const {
@@ -457,6 +542,7 @@ namespace m1pn {
 Stage Transport::evaluate_r2(double time, const Field &u, bool unlimited, const Field &source,
                              double implicit_dt) {
     check_state(u);
+    const bool pn_mass_correction=options.stabilization=="m1pn_mass_correction";
     Stage out;
     auto &diag=out.diagnostics;
     std::array<Field,3> cached_pn_flux;
@@ -473,7 +559,9 @@ Stage Transport::evaluate_r2(double time, const Field &u, bool unlimited, const 
     };
     double start=seconds();
     Field stabilization_pairs;
-    Field rhs=stabilization_operator->apply(u,&stabilization_pairs,options.bh_pair_mode);
+    Field rhs;
+    if(pn_mass_correction){rhs=Field::Zero(fe.nodes,pn.q);stabilization_pairs=Field::Zero(fe.pairs.size(),pn.q);}
+    else rhs=stabilization_operator->apply(u,&stabilization_pairs,options.bh_pair_mode);
     timings.biharmonic+=seconds()-start;
     for(int d=0;d<3;++d) rhs.noalias()+=fe.C[d].transpose()*(u*pn.A[d].transpose());
     out.source=source.size()?source:Field::Zero(fe.nodes,pn.q);
@@ -494,6 +582,7 @@ Stage Transport::evaluate_r2(double time, const Field &u, bool unlimited, const 
     if (unlimited || !options.lazy)
         for(int i=0;i<fe.nodes;++i) get_closure(i);
     std::vector<Field> face_high,face_low,face_bar;
+    Field pn_boundary_rhs=Field::Zero(fe.nodes,pn.q);
     std::vector<unsigned char> face_lazy_certified;
     start=seconds();
     for(const auto &face:fe.faces) {
@@ -545,7 +634,10 @@ Stage Transport::evaluate_r2(double time, const Field &u, bool unlimited, const 
                 face_lazy_certified.push_back(1);
                 face_high.push_back(std::move(hn)); face_low.push_back(std::move(hl));
                 face_bar.push_back(std::move(bar));
-                for(int j=0;j<nd;++j) rhs.row(face.nodes[j])-=face_high.back().row(j);
+                for(int j=0;j<nd;++j) {
+                    rhs.row(face.nodes[j])-=face_high.back().row(j);
+                    pn_boundary_rhs.row(face.nodes[j])-=face_high.back().row(j);
+                }
                 continue;
             }
             hn.setZero();
@@ -597,6 +689,7 @@ Stage Transport::evaluate_r2(double time, const Field &u, bool unlimited, const 
         }
         for(int j=0;j<nd;++j) {
             rhs.row(face.nodes[j])-=hn.row(j);
+            pn_boundary_rhs.row(face.nodes[j])-=hn.row(j);
             if(face.mass[j]>0) bar.row(j)/=face.mass[j];
         }
         face_lazy_certified.push_back(0);
@@ -606,7 +699,16 @@ Stage Transport::evaluate_r2(double time, const Field &u, bool unlimited, const 
     timings.boundary+=seconds()-start;
     start=seconds();
     Field mass_predictor;
-    if (implicit_dt > 0) {
+    if(pn_mass_correction) {
+        start=seconds();
+        mass_predictor=pn_low_order_rate(u,pn_boundary_rhs,out.source);
+        timings.pn_predictor+=seconds()-start;
+        start=seconds();
+        out.target=mass_correction_target(rhs,mass_predictor);
+        timings.pn_mass_correction+=seconds()-start;
+        diag.mass_residual=0.;
+        out.mass_error=Field::Zero(fe.nodes,pn.q);
+    } else if (implicit_dt > 0) {
         if (!implicit_solver) {
             implicit_positive=stabilization_operator->positive_matrix();
             if (implicit_positive.rows()!=fe.nodes) {
