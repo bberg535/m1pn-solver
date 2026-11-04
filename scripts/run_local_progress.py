@@ -28,16 +28,22 @@ def main() -> int:
     parser.add_argument("--elements", type=int, default=16)
     parser.add_argument("--pn-order", type=int, default=3)
     parser.add_argument("--time", type=float, default=.32)
-    parser.add_argument("--dt", type=float, default=.0001)
+    parser.add_argument("--dt", type=float, default=.0001, help="Fixed step; 0 selects automatic M1/PN step control.")
+    parser.add_argument("--cfl", type=float, default=.2, help="Safety factor for automatic step control (default: 0.2).")
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--memory-mib", type=int, default=4096, help="Solver memory budget in MiB (default: 4096).")
     parser.add_argument("--interval", type=float, default=1, help="Progress interval in seconds.")
     parser.add_argument("--exe", type=Path, default=ROOT / "nx/tmp/build_local/m1pn_mc_study")
     parser.add_argument("--output", type=Path, help="New result directory; default: tmp/local_B_<timestamp>.")
     args = parser.parse_args()
-    if min(args.elements, args.pn_order, args.threads) < 1:
-        parser.error("elements, pn-order and threads must be positive")
-    if not all(math.isfinite(v) and v > 0 for v in (args.time, args.dt, args.interval)):
-        parser.error("time, dt and interval must be finite and positive")
+    if min(args.elements, args.pn_order, args.threads, args.memory_mib) < 1:
+        parser.error("elements, pn-order, threads and memory-mib must be positive")
+    if not all(math.isfinite(v) and v > 0 for v in (args.time, args.interval)):
+        parser.error("time and interval must be finite and positive")
+    if not math.isfinite(args.dt) or args.dt < 0:
+        parser.error("dt must be finite and nonnegative; use 0 for automatic step control")
+    if not math.isfinite(args.cfl) or not 0 < args.cfl <= 1:
+        parser.error("cfl must lie in (0,1]")
     if args.interval > 30:
         parser.error("interval must not exceed 30 seconds")
     exe = args.exe.resolve()
@@ -52,14 +58,17 @@ def main() -> int:
     command = [str(exe), "--case", "crossing-study", "--inflow", "crossing-study-transport",
                "--dimension", "2", "--mesh-type", "hex", "--elements", str(args.elements),
                "--pn-order", str(args.pn_order), "--time", str(args.time), "--dt", str(args.dt),
-               "--cfl", "1", "--model", "r2", "--mass-mode", "lumped",
+               "--cfl", str(args.cfl), "--model", "r2", "--mass-mode", "lumped",
                "--stabilization", "m1pn_mass_correction", "--pn-viscosity-scale", "1",
                "--biharmonic-gamma", "0", "--kv-gamma", "0", "--time-integrator", "ssprk3",
                "--pulse-width", ".07", "--background", ".001", "--threads", str(args.threads),
-               "--max-steps", "1000000", "--memory-mib", "4096", "--output", str(output)]
+               "--max-steps", "1000000", "--memory-mib", str(args.memory_mib), "--output", str(output)]
     env = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1",
                MKL_NUM_THREADS="1", OMP_DYNAMIC="FALSE")
     print(f"Standard B · Crossing {args.elements}×{args.elements} · P{args.pn_order} · {args.threads} Thread(s)", flush=True)
+    print(f"Speicherbudget: {args.memory_mib} MiB", flush=True)
+    if args.dt == 0:
+        print(f"Zeitschritt: automatisch aus M1/PN-Grenzen · Sicherheitsfaktor {args.cfl:g}", flush=True)
     print(f"Ergebnisse: {output}\nSolver-Log: {log_path}", flush=True)
     start = time.monotonic()
     terminal = sys.stdout.isatty()

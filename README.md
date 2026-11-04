@@ -42,6 +42,10 @@ python3 scripts/run_local_progress.py
 
 # Höhere PN-Ordnung auf demselben Gitter.
 python3 scripts/run_local_progress.py --pn-order 7
+
+# Größeres Gitter: Budget erhöhen und Schrittweite automatisch bestimmen.
+python3 scripts/run_local_progress.py --elements 256 --pn-order 11 \
+  --memory-mib 16384 --dt 0 --cfl .2
 ```
 
 Die Anzeige enthält Prozent, Schrittzahl, Simulationszeit, Laufzeit und eine
@@ -49,6 +53,10 @@ geschätzte Restzeit. Neue Ergebnisse liegen unter `tmp/local_B_<Zeitstempel>`,
 das Solverlog daneben. Nach dem Lauf werden die gespeicherten Felder auf den
 M1-Kegel und die globale Bilanz geprüft. `Strg+C` beendet den lokalen Lauf und
 behält die bisherigen Daten. Die Clusterjobs werden davon nicht beeinflusst.
+`--memory-mib` setzt das interne Solverbudget (Standard 4096 MiB).
+Mit `--dt 0` wird die Schrittweite als `cfl * min(M1-Grenze, PN-Grenze)`
+berechnet; ein positiver `--dt`-Wert gibt sie fest vor und wird gegen beide
+Grenzen geprüft. Der Standardwert bleibt `--dt .0001`.
 
 Den zuletzt abgeschlossenen lokalen Crossing-Lauf mit kinetischer Referenz,
 signiertem Dichtefehler und Mittelschnitt plotten:
