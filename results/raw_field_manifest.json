@@ -1,0 +1,22 @@
+[
+  {
+    "path": "tmp/main_biharmonic/crossing64_P7_Aex/final.csv",
+    "bytes": 6220749,
+    "sha256": "417ba265e998ab4f9a3cb71ec31c9d6045a50dcdb504c4a08513a187777864f7"
+  },
+  {
+    "path": "tmp/main_biharmonic/crossing64_P7_A/final.csv",
+    "bytes": 6220577,
+    "sha256": "cf33d6d43d9bd33e79978b116009f1a7b0a3a959cb13aad1899e9c6b4baf6315"
+  },
+  {
+    "path": "tmp/main_B/crossing64_P7_B/final.csv",
+    "bytes": 6220790,
+    "sha256": "3cb43800746ffc9e680efe438ad9d3212132856d87ef17024c758194953b10ba"
+  },
+  {
+    "path": "tmp/main_C/crossing64_P7_C/final.csv",
+    "bytes": 6220647,
+    "sha256": "cac9bdd8e8ff39ef86d94cc9d69367873ca2bb5db2ece537c934f7fb7a8a1bb2"
+  }
+]

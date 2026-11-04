@@ -1,0 +1,272 @@
+[
+  {
+    "variant": "A",
+    "suite": "patches",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "patches",
+      "--variant",
+      "A",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.43041083400021307
+  },
+  {
+    "variant": "A",
+    "suite": "convergence",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "convergence",
+      "--variant",
+      "A",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 1.0986377420049394
+  },
+  {
+    "variant": "A",
+    "suite": "spectrum",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "spectrum",
+      "--variant",
+      "A",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.0516114330093842
+  },
+  {
+    "variant": "PN",
+    "suite": "patches",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "patches",
+      "--variant",
+      "PN",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.4313698430050863
+  },
+  {
+    "variant": "PN",
+    "suite": "convergence",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "convergence",
+      "--variant",
+      "PN",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 1.094897357004811
+  },
+  {
+    "variant": "PN",
+    "suite": "spectrum",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "spectrum",
+      "--variant",
+      "PN",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.05105972099408973
+  },
+  {
+    "variant": "B",
+    "suite": "patches",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "patches",
+      "--variant",
+      "B",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.5039761279913364
+  },
+  {
+    "variant": "B",
+    "suite": "convergence",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "convergence",
+      "--variant",
+      "B",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 1.0721349119994557
+  },
+  {
+    "variant": "B",
+    "suite": "spectrum",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "spectrum",
+      "--variant",
+      "B",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.047484035007073544
+  },
+  {
+    "variant": "C",
+    "suite": "patches",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "patches",
+      "--variant",
+      "C",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.5094356049958151
+  },
+  {
+    "variant": "C",
+    "suite": "convergence",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "convergence",
+      "--variant",
+      "C",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 1.068514694008627
+  },
+  {
+    "variant": "C",
+    "suite": "spectrum",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "spectrum",
+      "--variant",
+      "C",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.046605524999904446
+  },
+  {
+    "variant": "Aex",
+    "suite": "patches",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "patches",
+      "--variant",
+      "Aex",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 1.4851142249972327
+  },
+  {
+    "variant": "Aex",
+    "suite": "convergence",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "convergence",
+      "--variant",
+      "Aex",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.6711240870063193
+  },
+  {
+    "variant": "Aex",
+    "suite": "spectrum",
+    "command": [
+      "taskset",
+      "-c",
+      "3",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build/pn_mc_study",
+      "--suite",
+      "spectrum",
+      "--variant",
+      "Aex",
+      "--output",
+      "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/study_verified"
+    ],
+    "returncode": 0,
+    "seconds": 0.037292139008059166
+  }
+]

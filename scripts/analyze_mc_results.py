@@ -80,7 +80,7 @@ def campaign_runs(campaign_dirs: list[Path]) -> tuple[list[dict[str, Any]], dict
             planned = number(cfg.get("final_time"))
             reached = number(summary.get("time"), number(progress.get("time"), 0.))
             status = str(summary.get("status", proc.get("status", progress.get("status", "unknown"))))
-            complete = status == "completed" and (folder / "final.csv").exists()
+            complete = status == "completed" and (folder / "final.csv").exists() and abs(reached-planned)<=1e-10*max(1.,abs(planned))
             if not complete and status == "unknown":
                 status = "incomplete" if progress else "missing_status"
             record = {
@@ -174,20 +174,23 @@ def crossing_analysis(runs: dict[str, dict[str, Any]], out: Path) -> list[dict[s
                 row["method_A_relative_L1_numerator"] = float(mass @ np.abs(delta))
                 row["method_A_relative_L1_denominator"] = den
                 row["method_A_relative_L1"] = row["method_A_relative_L1_numerator"] / den if den else math.nan
-                row["method_A_relative_L2"] = float(np.sqrt(mass @ (delta ** 2)))
-                row["method_A_relative_Linf"] = float(np.max(np.abs(delta)))
+                row["method_A_difference_L2"] = float(np.sqrt(mass @ (delta ** 2)))
+                row["method_A_difference_Linf"] = float(np.max(np.abs(delta)))
                 for region, mask in {
                     "boundary": np.any((x[:, :2] < 1e-12) | (x[:, :2] > 1 - 1e-12), axis=1),
                     "boundary_zone": np.any((x[:, :2] < .1) | (x[:, :2] > .9), axis=1),
                     "crossing_zone": np.linalg.norm(x[:, :2] - .5, axis=1) < .2,
                 }.items():
-                    row[f"method_A_relative_Linf_{region}"] = float(np.max(np.abs(delta[mask]))) if mask.any() else math.nan
+                    row[f"method_A_difference_Linf_{region}"] = float(np.max(np.abs(delta[mask]))) if mask.any() else math.nan
 
     # Concentrated exportable maps: method density, analytic error, and
     # method-minus-A, with a horizontal y=0.5 lineout table.
     map_dir = out / "crossing_maps"
     map_dir.mkdir(parents=True, exist_ok=True)
     xref, _, exact, _ = next(iter(arrays.values()))
+    density_max=max(float(max(np.max(v[1]),np.max(v[2]))) for v in arrays.values())
+    analytic_error_max=max(float(np.max(abs(v[1]-v[2]))) for v in arrays.values())
+    method_error_max=max([float(np.max(abs(v[1]-arrays["A"][1]))) for v in arrays.values()]) if "A" in arrays else 0.
     for variant, (x, rho, ex, _) in arrays.items():
         fields = [(rho, f"{variant} density"), (ex, "analytic kinetic rho"),
                   (rho - ex, f"{variant} minus analytic kinetic rho")]
@@ -195,7 +198,11 @@ def crossing_analysis(runs: dict[str, dict[str, Any]], out: Path) -> list[dict[s
             fields.append((rho - arrays["A"][1], f"{variant} minus A"))
         fig, axes = plt.subplots(1, len(fields), figsize=(4 * len(fields), 3.6), constrained_layout=True, squeeze=False)
         for ax, (value, title) in zip(axes[0], fields):
-            im = ax.tricontourf(x[:, 0], x[:, 1], value, levels=30, cmap="coolwarm" if "minus" in title else "viridis")
+            if "minus" in title:
+                vmax=max(method_error_max if title.endswith("minus A") else analytic_error_max,1e-15)
+                levels=np.linspace(-vmax,vmax,31)
+            else:levels=np.linspace(0,density_max,31)
+            im = ax.tricontourf(x[:, 0], x[:, 1], value, levels=levels, cmap="coolwarm" if "minus" in title else "viridis")
             ax.set_aspect("equal"); ax.set_title(title); ax.set_xlabel("x"); ax.set_ylabel("y")
             fig.colorbar(im, ax=ax, shrink=.8)
         fig.savefig(map_dir / f"crossing_{variant}.png", dpi=160); fig.savefig(map_dir / f"crossing_{variant}.pdf"); plt.close(fig)
@@ -214,6 +221,14 @@ def crossing_analysis(runs: dict[str, dict[str, Any]], out: Path) -> list[dict[s
                     row[f"difference_{variant}_A"] = float(data[1][i] - arrays["A"][1][i])
             line_rows.append(row)
         write_csv(map_dir / "lineout_y_mid.csv", line_rows)
+        fig,axes=plt.subplots(1,2,figsize=(11,4),constrained_layout=True)
+        axes[0].plot([r["x"] for r in line_rows],[r["analytic_rho"] for r in line_rows],"k--",label="analytic kinetic")
+        for variant in arrays:
+            axes[0].plot([r["x"] for r in line_rows],[r[f"rho_{variant}"] for r in line_rows],label=variant)
+            axes[1].plot([r["x"] for r in line_rows],[r[f"error_{variant}"] for r in line_rows],label=variant)
+        axes[0].set(xlabel="x, y=0.5",ylabel="density");axes[1].set(xlabel="x, y=0.5",ylabel="error to analytic kinetic density")
+        for ax in axes:ax.grid();ax.legend()
+        fig.savefig(map_dir/"lineout_y_mid.png",dpi=160);fig.savefig(map_dir/"lineout_y_mid.pdf");plt.close(fig)
     return rows
 
 
@@ -231,9 +246,9 @@ def study_csvs(study_dirs: list[Path]) -> tuple[list[dict[str, Any]], list[dict[
             for path in base.glob(f"{suite}_*.csv"):
                 variant = path.stem[len(suite) + 1:]
                 key = (suite, variant)
-                rank = 2 if "final" in base.name else 1
+                rank = 4 if "continuous" in base.name else 3 if "verified" in base.name else 2 if "final" in base.name else 1
                 previous = files.get(key)
-                old_rank = 2 if previous and "final" in previous.parent.name else 1
+                old_rank = 4 if previous and "continuous" in previous.parent.name else 3 if previous and "verified" in previous.parent.name else 2 if previous and "final" in previous.parent.name else 1
                 if previous is None or rank >= old_rank:
                     files[key] = path
     for (suite, variant), path in files.items():
@@ -257,7 +272,7 @@ def study_csvs(study_dirs: list[Path]) -> tuple[list[dict[str, Any]], list[dict[
     for group in groups.values():
         group.sort(key=lambda r: number(r.get("cells")))
         for j, row in enumerate(group):
-            for col in ["pn_l1", "pn_l2", "pn_linf", "density_l1", "density_l2", "density_linf"]:
+            for col in ["pn_l1", "pn_l2", "pn_linf", "density_l1", "density_l2", "density_linf", "fe_pn_l1", "fe_pn_l2", "fe_pn_linf_sampled", "fe_density_l1", "fe_density_l2", "fe_density_linf_sampled"]:
                 rate = math.nan
                 if j and number(group[j-1].get(col)) > 0 and number(row.get(col)) > 0:
                     rate = math.log(number(group[j-1][col]) / number(row[col])) / math.log(number(row["cells"]) / number(group[j-1]["cells"]))
@@ -347,20 +362,29 @@ def plots(convergence: list[dict[str, Any]], patches: list[dict[str, Any]], out:
                     ax.loglog([r["cells"] for r in rr], [max(number(r.get("pn_l2")), 1e-18) for r in rr], "o-", label=variant)
                     ax.loglog([r["cells"] for r in rr], [max(number(r.get("density_l2")), 1e-18) for r in rr], "--", label=f"{variant} density")
         for ax, boundary in zip(axes, ["periodic", "open"]):
-            ax.set_title(boundary); ax.set_xlabel("cells"); ax.set_ylabel("PN L2 error"); ax.grid(True, which="both"); ax.legend()
+            ax.set_title(boundary); ax.set_xlabel("cells"); ax.set_ylabel("PN / density L2 error"); ax.grid(True, which="both"); ax.legend()
         fig.savefig(out / "convergence.png", dpi=160); fig.savefig(out / "convergence.pdf"); plt.close(fig)
+    if convergence and any("fe_pn_l2" in r for r in convergence):
+        fig,axes=plt.subplots(1,2,figsize=(10,4),constrained_layout=True)
+        for variant in sorted({str(r.get("variant")) for r in convergence}):
+            for boundary,ax in zip(["periodic","open"],axes):
+                rr=sorted([r for r in convergence if str(r.get("variant"))==variant and r.get("boundary")==boundary and "fe_pn_l2" in r],key=lambda r:number(r.get("cells")))
+                if rr:ax.loglog([r["cells"] for r in rr],[r["fe_pn_l2"] for r in rr],"o-",label=variant)
+        for boundary,ax in zip(["periodic","open"],axes):ax.set(title=f"{boundary}: continuous FE norm",xlabel="cells",ylabel="PN L2 error (element quadrature)");ax.grid(True,which="both");ax.legend()
+        fig.savefig(out/"convergence_fe.png",dpi=160);fig.savefig(out/"convergence_fe.pdf");plt.close(fig)
     if patches:
         selected = [r for r in patches if r.get("patch") in {"affine", "smooth"}]
-        if selected:
-            fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
-            for ax, kind in zip(axes, ["affine", "smooth"]):
-                for variant in sorted({str(r.get("variant")) for r in selected}):
-                    for codim in sorted({r.get("codimension") for r in selected if r.get("patch") == kind}):
-                        rr = sorted([r for r in selected if r.get("patch") == kind and str(r.get("variant")) == variant and r.get("codimension") == codim], key=lambda r: number(r.get("cells")))
-                        if rr:
-                            ax.loglog([r["cells"] for r in rr], [max(number(r.get("max_rate_error")), 1e-18) for r in rr], "o-", label=f"{variant}, codim {codim}")
-                ax.set(title=f"{kind} derivative error by stratum", xlabel="cells", ylabel="max rate error"); ax.grid(True, which="both"); ax.legend(fontsize=7)
-            fig.savefig(out / "boundary_error_strata.png", dpi=160); fig.savefig(out / "boundary_error_strata.pdf"); plt.close(fig)
+        for dim in [1,2,3]:
+            part=[r for r in selected if int(r.get("dimension",0))==dim]
+            if not part:continue
+            fig,axes=plt.subplots(1,2,figsize=(11,4),constrained_layout=True)
+            for ax,kind in zip(axes,["affine","smooth"]):
+                for variant in sorted({str(r.get("variant")) for r in part}):
+                    for codim in sorted({r.get("codimension") for r in part if r.get("patch")==kind and int(r.get("codimension",0))>0}):
+                        rr=sorted([r for r in part if r.get("patch")==kind and str(r.get("variant"))==variant and r.get("codimension")==codim],key=lambda r:number(r.get("cells")))
+                        if rr:ax.loglog([r["cells"] for r in rr],[max(number(r.get("max_rate_error")),1e-18) for r in rr],"o-",label=f"{variant}, codim {codim}")
+                ax.set(title=f"{dim}D {kind}, boundary strata",xlabel="cells",ylabel="max rate error");ax.grid(True,which="both");ax.legend(fontsize=6)
+            fig.savefig(out/f"boundary_error_strata_{dim}d.png",dpi=160);fig.savefig(out/f"boundary_error_strata_{dim}d.pdf");plt.close(fig)
 
 
 def main() -> None:
@@ -371,8 +395,8 @@ def main() -> None:
     ap.add_argument("--output", type=Path, default=root / "results" / "comparison")
     a = ap.parse_args()
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=True)
-    study_dirs = [a.study_dir / "tmp" / "study_final", a.study_dir / "tmp" / "study_standard", a.study_dir / "results" / "study_final", a.study_dir / "results" / "study_standard"]
-    campaign_dirs = a.campaign_dir or [a.study_dir / "tmp" / x for x in ["main_biharmonic", "main_B", "main_C", "performance", "boundary", "cfl", "regression_v1"]]
+    study_dirs = [a.study_dir / "tmp" / "study_continuous", a.study_dir / "results" / "study_continuous", a.study_dir / "tmp" / "study_verified", a.study_dir / "results" / "study_verified", a.study_dir / "tmp" / "study_final", a.study_dir / "tmp" / "study_standard", a.study_dir / "results" / "study_final", a.study_dir / "results" / "study_standard"]
+    campaign_dirs = a.campaign_dir or [a.study_dir / "tmp" / x for x in ["main_biharmonic", "main_B", "main_C", "performance", "performance_quiet", "boundary", "cfl", "regression_v1"]]
     statuses, runs = campaign_runs(campaign_dirs)
     conv, patch_rows, spectra = study_csvs(study_dirs)
     cross = crossing_analysis(runs, out)

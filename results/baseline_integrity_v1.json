@@ -1,0 +1,120 @@
+{
+  "all_match": false,
+  "checks": [
+    {
+      "file": "src/angular.cpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/angular.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/base_bar.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/boundary.cpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/boundary.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/common.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/cone.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/ghost_local.cpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/ghost_local.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/imex.cpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/imex.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/lazy_m1.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/m1.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/main.cpp",
+      "frozen_matches": true,
+      "original_matches": false
+    },
+    {
+      "file": "src/parallel.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/spatial.cpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/spatial.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/stabilization.cpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/stabilization.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/time.cpp",
+      "frozen_matches": true,
+      "original_matches": false
+    },
+    {
+      "file": "src/time.hpp",
+      "frozen_matches": true,
+      "original_matches": true
+    },
+    {
+      "file": "src/transport.cpp",
+      "frozen_matches": true,
+      "original_matches": false
+    },
+    {
+      "file": "src/transport.hpp",
+      "frozen_matches": true,
+      "original_matches": false
+    }
+  ]
+}

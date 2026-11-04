@@ -13,7 +13,9 @@ Kegellimiter, physikalischen Randfluss und SSPRK3.
 
 Der [Ergebnisbericht](docs/REPORT.md), die [Herleitung](docs/MATHEMATICS.md),
 [Quellenprüfung](docs/LITERATURE.md), [Versuchsmatrix](docs/EXPERIMENT_PLAN.json)
-und [Vergleichsdaten](results/comparison/summary.json) enthalten Evidenz und Grenzen.
+und [Vergleichsdaten](results/comparison/analysis.json) enthalten Evidenz und Grenzen.
+
+Die ausführliche interne Gegenprüfung steht in [AUDIT.md](docs/AUDIT.md). Die Ergebnisempfehlung lautet: bestehende Biharmonik für das Paper beibehalten. Die vier Vakuum-Einström-Stressläufe brechen ab; dies wird im Bericht gesondert ausgewiesen.
 
 ## Bauen und testen
 

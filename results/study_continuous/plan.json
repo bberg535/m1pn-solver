@@ -1,0 +1,38 @@
+{
+  "variants": [
+    "A",
+    "PN",
+    "B",
+    "C",
+    "Aex"
+  ],
+  "suite": "convergence",
+  "binary_sha256": "fb283ac55e33bb4be40f4ed1392a08226a814a2031f7858eddb376f9d6039c32",
+  "study_sha256": "b1fc63a4b46cf1726e9b6e270566956bfbd4eba8117fe64de34732709d1ebbba",
+  "source_sha256": {
+    "src/angular.cpp": "ded7ad4ffadf3365e13bb2460ff15588e1e8a4ee35ec0224c75ea6a7e1f658b9",
+    "src/angular.hpp": "fab22572ff0287927e4c3c52aa5057ffac026b86c1b4bae2eb5fc96beb25512c",
+    "src/base_bar.hpp": "6cc441ff7069216ce86ca44fac0c79c0dd91fd8e407647d644b04131e8c28e66",
+    "src/boundary.cpp": "2ea11899a5cb8b13cbbdb3b6a490cf6a615b3310ad9143ba920b7f14aa92870d",
+    "src/boundary.hpp": "7a9e5461efb406a5e5d458cf86e824381fe1f0ad4fcc5500a0b382f5d1615c6b",
+    "src/common.hpp": "4c8323e430e10caec5458960925c69c0594e028102cb88d8385ea70cf0b70ba4",
+    "src/cone.hpp": "5935baac41e37a0e721bff4e6db066a30cf042483579db705a63e7e37e4d45b8",
+    "src/ghost_local.cpp": "78e051cb0f5917100c0b93b11252f694dcb6c372dc588fc1c36980fdcaca9df1",
+    "src/ghost_local.hpp": "e2e7c4a23a1c373de0f352790684e076b275904b1c018bd1f62988fd1bba3128",
+    "src/imex.cpp": "fceb3552a369cae1b252e5e3cf11ff6e17820cf4ed24bba25313d4e953c36fe9",
+    "src/imex.hpp": "8ebd4dbb6f802e7ca0a1810f7af13b5cf54c5c31ba67e848d50dc639d4e2686e",
+    "src/lazy_m1.hpp": "95b3ad7bb2ece5b79f2a74ee2cb0da245405c68359fb3ca1428c028147cec9c6",
+    "src/m1.hpp": "f73472794a1fd25aa5b6f55202978757e1112f7eca0dd84877f3847c7d39cc4e",
+    "src/main.cpp": "725845f223d7b2001a93400a58ee23c1b366a91c5367cc3503240bb2bb7543d3",
+    "src/parallel.hpp": "b5286e828b9868cfa9e5fa4d158bd330878bdb28a81289f6659a000d4253e5d4",
+    "src/spatial.cpp": "3953d7016b6751fbd3fe15096ce8baa407a57772a1a274a78e5ac3126d9b5bb6",
+    "src/spatial.hpp": "18d50b58ee1ffa8e2cf0b98312933e0678129a403de75ac39ae0cac85f796707",
+    "src/stabilization.cpp": "f05546854cde3d7e95f33a2ea9b3e4d3d61f23d7989d0dfe5861ab3ccd4b394f",
+    "src/stabilization.hpp": "d95afa57af593bb4da89762bb54714d2571014f076235438cbfd4c8ea205175b",
+    "src/time.cpp": "c46c34719cc5c5b7a58c226d5ffbecbd20aa57a2fb1b6d67cfe4f3c9467c5d53",
+    "src/time.hpp": "f4a8fca539482e2c8d04e37479c06a80bd78da21589f482277462e54f80e4e79",
+    "src/transport.cpp": "1fe197ff03f926c31a6ae28c4adb58671ece94520c0e03261cc568aa80e0e310",
+    "src/transport.hpp": "6b8a0e763831a830bc4a064c005b49ed690d23485756d9ecd4df005c3d271a8b"
+  },
+  "metric": "Integrated FE L1/L2; Linf sampled at order20 quadrature and vertices. Original nodal metrics unchanged."
+}

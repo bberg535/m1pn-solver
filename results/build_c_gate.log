@@ -1,0 +1,21 @@
+-- Configuring done (1.1s)
+-- Generating done (2.4s)
+-- Build files have been written to: /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build
+[  9%] Building CXX object CMakeFiles/m1pn_core.dir/src/transport.cpp.o
+In file included from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/m1.hpp:2,
+                 from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/transport.hpp:3,
+                 from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/transport.cpp:1:
+/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/cone.hpp:9:23: warning: ISO C++ does not support ‘__int128’ for ‘type name’ [-Wpedantic]
+    9 | using U128 = unsigned __int128;
+      |                       ^~~~~~~~
+[ 18%] Linking CXX static library libm1pn_core.a
+[ 81%] Built target m1pn_core
+[ 90%] Building CXX object CMakeFiles/pn_mass_correction_tests.dir/tests/pn_mass_correction.cpp.o
+[100%] Linking CXX executable pn_mass_correction_tests
+[100%] Built target pn_mass_correction_tests
+[ 81%] Built target m1pn_core
+[ 90%] Linking CXX executable m1pn
+[100%] Built target m1pn
+[ 81%] Built target m1pn_core
+[ 90%] Linking CXX executable pn_mc_study
+[100%] Built target pn_mc_study

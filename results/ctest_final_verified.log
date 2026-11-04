@@ -1,0 +1,58 @@
+Internal ctest changing into directory: /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build
+Test project /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/build
+      Start  1: ghost_local
+ 1/26 Test  #1: ghost_local ......................   Passed    0.06 sec
+      Start  2: ghost_coupling
+ 2/26 Test  #2: ghost_coupling ...................   Passed    0.22 sec
+      Start  3: ghost_diagnostics
+ 3/26 Test  #3: ghost_diagnostics ................   Passed    0.85 sec
+      Start  4: r2_stabilization
+ 4/26 Test  #4: r2_stabilization .................   Passed    0.04 sec
+      Start  5: r2_transport
+ 5/26 Test  #5: r2_transport .....................   Passed    0.03 sec
+      Start  6: angular
+ 6/26 Test  #6: angular ..........................   Passed    0.12 sec
+      Start  7: boundary
+ 7/26 Test  #7: boundary .........................   Passed    0.68 sec
+      Start  8: spatial
+ 8/26 Test  #8: spatial ..........................   Passed    0.08 sec
+      Start  9: coupling
+ 9/26 Test  #9: coupling .........................   Passed    0.62 sec
+      Start 10: time
+10/26 Test #10: time .............................   Passed    0.04 sec
+      Start 11: cone_filter
+11/26 Test #11: cone_filter ......................   Passed    0.09 sec
+      Start 12: base_bar
+12/26 Test #12: base_bar .........................   Passed    0.02 sec
+      Start 13: pair_limiter
+13/26 Test #13: pair_limiter .....................   Passed    0.02 sec
+      Start 14: ghost_cli
+14/26 Test #14: ghost_cli ........................   Passed    0.16 sec
+      Start 15: cli_guards
+15/26 Test #15: cli_guards .......................   Passed    0.28 sec
+      Start 16: crossing_2d
+16/26 Test #16: crossing_2d ......................   Passed    0.21 sec
+      Start 17: crossing_three
+17/26 Test #17: crossing_three ...................   Passed    0.19 sec
+      Start 18: mass_afc
+18/26 Test #18: mass_afc .........................   Passed    0.05 sec
+      Start 19: mass_fourier
+19/26 Test #19: mass_fourier .....................   Passed    0.10 sec
+      Start 20: mass_accuracy
+20/26 Test #20: mass_accuracy ....................   Passed    0.33 sec
+      Start 21: lazy_extension
+21/26 Test #21: lazy_extension ...................   Passed    0.02 sec
+      Start 22: imex_extension
+22/26 Test #22: imex_extension ...................   Passed    0.10 sec
+      Start 23: bh_pairs_extension
+23/26 Test #23: bh_pairs_extension ...............   Passed    0.02 sec
+      Start 24: inflow_extension
+24/26 Test #24: inflow_extension .................   Passed    0.03 sec
+      Start 25: pn_mass_correction
+25/26 Test #25: pn_mass_correction ...............   Passed    0.10 sec
+      Start 26: pn_mass_correction_cli
+26/26 Test #26: pn_mass_correction_cli ...........   Passed    0.33 sec
+
+100% tests passed, 0 tests failed out of 26
+
+Total Test time (real) =   4.90 sec

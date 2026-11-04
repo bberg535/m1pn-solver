@@ -202,9 +202,71 @@ double pn_error(const Spatial &fe, const Field &a, const Field &b, int norm) {
     return norm == 1 ? sum / volume : std::sqrt(sum / volume);
 }
 
+struct ContinuousErrors {
+    double pn_l1=0., pn_l2=0., pn_linf=0.;
+    double density_l1=0., density_l2=0., density_linf=0.;
+};
+
+// Integrate the P1/Q1 finite-element error on the actual MFEM elements.
+// Linf is deliberately labelled sampled: it takes the quadrature points and
+// all vertices, so endpoints are included in one dimension.
+ContinuousErrors continuous_wave_errors(const Spatial &fe, const Angular &pn,
+                                        const Field &state, const Wave &wave,
+                                        double time, double eps) {
+    ContinuousErrors out;
+    double pn_sq=0., density_sq=0.;
+    for (int e=0; e<fe.mesh->GetNE(); ++e) {
+        const mfem::FiniteElement *el=fe.space->GetFE(e);
+        mfem::ElementTransformation *tr=fe.mesh->GetElementTransformation(e);
+        mfem::Array<int> dofs;
+        fe.space->GetElementDofs(e,dofs);
+        const int nd=dofs.Size();
+        const auto &rule=mfem::IntRules.Get(el->GetGeomType(),20);
+        auto sample=[&](const mfem::IntegrationPoint &ip, double weight) {
+            mfem::Vector shape(nd), x(fe.dimension);
+            el->CalcShape(ip,shape);
+            tr->SetIntPoint(&ip);
+            tr->Transform(ip,x);
+            Vec uh=Vec::Zero(pn.q);
+            for(int a=0;a<nd;++a) {
+                int dof=dofs[a];
+                const double sign=dof<0?-1.:1.;
+                if(dof<0) dof=-1-dof;
+                uh.noalias() += sign*shape[a]*state.row(dof).transpose();
+            }
+            const double phase=2*pi*(x[0]-wave.speed*time);
+            Vec exact=Vec::Zero(pn.q);
+            exact[0]=1./std::sqrt(4*pi);
+            exact.noalias() += eps*std::cos(phase)*wave.vector;
+            const double pe=(uh-exact).norm();
+            const double de=std::abs(project(uh)[0]-project(exact)[0]);
+            out.pn_l1 += weight*pe;
+            pn_sq += weight*pe*pe;
+            out.density_l1 += weight*de;
+            density_sq += weight*de*de;
+            out.pn_linf=std::max(out.pn_linf,pe);
+            out.density_linf=std::max(out.density_linf,de);
+        };
+        for(int q=0;q<rule.GetNPoints();++q) {
+            const auto &ip=rule.IntPoint(q);
+            tr->SetIntPoint(&ip);
+            sample(ip,ip.weight*tr->Weight());
+        }
+        mfem::Array<int> vertices;
+        fe.mesh->GetElementVertices(e,vertices);
+        for(int a=0;a<vertices.Size();++a) {
+            const mfem::IntegrationPoint &ip=el->GetNodes().IntPoint(a);
+            sample(ip,0.);
+        }
+    }
+    out.pn_l2=std::sqrt(pn_sq);
+    out.density_l2=std::sqrt(density_sq);
+    return out;
+}
+
 void convergence(const std::string &variant) {
     const Numerics opts = numerics(variant);
-    std::cout << "suite,variant,boundary,cells,steps,dt,time,wave_speed,pn_l1,pn_l2,pn_linf,density_l1,density_l2,density_linf,active_pairs,mass_balance,elapsed_seconds,density_boundary_linf,density_boundary_zone_linf,inflow_linf,outflow_linf,opposite_branch_error_l2\n";
+    std::cout << "suite,variant,boundary,cells,steps,dt,time,wave_speed,pn_l1,pn_l2,pn_linf,density_l1,density_l2,density_linf,active_pairs,mass_balance,elapsed_seconds,density_boundary_linf,density_boundary_zone_linf,inflow_linf,outflow_linf,opposite_branch_error_l2,fe_pn_l1,fe_pn_l2,fe_pn_linf_sampled,fe_density_l1,fe_density_l2,fe_density_linf_sampled\n";
     for (bool periodic : {true, false}) for (int cells : {16, 32, 64}) {
         if (variant == "Aex" && periodic) continue;
         MeshSpec mesh; mesh.dimension = 1; mesh.elements = cells; mesh.periodic = periodic;
@@ -228,6 +290,7 @@ void convergence(const std::string &variant) {
         }
         const double elapsed = seconds() - t0;
         Field exact = wave_state(fe, pn, wave, T, eps);
+        const ContinuousErrors fe_errors=continuous_wave_errors(fe,pn,state,wave,T,eps);
         Field den(fe.nodes, 1), denex(fe.nodes, 1);
         for (int i = 0; i < fe.nodes; ++i) {
             den(i, 0) = project(state.row(i).transpose())[0];
@@ -252,7 +315,9 @@ void convergence(const std::string &variant) {
                   << pn_error(fe,state,exact,2) << ',' << pn_error(fe,state,exact,0) << ','
                   << scalar_error(1) << ',' << scalar_error(2) << ',' << scalar_error(0) << ',' << active << ','
                   << balance << ',' << elapsed << ',' << boundary_error << ',' << zone_error << ','
-                  << inflow_error << ',' << outflow_error << ',' << std::sqrt(opposite_error) << '\n';
+                  << inflow_error << ',' << outflow_error << ',' << std::sqrt(opposite_error) << ','
+                  << fe_errors.pn_l1 << ',' << fe_errors.pn_l2 << ',' << fe_errors.pn_linf << ','
+                  << fe_errors.density_l1 << ',' << fe_errors.density_l2 << ',' << fe_errors.density_linf << '\n';
     }
 }
 

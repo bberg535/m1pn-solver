@@ -1,0 +1,114 @@
+[  1%] Building CXX object CMakeFiles/m1pn_reference_core.dir/reference/src/angular.cpp.o
+[  2%] Building CXX object CMakeFiles/m1pn_core.dir/src/angular.cpp.o
+[  4%] Building CXX object CMakeFiles/m1pn_reference_core.dir/reference/src/boundary.cpp.o
+[  5%] Building CXX object CMakeFiles/m1pn_core.dir/src/boundary.cpp.o
+In file included from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/boundary.cpp:2:
+/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/cone.hpp:9:23: warning: ISO C++ does not support ‘__int128’ for ‘type name’ [-Wpedantic]
+    9 | using U128 = unsigned __int128;
+      |                       ^~~~~~~~
+[  7%] Building CXX object CMakeFiles/m1pn_reference_core.dir/reference/src/spatial.cpp.o
+[  8%] Building CXX object CMakeFiles/m1pn_core.dir/src/spatial.cpp.o
+In file included from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/spatial.cpp:2:
+/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/cone.hpp:9:23: warning: ISO C++ does not support ‘__int128’ for ‘type name’ [-Wpedantic]
+    9 | using U128 = unsigned __int128;
+      |                       ^~~~~~~~
+[ 10%] Building CXX object CMakeFiles/m1pn_reference_core.dir/reference/src/ghost_local.cpp.o
+[ 11%] Building CXX object CMakeFiles/m1pn_core.dir/src/ghost_local.cpp.o
+[ 12%] Building CXX object CMakeFiles/m1pn_reference_core.dir/reference/src/stabilization.cpp.o
+[ 14%] Building CXX object CMakeFiles/m1pn_core.dir/src/stabilization.cpp.o
+[ 15%] Building CXX object CMakeFiles/m1pn_reference_core.dir/reference/src/transport.cpp.o
+[ 17%] Building CXX object CMakeFiles/m1pn_core.dir/src/transport.cpp.o
+In file included from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/m1.hpp:2,
+                 from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/transport.hpp:3,
+                 from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/transport.cpp:1:
+/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/cone.hpp:9:23: warning: ISO C++ does not support ‘__int128’ for ‘type name’ [-Wpedantic]
+    9 | using U128 = unsigned __int128;
+      |                       ^~~~~~~~
+[ 18%] Building CXX object CMakeFiles/m1pn_reference_core.dir/reference/src/time.cpp.o
+[ 20%] Building CXX object CMakeFiles/m1pn_core.dir/src/time.cpp.o
+In file included from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/m1.hpp:2,
+                 from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/transport.hpp:3,
+                 from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/time.hpp:2,
+                 from /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/time.cpp:1:
+/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/src/cone.hpp:9:23: warning: ISO C++ does not support ‘__int128’ for ‘type name’ [-Wpedantic]
+    9 | using U128 = unsigned __int128;
+      |                       ^~~~~~~~
+[ 21%] Linking CXX static library libm1pn_reference_core.a
+[ 21%] Built target m1pn_reference_core
+[ 22%] Building CXX object CMakeFiles/m1pn_baseline_core.dir/baseline/src/angular.cpp.o
+[ 24%] Building CXX object CMakeFiles/m1pn_core.dir/src/imex.cpp.o
+[ 25%] Building CXX object CMakeFiles/m1pn_baseline_core.dir/baseline/src/boundary.cpp.o
+[ 27%] Linking CXX static library libm1pn_core.a
+[ 27%] Built target m1pn_core
+[ 28%] Building CXX object CMakeFiles/m1pn_baseline_core.dir/baseline/src/spatial.cpp.o
+[ 30%] Building CXX object CMakeFiles/m1pn.dir/src/main.cpp.o
+[ 31%] Building CXX object CMakeFiles/m1pn_baseline_core.dir/baseline/src/ghost_local.cpp.o
+[ 32%] Building CXX object CMakeFiles/m1pn_baseline_core.dir/baseline/src/stabilization.cpp.o
+[ 34%] Linking CXX executable m1pn
+[ 34%] Built target m1pn
+[ 35%] Building CXX object CMakeFiles/m1pn_benchmark.dir/tests/benchmark.cpp.o
+[100%] Building CXX object CMakeFiles/m1pn_baseline_core.dir/baseline/src/transport.cpp.o
+[109%] Linking CXX executable m1pn_benchmark
+[118%] Built target m1pn_benchmark
+[127%] Building CXX object CMakeFiles/m1pn_ghost_tests.dir/tests/ghost_local.cpp.o
+[136%] Building CXX object CMakeFiles/m1pn_baseline_core.dir/baseline/src/time.cpp.o
+[145%] Linking CXX executable m1pn_ghost_tests
+[145%] Built target m1pn_ghost_tests
+[154%] Building CXX object CMakeFiles/m1pn_ghost_coupling_tests.dir/tests/ghost_coupling.cpp.o
+[163%] Linking CXX executable m1pn_ghost_coupling_tests
+[ 27%] Built target m1pn_ghost_coupling_tests
+[ 36%] Building CXX object CMakeFiles/m1pn_baseline_core.dir/baseline/src/imex.cpp.o
+[ 45%] Building CXX object CMakeFiles/m1pn_ghost_diagnostics.dir/tests/ghost_diagnostics.cpp.o
+[ 54%] Linking CXX static library libm1pn_baseline_core.a
+[118%] Built target m1pn_baseline_core
+[127%] Building CXX object CMakeFiles/m1pn_stabilization_tests.dir/tests/stabilization.cpp.o
+[136%] Linking CXX executable m1pn_stabilization_tests
+[145%] Linking CXX executable m1pn_ghost_diagnostics
+[145%] Built target m1pn_stabilization_tests
+[163%] Building CXX object CMakeFiles/m1pn_r2_tests.dir/tests/r2_transport.cpp.o
+[236%] Built target m1pn_ghost_diagnostics
+[245%] Building CXX object CMakeFiles/m1pn_tests.dir/tests/checks.cpp.o
+[263%] Linking CXX executable m1pn_r2_tests
+Built target m1pn_r2_tests
+Building CXX object CMakeFiles/mass_afc_tests.dir/tests/mass_afc.cpp.o
+Linking CXX executable mass_afc_tests
+Built target mass_afc_tests
+Linking CXX executable m1pn_tests
+Building CXX object CMakeFiles/mass_kernel_benchmark.dir/tests/kernel_benchmark.cpp.o
+Linking CXX executable mass_kernel_benchmark
+Built target m1pn_tests
+Building CXX object CMakeFiles/mass_accuracy.dir/tests/accuracy.cpp.o
+Built target mass_kernel_benchmark
+Building CXX object CMakeFiles/mass_fourier_tests.dir/tests/mass_fourier.cpp.o
+Linking CXX executable mass_accuracy
+Built target mass_accuracy
+Building CXX object CMakeFiles/m1pn_reference.dir/reference/src/main.cpp.o
+Linking CXX executable mass_fourier_tests
+Built target mass_fourier_tests
+Linking CXX executable m1pn_reference
+Building CXX object CMakeFiles/lazy_tests.dir/tests/lazy.cpp.o
+Built target m1pn_reference
+Building CXX object CMakeFiles/imex_tests.dir/tests/imex.cpp.o
+Linking CXX executable lazy_tests
+Built target lazy_tests
+Building CXX object CMakeFiles/bh_pairs_tests.dir/tests/bh_pairs.cpp.o
+Linking CXX executable imex_tests
+Built target imex_tests
+Building CXX object CMakeFiles/inflow_tests.dir/tests/inflow.cpp.o
+Linking CXX executable bh_pairs_tests
+Built target bh_pairs_tests
+Building CXX object CMakeFiles/efficiency_benchmark.dir/tests/efficiency.cpp.o
+Linking CXX executable inflow_tests
+Built target inflow_tests
+Building CXX object CMakeFiles/efficiency_reference.dir/tests/efficiency.cpp.o
+Linking CXX executable efficiency_benchmark
+Built target efficiency_benchmark
+Building CXX object CMakeFiles/m1pn_baseline.dir/baseline/src/main.cpp.o
+Linking CXX executable efficiency_reference
+Built target efficiency_reference
+Built target pn_mass_correction_tests
+Building CXX object CMakeFiles/pn_mc_study.dir/tests/pn_mc_study.cpp.o
+Linking CXX executable m1pn_baseline
+Built target m1pn_baseline
+Linking CXX executable pn_mc_study
+Built target pn_mc_study

@@ -1,0 +1,15 @@
+{
+  "suite": "performance",
+  "variants": [
+    "A",
+    "Aex",
+    "B",
+    "C"
+  ],
+  "host": "lws2024-05",
+  "cpu": 5,
+  "threads": 1,
+  "driver_sha256": "6088785c1fcc7aa9be3fd0c3f5a9d1c2588d4361e507bd7ead21dfe336370e58",
+  "binary_sha256": "12eb699a7698b00021b65e1221139fbce52ccbab995a7a1ed5d10fcec95eeb90",
+  "reference": "docs/EXPERIMENT_PLAN.json"
+}

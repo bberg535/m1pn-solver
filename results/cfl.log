@@ -1,0 +1,17 @@
+RUN cfl_A_0.2
+RUN cfl_A_0.5
+RUN cfl_A_0.8
+RUN cfl_A_1.0
+RUN cfl_Aex_0.2
+RUN cfl_Aex_0.5
+RUN cfl_Aex_0.8
+RUN cfl_Aex_1.0
+RUN cfl_B_0.2
+RUN cfl_B_0.5
+RUN cfl_B_0.8
+RUN cfl_B_1.0
+RUN cfl_C_0.2
+RUN cfl_C_0.5
+RUN cfl_C_0.8
+RUN cfl_C_1.0
+DONE 16 runs; 0 failed
