@@ -1,0 +1,2 @@
+# CSV writers use RFC-style CRLF; preserve raw evidence bytes.
+*.csv whitespace=cr-at-eol

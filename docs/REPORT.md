@@ -1,7 +1,7 @@
 # Abschlussbericht: PN-Massenkorrektur im M1PN-MCL-Verfahren
 
-Stand: 4. November 2026  
-Arbeitsordner: `M1PN_MassCorrection_20261104`  
+Stand: 4. November 2026
+Arbeitsordner: `M1PN_MassCorrection_20261104`
 Feature-Branch: `experiment/m1pn-pn-mass-correction`
 
 ## Ergebnis und Empfehlung

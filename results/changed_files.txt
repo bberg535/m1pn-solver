@@ -1,3 +1,4 @@
+.gitattributes
 CMakeLists.txt
 README.md
 docs/AUDIT.md
