@@ -30,6 +30,26 @@ bash scripts/build.sh
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 bash scripts/test.sh
 ```
 
+Ein lokaler Crossing-Test mit Fortschritt im Terminal verwendet die bereits
+gebaute Studienbinary aus `nx/tmp/build_local`:
+
+```bash
+# Kurzer Test: 16×16, P3, T=0.01, ein Thread.
+python3 scripts/run_local_progress.py --time .01
+
+# Vollständige Crossing-Zeit T=0.32, gleiche lokale Größe.
+python3 scripts/run_local_progress.py
+
+# Höhere PN-Ordnung auf demselben Gitter.
+python3 scripts/run_local_progress.py --pn-order 7
+```
+
+Die Anzeige enthält Prozent, Schrittzahl, Simulationszeit, Laufzeit und eine
+geschätzte Restzeit. Neue Ergebnisse liegen unter `tmp/local_B_<Zeitstempel>`,
+das Solverlog daneben. Nach dem Lauf werden die gespeicherten Felder auf den
+M1-Kegel und die globale Bilanz geprüft. `Strg+C` beendet den lokalen Lauf und
+behält die bisherigen Daten. Die Clusterjobs werden davon nicht beeinflusst.
+
 Ein bereits vorhandener anderer kompatibler Stack kann über `MFEM_CONFIG`
 ausgewählt werden. Builds und große Rohfelder bleiben unter `tmp/`.
 
