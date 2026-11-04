@@ -83,3 +83,25 @@ NX-Knoten; Array und Auswertung warteten auf ihre Abhängigkeiten.
 Der [Einreichungsnachweis](results/launch_20261104_161438_760701.json) enthält
 die Befehle, Job-IDs, Methode und den zuletzt beobachteten Zustand.
 Lokal sind vier Tests der Cluster-Pipeline und alle 15 Smoke-Aufgaben bestanden.
+
+## Längere Aufgaben gezielt auf long verschieben
+
+`python3 nx/scripts/submit_long_tasks.py --dry-run` vom Projektordner aus zeigt
+die gezielte Verschiebung der vier noch nicht gestarteten Aufgaben 17 und 45–47.
+Ohne `--dry-run` wird ein zunächst gehaltener Long-Array-Auftrag eingereicht,
+der nach Ende des bisherigen Arrays startet. Danach wird die Abhängigkeit des
+bestehenden Collectors um das neue Array ergänzt; nur die vier wartenden
+Originalaufgaben werden entfernt und das neue Array freigegeben. Die Zahl
+gleichzeitig rechnender Aufgaben bleibt dadurch insgesamt auf zwei begrenzt.
+
+Das Long-Profil verwendet weiterhin 16 Threads, NX und 64 GiB Slurm-Speicher,
+aber 24 Stunden Slurm-Zeit und 23 Stunden internes Timeout. Die eingefrorenen
+Solverdateien, Aufgaben, Schrittweiten und der Studienplan bleiben erhalten.
+Das Laufskript übergibt das längere Timeout als Ausführungsoption; laufende und
+abschließende Statusdateien dokumentieren `effective_timeout_seconds` und
+`timeout_source`. Ohne Override gelten weiterhin die sieben Stunden des Plans.
+
+Der Vorgang wird unter `results/long_migration_*.json` protokolliert. Ein
+vorhandener Verschiebungsnachweis verhindert eine doppelte Einreichung.
+Bereits gestartete Aufgaben werden abgewiesen, damit vorhandene Ergebnisse
+oder Teilergebnisse erhalten bleiben.

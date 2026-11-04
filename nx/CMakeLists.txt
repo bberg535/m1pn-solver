@@ -16,6 +16,7 @@ add_test(NAME nx_cases COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}
 add_test(NAME nx_study_driver COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_study.py)
 add_test(NAME nx_study_analysis COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_analysis.py)
 add_test(NAME nx_submission COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_submission.py)
-set_tests_properties(nx_cases nx_study_driver nx_study_analysis nx_submission PROPERTIES
+add_test(NAME nx_long_migration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_long_tasks.py)
+set_tests_properties(nx_cases nx_study_driver nx_study_analysis nx_submission nx_long_migration PROPERTIES
   ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;TMPDIR=${CMAKE_CURRENT_SOURCE_DIR}/tmp/test_tmp"
   TIMEOUT 180)

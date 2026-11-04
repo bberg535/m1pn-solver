@@ -331,16 +331,20 @@ def run_task(ns: argparse.Namespace) -> int:
         command = ["srun", "--mpi=none", "--ntasks=1", f"--cpus-per-task={manifest['threads']}",
                    "--cpu-bind=cores", "--distribution=block:block", *command]
     status_path = campaign / "status" / f"{task['id']}.json"
+    effective_timeout = (ns.timeout if ns.timeout is not None else
+                         manifest["plan"]["execution"]["timeout_seconds"])
+    timeout_source = "cli_override" if ns.timeout is not None else "manifest"
     common = {"id": task["id"], "label": task["label"], "task": task,
               "output_dir": task["output_dir"], "command": command, "log": str(log.relative_to(campaign)),
               "binary_sha256": manifest["binary_sha256"],
+              "effective_timeout_seconds": effective_timeout,
+              "timeout_source": timeout_source,
               "allocation": {k: os.environ[k] for k in (
                   "SLURM_JOB_ID", "SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID",
                   "SLURM_JOB_NODELIST", "SLURM_CPUS_PER_TASK", "SLURM_JOB_PARTITION",
                   "SLURM_JOB_CONSTRAINTS") if k in os.environ}}
     atomic_json(status_path, {**common, "status": "running", "started_at": time.time()})
-    timeout = ns.timeout or manifest["plan"]["execution"]["timeout_seconds"]
-    rc, wall = run_logged(command, log, timeout)
+    rc, wall = run_logged(command, log, effective_timeout)
     diagnostics = {}
     state = "failed"
     try:
@@ -387,7 +391,7 @@ def run_task(ns: argparse.Namespace) -> int:
                 raise ValueError("run metadata violates requested controls or final-time target")
             vr = subprocess.run([sys.executable, str(verifier), str(runs)],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                timeout=min(timeout, 600), check=False)
+                                timeout=min(effective_timeout, 600), check=False)
             diagnostics["verification_output"] = vr.stdout
             if vr.returncode:
                 state = "validation_failed"
