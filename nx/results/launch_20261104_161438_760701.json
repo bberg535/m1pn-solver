@@ -19,6 +19,8 @@
   "git_head": "3b83ddd1170413f9b8481f1406bf57090ab6a057",
   "last_observed_utc": "2026-11-04T15:15:03.849145+00:00",
   "launch_record": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/results/launch_20261104_161438_760701.json",
+  "long_array_job_id": "156706",
+  "long_migration": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/results/long_migration_20261104_171944_552809.json",
   "max_concurrent_tasks": 2,
   "method": {
     "biharmonic_gamma": 0.0,

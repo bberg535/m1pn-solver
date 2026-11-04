@@ -105,3 +105,12 @@ Der Vorgang wird unter `results/long_migration_*.json` protokolliert. Ein
 vorhandener Verschiebungsnachweis verhindert eine doppelte Einreichung.
 Bereits gestartete Aufgaben werden abgewiesen, damit vorhandene Ergebnisse
 oder Teilergebnisse erhalten bleiben.
+
+Am 04.11.2026 wurden diese vier Aufgaben als Long-Array **156706** neu
+eingereiht: Crossing 128²/P15 sowie die drei feinsten zeitlichen Referenzläufe
+Crossing 128²/P15, Lattice 112²/P11 und 3D-Crossing 32³/P9 mit jeweils halbem
+Zeitschritt. Die vier ursprünglichen wartenden Med-Aufgaben wurden entfernt.
+Das Long-Array wartet auf das restliche Array **156674**; Collector **156675**
+wartet auf beide Arrays. Partition, 24-Stunden-Limit, 16 Threads und die
+Abhängigkeiten wurden im Controller verifiziert. Der genaue Nachweis steht in
+[long_migration_20261104_171944_552809.json](results/long_migration_20261104_171944_552809.json).
