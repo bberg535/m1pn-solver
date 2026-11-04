@@ -6,6 +6,7 @@ import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 VARIANTS={'A':['--stabilization','biharmonic-corrected','--biharmonic-gamma','.004'],
           'B':['--stabilization','m1pn_mass_correction'],
+          'Aex':['--stabilization','m1pn_ghost_local_projected_p4','--ghost-gamma','0.00032911848351755427'],
           'C':['--stabilization','m1pn_mass_correction_boundary_consistent']}
 
 def metric(folder,t,scenario):
@@ -42,11 +43,11 @@ def run(out,name,variant,dim,n,pn,t,dt,scenario='crossing',repeat=0,binary='m1pn
     return row
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--suite',choices=['screen','performance','main','regression','boundary','cfl'],required=True);ap.add_argument('--output',type=Path,required=True);ap.add_argument('--variants',nargs='+',default=['A','B','C']);a=ap.parse_args();out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
+    ap=argparse.ArgumentParser();ap.add_argument('--suite',choices=['screen','performance','main','regression','boundary','cfl'],required=True);ap.add_argument('--output',type=Path,required=True);ap.add_argument('--variants',nargs='+',default=['A','B','C']);ap.add_argument('--binary',default='m1pn');a=ap.parse_args();out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     plan=dict(suite=a.suite,variants=a.variants,host=platform.node(),cpu=min(os.sched_getaffinity(0)),threads=1,driver_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),binary_sha256=hashlib.sha256((ROOT/'tmp/build/m1pn').read_bytes()).hexdigest(),reference='docs/EXPERIMENT_PLAN.json')
     (out/'plan.json').write_text(json.dumps(plan,indent=2)+'\n');rows=[]
     def record(**kw):
-        rows.append(run(out,**kw));(out/'trials.json').write_text(json.dumps(rows,indent=2)+'\n')
+        kw.setdefault('binary',a.binary);rows.append(run(out,**kw));(out/'trials.json').write_text(json.dumps(rows,indent=2)+'\n')
     if a.suite in ['screen','performance']:
         for n,pn in [(8,3),(16,7)]:
             for rep in range(3 if a.suite=='performance' else 1):

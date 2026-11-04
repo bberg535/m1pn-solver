@@ -3,6 +3,7 @@
 #include "lazy_m1.hpp"
 #include <mutex>
 #include <atomic>
+#include <numeric>
 namespace m1pn {
 Transport::Transport(const Angular &a, Spatial &f, const Numerics &n, Inflow g, Runtime r)
     : pn(a), fe(f), options(n), runtime(r), canonical(pn), inflow(std::move(g)) {
@@ -19,11 +20,81 @@ Transport::Transport(const Angular &a, Spatial &f, const Numerics &n, Inflow g, 
             "Unknown PN boundary quadrature mode");
     require(n.r2 || n.stabilization != "m1pn_ghost_local_projected_p4",
             "Local projected ghost stabilization requires the R2 transfer");
-    const bool pn_mass_correction = n.stabilization == "m1pn_mass_correction";
+    const bool pn_mass_correction = n.stabilization == "m1pn_mass_correction" ||
+                                    n.stabilization == "m1pn_mass_correction_boundary_consistent";
     require(!pn_mass_correction || (n.r2 && n.mass_mode == "lumped"),
-            "m1pn_mass_correction requires R2 and lumped mass mode");
+            "PN mass correction requires R2 and lumped mass mode");
     require(n.pn_viscosity_scale >= 1 && std::isfinite(n.pn_viscosity_scale),
             "PN viscosity scale must be finite and at least one");
+    if(n.stabilization=="m1pn_mass_correction_boundary_consistent") {
+        pn_boundary_map.resize(f.nodes); std::iota(pn_boundary_map.begin(),pn_boundary_map.end(),0);
+        if(!f.faces.empty()) {
+            std::array<std::vector<double>,3> axes;
+            std::array<int,3> count{1,1,1};
+            for(int d=0;d<f.dimension;++d) {
+                for(int i=0;i<f.nodes;++i)axes[d].push_back(f.coordinates(i,d));
+                std::sort(axes[d].begin(),axes[d].end());
+                axes[d].erase(std::unique(axes[d].begin(),axes[d].end(),[](double x,double y){return std::abs(x-y)<2e-12;}),axes[d].end());
+                count[d]=int(axes[d].size());
+                require(count[d]>=4,"Boundary-consistent PN mass correction requires at least three Cartesian cells per axis");
+                const double h=axes[d][1]-axes[d][0];
+                for(int k=2;k<count[d];++k)require(std::abs((axes[d][k]-axes[d][k-1])-h)<2e-10*std::max(1.,std::abs(h)),
+                    "Boundary-consistent PN mass correction requires a uniform Cartesian grid");
+            }
+            const long long grid_nodes=1LL*count[0]*count[1]*count[2];
+            require(grid_nodes==f.nodes,"Boundary-consistent PN mass correction requires a full Cartesian Q1 grid");
+            long long tensor_elements=1;
+            for(int d=0;d<f.dimension;++d)tensor_elements*=count[d]-1;
+            require(f.mesh->GetNE()==tensor_elements,"Boundary-consistent PN mass correction requires a full tensor-product element grid");
+            for(int e=0;e<f.mesh->GetNE();++e)
+                require(f.mesh->GetElement(e)->GetNVertices()==(1<<f.dimension),
+                        "Boundary-consistent PN mass correction requires line, quadrilateral, or hexahedral Q1 elements");
+            auto key=[&](const std::array<int,3>&q){return (q[0]*count[1]+q[1])*count[2]+q[2];};
+            std::vector<int> node_at(f.nodes,-1); std::vector<std::array<int,3>> multi(f.nodes);
+            for(int i=0;i<f.nodes;++i) {
+                std::array<int,3> q{0,0,0};
+                for(int d=0;d<f.dimension;++d) {
+                    auto it=std::lower_bound(axes[d].begin(),axes[d].end(),f.coordinates(i,d));
+                    require(it!=axes[d].end()&&std::abs(*it-f.coordinates(i,d))<2e-12,"Non-Cartesian node in boundary-consistent PN grid");
+                    q[d]=int(it-axes[d].begin());
+                }
+                require(node_at[key(q)]<0,"Duplicate Cartesian node in boundary-consistent PN grid");
+                node_at[key(q)]=i; multi[i]=q;
+            }
+            for(int x:node_at)require(x>=0,"Missing Cartesian node in boundary-consistent PN grid");
+            std::set<std::array<int,3>> cells_seen;
+            for(int e=0;e<f.mesh->GetNE();++e) {
+                mfem::Array<int> vertices; f.mesh->GetElementVertices(e,vertices);
+                require(vertices.Size()==(1<<f.dimension),"Boundary-consistent PN element is not tensor-product Q1");
+                std::array<int,3> lo{count[0],count[1],count[2]},hi{-1,-1,-1};
+                for(int k=0;k<vertices.Size();++k)for(int d=0;d<f.dimension;++d) {
+                    lo[d]=std::min(lo[d],multi[vertices[k]][d]); hi[d]=std::max(hi[d],multi[vertices[k]][d]);
+                }
+                require(cells_seen.insert(lo).second,"Duplicate Cartesian cell in boundary-consistent PN grid");
+                int seen=0;
+                for(int k=0;k<vertices.Size();++k) {
+                    int mask=0;
+                    for(int d=0;d<f.dimension;++d) {
+                        require(hi[d]-lo[d]==1,"Boundary-consistent PN element spans more than one Cartesian cell");
+                        mask|=(multi[vertices[k]][d]-lo[d])<<d;
+                    }
+                    require(!(seen&(1<<mask)),"Boundary-consistent PN element repeats a tensor vertex");
+                    seen|=1<<mask;
+                }
+                require(seen==((1<<(1<<f.dimension))-1),"Boundary-consistent PN element does not cover one Cartesian cell");
+            }
+            for(int i=0;i<f.nodes;++i)if(f.boundary[i]) {
+                auto q=multi[i];
+                for(int d=0;d<f.dimension;++d)q[d]=std::clamp(q[d],1,count[d]-2);
+                pn_boundary_map[i]=node_at[key(q)];
+            }
+            Vec accumulated=Vec::Zero(f.nodes);
+            for(int i=0;i<f.nodes;++i)accumulated[pn_boundary_map[i]]+=f.mass[i];
+            double ratio=1.;
+            for(int j=0;j<f.nodes;++j)ratio=std::max(ratio,accumulated[j]/f.mass[j]);
+            pn_boundary_map_norm=std::sqrt(ratio);
+        }
+    }
     if (n.r2 && !pn_mass_correction) stabilization_operator = std::make_unique<SpatialStabilization>(f,n.stabilization,n.stabilization=="gradient-defect"?n.kv_gamma:n.gamma,pn.speed);
     if (n.geometry_cache) {
         pair_geometry.resize(f.pairs.size());
@@ -123,7 +194,9 @@ Transport::Transport(const Angular &a, Spatial &f, const Numerics &n, Inflow g, 
         const double low_order_bound=weak_advection+2.*(graph_degree.array()/f.mass.array()).maxCoeff()+boundary_diagonal.maxCoeff()+numerical_boundary_bound;
         // In the lumped-mass norm, ||I-M_L^{-1/2} M M_L^{-1/2}|| <= 1.
         // This bounds R_C plus the mass correction composed with the PN LO rate.
-        generator_norm_bound=(weak_advection+numerical_boundary_bound+low_order_bound)*(1+1e-11);
+        const double standard_bound=weak_advection+numerical_boundary_bound+low_order_bound;
+        generator_norm_bound=(n.stabilization=="m1pn_mass_correction_boundary_consistent" ?
+            weak_advection+numerical_boundary_bound+pn_boundary_map_norm*low_order_bound : standard_bound)*(1+1e-11);
     } else {
         generator_norm_bound=(generator_norm_bound+bound.maxCoeff())/f.mass_equivalence*(1+1e-11);
     }
@@ -148,7 +221,7 @@ Field Transport::gather_pairs(const Field &a) const {
     return g;
 }
 Field Transport::linear_target(const Field &u) const {
-    if(options.r2 && options.stabilization=="m1pn_mass_correction") {
+    if(options.r2 && (options.stabilization=="m1pn_mass_correction" || options.stabilization=="m1pn_mass_correction_boundary_consistent")) {
         Field rhs=Field::Zero(fe.nodes,pn.q),boundary_rhs=Field::Zero(fe.nodes,pn.q);
         for(int d=0;d<3;++d)rhs.noalias()+=fe.C[d].transpose()*(u*pn.A[d].transpose());
         for(const auto &face:fe.faces)for(const auto &p:face.points){
@@ -220,7 +293,9 @@ Field Transport::mass_target(const Field &rhs, double &residual, Field *predicto
     return target;
 }
 Field Transport::pn_low_order_rate(const Field &u, const Field &boundary_rhs, const Field &source) const {
-    require(options.stabilization == "m1pn_mass_correction", "PN low-order rate is only available for m1pn_mass_correction");
+    const bool mass_correction_mode=options.stabilization=="m1pn_mass_correction" ||
+                                    options.stabilization=="m1pn_mass_correction_boundary_consistent";
+    require(mass_correction_mode, "PN low-order rate is only available for a PN mass correction");
     require(u.rows()==fe.nodes&&u.cols()==pn.q&&u.allFinite(),"Invalid PN field for low-order predictor");
     Field rhs=Field::Zero(fe.nodes,pn.q);
     for(const auto &p:fe.pairs) {
@@ -245,6 +320,11 @@ Field Transport::pn_low_order_rate(const Field &u, const Field &boundary_rhs, co
     }
     if(source.size()){require(source.rows()==fe.nodes&&source.cols()==pn.q&&source.allFinite(),"Invalid PN low-order source load");rhs+=source;}
     for(int i=0;i<fe.nodes;++i)rhs.row(i)/=fe.mass[i];
+    if(options.stabilization=="m1pn_mass_correction_boundary_consistent") {
+        require(int(pn_boundary_map.size())==fe.nodes,"Missing boundary-consistent PN predictor map");
+        const Field standard=rhs;
+        for(int i=0;i<fe.nodes;++i)rhs.row(i)=standard.row(pn_boundary_map[i]);
+    }
     return rhs;
 }
 Field Transport::mass_correction(const Field &rate) const {
@@ -542,7 +622,8 @@ namespace m1pn {
 Stage Transport::evaluate_r2(double time, const Field &u, bool unlimited, const Field &source,
                              double implicit_dt) {
     check_state(u);
-    const bool pn_mass_correction=options.stabilization=="m1pn_mass_correction";
+    const bool pn_mass_correction=options.stabilization=="m1pn_mass_correction" ||
+                                  options.stabilization=="m1pn_mass_correction_boundary_consistent";
     Stage out;
     auto &diag=out.diagnostics;
     std::array<Field,3> cached_pn_flux;
@@ -561,8 +642,10 @@ Stage Transport::evaluate_r2(double time, const Field &u, bool unlimited, const 
     Field stabilization_pairs;
     Field rhs;
     if(pn_mass_correction){rhs=Field::Zero(fe.nodes,pn.q);stabilization_pairs=Field::Zero(fe.pairs.size(),pn.q);}
-    else rhs=stabilization_operator->apply(u,&stabilization_pairs,options.bh_pair_mode);
-    timings.biharmonic+=seconds()-start;
+    else {
+        rhs=stabilization_operator->apply(u,&stabilization_pairs,options.bh_pair_mode);
+        timings.biharmonic+=seconds()-start;
+    }
     for(int d=0;d<3;++d) rhs.noalias()+=fe.C[d].transpose()*(u*pn.A[d].transpose());
     out.source=source.size()?source:Field::Zero(fe.nodes,pn.q);
     require(out.source.rows()==fe.nodes && out.source.cols()==pn.q && out.source.allFinite(),

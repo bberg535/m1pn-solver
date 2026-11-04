@@ -102,5 +102,18 @@ def main():
         rr=[r for r in rows if r['grid']==grid and r['scale']==1]
         ax.scatter([r['real'] for r in rr],[r['imag'] for r in rr],label=grid,s=12)
     ax.set(xlabel='real eigenvalue',ylabel='imaginary eigenvalue');ax.legend();ax.grid();fig.tight_layout();fig.savefig(a.output/'spectra.png',dpi=160);plt.close(fig)
+    t=np.linspace(0,np.pi,500);r=(2+np.cos(t))/3
+    fig,ax=plt.subplots(1,2,figsize=(10,4))
+    ax[0].plot(t,(1-np.cos(t))**2/3,label='B mass correction')
+    ax[0].plot(t,4/12*(1-np.cos(t))**2/r,label='Gram beta=lambda*h^3/12, consistent mass')
+    ax[0].plot(t,4*.004*(1-np.cos(t))**2/r,label='Gram gamma=.004, consistent mass')
+    ax[0].set(xlabel='theta',ylabel='negative real symbol * h / lambda')
+    ax[1].plot(t,np.sin(t)*(1+(1-np.cos(t))/3),label='B')
+    ax[1].plot(t,np.sin(t)/r,label='consistent Galerkin')
+    ax[1].set(xlabel='theta',ylabel='negative imaginary symbol * h / c')
+    for aa in ax:aa.legend(fontsize=7);aa.grid()
+    fig.tight_layout();fig.savefig(a.output/'matched_interior_symbols.png',dpi=160);plt.close(fig)
+    import hashlib, platform, sys
+    (a.output/'provenance.json').write_text(json.dumps(dict(command=sys.argv,script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),host=platform.node(),python=platform.python_version(),numpy=np.__version__,notes='Independent scalar assembly; A_Gram is a proxy. .5 viscosity is an underdiffusive sensitivity case, not supported production.'),indent=2)+'\n')
     print(json.dumps(findings,indent=2))
 if __name__=='__main__':main()

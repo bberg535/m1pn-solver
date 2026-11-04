@@ -87,7 +87,8 @@ TimeControl::TimeControl(Transport &tr, const MeshSpec &mesh, int rk, int max_do
         return;
     }
     if(mesh.periodic&&mesh.file.empty()&&!mesh.tetrahedra&&
-       tr.options.stabilization=="m1pn_mass_correction"&&mesh.dimension==1) {
+       (tr.options.stabilization=="m1pn_mass_correction" ||
+        tr.options.stabilization=="m1pn_mass_correction_boundary_consistent")&&mesh.dimension==1) {
         method="periodic-q1-pn-mass-correction-fourier";
         double hi=tr.fe.cfl_step,lo=0.;
         for(int i=0;i<50;++i){const double mid=.5*(lo+hi);
@@ -97,7 +98,8 @@ TimeControl::TimeControl(Transport &tr, const MeshSpec &mesh, int rk, int max_do
         step_limit=.95*lo;
         contraction=mass_correction_fourier_amplification(tr.pn,mesh.elements,step_limit,rk,tr.options.pn_viscosity_scale);
     } else if (mesh.periodic && mesh.file.empty() && !mesh.tetrahedra &&
-        tr.options.stabilization != "m1pn_mass_correction") {
+        tr.options.stabilization != "m1pn_mass_correction" &&
+        tr.options.stabilization != "m1pn_mass_correction_boundary_consistent") {
         const int correction_degree = tr.options.mass_mode == "consistent" ? -1 :
                                       tr.options.mass_mode == "lumped" ? 0 : tr.options.mass_corrections;
         const bool kv = tr.options.r2 && tr.options.stabilization == "gradient-defect";

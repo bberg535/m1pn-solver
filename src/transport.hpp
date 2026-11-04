@@ -55,6 +55,8 @@ struct Transport {
     std::unique_ptr<ImplicitMassSolver> implicit_solver;
     Sparse implicit_positive;
     std::vector<std::array<V3,2>> pair_geometry;
+    std::vector<int> pn_boundary_map;
+    double pn_boundary_map_norm = 1.;
     double generator_norm_bound = 0;
     Timings timings;
     Transport(const Angular &, Spatial &, const Numerics &, Inflow = {}, Runtime = {});

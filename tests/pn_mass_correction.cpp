@@ -32,10 +32,10 @@ Field admissible_state(const Spatial &fe, const Angular &pn) {
     return u;
 }
 
-Numerics candidate_options() {
+Numerics candidate_options(const std::string &kind = "m1pn_mass_correction") {
     Numerics n;
     n.r2 = true;
-    n.stabilization = "m1pn_mass_correction";
+    n.stabilization = kind;
     n.mass_mode = "lumped";
     n.pn_viscosity_scale = 1.;
     return n;
@@ -221,7 +221,13 @@ Field pn_boundary_load(const Transport &tr, const Field &u, double time) {
             const auto data = boundary.data(tr.inflow, point.x, time);
             for (std::size_t j = 0; j < face.nodes.size(); ++j) {
                 const int i = face.nodes[j];
-                const Vec interior = u.row(i).transpose();
+                Vec interior = u.row(i).transpose();
+                if (tr.options.pn_boundary_quadrature == "consistent") {
+                    interior.setZero();
+                    for (std::size_t k = 0; k < face.nodes.size(); ++k)
+                        interior.noalias() += point.shape[k] *
+                            u.row(face.nodes[k]).transpose();
+                }
                 const Vec exterior = boundary.exterior(interior, data.d);
                 const Vec flux = .5 * (tr.pn.apply(point.normal, interior) +
                                        tr.pn.apply(point.normal, exterior)) -
@@ -232,14 +238,15 @@ Field pn_boundary_load(const Transport &tr, const Field &u, double time) {
     return load;
 }
 
-void full_mcl_identity(int dimension, bool periodic) {
+void full_mcl_identity(int dimension, bool periodic,
+                       const std::string &kind = "m1pn_mass_correction") {
     MeshSpec spec;
     spec.dimension = dimension;
     spec.elements = 3;
     spec.periodic = periodic;
     Spatial fe(spec, 1, {}, false);
     Angular pn(2);
-    Numerics n = candidate_options();
+    Numerics n = candidate_options(kind);
     int exterior_calls = 0;
     Inflow inflow;
     inflow.density = [](const V3 &, double, const V3 &) { return .02 / (4 * pi); };
@@ -282,7 +289,7 @@ void full_mcl_identity(int dimension, bool periodic) {
         closure.emplace_back(m1[i]);
     }
     Field pair_low = Field::Zero(fe.nodes, 4), pair_mc = pair_low;
-    double high_pair_error = 0, bij_formula_error = 0;
+    double high_pair_error = 0, bij_formula_error = 0, antisymmetry_error = 0;
     for (std::size_t e = 0; e < fe.pairs.size(); ++e) {
         const auto &edge = fe.pairs[e];
         V3 cij = V3::Zero(), cji = V3::Zero();
@@ -304,6 +311,10 @@ void full_mcl_identity(int dimension, bool periodic) {
                              edge.viscosity * (m1[edge.i] - m1[edge.j]) +
                              Tj_cji - Ti_cij + closure[edge.j].flux(bij) -
                              closure[edge.i].flux(bij);
+        const Four reverse = edge.mass * project((low_rate.row(edge.j)-low_rate.row(edge.i)).transpose()) +
+                             edge.viscosity*(m1[edge.j]-m1[edge.i]) +
+                             Ti_cij-Tj_cji+closure[edge.i].flux(bij)-closure[edge.j].flux(bij);
+        antisymmetry_error=std::max(antisymmetry_error,(formula+reverse).lpNorm<Eigen::Infinity>());
         high_pair_error = std::max(high_pair_error,
             (project(high) - project(stage.accepted_pairs.row(e).transpose())).norm());
         bij_formula_error = std::max(bij_formula_error,
@@ -313,6 +324,7 @@ void full_mcl_identity(int dimension, bool periodic) {
         pair_mc.row(edge.i) += formula.transpose();
         pair_mc.row(edge.j) -= formula.transpose();
     }
+    close(antisymmetry_error, 3e-13, "all_inner_raw_corrections_antisymmetric_dim"+std::to_string(dimension)+(periodic?"_periodic":"_open"));
     close(high_pair_error, 2e-10,
           "unlimited_stage_retains_full_PN_edge_target_dim" +
               std::to_string(dimension) + (periodic ? "_periodic" : "_open"));
@@ -414,6 +426,116 @@ void ssprk3_cone_and_high_modes() {
           "candidate_SSPRK3_stages_use_no_consistent_mass_solve");
 }
 
+void boundary_consistent_affine(int dimension) {
+    MeshSpec spec;
+    spec.dimension = dimension;
+    spec.elements = 3;
+    Spatial fe(spec, 1, {}, false);
+    Angular pn(3);
+    Numerics nb = candidate_options("m1pn_mass_correction");
+    nb.pn_boundary_quadrature = "consistent";
+    Numerics nc = candidate_options("m1pn_mass_correction_boundary_consistent");
+    nc.pn_boundary_quadrature = "consistent";
+    const V3 gradient(1., dimension > 1 ? .5 : 0., dimension == 3 ? -.3 : 0.);
+    Inflow affine;
+    affine.density=[gradient](const V3 &x,double t,const V3 &w){
+        return (1.+.12*gradient.dot(x)-.12*t*gradient.dot(w))/(4*pi);
+    };
+    affine.exterior_m1=[gradient](const V3 &x,double t){
+        return Four(1.+.12*gradient.dot(x),-.04*t*gradient[0],-.04*t*gradient[1],-.04*t*gradient[2]);
+    };
+    Transport b(pn, fe, nb, affine), c(pn, fe, nc, affine);
+    const auto pairs_before = fe.pairs.size();
+    Field u = Field::Zero(fe.nodes, pn.q), exact_rate = u;
+    for (int i = 0; i < fe.nodes; ++i) {
+        const V3 x(fe.coordinates(i,0), fe.coordinates(i,1), fe.coordinates(i,2));
+        set_low(u.row(i), Four(1. + .12 * gradient.dot(x), 0., 0., 0.));
+        set_low(exact_rate.row(i), Four(0., -.04*gradient[0], -.04*gradient[1], -.04*gradient[2]));
+    }
+    const Field boundary = pn_boundary_load(b, u, 0.);
+    const Field rb = b.pn_low_order_rate(u, boundary);
+    const Field rc = c.pn_low_order_rate(u, boundary);
+    // Independent tensor-index coordinate clamp, matching the stated C map.
+    std::array<std::vector<double>,3> axes;
+    std::array<int,3> count{1,1,1};
+    for(int d=0;d<dimension;++d) {
+        for(int i=0;i<fe.nodes;++i) axes[d].push_back(fe.coordinates(i,d));
+        std::sort(axes[d].begin(),axes[d].end());
+        axes[d].erase(std::unique(axes[d].begin(),axes[d].end(),[](double x,double y){return std::abs(x-y)<2e-12;}),axes[d].end());
+        count[d]=int(axes[d].size());
+    }
+    auto key=[&](const std::array<int,3>&q){return (q[0]*count[1]+q[1])*count[2]+q[2];};
+    std::vector<int> at(fe.nodes,-1), map(fe.nodes);
+    std::vector<std::array<int,3>> multi(fe.nodes);
+    for(int i=0;i<fe.nodes;++i) {
+        std::array<int,3> q{0,0,0};
+        for(int d=0;d<dimension;++d) {
+            auto it=std::lower_bound(axes[d].begin(),axes[d].end(),fe.coordinates(i,d));
+            q[d]=int(it-axes[d].begin());
+        }
+        multi[i]=q; at[key(q)]=i;
+    }
+    for(int i=0;i<fe.nodes;++i) {
+        auto q=multi[i];
+        if(fe.boundary[i]) for(int d=0;d<dimension;++d) q[d]=std::clamp(q[d],1,count[d]-2);
+        map[i]=at[key(q)];
+    }
+    check(map==c.pn_boundary_map,"C_coordinate_clamp_map_dim"+std::to_string(dimension));
+    Field mapped=rc;
+    for(int i=0;i<fe.nodes;++i) mapped.row(i)=rb.row(map[i]);
+    close(maxabs(rc-mapped),3e-13,"C_predictor_is_B_rate_with_independent_clamp_dim"+std::to_string(dimension));
+    check(maxabs(b.mass_correction(rb))>1e-6,"B_affine_predictor_has_nonzero_Z_dim"+std::to_string(dimension),maxabs(b.mass_correction(rb)));
+    close(maxabs(c.mass_correction(rc)),2e-12,"C_affine_predictor_has_zero_Z_dim"+std::to_string(dimension));
+    const Stage stage=c.evaluate(0.,u,true);
+    close(maxabs(stage.target-exact_rate),3e-10,"C_affine_all_Q_target_exact_dim"+std::to_string(dimension));
+    const Stage limited=c.evaluate(0.,u,false);
+    close(maxabs(limited.rate-exact_rate),3e-10,"C_limited_affine_all_Q_target_exact_dim"+std::to_string(dimension));
+    check(stage.diagnostics.active_pairs==0,"C_affine_target_requires_no_pair_clipping_dim"+std::to_string(dimension),stage.diagnostics.active_pairs);
+    check(fe.pairs.size()==pairs_before,"C_preserves_spatial_graph_dim"+std::to_string(dimension));
+    check(fe.mass_solve_calls==0&&!fe.factorized&&!c.stabilization_operator,
+          "C_uses_no_consistent_mass_or_stabilization_dim"+std::to_string(dimension));
+}
+
+void boundary_consistent_guards_and_periodic() {
+    for(int dim=1;dim<=3;++dim) {
+        MeshSpec s; s.dimension=dim; s.elements=3; s.periodic=true;
+        Spatial fe(s,1,{},false); Angular pn(2);
+        Transport b(pn,fe,candidate_options()), c(pn,fe,candidate_options("m1pn_mass_correction_boundary_consistent"));
+        const Field u=admissible_state(fe,pn);
+        check(c.pn_boundary_map.size()==std::size_t(fe.nodes),"C_periodic_map_present");
+        check(c.pn_boundary_map_norm==1.,"C_periodic_map_identity_norm");
+        close(maxabs(c.pn_low_order_rate(u)-b.pn_low_order_rate(u)),2e-13,"C_periodic_equals_B_dim"+std::to_string(dim));
+    }
+    bool rejected=false;
+    try { MeshSpec s; s.dimension=2; s.elements=2; Spatial fe(s,1,{},false); Angular pn(1); Transport c(pn,fe,candidate_options("m1pn_mass_correction_boundary_consistent")); }
+    catch(const std::exception&) { rejected=true; }
+    check(rejected,"C_rejects_fewer_than_three_open_cells");
+    rejected=false;
+    try { MeshSpec s; s.dimension=3; s.elements=3; s.tetrahedra=true; Spatial fe(s,1,{},false); Angular pn(1); Transport c(pn,fe,candidate_options("m1pn_mass_correction_boundary_consistent")); }
+    catch(const std::exception&) { rejected=true; }
+    check(rejected,"C_rejects_tetrahedral_grid");
+}
+
+void boundary_consistent_vacuum_ssprk() {
+    MeshSpec spec; spec.dimension=2; spec.elements=3;
+    Spatial fe(spec,1,{},false); Angular pn(2);
+    Transport tr(pn,fe,candidate_options("m1pn_mass_correction_boundary_consistent"));
+    const Field zero=Field::Zero(fe.nodes,pn.q);
+    const Stage vacuum=tr.evaluate(0.,zero,true);
+    check(maxabs(vacuum.target)==0&&maxabs(vacuum.rate)==0,"C_preserves_exact_vacuum");
+    Field u=admissible_state(fe,pn);
+    const double h=.01*fe.cfl_step;
+    auto cone_ok=[&](const Field&v){for(int i=0;i<fe.nodes;++i)if(!exact::cone(project(v.row(i).transpose())))return false;return true;};
+    auto rate=[&](double t,const Field&v){const Stage s=tr.evaluate(t,v,false);if(pn.q>4)close(maxabs(s.rate.rightCols(pn.q-4)-s.target.rightCols(pn.q-4)),2e-10,"C_SSPRK_high_modes_preserved");return s.rate;};
+    const Field k1=rate(0.,u),u1=u+h*k1;
+    check(cone_ok(u1),"C_SSPRK_forward_euler_cone");
+    const Field k2=rate(h,u1),u2=.75*u+.25*(u1+h*k2);
+    check(cone_ok(u2),"C_SSPRK_second_state_cone");
+    const Field k3=rate(.5*h,u2),u3=u/3.+(2./3.)*(u2+h*k3);
+    check(cone_ok(u3),"C_SSPRK_final_state_cone");
+    check(fe.mass_solve_calls==0&&!fe.factorized&&!tr.stabilization_operator,"C_SSPRK_no_mass_solve_or_stabilizer");
+}
+
 } // namespace
 
 int main() {
@@ -432,9 +554,13 @@ int main() {
         for (int dimension = 1; dimension <= 3; ++dimension) {
             full_mcl_identity(dimension, true);
             full_mcl_identity(dimension, false);
+            full_mcl_identity(dimension, false, "m1pn_mass_correction_boundary_consistent");
         }
         exact_vacuum();
         ssprk3_cone_and_high_modes();
+        for (int dimension=1; dimension<=3; ++dimension) boundary_consistent_affine(dimension);
+        boundary_consistent_guards_and_periodic();
+        boundary_consistent_vacuum_ssprk();
         std::cout << "pn_mass_correction checks=" << checks << " passed\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

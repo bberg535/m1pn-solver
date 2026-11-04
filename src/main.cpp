@@ -41,6 +41,7 @@ Options parse(int argc, char **argv) {
                    " --model r2|legacy --stabilization gradient-defect|biharmonic-original|biharmonic-corrected\n"
                    " --stabilization m1pn_ghost_local_projected_p4 --ghost-gamma G (open Cartesian Q1 only)\n"
                    " --stabilization m1pn_mass_correction --pn-viscosity-scale L (SSPRK3, lumped mass)\n"
+                   " --stabilization m1pn_mass_correction_boundary_consistent (uniform open Cartesian P1/Q1)\n"
                    " --kv-gamma G --pair-limiter scalar|density-vector (legacy only)\n"
                    " --inflow vacuum|isotropic|time-dependent|beam|crossing|matching|"
                    "smooth-transport|crossing-transport|crossing-three-transport\n"
@@ -113,7 +114,7 @@ Options parse(int argc, char **argv) {
         } else if (key == "--stabilization") {
             require(v == "gradient-defect" || v == "biharmonic-original" ||
                     v == "biharmonic-corrected" || v == "m1pn_ghost_local_projected_p4" ||
-                    v == "m1pn_mass_correction", "Invalid stabilization");
+                    v == "m1pn_mass_correction" || v == "m1pn_mass_correction_boundary_consistent", "Invalid stabilization");
             o.num.stabilization = v;
         } else if (key == "--kv-gamma")
             o.num.kv_gamma = real();
@@ -210,11 +211,11 @@ Options parse(int argc, char **argv) {
     require(o.num.kv_gamma >= 0 && o.num.gamma >= 0, "Negative stabilization coefficient");
     require(o.num.mass_corrections >= 1 && o.num.mass_corrections <= 32,
             "Mass corrections must lie in [1,32]");
-    if(o.num.stabilization=="m1pn_mass_correction") {
-        require(o.num.r2,"m1pn_mass_correction requires --model r2");
-        require(o.rk==3,"m1pn_mass_correction requires --time-integrator ssprk3");
+    if(o.num.stabilization=="m1pn_mass_correction" || o.num.stabilization=="m1pn_mass_correction_boundary_consistent") {
+        require(o.num.r2,"PN mass correction requires --model r2");
+        require(o.rk==3,"PN mass correction requires --time-integrator ssprk3");
         require(!o.mass_mode_explicit || o.num.mass_mode=="lumped",
-                "m1pn_mass_correction requires --mass-mode lumped; conflicting explicit mass mode rejected");
+                "PN mass correction requires --mass-mode lumped; conflicting explicit mass mode rejected");
         o.num.mass_mode="lumped";
         require(o.num.pn_viscosity_scale>=1&&std::isfinite(o.num.pn_viscosity_scale),"PN viscosity scale must be finite and at least one");
     }
@@ -471,7 +472,7 @@ int main(int argc, char **argv) {
                    << "{\n\"method\":" << std::quoted(o.num.r2 ?
                        (o.num.stabilization == "m1pn_ghost_local_projected_p4" ?
                         "m1pn_ghost_local_projected_p4" :
-                        o.num.stabilization == "m1pn_mass_correction" ? "m1pn_mass_correction" : "m1pn-r2") : "m1pn-biharmonic-c1")
+                        (o.num.stabilization == "m1pn_mass_correction" || o.num.stabilization == "m1pn_mass_correction_boundary_consistent") ? o.num.stabilization : "m1pn-r2") : "m1pn-biharmonic-c1")
                    << ",\"pn_order\":" << pn.order
                    << ",\"Q\":" << pn.q << ",\"dimension\":" << fe.dimension
                    << ",\"elements_per_axis\":" << o.mesh.elements << ",\"nodes\":" << fe.nodes
@@ -486,7 +487,8 @@ int main(int argc, char **argv) {
                                   (o.num.masked ? "biharmonic-masked" : "biharmonic-natural"))
                    << ",\"kv_gamma\":" << o.num.kv_gamma
                    << ",\"pn_viscosity_scale\":" << o.num.pn_viscosity_scale
-                   << ",\"pn_mass_correction_applications\":1"
+                   << ",\"pn_mass_correction_applications\":"
+                   << ((o.num.stabilization=="m1pn_mass_correction" || o.num.stabilization=="m1pn_mass_correction_boundary_consistent")?1:0)
                    << ",\"boundary_flux\":" << std::quoted(o.num.r2 ? "LLF_lambda_1" : "characteristic_PN_kinetic_M1")
                    << ",\"m1_exterior_policy\":" << std::quoted(o.exterior_policy)
                    << ",\"m1_exterior_rounding\":" << std::quoted(o.num.r2 ? (o.exterior_policy == "kinetic" ? "outward_density_ulp_until_exact_cone" : "reject_invalid_prescribed_state") : "unused")

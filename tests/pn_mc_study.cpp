@@ -22,6 +22,9 @@ Numerics numerics(const std::string &variant) {
     if (variant == "A" || variant == "standard") {
         n.stabilization = "biharmonic-corrected";
         n.gamma = .004;
+    } else if (variant == "Aex") {
+        n.stabilization = "m1pn_ghost_local_projected_p4";
+        n.gamma = .00032911848351755427;
     } else if (variant == "PN" || variant == "gamma0") {
         n.stabilization = "biharmonic-corrected";
         n.gamma = 0.;
@@ -34,7 +37,7 @@ Numerics numerics(const std::string &variant) {
         n.mass_mode = "lumped";
         n.gamma = .004;
     } else {
-        throw std::runtime_error("variant must be A, PN, B, or C");
+        throw std::runtime_error("variant must be A, Aex, PN, B, or C");
     }
     return n;
 }
@@ -201,8 +204,9 @@ double pn_error(const Spatial &fe, const Field &a, const Field &b, int norm) {
 
 void convergence(const std::string &variant) {
     const Numerics opts = numerics(variant);
-    std::cout << "suite,variant,boundary,cells,steps,dt,time,pn_l1,pn_l2,pn_linf,density_l1,density_l2,density_linf,active_pairs,mass_balance,elapsed_seconds\n";
+    std::cout << "suite,variant,boundary,cells,steps,dt,time,wave_speed,pn_l1,pn_l2,pn_linf,density_l1,density_l2,density_linf,active_pairs,mass_balance,elapsed_seconds,density_boundary_linf,density_boundary_zone_linf,inflow_linf,outflow_linf,opposite_branch_error_l2\n";
     for (bool periodic : {true, false}) for (int cells : {16, 32, 64}) {
+        if (variant == "Aex" && periodic) continue;
         MeshSpec mesh; mesh.dimension = 1; mesh.elements = cells; mesh.periodic = periodic;
         Spatial fe(mesh, 1., {}, opts.mass_mode == "consistent");
         Angular pn(3);
@@ -230,11 +234,25 @@ void convergence(const std::string &variant) {
             denex(i, 0) = project(exact.row(i).transpose())[0];
         }
         auto scalar_error = [&](int norm) { return pn_error(fe, den, denex, norm); };
+        double boundary_error=0, zone_error=0, inflow_error=0, outflow_error=0, opposite_error=0;
+        Eigen::SelfAdjointEigenSolver<Mat> angular_eig(Mat(pn.A[0]));
+        for(int i=0;i<fe.nodes;++i) {
+            const double x=fe.coordinates(i,0),e=std::abs(den(i,0)-denex(i,0));
+            if(x<1e-12||x>1-1e-12) boundary_error=std::max(boundary_error,e);
+            if(x<.125||x>.875) zone_error=std::max(zone_error,e);
+            if((wave.speed>0&&x<1e-12)||(wave.speed<0&&x>1-1e-12))inflow_error=e;
+            if((wave.speed<0&&x<1e-12)||(wave.speed>0&&x>1-1e-12))outflow_error=e;
+            for(int k=0;k<pn.q;++k) if(angular_eig.eigenvalues()[k]*wave.speed < -1e-12) {
+                const double modal=(state.row(i)-exact.row(i)).dot(angular_eig.eigenvectors().col(k));
+                opposite_error+=fe.mass[i]*modal*modal;
+            }
+        }
         std::cout << "convergence," << variant << ',' << (periodic ? "periodic" : "open") << ',' << cells << ',' << steps << ','
-                  << std::setprecision(16) << dt << ',' << T << ',' << pn_error(fe,state,exact,1) << ','
+                  << std::setprecision(16) << dt << ',' << T << ',' << wave.speed << ',' << pn_error(fe,state,exact,1) << ','
                   << pn_error(fe,state,exact,2) << ',' << pn_error(fe,state,exact,0) << ','
                   << scalar_error(1) << ',' << scalar_error(2) << ',' << scalar_error(0) << ',' << active << ','
-                  << balance << ',' << elapsed << '\n';
+                  << balance << ',' << elapsed << ',' << boundary_error << ',' << zone_error << ','
+                  << inflow_error << ',' << outflow_error << ',' << std::sqrt(opposite_error) << '\n';
     }
 }
 
@@ -242,6 +260,7 @@ void spectrum(const std::string &variant) {
     const Numerics opts = numerics(variant);
     std::cout << "suite,variant,boundary,order,cells,row,column,value\n";
     for (bool periodic : {true, false}) for (int order : {1, 3}) {
+        if (variant == "Aex" && periodic) continue;
         MeshSpec mesh; mesh.dimension = 1; mesh.elements = 4; mesh.periodic = periodic;
         Spatial fe(mesh, 1., {}, opts.mass_mode == "consistent");
         Angular pn(order);
