@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.20)
+project(pn_mc_nx_study LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+get_filename_component(PN_AFC_PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+# Reuse the tested core, without editing the accepted source or build tree.
+add_subdirectory("${PN_AFC_PROJECT_ROOT}" "${CMAKE_BINARY_DIR}/afc_core")
+add_executable(m1pn_mc_study src/study_main.cpp)
+target_link_libraries(m1pn_mc_study PRIVATE m1pn_core)
+target_compile_definitions(m1pn_mc_study PRIVATE PN_AFC_ROOT="${PN_AFC_PROJECT_ROOT}")
+enable_testing()
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tmp/test_tmp")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/afc_core/tmp")
+add_test(NAME nx_cases COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cases.py $<TARGET_FILE:m1pn_mc_study>)
+add_test(NAME nx_study_driver COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_study.py)
+add_test(NAME nx_study_analysis COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_analysis.py)
+add_test(NAME nx_submission COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_submission.py)
+set_tests_properties(nx_cases nx_study_driver nx_study_analysis nx_submission PROPERTIES
+  ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;TMPDIR=${CMAKE_CURRENT_SOURCE_DIR}/tmp/test_tmp"
+  TIMEOUT 180)

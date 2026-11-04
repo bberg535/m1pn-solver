@@ -17,6 +17,10 @@ und [Vergleichsdaten](results/comparison/analysis.json) enthalten Evidenz und Gr
 
 Die ausführliche interne Gegenprüfung steht in [AUDIT.md](docs/AUDIT.md). Die Ergebnisempfehlung lautet: bestehende Biharmonik für das Paper beibehalten. Die vier Vakuum-Einström-Stressläufe brechen ab; dies wird im Bericht gesondert ausgewiesen.
 
+Die neue [NX-Clusterstudie](nx/README.md) überträgt den 48-Aufgaben-Plan der
+Biharmonik-Studie auf Standardvariante B. Sie berechnet ihre Schrittweiten neu
+und startet mit `python3 nx/scripts/start_mass_correction.py`.
+
 ## Bauen und testen
 
 Vorhandene MFEM/MPI/Eigen-Installation verwenden; es wird nichts installiert:
