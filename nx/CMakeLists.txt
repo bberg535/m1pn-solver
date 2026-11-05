@@ -13,10 +13,11 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tmp/test_tmp")
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/afc_core/tmp")
 add_test(NAME nx_cases COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cases.py $<TARGET_FILE:m1pn_mc_study>)
+add_test(NAME nx_pn_only COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pn_only.py $<TARGET_FILE:m1pn_mc_study>)
 add_test(NAME nx_study_driver COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_study.py)
 add_test(NAME nx_study_analysis COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_analysis.py)
 add_test(NAME nx_submission COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_submission.py)
 add_test(NAME nx_long_migration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_long_tasks.py)
-set_tests_properties(nx_cases nx_study_driver nx_study_analysis nx_submission nx_long_migration PROPERTIES
+set_tests_properties(nx_cases nx_pn_only nx_study_driver nx_study_analysis nx_submission nx_long_migration PROPERTIES
   ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;TMPDIR=${CMAKE_CURRENT_SOURCE_DIR}/tmp/test_tmp"
   TIMEOUT 180)

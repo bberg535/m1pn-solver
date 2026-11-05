@@ -58,6 +58,36 @@ Mit `--dt 0` wird die Schrittweite als `cfl * min(M1-Grenze, PN-Grenze)`
 berechnet; ein positiver `--dt`-Wert gibt sie fest vor und wird gegen beide
 Grenzen geprüft. Der Standardwert bleibt `--dt .0001`.
 
+Ein reiner PN-Lauf mit demselben Standard-B-Operator lässt sich über
+`--coupling pn-only` starten. Er verwendet die vollständigen PN-Randflüsse
+einschließlich vorgeschriebener Einstrahlung, aber keine M1-Abschlussrelation,
+keinen Kegellimiter und keine Synchronisierung der niedrigen Momente. Negative
+Dichten und Verletzungen des M1-Kegels werden erfasst und nicht begrenzt.
+Dieser zusätzliche Studienpfad unterstützt derzeit das materialfreie
+`crossing-study`-Problem mit Standard B und SSPRK3.
+
+```bash
+# P3 auf 128×128 bis T=0.32, gleiche Schrittweite wie der NX-Vergleichslauf.
+python3 scripts/run_local_progress.py --coupling pn-only \
+  --elements 128 --pn-order 3 --time .32 \
+  --dt 6.459426725878078e-05 --threads 8
+```
+
+Die Ergebnisse liegen unter `tmp/local_PN_B_<Zeitstempel>`. Die automatische
+Nachprüfung kontrolliert endliche Felder und die globale Bilanz aller
+PN-Komponenten; sie protokolliert zusätzlich negative Dichten und
+M1-Kegelverletzungen.
+
+Der direkte Vergleich mit dem fertigen gekoppelten P3/128²-Lauf verlangt
+identische gespeicherte Anfangsdaten, Knotenmassen und Zeitschritte:
+
+```bash
+python3 scripts/plot_pn_comparison.py \
+  --pn-run tmp/local_PN_B_<Zeitstempel> \
+  --coupled-run nx/tmp/pn_mc_production_20261104_161438_760701/runs/crossing_N128_P3 \
+  --output results/pn_comparisons/<neuer_Ordner>
+```
+
 Den zuletzt abgeschlossenen lokalen Crossing-Lauf mit kinetischer Referenz,
 signiertem Dichtefehler und Mittelschnitt plotten:
 

@@ -1,4 +1,5 @@
 #include "time.hpp"
+#include "pn_uncoupled.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -17,8 +18,8 @@ struct Options {
     int order = 3, rk = 3, max_steps = 100000, norm_max = 512, threads = 1, checkpoint_stride = 0;
     double final_time = .01, dt = 0, cfl = .8, sigma_a = 0, sigma_s = 0, anisotropy = 0, source = 0;
     double pulse_width = .07, background = .001;
-    bool jump = false, deterministic = false, mass_mode_explicit = false;
-    std::string problem = "smooth", inflow = "vacuum", output = std::string(PN_AFC_ROOT) + "/tmp/run", pair_limiter = "scalar";
+    bool jump = false, deterministic = false, mass_mode_explicit = false, pn_only_self_test = false;
+    std::string problem = "smooth", inflow = "vacuum", output = std::string(PN_AFC_ROOT) + "/tmp/run", pair_limiter = "scalar", coupling = "m1pn";
 };
 Options parse(int argc, char **argv) {
     Options o;
@@ -38,6 +39,7 @@ Options parse(int argc, char **argv) {
                    " --model r2|legacy --stabilization gradient-defect|biharmonic-original|biharmonic-corrected\n"
                    " --stabilization m1pn_ghost_local_projected_p4 --ghost-gamma G (open Cartesian Q1 only)\n"
                    " --stabilization m1pn_mass_correction --pn-viscosity-scale L (SSPRK3, lumped mass)\n"
+                   " --coupling m1pn|pn-only (pn-only is restricted to crossing-study with standard B)\n"
                    " --kv-gamma G --pair-limiter scalar|density-vector (legacy only)\n"
                    " --inflow vacuum|isotropic|time-dependent|beam|crossing|matching|"
                    "smooth-transport|crossing-transport|crossing-three-transport|crossing-study-transport|crossing-3d-transport\n"
@@ -59,6 +61,10 @@ Options parse(int argc, char **argv) {
         }
         if (key == "--deterministic") {
             o.deterministic = true;
+            continue;
+        }
+        if (key == "--pn-only-self-test") {
+            o.pn_only_self_test = true;
             continue;
         }
         require(i + 1 < argc, "Missing value for " + key);
@@ -118,6 +124,10 @@ Options parse(int argc, char **argv) {
         }
         else if (key == "--case")
             o.problem = v;
+        else if (key == "--coupling") {
+            require(v == "m1pn" || v == "pn-only", "Invalid coupling mode");
+            o.coupling = v;
+        }
         else if (key == "--pair-limiter") {
             require(v == "scalar" || v == "density-vector", "Invalid pair limiter");
             o.pair_limiter = v;
@@ -189,6 +199,18 @@ Options parse(int argc, char **argv) {
         require(o.num.pn_viscosity_scale >= 1 && std::isfinite(o.num.pn_viscosity_scale),
                 "PN viscosity scale must be finite and at least one");
     }
+    if (o.coupling == "pn-only") {
+        require(o.num.r2 && o.num.stabilization == "m1pn_mass_correction",
+                "PN-only coupling requires R2 with standard m1pn_mass_correction");
+        require(o.rk == 3, "PN-only coupling requires SSPRK3");
+        require(o.problem == "crossing-study" && o.mesh.dimension == 2 &&
+                    o.inflow == "crossing-study-transport",
+                "PN-only coupling is currently restricted to 2D crossing-study transport");
+        require(o.sigma_a == 0 && o.sigma_s == 0 && o.source == 0 && o.anisotropy == 0 && !o.jump,
+                "PN-only coupling requires zero material, source and jump terms");
+    }
+    require(!o.pn_only_self_test || o.coupling == "pn-only",
+            "--pn-only-self-test requires --coupling pn-only");
     require(o.num.r2 || o.num.mass_mode == "consistent", "Lumped modes require --model r2");
     require(o.pulse_width > 0 && o.background >= 0, "Invalid pulse width/background");
     require(o.num.r2 || o.num.stabilization != "m1pn_ghost_local_projected_p4",
@@ -412,8 +434,41 @@ int main(int argc, char **argv) {
         double assembly = seconds() - assembly_start;
         Transport tr(pn, fe, o.num, make_inflow(o, fe.dimension), world);
         TimeControl control(tr, o.mesh, o.rk, o.norm_max);
+        const bool pn_only = o.coupling == "pn-only";
         Field u = initial(o, fe, pn), u0 = u;
-        tr.check_state(u);
+        if (pn_only) pn_only_require_finite(u, fe, pn);
+        else tr.check_state(u);
+        if (o.pn_only_self_test) {
+            const Stage coupled_oracle = tr.evaluate(.0123, u);
+            const PNOnlyStage uncoupled_oracle = evaluate_pn_only(tr, .0123, u);
+            const double oracle_target_difference =
+                maxabs(coupled_oracle.target - uncoupled_oracle.stage.target);
+            require(oracle_target_difference < 2e-12,
+                    "PN-only target differs from the standard-B coupled oracle on admissible state");
+            Field nonrealizable = Field::Zero(fe.nodes, pn.q);
+            for (int i = 0; i < fe.nodes; ++i) {
+                Vec row = nonrealizable.row(i).transpose();
+                set_low(row, Four(.25, .5, 0., 0.));
+                for (int k = 4; k < pn.q; ++k)
+                    row[k] = .001 * std::sin((i + 1.) * (k + 2.));
+                nonrealizable.row(i) = row.transpose();
+            }
+            const PNOnlyStage probe = evaluate_pn_only(tr, 0., nonrealizable);
+            require(probe.state.outside_m1_cone_nodes == fe.nodes,
+                    "PN-only self-test state did not lie outside the M1 cone");
+            require(probe.stage.rate.allFinite() && probe.maximum_target_recovery < 2e-10,
+                    "PN-only nonrealizable derivative/oracle check failed");
+            if (world.rank == 0)
+                std::cout << "{\"status\":\"passed\",\"suite\":\"pn_only\",\"oracle_target_difference\":"
+                          << std::setprecision(17) << oracle_target_difference
+                          << ",\"outside_cone_nodes\":"
+                          << probe.state.outside_m1_cone_nodes << ",\"target_recovery\":"
+                          << std::setprecision(17) << probe.maximum_target_recovery << "}\n";
+#ifdef M1PN_MPI
+            MPI_Finalize();
+#endif
+            return 0;
+        }
         Vec absorption = Vec::Constant(fe.nodes, o.sigma_a),
             scattering = Vec::Constant(fe.nodes, o.sigma_s);
         Field src = Field::Zero(fe.nodes, pn.q);
@@ -467,6 +522,14 @@ int main(int argc, char **argv) {
                         "m1pn_ghost_local_projected_p4" :
                         (o.num.stabilization == "m1pn_mass_correction" ?
                          "m1pn_mass_correction" : "m1pn-r2")) : "m1pn-biharmonic-c1")
+                   << ",\"model\":\"r2\""
+                   << ",\"coupling\":" << std::quoted(o.coupling)
+                   << ",\"coupling_mode\":" << std::quoted(o.coupling)
+                   << ",\"m1_coupling_enabled\":" << (pn_only ? "false" : "true")
+                   << ",\"m1_closure_enabled\":" << (pn_only ? "false" : "true")
+                   << ",\"pair_limiter_enabled\":" << (pn_only ? "false" : "true")
+                   << ",\"cone_rejection_enabled\":" << (pn_only ? "false" : "true")
+                   << ",\"pn_target\":\"standard_B_mass_corrected\""
                    << ",\"pn_order\":" << pn.order
                    << ",\"Q\":" << pn.q << ",\"dimension\":" << fe.dimension
                    << ",\"elements_per_axis\":" << o.mesh.elements << ",\"nodes\":" << fe.nodes
@@ -545,7 +608,21 @@ int main(int argc, char **argv) {
                min_margin = std::numeric_limits<double>::infinity();
         double max_mass_residual = 0, max_sync_work = 0, min_sync_work = 0;
         long active_pair_total = 0, active_face_total = 0, stage_total = 0;
+        long closure_evaluations_total = 0;
         double density_clip_total = 0, momentum_redirection_total = 0, density_retention_total = 0;
+        double minimum_density_observed = std::numeric_limits<double>::infinity();
+        double minimum_cone_margin_observed = std::numeric_limits<double>::infinity();
+        long negative_density_node_stage_observations = 0;
+        long outside_m1_cone_node_stage_observations = 0;
+        double pn_only_target_recovery_max = 0;
+        double pn_only_rate_residual_max = 0;
+        auto observe_pn_state = [&](const PNOnlyStateDiagnostics &obs) {
+            minimum_density_observed = std::min(minimum_density_observed, obs.minimum_density);
+            minimum_cone_margin_observed = std::min(minimum_cone_margin_observed,
+                                                     obs.minimum_cone_margin);
+            negative_density_node_stage_observations += obs.negative_density_nodes;
+            outside_m1_cone_node_stage_observations += obs.outside_m1_cone_nodes;
+        };
         long pair_target_pass_total = 0, pair_rounding_fallback_total = 0,
              pair_scalar_fallback_total = 0, base_bar_reevaluation_total = 0;
         int steps = 0;
@@ -570,6 +647,7 @@ int main(int argc, char **argv) {
             require(steps < o.max_steps, "Maximum step count exceeded");
             double dt = std::min(selected, o.final_time - t);
             Step step;
+            PNOnlyStep pn_only_step;
             Field candidate, trial_reaction;
             bool accepted = false;
             for (int attempt = 0; attempt <= 12; ++attempt) {
@@ -581,7 +659,12 @@ int main(int argc, char **argv) {
                         trial_reaction += fe.mass.asDiagonal() * (candidate - u);
                     }
                     const double step_start = seconds();
-                    step = advance(tr, control, t, dt, candidate);
+                    if (pn_only) {
+                        pn_only_step = advance_pn_only(tr, control, t, dt, candidate);
+                        step = pn_only_step.step;
+                    } else {
+                        step = advance(tr, control, t, dt, candidate);
+                    }
                     solver_seconds += seconds() - step_start;
                     candidate = step.state;
                     if (splitting) {
@@ -590,7 +673,8 @@ int main(int argc, char **argv) {
                         trial_reaction += fe.mass.asDiagonal() * (after - candidate);
                         candidate = std::move(after);
                     }
-                    tr.check_state(candidate);
+                    if (pn_only) pn_only_require_finite(candidate, fe, pn);
+                    else tr.check_state(candidate);
                     accepted = true;
                     break;
                 } catch (const StepRejected &error) {
@@ -626,6 +710,13 @@ int main(int argc, char **argv) {
             }
             // Commit only an entirely accepted Strang/SSP step.
             u = std::move(candidate);
+            if (pn_only) {
+                for (const auto &obs : pn_only_step.observations) observe_pn_state(obs);
+                pn_only_target_recovery_max = std::max(pn_only_target_recovery_max,
+                                                        pn_only_step.maximum_target_recovery);
+                pn_only_rate_residual_max = std::max(pn_only_rate_residual_max,
+                                                      step.rate_residual);
+            }
             reaction_ledger += trial_reaction;
             boundary += step.integrated_boundary;
             selected = std::min(selected, dt);
@@ -657,6 +748,7 @@ int main(int argc, char **argv) {
                 pair_rounding_fallback_total += d.pair_rounding_fallbacks;
                 pair_scalar_fallback_total += d.pair_scalar_fallbacks;
                 base_bar_reevaluation_total += d.base_bar_reevaluations;
+                closure_evaluations_total += d.closure_evaluations;
                 ++stage_total;
                 min_margin = std::min(min_margin, d.minimum_state);
             }
@@ -702,6 +794,16 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < fe.nodes; ++i)
                     min_margin = std::min(min_margin, margin(project(u.row(i).transpose())));
             }
+            const auto final_pn_diagnostics = pn_only_state_diagnostics(u, fe, pn);
+            if (!pn_only) {
+                minimum_density_observed = std::min(
+                    pn_only_state_diagnostics(u0, fe, pn).minimum_density,
+                    final_pn_diagnostics.minimum_density);
+                minimum_cone_margin_observed = min_margin;
+            } else if (!std::isfinite(minimum_density_observed)) {
+                minimum_density_observed = final_pn_diagnostics.minimum_density;
+                minimum_cone_margin_observed = final_pn_diagnostics.minimum_cone_margin;
+            }
             result << std::setprecision(17) << "{\"status\":\"completed\",\"steps\":" << steps
                    << ",\"time\":" << t << ",\"total_seconds\":" << seconds() - begin
                    << ",\"solver_seconds\":" << solver_seconds
@@ -717,6 +819,21 @@ int main(int argc, char **argv) {
                    << ",\"peak_rss_kib_rank0\":" << usage.ru_maxrss
                    << ",\"rejected_attempts\":" << rejected
                    << ",\"mass_solve_calls\":" << fe.mass_solve_calls
+                   << ",\"m1_closure_evaluations\":" << (pn_only ? 0 : closure_evaluations_total)
+                   << ",\"pair_limiter_evaluations\":" << (pn_only ? 0 : active_pair_total)
+                   << ",\"cone_rejections\":" << (pn_only ? 0 : rejected)
+                   << ",\"minimum_density_observed\":" << minimum_density_observed
+                   << ",\"minimum_cone_margin_observed\":" << minimum_cone_margin_observed
+                   << ",\"negative_density_node_stage_observations\":"
+                   << negative_density_node_stage_observations
+                   << ",\"outside_m1_cone_node_stage_observations\":"
+                   << outside_m1_cone_node_stage_observations
+                   << ",\"final_negative_density_nodes\":"
+                   << final_pn_diagnostics.negative_density_nodes
+                   << ",\"final_outside_m1_cone_nodes\":"
+                   << final_pn_diagnostics.outside_m1_cone_nodes
+                   << ",\"pn_only_target_recovery_max\":" << pn_only_target_recovery_max
+                   << ",\"pn_only_rate_residual_max\":" << pn_only_rate_residual_max
                    << ",\"mass_iterations\":" << (o.num.mass_mode == "lumped_afc" ? o.num.mass_corrections : 0)
                    << ",\"mass_iterations_note\":" << std::quoted(o.num.mass_mode == "consistent" ?
                        "direct_factorization" : "fixed_local_corrections_per_stage") << ","

@@ -27,6 +27,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--elements", type=int, default=16)
     parser.add_argument("--pn-order", type=int, default=3)
+    parser.add_argument("--coupling", choices=("m1pn", "pn-only"), default="m1pn",
+                        help="m1pn: coupled method; pn-only: same PN target without M1 limiter/synchronization.")
     parser.add_argument("--time", type=float, default=.32)
     parser.add_argument("--dt", type=float, default=.0001, help="Fixed step; 0 selects automatic M1/PN step control.")
     parser.add_argument("--cfl", type=float, default=.2, help="Safety factor for automatic step control (default: 0.2).")
@@ -34,7 +36,7 @@ def main() -> int:
     parser.add_argument("--memory-mib", type=int, default=4096, help="Solver memory budget in MiB (default: 4096).")
     parser.add_argument("--interval", type=float, default=1, help="Progress interval in seconds.")
     parser.add_argument("--exe", type=Path, default=ROOT / "nx/tmp/build_local/m1pn_mc_study")
-    parser.add_argument("--output", type=Path, help="New result directory; default: tmp/local_B_<timestamp>.")
+    parser.add_argument("--output", type=Path, help="New result directory; default: tmp/local_B_<timestamp> or tmp/local_PN_B_<timestamp>.")
     args = parser.parse_args()
     if min(args.elements, args.pn_order, args.threads, args.memory_mib) < 1:
         parser.error("elements, pn-order, threads and memory-mib must be positive")
@@ -50,7 +52,8 @@ def main() -> int:
     if not exe.is_file() or not os.access(exe, os.X_OK):
         parser.error(f"Study executable missing: {exe}. Build the study first or select --exe.")
     stamp = datetime.datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y%m%d_%H%M%S_%f")
-    output = (args.output or ROOT / "tmp" / ("local_B_" + stamp)).resolve()
+    prefix = "local_PN_B_" if args.coupling == "pn-only" else "local_B_"
+    output = (args.output or ROOT / "tmp" / (prefix + stamp)).resolve()
     log_path = output.with_name(output.name + ".log")
     if output.exists() or log_path.exists():
         parser.error(f"Choose a new output directory: {output}")
@@ -63,9 +66,12 @@ def main() -> int:
                "--biharmonic-gamma", "0", "--kv-gamma", "0", "--time-integrator", "ssprk3",
                "--pulse-width", ".07", "--background", ".001", "--threads", str(args.threads),
                "--max-steps", "1000000", "--memory-mib", str(args.memory_mib), "--output", str(output)]
+    if args.coupling == "pn-only":
+        command += ["--coupling", "pn-only"]
     env = dict(os.environ, OMP_NUM_THREADS=str(args.threads), OPENBLAS_NUM_THREADS="1",
                MKL_NUM_THREADS="1", OMP_DYNAMIC="FALSE")
-    print(f"Standard B · Crossing {args.elements}×{args.elements} · P{args.pn_order} · {args.threads} Thread(s)", flush=True)
+    mode_label = "PN ohne M1-Kopplung · B-Operator" if args.coupling == "pn-only" else "Standard B"
+    print(f"{mode_label} · Crossing {args.elements}×{args.elements} · P{args.pn_order} · {args.threads} Thread(s)", flush=True)
     print(f"Speicherbudget: {args.memory_mib} MiB", flush=True)
     if args.dt == 0:
         print(f"Zeitschritt: automatisch aus M1/PN-Grenzen · Sicherheitsfaktor {args.cfl:g}", flush=True)
@@ -125,14 +131,21 @@ def main() -> int:
         print(f"Solver beendet mit Code {process.returncode}. Letzte Logzeilen:", file=sys.stderr)
         print("\n".join(log_path.read_text().splitlines()[-15:]), file=sys.stderr)
         return process.returncode if process.returncode > 0 else 1
-    print("Prüfe gespeicherte Felder, M1-Kegel und globale Bilanz …", flush=True)
-    verified = subprocess.run([sys.executable, str(ROOT / "scripts/verify_run.py"), str(output)],
+    if args.coupling == "pn-only":
+        print("Prüfe endliche PN-Felder und globale Bilanz; erfasse negative Dichten …", flush=True)
+        verifier = ROOT / "scripts/verify_pn_run.py"
+    else:
+        print("Prüfe gespeicherte Felder, M1-Kegel und globale Bilanz …", flush=True)
+        verifier = ROOT / "scripts/verify_run.py"
+    verified = subprocess.run([sys.executable, str(verifier), str(output)],
                               capture_output=True, text=True, env=env)
     if verified.returncode:
         print(verified.stdout + verified.stderr, file=sys.stderr)
         return 1
     result = json.loads(verified.stdout)
-    print(f"Bestanden · {result['nodes']} Knoten · globale Bilanz {result['maximum_global_Q_balance']:.3e}")
+    print(f"Lauf geprüft · {result['nodes']} Knoten · globale Bilanz {result['maximum_global_Q_balance']:.3e}")
+    if args.coupling == "pn-only":
+        print(f"Minimale Dichte: {result['minimum_density']:.6g} · negative Knoten: {result['negative_density_nodes']}")
     print(f"Endfeld: {output / 'final.csv'}", flush=True)
     return 0
 
