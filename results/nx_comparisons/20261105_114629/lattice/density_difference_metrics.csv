@@ -1,0 +1,16 @@
+comparison,coarse_grid,fine_grid,order,norm_evaluation,L1,L2,Linf,grid,reference_order,reference_status
+same_order_grid_difference,28,56,3,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.004555500334104865,0.015874352799237535,0.14547631779712278,,,
+same_order_grid_difference,56,112,3,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.0017171993461643424,0.007006584315175898,0.08919170884714933,,,
+same_order_grid_difference,28,56,5,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.004901546283745346,0.016664700147862938,0.1533704008257214,,,
+same_order_grid_difference,56,112,5,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.0017476917229614598,0.006611742242102441,0.07728872300583906,,,
+same_order_grid_difference,28,56,7,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.004976529222734878,0.01689717908287648,0.15262893977273906,,,
+same_order_grid_difference,56,112,7,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.001800679040081767,0.006612368308509324,0.07128970637578508,,,
+same_order_grid_difference,28,56,9,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.005000252089625157,0.01697393355239014,0.1530188673506594,,,
+same_order_grid_difference,56,112,9,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.001838886150594913,0.006673289917844481,0.07042373470487884,,,
+same_order_grid_difference,28,56,11,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.005013175491355867,0.017015002697050176,0.15354163011323474,,,
+same_order_grid_difference,56,112,11,finer-grid nodal FE masses; coarse field multilinearly interpolated,0.0018645107275373164,0.006748503167529151,0.07287479495218507,,,
+same_grid_angular_difference,,,3,,0.002428725405115417,0.010313816121626147,0.0817800865446432,112,11,PN11 finite-order reference; not exact solution
+same_grid_angular_difference,,,5,,0.0006989671341665251,0.002667110175286946,0.02331997720125356,112,11,PN11 finite-order reference; not exact solution
+same_grid_angular_difference,,,7,,0.0002707547993008433,0.0012148306387293401,0.01346412519766349,112,11,PN11 finite-order reference; not exact solution
+same_grid_angular_difference,,,9,,0.00010339930357069796,0.0005054950150036087,0.005867044828071988,112,11,PN11 finite-order reference; not exact solution
+same_grid_angular_difference,,,11,,0.0,0.0,0.0,112,11,PN11 finite-order reference; not exact solution
