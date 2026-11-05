@@ -45,7 +45,12 @@ def main() -> int:
         raise ValueError("This plot requires a 2D Crossing run with beam metadata.")
     if summary["status"] != "completed" or abs(summary["time"] - cfg["final_time"]) > 1e-12:
         raise ValueError("Run has not completed at its requested final time.")
-    verification = study_analysis.verify_saved_inputs(run)
+    pn_only = cfg.get("coupling_mode", cfg.get("coupling")) == "pn-only"
+    if pn_only:
+        import verify_pn_run
+        verification, _ = verify_pn_run.check(run)
+    else:
+        verification = study_analysis.verify_saved_inputs(run)
     _, initial = study_analysis.read_csv(run / "initial.csv")
     _, final = study_analysis.read_csv(run / "final.csv")
     _, mass_data = study_analysis.read_csv(run / "nodal_mass.csv")
@@ -73,18 +78,23 @@ def main() -> int:
                          "pdf.fonttype": 42, "axes.spines.top": False, "axes.spines.right": False})
     values = np.column_stack((initial_rho, reference, rho, error))
     axes, tensor = study_analysis.grid_tensor(xyz, values, 2)
-    density_norm = Normalize(0, float(np.max(values[:, :3])))
+    density_min = min(0., float(np.min(values[:, :3])))
+    density_max = float(np.max(values[:, :3]))
+    density_norm = (TwoSlopeNorm(vcenter=0., vmin=density_min, vmax=density_max)
+                    if density_min < 0 else Normalize(0, density_max))
+    density_cmap = "RdBu_r" if density_min < 0 else "viridis"
     error_max = max(float(np.max(np.abs(error))), 1e-15)
     error_norm = TwoSlopeNorm(vcenter=0, vmin=-error_max, vmax=error_max)
-    title = (f"PN-Massenkorrektur B · {cfg['elements_per_axis']}×{cfg['elements_per_axis']} Zellen"
+    method_label = "PN-only B (ohne M1-Kopplung)" if pn_only else "PN-Massenkorrektur B"
+    title = (f"{method_label} · {cfg['elements_per_axis']}×{cfg['elements_per_axis']} Zellen"
              f" · P{cfg['pn_order']} · t={summary['time']:g} · Δt={cfg['dt_selected']:g}")
     fig, axs = plt.subplots(2, 2, figsize=(10.5, 9), layout="constrained")
     titles = ["Anfangsdichte", "Kinetische Referenz am Endzeitpunkt",
-              "Berechnete Enddichte", "Signierter Dichtefehler ρ − ρ_ref"]
+              f"Berechnete Enddichte · min ρ={rho.min():.4g}", "Signierter Dichtefehler ρ − ρ_ref"]
     for index, (ax, panel_title) in enumerate(zip(axs.flat, titles)):
         is_error = index == 3
         mesh = ax.pcolormesh(axes[0], axes[1], tensor[:, :, index].T, shading="auto",
-                             cmap="RdBu_r" if is_error else "viridis",
+                             cmap="RdBu_r" if is_error else density_cmap,
                              norm=error_norm if is_error else density_norm)
         ax.set(xlabel="x", ylabel="y", title=panel_title, aspect="equal",
                xlim=(axes[0][0], axes[0][-1]), ylim=(axes[1][0], axes[1][-1]))
@@ -98,7 +108,7 @@ def main() -> int:
     np.savetxt(out / "lineout.csv", line, delimiter=",", comments="", header="x,reference_density,numerical_density,signed_error")
     fig, ax = plt.subplots(figsize=(8.3, 4.2), layout="constrained")
     ax.plot(line[:, 0], line[:, 1], color="black", lw=2, label="Kinetische Referenz")
-    ax.plot(line[:, 0], line[:, 2], "o-", color="tab:blue", ms=3, lw=1.4, label="PN-Massenkorrektur B")
+    ax.plot(line[:, 0], line[:, 2], "o-", color="tab:blue", ms=3, lw=1.4, label=method_label)
     ax.set(xlabel="x", ylabel="Dichte ρ", title=title + f"\nSchnitt bei y={axes[1][mid]:g}")
     ax.grid(alpha=.25)
     ax.legend()
@@ -109,7 +119,12 @@ def main() -> int:
               "reference": "Analytic kinetic transport density; differences include finite-PN model error.",
               "norm": "Lumped-node-mass weighted errors divided by domain volume; Linf over nodes.",
               "verified_input_sha256": verification["sha256"],
-              "plot_script_sha256": study_analysis.sha256(Path(__file__)), "lineout_y": float(axes[1][mid])}
+              "plot_script_sha256": study_analysis.sha256(Path(__file__)), "lineout_y": float(axes[1][mid]),
+              "density_diagnostics": {"minimum_density": float(rho.min()),
+                                      "negative_density_nodes": int(np.count_nonzero(rho < 0))},
+              "density_color_scale": {"minimum": density_min, "maximum": density_max,
+                                      "cmap": density_cmap, "zero_centered": density_min < 0},
+              "coupling_mode": "pn-only" if pn_only else "m1pn"}
     (out / "plot_manifest.json").write_text(json.dumps(record, indent=2) + "\n")
     print(json.dumps({"run": str(run), "plots": str(out), "metrics": metrics}, indent=2))
     return 0
