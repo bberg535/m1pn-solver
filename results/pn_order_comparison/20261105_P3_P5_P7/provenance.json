@@ -1,0 +1,116 @@
+{
+  "analysis_helper_sha256": "f76ee321c5515bc4f72b0c3af363ae2afa468000a426a2c40769b900ffbd6923",
+  "common_settings": {
+    "beam_geometry": {
+      "amplitude": 1,
+      "background": 0.001,
+      "beams": [
+        {
+          "center": [
+            0.3,
+            0.5,
+            0
+          ],
+          "direction": [
+            1,
+            0,
+            0
+          ]
+        },
+        {
+          "center": [
+            0.5,
+            0.3,
+            0
+          ],
+          "direction": [
+            0,
+            1,
+            0
+          ]
+        }
+      ],
+      "width_exponent": -102.0408163265306
+    },
+    "case": "crossing-study",
+    "dimension": 2,
+    "dt_selected": 6.459426725878078e-05,
+    "final_time": 0.32,
+    "inflow": "crossing-study-transport",
+    "mesh_type": "hex",
+    "model": "r2",
+    "pn_target": "standard_B_mass_corrected",
+    "stabilization": "m1pn_mass_correction"
+  },
+  "common_steps": 4954,
+  "comparison": "PN-only standard B, P3/P5/P7",
+  "density_scale": {
+    "vmax": 1.3533018277765192,
+    "vmin": -0.2511280543764084,
+    "zero_centered": true
+  },
+  "midline": "Native y=0.5 samples per run; analytic reference evaluated on finest available x grid.",
+  "norm": "L1=sum(m_i |e_i|)/volume; L2=sqrt(sum(m_i e_i^2)/volume); Linf=max nodal absolute error; each on its own native mesh and lumped masses.",
+  "plot_script_sha256": "90e3d3ed8522b211d9443f727a8c0377ec6b02215a37f162ac17972e1e05ecbc",
+  "reference": "Analytic kinetic free-transport density; includes finite PN model, boundary, and spatial errors.",
+  "runs": [
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/local_PN_B_20261105_125048_939872",
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/local_PN_B_20261105_132539_380277",
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/local_PN_B_20261105_144556_955427"
+  ],
+  "runs_metadata": [
+    {
+      "config_sha256": "a44b6c426d70973f1b08446bc9de132dff9dd4b8e45d9c0d8a5f0ef9180a8e47",
+      "grid": 128,
+      "pn_order": 3,
+      "summary_sha256": "05e2dcf2644cbc787fb34dce2ebce321c78ee545c93a4daa7afc118e7c0b3034",
+      "verification_sha256": "7842b1b747cdfa15e0a89b2093588655f0dd4b4a95a9cd8a56a3e563bf621122",
+      "verified_input_hashes": {
+        "boundary_integral.csv": "5b595c93a6856cc4d46091418887cb6f2c52f816cb754f5c192ad86a52d76e27",
+        "config.json": "a44b6c426d70973f1b08446bc9de132dff9dd4b8e45d9c0d8a5f0ef9180a8e47",
+        "final.csv": "44eac329b6494f3895a73680ea09db1cfbf85d35282e10dd76cfd89b6c2abe88",
+        "initial.csv": "ce16cd882db1594ef873db52fa2de0313cd08168e6a77187b31a4b46f26698aa",
+        "nodal_mass.csv": "522359798bcc70dd9eabcde9474b54b601d8e991303f04589e2fde8b35ee36a6",
+        "reaction_integral.csv": "e68ac634f54637fb3d23a6e6471157eae1c40a01a681bd95c422da3dac40a609",
+        "summary.json": "05e2dcf2644cbc787fb34dce2ebce321c78ee545c93a4daa7afc118e7c0b3034"
+      }
+    },
+    {
+      "config_sha256": "b41dd1279df11da87dd4885d6ea98563c6642ddbf09cf66b96e029c083ef5843",
+      "grid": 64,
+      "pn_order": 5,
+      "summary_sha256": "b6245714522e20fa860dbdb38639d771488a780137eb3f3ec8ccc68ad0719b97",
+      "verification_sha256": "7cf04f957866c6157290072599020498199f87e2524a7a646915daf5df1093f4",
+      "verified_input_hashes": {
+        "boundary_integral.csv": "36e6280196a14759a9870b572b53aab65b0302facbf950d71aa994ecc1a247c3",
+        "config.json": "b41dd1279df11da87dd4885d6ea98563c6642ddbf09cf66b96e029c083ef5843",
+        "final.csv": "03646db479c05c0247be10ce40a3929a79017602ad66fb290d0c552bfe39eade",
+        "initial.csv": "c0454173c667b0150ba7710f530461f3030b63e2fdc8c11f880058fc3c080e6d",
+        "nodal_mass.csv": "3556c9af6e4ec7ddd971baf252204a40cfd4a5dc3f41eed4533c402f7f6b73b4",
+        "reaction_integral.csv": "d94c288ca56caf734d67379c1257a6138dab40b25f723491ef55d298fc7cb097",
+        "summary.json": "b6245714522e20fa860dbdb38639d771488a780137eb3f3ec8ccc68ad0719b97"
+      }
+    },
+    {
+      "config_sha256": "044075f161dc0c0ff865e54111fc3b11251a135d08299d5ede13619c4ec9cb23",
+      "grid": 128,
+      "pn_order": 7,
+      "summary_sha256": "ed39558a6aa7070cbfaafc0c8da235e03e355f2c5e45cad30d7b40dc7a6f66ad",
+      "verification_sha256": "e3c096474ae4ffdad4e0d168d854e08c91d3d570d080925321ae547bb2de8176",
+      "verified_input_hashes": {
+        "boundary_integral.csv": "d063000aee3fd73ad474cbfb3518730b323c076e28ae3e1a69595757960d1cd5",
+        "config.json": "044075f161dc0c0ff865e54111fc3b11251a135d08299d5ede13619c4ec9cb23",
+        "final.csv": "edeccd66e2804a856edc55bae93d5840b881ef5a92fda1416c4c9dce1863189d",
+        "initial.csv": "7b580cade9cebeb9885cd19e6d77edba457c3135378a30ef89b60472575c9a40",
+        "nodal_mass.csv": "522359798bcc70dd9eabcde9474b54b601d8e991303f04589e2fde8b35ee36a6",
+        "reaction_integral.csv": "e70515585c5ccd4b6eba7c74bc79b866715f980cd2faace314c3a91d1b0e2ce6",
+        "summary.json": "ed39558a6aa7070cbfaafc0c8da235e03e355f2c5e45cad30d7b40dc7a6f66ad"
+      }
+    }
+  ],
+  "signed_error_symmetric_scale": [
+    -0.4879615227375247,
+    0.4879615227375247
+  ],
+  "verifier_sha256": "a7d3fecef7fdfa78f9e40252c7f6326054bf0f50520f0d8a81807bc42644d052"
+}
