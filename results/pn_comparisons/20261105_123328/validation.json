@@ -1,0 +1,76 @@
+{
+  "created": "2026-11-05T12:37:26.584496+01:00",
+  "feature_commit": "d75613c",
+  "ctest": {
+    "command": "ctest --test-dir nx/tmp/build_local --output-on-failure -R ^nx_(pn_only|cases)$",
+    "tests": [
+      "nx_cases",
+      "nx_pn_only"
+    ],
+    "passed": 2,
+    "failed": 0,
+    "seconds": 4.72,
+    "log_sha256": "6e4655b68d758761154cf37fd780d1d8c81c3e450b1dbb23425dd118de5ee5b4"
+  },
+  "frozen_coupled_comparison": {
+    "status": "passed",
+    "scope": "Coupled default bitwise comparison of five saved fields vs frozen NX binary on crossing N8 P3 T=.002 dt=6.459426725878078e-05, threads 1 and 4",
+    "hashes": {
+      "frozen_t1": {
+        "initial.csv": "62f68669ffdaa5a965438ed0c06b1959437dddd4d15106c953e6d212e150867a",
+        "final.csv": "a760102878ca2304c54820a73d480a7a95f39a3c7cd332faff302954495a169e",
+        "nodal_mass.csv": "4ca2b08776ba7e0854629ddd197a32378993aead102642e549e9563bef89225f",
+        "boundary_integral.csv": "2fb591da001eff2cb601ab66eb412f9ca5313d645313e380324f760d24654cc3",
+        "reaction_integral.csv": "d6139c86bc7f93c6f258cfe8049bcc3731b4befe5fe962afa4be914f0b011971"
+      },
+      "frozen_t4": {
+        "initial.csv": "62f68669ffdaa5a965438ed0c06b1959437dddd4d15106c953e6d212e150867a",
+        "final.csv": "a760102878ca2304c54820a73d480a7a95f39a3c7cd332faff302954495a169e",
+        "nodal_mass.csv": "4ca2b08776ba7e0854629ddd197a32378993aead102642e549e9563bef89225f",
+        "boundary_integral.csv": "2fb591da001eff2cb601ab66eb412f9ca5313d645313e380324f760d24654cc3",
+        "reaction_integral.csv": "d6139c86bc7f93c6f258cfe8049bcc3731b4befe5fe962afa4be914f0b011971"
+      },
+      "new_t1": {
+        "initial.csv": "62f68669ffdaa5a965438ed0c06b1959437dddd4d15106c953e6d212e150867a",
+        "final.csv": "a760102878ca2304c54820a73d480a7a95f39a3c7cd332faff302954495a169e",
+        "nodal_mass.csv": "4ca2b08776ba7e0854629ddd197a32378993aead102642e549e9563bef89225f",
+        "boundary_integral.csv": "2fb591da001eff2cb601ab66eb412f9ca5313d645313e380324f760d24654cc3",
+        "reaction_integral.csv": "d6139c86bc7f93c6f258cfe8049bcc3731b4befe5fe962afa4be914f0b011971"
+      },
+      "new_t4": {
+        "initial.csv": "62f68669ffdaa5a965438ed0c06b1959437dddd4d15106c953e6d212e150867a",
+        "final.csv": "a760102878ca2304c54820a73d480a7a95f39a3c7cd332faff302954495a169e",
+        "nodal_mass.csv": "4ca2b08776ba7e0854629ddd197a32378993aead102642e549e9563bef89225f",
+        "boundary_integral.csv": "2fb591da001eff2cb601ab66eb412f9ca5313d645313e380324f760d24654cc3",
+        "reaction_integral.csv": "d6139c86bc7f93c6f258cfe8049bcc3731b4befe5fe962afa4be914f0b011971"
+      }
+    }
+  },
+  "source_review": {
+    "reviewer": "independent nx_review agent",
+    "scope": "PN target equivalence including inhomogeneous LLF/Onsager boundary, SSPRK3 time stages/weights, all-Q ledger, finite-only checks, no state-dependent M1 closure/limiter/synchronization",
+    "result": "no source correctness blocker after direct-target self-test added"
+  },
+  "limitations": [
+    "Frozen coupled equality check samples N8/P3/T=.002 on one small case, with 1 and 4 threads.",
+    "The large local run uses 8 threads; the stored NX coupled comparator uses 16 threads on different hardware. Runtime is not a controlled speed comparison.",
+    "Parallel worktree core optimizations are present in the local build and were not authored or committed by this task; exact source/binary hashes are in source_record.json."
+  ],
+  "full_run": {
+    "run": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/local_PN_B_20261105_125048_939872",
+    "completed": "2026-11-05T13:08:07.639608+01:00",
+    "status": "completed",
+    "verification_status": "passed",
+    "steps": 4954,
+    "time": 0.32,
+    "maximum_global_Q_balance": 3.5016118740302704e-15,
+    "minimum_density": -0.2511280543764084,
+    "negative_density_nodes": 4967,
+    "outside_M1_low_moment_cone_nodes": 6958,
+    "m1_closure_evaluations": 0,
+    "pair_limiter_evaluations": 0,
+    "cone_rejections": 0,
+    "peak_rss_MiB": 135.8984375,
+    "source_binary_sha256": "cb5798b8b81680c82edc7a7f5c41fce8a53b1730a6e9b0ff587c980634eb3284"
+  }
+}

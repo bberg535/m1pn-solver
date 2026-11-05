@@ -21,6 +21,12 @@ Die neue [NX-Clusterstudie](nx/README.md) überträgt den 48-Aufgaben-Plan der
 Biharmonik-Studie auf Standardvariante B. Sie berechnet ihre Schrittweiten neu
 und startet mit `python3 nx/scripts/start_mass_correction.py`.
 
+Die [ersten NX-Vergleichsplots](results/nx_comparisons/README.md) umfassen
+44 abgeschlossene Aufgaben. Der [lokale Vergleich von reinem P3 und
+gekoppeltem M1PN auf 128²](results/pn_comparisons/20261105_123328/README.md)
+zeigt die Wirkung der abgeschalteten M1-Kopplung bei gleichen Anfangsdaten
+und gleicher Schrittweite.
+
 ## Bauen und testen
 
 Vorhandene MFEM/MPI/Eigen-Installation verwenden; es wird nichts installiert:

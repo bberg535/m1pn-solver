@@ -1,0 +1,159 @@
+{
+  "comparison": "PN-only standard B versus coupled M1PN standard B",
+  "coupled_campaign": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/pn_mc_production_20261104_161438_760701",
+  "coupled_provenance": {
+    "binary_sha256": "fbacdb3a830c0f6c6261ec537c45b043cfca1d50e921e38eb3ce7d9c2c08289f",
+    "campaign_manifest_sha256": "853525f3c904f9514d1c23e1556b87a3f1a9952c4599d1a8e8c4ff39b5abd64e",
+    "field_sha256": "89fd04e6816aa621387af7ae9d14017b5e65232cf6eb7f20a00a24f18bc0bd60",
+    "tasks_sha256": "0697504cd5150c3bfac9bb7e8cedf57228436fc7e73358db52f4a5f42f3929aa",
+    "verified_input_hashes": {
+      "boundary_integral.csv": "a9962bab7ece6590b256f1cecab05e3a124a93fe5f2535d79a1be19d4ab451a7",
+      "config.json": "c9d632b2d1e0a7df69c29ea8a301e57ec1b9470d5d0e3ae13f160a4c6b098a97",
+      "final.csv": "89fd04e6816aa621387af7ae9d14017b5e65232cf6eb7f20a00a24f18bc0bd60",
+      "initial.csv": "ce16cd882db1594ef873db52fa2de0313cd08168e6a77187b31a4b46f26698aa",
+      "mesh.mesh": "86f1efe01221f1ed6307fb6b6248feb69b5926ca52b0e55e26ba6f212d2eb777",
+      "nodal_mass.csv": "522359798bcc70dd9eabcde9474b54b601d8e991303f04589e2fde8b35ee36a6",
+      "progress.json": "bd50a875f7f49178f6b0e3df26220ba7440e60af8b34fda2e2814621b422c65f",
+      "reaction_integral.csv": "e68ac634f54637fb3d23a6e6471157eae1c40a01a681bd95c422da3dac40a609",
+      "rejections.csv": "6446ac7833ed3dda2d6d640b3b0b7e4815d1426189edbaec35a84e8bddea2127",
+      "stages.csv": "925c16639d2346444dafb4d0d17ee20200c2c9e5bcb9b880913fb2c01e8465e9",
+      "steps.csv": "ae4a2064c67906ffae4ffdd812b1abc8ac08dc1816299f397677067421316d53",
+      "summary.json": "a19caa321d785712becee14c88d0fd333918a5a77354982aba6c550f2a461755"
+    }
+  },
+  "coupled_run": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/pn_mc_production_20261104_161438_760701/runs/crossing_N128_P3",
+  "metadata_match": {
+    "same_beam_geometry": true,
+    "same_dimension": 2,
+    "same_dt": 6.459426725878078e-05,
+    "same_final_time": 0.32,
+    "same_grid": 128,
+    "same_initial_csv_sha256": "ce16cd882db1594ef873db52fa2de0313cd08168e6a77187b31a4b46f26698aa",
+    "same_mesh_type": "hex",
+    "same_nodal_mass_csv_sha256": "522359798bcc70dd9eabcde9474b54b601d8e991303f04589e2fde8b35ee36a6",
+    "same_pn_order": 3,
+    "same_steps": 4954
+  },
+  "metrics": [
+    {
+      "density_L1": 0.07544365665603134,
+      "density_L2": 0.11973566068253734,
+      "density_Linf": 0.4879615227375247,
+      "domain_volume": 1.0,
+      "dt": 6.459426725878078e-05,
+      "grid": 128,
+      "method": "PN-only B",
+      "pn_order": 3,
+      "relative_density_L1": 1.2056475972600302,
+      "relative_density_L1_denominator": 0.06257521420644435,
+      "steps": 4954,
+      "target": "kinetic_reference",
+      "time": 0.32
+    },
+    {
+      "density_L1": 0.032799912448262816,
+      "density_L2": 0.09248708216255454,
+      "density_Linf": 0.8843856361648174,
+      "domain_volume": 1.0,
+      "dt": 6.459426725878078e-05,
+      "grid": 128,
+      "method": "coupled M1PN B",
+      "pn_order": 3,
+      "relative_density_L1": 0.5241678013286752,
+      "relative_density_L1_denominator": 0.06257521420644435,
+      "steps": 4954,
+      "target": "kinetic_reference",
+      "time": 0.32
+    },
+    {
+      "density_L1": 0.0634961709752819,
+      "density_L2": 0.10348966356273992,
+      "density_Linf": 0.6433256361251138,
+      "domain_volume": 1.0,
+      "dt": 6.459426725878078e-05,
+      "grid": 128,
+      "method": "PN-only B minus coupled M1PN B",
+      "pn_order": 3,
+      "relative_density_L1": 1.0140893955640298,
+      "relative_density_L1_denominator": 0.06261397787318913,
+      "steps": 4954,
+      "target": "method_difference",
+      "time": 0.32
+    }
+  ],
+  "norms": {
+    "density_L1": "sum_i m_i |e_i| / domain_volume",
+    "density_L2": "sqrt(sum_i m_i e_i^2 / domain_volume)",
+    "method_difference_relative_L1_denominator": 0.06261397787318913,
+    "relative_density_L1_reference_denominator": 0.06257521420644435
+  },
+  "output": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/results/pn_comparisons/20261105_123328/plots",
+  "pn_config": {
+    "beam_geometry": {
+      "amplitude": 1,
+      "background": 0.001,
+      "beams": [
+        {
+          "center": [
+            0.3,
+            0.5,
+            0
+          ],
+          "direction": [
+            1,
+            0,
+            0
+          ]
+        },
+        {
+          "center": [
+            0.5,
+            0.3,
+            0
+          ],
+          "direction": [
+            0,
+            1,
+            0
+          ]
+        }
+      ],
+      "width_exponent": -102.0408163265306
+    },
+    "coupling": "pn-only",
+    "coupling_mode": "pn-only",
+    "dimension": 2,
+    "dt_selected": 6.459426725878078e-05,
+    "elements_per_axis": 128,
+    "final_time": 0.32,
+    "mass_corrections": 0,
+    "mass_mode": "lumped",
+    "mesh_type": "hex",
+    "model": "r2",
+    "pn_order": 3,
+    "pn_target": "standard_B_mass_corrected",
+    "stabilization": "m1pn_mass_correction"
+  },
+  "pn_run": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/local_PN_B_20261105_125048_939872",
+  "pn_verification": {
+    "maximum_global_Q_balance": 3.5016118740302704e-15,
+    "scope": "PN-only finite fields and all-Q conservation only; negative density and M1 low-moment cone violations are reported, not rejected; no positivity, M1 cone, or higher-moment realizability guarantee.",
+    "sha256": {
+      "boundary_integral.csv": "5b595c93a6856cc4d46091418887cb6f2c52f816cb754f5c192ad86a52d76e27",
+      "config.json": "a44b6c426d70973f1b08446bc9de132dff9dd4b8e45d9c0d8a5f0ef9180a8e47",
+      "final.csv": "44eac329b6494f3895a73680ea09db1cfbf85d35282e10dd76cfd89b6c2abe88",
+      "initial.csv": "ce16cd882db1594ef873db52fa2de0313cd08168e6a77187b31a4b46f26698aa",
+      "nodal_mass.csv": "522359798bcc70dd9eabcde9474b54b601d8e991303f04589e2fde8b35ee36a6",
+      "reaction_integral.csv": "e68ac634f54637fb3d23a6e6471157eae1c40a01a681bd95c422da3dac40a609",
+      "summary.json": "05e2dcf2644cbc787fb34dce2ebce321c78ee545c93a4daa7afc118e7c0b3034"
+    },
+    "verification_json_sha256": "7842b1b747cdfa15e0a89b2093588655f0dd4b4a95a9cd8a56a3e563bf621122"
+  },
+  "positivity_caveat": "PN-only verifier checks finite fields and all-Q conservation; it reports negative density/cone diagnostics but does not assert positivity or M1 realizability.",
+  "reference_caveat": "Analytic kinetic free-transport moments include finite-PN model error and are not an exact solution of the discrete finite-PN system.",
+  "scripts": {
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/scripts/analysis.py": "f76ee321c5515bc4f72b0c3af363ae2afa468000a426a2c40769b900ffbd6923",
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/scripts/plot_pn_comparison.py": "a1327db5f879f18bb36e6334dbfd2da621d2c4ef8d22c45f5b6394b41201a891",
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/scripts/verify_pn_run.py": "a7d3fecef7fdfa78f9e40252c7f6326054bf0f50520f0d8a81807bc42644d052"
+  }
+}

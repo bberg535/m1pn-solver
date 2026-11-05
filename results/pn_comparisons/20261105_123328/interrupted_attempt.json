@@ -1,0 +1,13 @@
+{
+  "run": "tmp/local_PN_B_20261105_123328_860992",
+  "driver_session_exit_code": 143,
+  "signal": "SIGTERM (15)",
+  "cause": "Not established; no numerical error was written to solver log. No final field/summary/verification was produced.",
+  "last_progress": {
+    "status": "running",
+    "time": 0.29325797335486475,
+    "steps": 4540,
+    "dt": 6.459426725878078e-05,
+    "wall_seconds": 837.2737404770014
+  }
+}

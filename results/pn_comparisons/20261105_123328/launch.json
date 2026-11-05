@@ -1,0 +1,29 @@
+{
+  "pid": 877789,
+  "run": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/local_PN_B_20261105_125048_939872",
+  "driver_log": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/local_PN_B_20261105_125048_939872.driver.log",
+  "command": [
+    "/usr/bin/python3",
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/scripts/run_local_progress.py",
+    "--coupling",
+    "pn-only",
+    "--elements",
+    "128",
+    "--pn-order",
+    "3",
+    "--time",
+    ".32",
+    "--dt",
+    "6.459426725878078e-05",
+    "--threads",
+    "8",
+    "--interval",
+    "10",
+    "--exe",
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/pn_only_build_wfidtb7y/m1pn_mc_study",
+    "--output",
+    "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/tmp/local_PN_B_20261105_125048_939872"
+  ],
+  "created": "2026-11-05T12:50:48.942891+01:00",
+  "execution": "Detached local process outside tool sandbox; same frozen PN-only binary and matched dt. Restart after first attempt received SIGTERM."
+}

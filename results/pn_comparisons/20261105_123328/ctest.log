@@ -1,0 +1,35 @@
+Start testing: Nov 05 12:32 CET
+----------------------------------------------------------
+1/32 Testing: nx_cases
+1/32 Test: nx_cases
+Command: "/usr/bin/python3.9" "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tests/cases.py" "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/build_local/m1pn_mc_study"
+Directory: /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/build_local
+"nx_cases" start time: Nov 05 12:32 CET
+Output:
+----------------------------------------------------------
+{"status": "passed", "raw_outputs": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/case_checks_qdvt7zln", "lattice_integrals": [49.000000000000014, 1.0000000000000004, 110.00000000000003, 38.00000000000001], "actual_cases": ["crossing-study", "crossing-3d", "lattice-paul"]}
+<end of output>
+Test time =   1.80 sec
+----------------------------------------------------------
+Test Passed.
+"nx_cases" end time: Nov 05 12:32 CET
+"nx_cases" time elapsed: 00:00:01
+----------------------------------------------------------
+
+2/32 Testing: nx_pn_only
+2/32 Test: nx_pn_only
+Command: "/usr/bin/python3.9" "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tests/pn_only.py" "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/build_local/m1pn_mc_study"
+Directory: /home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/build_local
+"nx_pn_only" start time: Nov 05 12:32 CET
+Output:
+----------------------------------------------------------
+{"status": "passed", "raw_outputs": "/home/warehouse15/bberg/phd/05_papers/M1PN_Paper_Revision_R2_20261029/M1PN_MassCorrection_20261104/nx/tmp/pn_only_checks_r1jjc_3x", "pn_only_steps": 2, "minimum_density_observed": 0.0009927361530142223, "minimum_cone_margin_observed": 0.0009875699716588603}
+<end of output>
+Test time =   2.88 sec
+----------------------------------------------------------
+Test Passed.
+"nx_pn_only" end time: Nov 05 12:32 CET
+"nx_pn_only" time elapsed: 00:00:02
+----------------------------------------------------------
+
+End testing: Nov 05 12:32 CET
