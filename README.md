@@ -123,6 +123,13 @@ tmp/build/m1pn --dimension 1 --elements 32 --pn-order 3 \
   --time .05 --dt .0001 --threads 1 --output tmp/my_mc_boundary_run
 ```
 
+`--ledger-stride S` (Standard 64) steuert die Prüfung der Standardvariante B: Jeder
+`S`-te Schritt, beginnend mit dem ersten, läuft über den vollständigen Pfad mit allen
+Q-Momenten. Dazwischen wertet `src/fast_mc.cpp` Paarflüsse nur für die vier limitierten
+Momente aus. In diesen Schritten decken `ledger_residual` und `target_recovery` nur diese
+vier Momente ab, und `target_energy` in `stages.csv` ist `nan`. `--ledger-stride 1`
+erzwingt auf jedem Schritt den vollständigen Pfad.
+
 Ausgabeziele müssen neu sein. Ein ausdrücklich inkompatibler Massenmodus,
 SSPRK2/IMEX oder `--model legacy` wird für die neuen Methoden abgewiesen.
 `--pn-viscosity-scale` hat Standardwert 1 und muss mindestens 1 sein. Die

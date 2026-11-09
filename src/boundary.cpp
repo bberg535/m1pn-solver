@@ -98,6 +98,16 @@ Boundary::Boundary(const Angular &a, const CanonicalC1 &c, const V3 &normal, boo
         .5 * (normal_matrix - Mat::Identity(pn.q,pn.q)) * exterior_map;
     Eigen::JacobiSVD<Mat> llf_svd(llf_homogeneous);
     llf_norm = llf_svd.singularValues()[0];
+    // Exterior datum map: incoming(0,d) of CanonicalC1 as a matrix, with the
+    // same true-residual guard that incoming() applies on every call.
+    {
+        const Mat load = std::sqrt(2.) * c.root.asDiagonal() * c.U.transpose();
+        const Mat z = c.solve.solve(load);
+        require(((Mat::Identity(c.r, c.r) + c.S) * z - load).norm() < 2e-12 * std::max(1., load.norm()),
+                "C1 SPD true residual failed for datum map");
+        llf_datum = .5 * (normal_matrix - Mat::Identity(pn.q, pn.q)) *
+                    (Rminus * (c.root.cwiseInverse().asDiagonal() * z));
+    }
     rule = sphere_rule(pn.order + 2, -1);
     odd_basis.resize(rule.size(), c.r);
     for (std::size_t p = 0; p < rule.size(); ++p) {

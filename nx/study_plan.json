@@ -59,7 +59,7 @@
         ],
         "time": 3.2,
         "width": 0.07,
-        "background": 1e-06
+        "background": 1e-10
       },
       "three_d": {
         "dimension": 3,
@@ -112,7 +112,7 @@
         ],
         "time": 2e-05,
         "width": 0.07,
-        "background": 1e-06
+        "background": 1e-10
       },
       "three_d": {
         "dimension": 3,
@@ -136,7 +136,7 @@
     "Full Cartesian product of orders and grids for each case: 45 spatial runs plus 3 dt/2 temporal references, 48 production tasks total.",
     "Probe every combination with the actual PN mass-correction configuration, then freeze common dt per case from the minimum M1/PN step bound times 0.2 and adjust to integer steps.",
     "Each case has one additional dt/2 run at largest N and finest grid.",
-    "Source/material lattice geometry follows old source; R2 LLF vacuum and nodal FE-averaged exact Strang reaction are distinct discretization conventions.",
+    "Lattice is the isotropic Paul benchmark: domain (0,7)^2, absorber Da from the paper figure, sigma_a=10 and sigma_s=0 in Da, sigma_s=1 elsewhere, unit source on [3,4]^2, initial density 1e-10. R2 LLF vacuum and nodal FE-averaged exact Strang reaction are distinct discretization conventions.",
     "No FCS; do not inherit unsupported old CLI arguments.",
     "Successful finite runs are not proof of generic floating-point IDP or a global energy inequality.",
     "Standard B uses lumped mass and one PN low-order predictor correction per RK stage; mass_corrections is zero because the AFC mass-solve iteration is not used.",

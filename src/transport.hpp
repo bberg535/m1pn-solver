@@ -21,6 +21,10 @@ struct Numerics {
     std::string stabilization = "gradient-defect";
     double kv_gamma = .5;
     double pn_viscosity_scale = 1.;
+    // Every ledger_stride-th step uses the audited all-Q path; between them the
+    // standard mass-correction method skips the redundant pair fields of the
+    // unlimited moments. 1 keeps the full path on every step.
+    int ledger_stride = 1;
     Budget budget;
 };
 struct Diagnostics {
@@ -42,6 +46,13 @@ struct Stage {
     Field rate, target, accepted_pairs, boundary_gather, source, gather, mass_error;
     Diagnostics diagnostics;
 };
+struct FastMassCorrection;
+struct FastMassCorrectionDeleter {
+    void operator()(FastMassCorrection *) const;
+};
+struct Transport;
+// Null unless the configuration is the standard method on planar boundary faces.
+FastMassCorrection *make_fast_mass_correction(Transport &);
 struct Transport {
     const Angular &pn;
     Spatial &fe;
@@ -55,10 +66,26 @@ struct Transport {
     std::unique_ptr<ImplicitMassSolver> implicit_solver;
     Sparse implicit_positive;
     std::vector<std::array<V3,2>> pair_geometry;
+    std::vector<double> pn_low_order_edge_viscosity;
+    // CSR incidence list, with edges in their original global pair order.
+    std::vector<std::size_t> pair_node_offsets;
+    std::vector<int> pair_node_edges;
+    std::vector<signed char> pair_node_sign;
     std::vector<int> pn_boundary_map;
     double pn_boundary_map_norm = 1.;
     double generator_norm_bound = 0;
     Timings timings;
+    // Stage workspace. Resized once and filled in place so the 76 MB fields
+    // are not allocated again on every SSPRK stage.
+    mutable std::array<Field, 3> stage_angular;
+    mutable Field stage_rhs;
+    mutable Field stage_stabilization_pairs;
+    mutable Field stage_boundary;
+    mutable Field stage_u1;
+    mutable Field stage_u2;
+    // Built only when the configuration matches the low-moment path; see fast_mc.cpp.
+    std::unique_ptr<FastMassCorrection, FastMassCorrectionDeleter> fast_mc;
+    std::uint64_t advance_count = 0;
     Transport(const Angular &, Spatial &, const Numerics &, Inflow = {}, Runtime = {});
     Stage evaluate(double time, const Field &u, bool unlimited = false,
                    const Field &integrated_source = Field());
@@ -70,8 +97,11 @@ struct Transport {
     Field linear_target(const Field &) const;
     Field mass_target(const Field &rhs, double &residual, Field *predictor = nullptr) const;
     // boundary_rhs is the signed, integrated numerical PN boundary load (-H).
+    // angular_flux, when set, is {A[0]*u, A[1]*u, A[2]*u}. Predictor edges then
+    // use sum_d c[d] * (flux_d[j] - flux_d[i]). Null keeps fast_apply.
     Field pn_low_order_rate(const Field &u, const Field &assembled_pn_boundary_rhs = Field(),
-                            const Field &source = Field()) const;
+                            const Field &source = Field(),
+                            const std::array<Field, 3> *angular_flux = nullptr) const;
     Field mass_correction(const Field &rate) const;
     Field mass_correction_target(const Field &consistent_rhs, const Field &low_rate) const;
     void check_state(const Field &) const;

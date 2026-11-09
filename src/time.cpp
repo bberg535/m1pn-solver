@@ -119,6 +119,10 @@ TimeControl::TimeControl(Transport &tr, const MeshSpec &mesh, int rk, int max_do
         step_limit = .95 * lo;
         contraction = fourier_amplification(tr.pn, mesh.elements, mesh.dimension, gamma, step_limit, rk, kv,
                                             correction_degree);
+    } else if (rk == 2 && (tr.options.stabilization == "m1pn_mass_correction" ||
+                           tr.options.stabilization == "m1pn_mass_correction_boundary_consistent")) {
+        method = "open-rk2-m1-cfl";
+        step_limit = tr.fe.cfl_step;
     } else if (rk == 3) {
         // For R2 this is a conservative resolution policy, not a full coupled
         // energy/entropy theorem; each actual Euler and stored state is checked.
@@ -179,6 +183,10 @@ void TimeControl::check(double dt) const {
 }
 Step advance(Transport &tr, const TimeControl &control, double time, double dt,
              const Field &initial) {
+    const std::uint64_t attempt = tr.advance_count++;
+    if (tr.fast_mc && control.order >= 2 && tr.options.ledger_stride > 1 &&
+        attempt % std::uint64_t(tr.options.ledger_stride) != 0)
+        return advance_fast_mc(tr, control, time, dt, initial);
     control.check(dt);
     tr.check_state(initial);
     Step out;
@@ -228,7 +236,10 @@ Step advance(Transport &tr, const TimeControl &control, double time, double dt,
         }
     };
     Stage s0 = stage(time, initial);
-    Field u1 = initial + dt * s0.rate;
+    Field &u1 = tr.stage_u1;
+    if (u1.rows() != initial.rows() || u1.cols() != initial.cols())
+        u1.resize(initial.rows(), initial.cols());
+    u1.noalias() = initial + dt * s0.rate;
     Stage s1 = stage(time + dt, u1);
     std::vector<Stage> stages;
     stages.push_back(std::move(s0));
@@ -238,7 +249,10 @@ Step advance(Transport &tr, const TimeControl &control, double time, double dt,
         out.state = .5 * initial + .5 * (u1 + dt * stages[1].rate);
         weights = {.5, .5};
     } else {
-        Field u2 = .75 * initial + .25 * (u1 + dt * stages[1].rate);
+        Field &u2 = tr.stage_u2;
+        if (u2.rows() != initial.rows() || u2.cols() != initial.cols())
+            u2.resize(initial.rows(), initial.cols());
+        u2.noalias() = .75 * initial + .25 * (u1 + dt * stages[1].rate);
         tr.check_state(u2);
         stages.push_back(stage(time + .5 * dt, u2));
         out.state = initial / 3. + (2. / 3) * (u2 + dt * stages[2].rate);
@@ -278,23 +292,38 @@ Field reaction(const Field &u, const Field &source, const Vec &absorption, const
             "Reaction shape mismatch");
     Field v(u.rows(), u.cols());
     const int n = int(std::sqrt(u.cols())) - 1;
-    for (int i = 0; i < u.rows(); ++i) {
+    std::vector<double> kept(n + 1);
+    for (int l = 0; l <= n; ++l)
+        kept[l] = 1 - std::pow(g, l);
+    parallel_for(int(u.rows()), [&](int i) {
         require(absorption[i] >= 0 && scattering[i] >= 0 &&
                     std::isfinite(absorption[i] + scattering[i]),
                 "Invalid reaction coefficients");
         require(exact::cone(project(source.row(i).transpose())),
                 "Reaction source outside physical cone");
-        for (int l = 0; l <= n; ++l) {
-            const double rate = absorption[i] + scattering[i] * (1 - std::pow(g, l));
-            const double z = -rate * tau, decay = std::exp(z), phi = z == 0 ? 1 : std::expm1(z) / z;
-            for (int m = -l; m <= l; ++m) {
-                int k = index(l, m);
-                v(i, k) = decay * u(i, k) + tau * phi * source(i, k);
+        // Coefficients repeat across a piecewise-constant material.
+        thread_local double last_a = -1, last_s = -1, last_tau = -1, last_g = 2;
+        thread_local int last_n = -1;
+        thread_local std::vector<double> decay, weight;
+        if (last_a != absorption[i] || last_s != scattering[i] || last_tau != tau || last_g != g || last_n != n) {
+            decay.resize(n + 1);
+            weight.resize(n + 1);
+            for (int l = 0; l <= n; ++l) {
+                const double rate = absorption[i] + scattering[i] * kept[l];
+                const double z = -rate * tau;
+                decay[l] = std::exp(z);
+                weight[l] = tau * (z == 0 ? 1 : std::expm1(z) / z);
             }
+            last_a = absorption[i]; last_s = scattering[i]; last_tau = tau; last_g = g; last_n = n;
         }
+        const double *from = &u.coeff(i, 0), *src = &source.coeff(i, 0);
+        double *to = &v.coeffRef(i, 0);
+        for (int l = 0; l <= n; ++l)
+            for (int k = l * l; k < (l + 1) * (l + 1); ++k)
+                to[k] = decay[l] * from[k] + weight[l] * src[k];
         cone_require(exact::cone(project(v.row(i).transpose())),
                      "Stored split reaction violates physical cone");
-    }
+    });
     return v;
 }
 } // namespace m1pn

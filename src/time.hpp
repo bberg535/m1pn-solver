@@ -16,6 +16,9 @@ struct Step {
     std::vector<Diagnostics> stages;
 };
 Step advance(Transport &, const TimeControl &, double time, double dt, const Field &);
+// Low-moment path of the standard method; see fast_mc.cpp. Step::integrated_pairs
+// stays empty and ledger_residual covers only the four limited moments.
+Step advance_fast_mc(Transport &, const TimeControl &, double time, double dt, const Field &);
 Field reaction(const Field &, const Field &source, const Vec &absorption, const Vec &scattering,
                double anisotropy, double tau);
 } // namespace m1pn

@@ -1,5 +1,6 @@
 #include "time.hpp"
 #include <filesystem>
+#include <malloc.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -25,6 +26,7 @@ struct Options {
 };
 Options parse(int argc, char **argv) {
     Options o;
+    o.num.ledger_stride = 64;
     o.num.r2 = true;
     for (int i = 1; i < argc; ++i) {
         std::string key = argv[i];
@@ -46,7 +48,7 @@ Options parse(int argc, char **argv) {
                    " --inflow vacuum|isotropic|time-dependent|beam|crossing|matching|"
                    "smooth-transport|crossing-transport|crossing-three-transport\n"
                    " --time T --dt DT --cfl C --anchor-scale 1|2 --mass-tolerance TOL\n"
-                   " --mass-mode consistent|lumped|lumped_afc --mass-corrections R\n"
+                   " --mass-mode consistent|lumped|lumped_afc --mass-corrections R --ledger-stride S\n"
                    " --mcl-mode eager|lazy --geometry-cache on|off\n"
                    " --time-integrator imex-euler --implicit-solver direct|defect|pcg\n"
                    " --implicit-rtol R --implicit-atol A --implicit-max-iterations K\n"
@@ -198,6 +200,10 @@ Options parse(int argc, char **argv) {
             o.background = real();
         else if (key == "--threads")
             o.threads = integer();
+        else if (key == "--ledger-stride") {
+            o.num.ledger_stride = integer();
+            require(o.num.ledger_stride >= 1, "--ledger-stride must be at least 1");
+        }
         else
             throw std::runtime_error("Unknown option: " + key);
     }
@@ -262,7 +268,7 @@ Inflow make_inflow(const Options &o, int dimension) {
             return (1 + .12*r.dot(x) - .12*t*r.dot(w))/(4*pi);
         };
     else if (o.inflow == "isotropic")
-        g.density = [](const V3 &, double, const V3 &) { return 1 / (4 * pi); };
+        g.density = [](const V3 &, double, const V3 &) { return 1 / (4 * pi); }, g.constant_density = 1 / (4 * pi);
     else if (o.inflow == "time-dependent")
         g.density = [](const V3 &x, double t, const V3 &w) {
             return (1 + .2 * x[0] + .1 * std::sin(t)) * (1 + .2 * w[1]) / (4 * pi);
@@ -273,6 +279,7 @@ Inflow make_inflow(const Options &o, int dimension) {
         };
     else if (o.inflow == "crossing-transport") {
         g.density = [](const V3 &, double, const V3 &) { return .01 / (4 * pi); };
+        g.constant_density = .01 / (4 * pi);
         g.atoms = [z = dimension == 2 ? 0. : .5](const V3 &x, double t) {
             return std::vector<Atom>{
                 {V3::UnitX(), std::exp(-50 * (x - t * V3::UnitX() - V3(.3, .5, z)).squaredNorm())},
@@ -281,6 +288,7 @@ Inflow make_inflow(const Options &o, int dimension) {
     } else if (o.inflow == "crossing-three-transport") {
         const double bg=o.background, w=o.pulse_width;
         g.density = [bg](const V3 &, double, const V3 &) { return bg / (4 * pi); };
+        g.constant_density = bg / (4 * pi);
         g.atoms = [z = dimension == 2 ? 0. : .5, w](const V3 &x, double t) {
             auto pulse=[w](const V3 &d){return std::exp(-d.squaredNorm()/(2*w*w));};
             return std::vector<Atom>{
@@ -413,6 +421,10 @@ void write_checkpoint(const std::string &dir,const Spatial &fe,const Field &u,in
 }
 } // namespace
 int main(int argc, char **argv) {
+    // Large fields are reallocated every step; keep them in the heap and reuse
+    // their pages instead of an mmap/munmap and page-fault cycle per allocation.
+    mallopt(M_MMAP_MAX, 0);
+    mallopt(M_TRIM_THRESHOLD, 1 << 30);
 #ifdef M1PN_MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
@@ -527,7 +539,9 @@ int main(int argc, char **argv) {
                    << ",\"reaction_discretization\":\"nodal_HG_exponential_Strang\",\"memory_"
                       "budget_bytes\":"
                    << o.num.budget.bytes << ",\"max_steps\":" << o.max_steps
-                   << ",\"threads\":" << o.threads << ",\"mpi_ranks\":" << world.size
+                   << ",\"threads\":" << o.threads << ",\"ledger_stride\":" << o.num.ledger_stride
+                   << ",\"fast_mass_correction_path\":" << (tr.fast_mc ? "true" : "false")
+                   << ",\"mpi_ranks\":" << world.size
                    << ",\"parallel_layout\":\"replicated_mesh_state_partitioned_pairs_faces\","
                       "\"deterministic\":"
                    << (o.deterministic ? "true" : "false")
@@ -586,23 +600,22 @@ int main(int argc, char **argv) {
             bool accepted = false;
             for (int attempt = 0; attempt <= 12; ++attempt) {
                 try {
-                    candidate = u;
-                    trial_reaction = Field::Zero(fe.nodes, pn.q);
                     if (splitting) {
+                        trial_reaction = Field::Zero(fe.nodes, pn.q);
                         candidate = reaction(u, src, absorption, scattering, o.anisotropy, dt / 2);
                         trial_reaction += fe.mass.asDiagonal() * (candidate - u);
                     }
                     double solve_begin = seconds();
-                    step = advance(tr, control, t, dt, candidate);
+                    step = advance(tr, control, t, dt, splitting ? candidate : u);
                     solver_seconds += seconds() - solve_begin;
-                    candidate = step.state;
+                    candidate = std::move(step.state);
                     if (splitting) {
                         Field after =
                             reaction(candidate, src, absorption, scattering, o.anisotropy, dt / 2);
                         trial_reaction += fe.mass.asDiagonal() * (after - candidate);
                         candidate = std::move(after);
+                        tr.check_state(candidate);
                     }
-                    tr.check_state(candidate);
                     accepted = true;
                     break;
                 } catch (const StepRejected &error) {
@@ -638,15 +651,20 @@ int main(int argc, char **argv) {
             }
             // Commit only an entirely accepted Strang/SSP step.
             u = std::move(candidate);
-            reaction_ledger += trial_reaction;
+            if (splitting) reaction_ledger += trial_reaction;
             boundary += step.integrated_boundary;
             selected = std::min(selected, dt);
             t += dt;
             ++steps;
             max_balance = std::max(max_balance, step.ledger_residual);
             min_margin = std::min(min_margin, step.minimum_margin);
-            for (int i = 0; i < fe.nodes; ++i)
-                min_margin = std::min(min_margin, margin(project(u.row(i).transpose())));
+            if (splitting) {
+                double smallest = std::numeric_limits<double>::infinity();
+#pragma omp parallel for schedule(static) reduction(min : smallest)
+                for (int i = 0; i < fe.nodes; ++i)
+                    smallest = std::min(smallest, margin(project(u.row(i).transpose())));
+                min_margin = std::min(min_margin, smallest);
+            }
             for (const auto &d : step.stages) {
                 max_mass_residual = std::max(max_mass_residual, d.mass_residual);
                 max_sync_work = std::max(max_sync_work, d.sync_work);

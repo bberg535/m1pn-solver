@@ -1,6 +1,8 @@
 #include "time.hpp"
+#include "cuda_path.hpp"
 #include "pn_uncoupled.hpp"
 #include <filesystem>
+#include <malloc.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -19,10 +21,12 @@ struct Options {
     double final_time = .01, dt = 0, cfl = .8, sigma_a = 0, sigma_s = 0, anisotropy = 0, source = 0;
     double pulse_width = .07, background = .001;
     bool jump = false, deterministic = false, mass_mode_explicit = false, pn_only_self_test = false;
+    bool cuda_explicit = false, cuda_on = false;
     std::string problem = "smooth", inflow = "vacuum", output = std::string(PN_AFC_ROOT) + "/tmp/run", pair_limiter = "scalar", coupling = "m1pn";
 };
 Options parse(int argc, char **argv) {
     Options o;
+    o.num.ledger_stride = 64;
     o.num.r2 = true;
     for (int i = 1; i < argc; ++i) {
         std::string key = argv[i];
@@ -47,8 +51,9 @@ Options parse(int argc, char **argv) {
                    " --mass-mode consistent|lumped|lumped_afc --mass-corrections R\n"
                    " --pulse-width W --background B --checkpoint-stride S\n"
                    " --sigma-a A --sigma-s S --anisotropy g --source-density Q --material-jump\n"
-                   " --memory-mib M --pn-norm-max-dofs K --threads T --deterministic --output "
-                   "DIR\n";
+                   " --memory-mib M --pn-norm-max-dofs K --threads T --ledger-stride S --deterministic --output "
+                   "DIR\n"
+                   " --cuda on|off --mcl-mode eager|lazy\n";
             std::exit(0);
         }
         if (key == "--periodic") {
@@ -177,7 +182,18 @@ Options parse(int argc, char **argv) {
             o.background = real();
         else if (key == "--threads")
             o.threads = integer();
-        else
+        else if (key == "--ledger-stride") {
+            o.num.ledger_stride = integer();
+            require(o.num.ledger_stride >= 1, "--ledger-stride must be at least 1");
+        }
+        else if (key == "--cuda") {
+            require(v == "on" || v == "off", "--cuda must be on or off");
+            o.cuda_explicit = true;
+            o.cuda_on = v == "on";
+        } else if (key == "--mcl-mode") {
+            require(v == "eager" || v == "lazy", "Invalid MCL mode");
+            o.num.lazy = v == "lazy";
+        } else
             throw std::runtime_error("Unknown option: " + key);
     }
     require(o.final_time >= 0 && o.dt >= 0 && o.cfl > 0 && o.cfl <= 1 && o.threads > 0 &&
@@ -192,7 +208,7 @@ Options parse(int argc, char **argv) {
             "Mass corrections must lie in [1,32]");
     if (o.num.stabilization == "m1pn_mass_correction") {
         require(o.num.r2, "PN mass correction requires --model r2");
-        require(o.rk == 3, "PN mass correction requires --time-integrator ssprk3");
+        require(o.rk == 2 || o.rk == 3, "PN mass correction requires --time-integrator ssprk2|ssprk3");
         require(!o.mass_mode_explicit || o.num.mass_mode == "lumped",
                 "PN mass correction requires --mass-mode lumped; conflicting explicit mass mode rejected");
         o.num.mass_mode = "lumped";
@@ -234,7 +250,7 @@ Inflow make_inflow(const Options &o, int dimension) {
     if (o.inflow == "vacuum")
         return g;
     if (o.inflow == "isotropic")
-        g.density = [](const V3 &, double, const V3 &) { return 1 / (4 * pi); };
+        g.density = [](const V3 &, double, const V3 &) { return 1 / (4 * pi); }, g.constant_density = 1 / (4 * pi);
     else if (o.inflow == "time-dependent")
         g.density = [](const V3 &x, double t, const V3 &w) {
             return (1 + .2 * x[0] + .1 * std::sin(t)) * (1 + .2 * w[1]) / (4 * pi);
@@ -245,12 +261,14 @@ Inflow make_inflow(const Options &o, int dimension) {
         };
     else if (o.inflow == "crossing-transport") {
         g.density = [](const V3 &, double, const V3 &) { return .01 / (4 * pi); };
+        g.constant_density = .01 / (4 * pi);
         g.atoms = [z = dimension == 2 ? 0. : .5](const V3 &x, double t) {
             return std::vector<Atom>{{V3::UnitX(),std::exp(-50*(x-t*V3::UnitX()-V3(.3,.5,z)).squaredNorm())},{V3::UnitY(),std::exp(-50*(x-t*V3::UnitY()-V3(.5,.3,z)).squaredNorm())}};
         };
     } else if (o.inflow == "crossing-three-transport") {
         const double bg=o.background, w=o.pulse_width;
         g.density = [bg](const V3 &, double, const V3 &) { return bg / (4 * pi); };
+        g.constant_density = bg / (4 * pi);
         g.atoms = [z = dimension == 2 ? 0. : .5, w](const V3 &x, double t) {
             auto pulse=[w](const V3 &d){return std::exp(-d.squaredNorm()/(2*w*w));};
             return std::vector<Atom>{
@@ -260,7 +278,7 @@ Inflow make_inflow(const Options &o, int dimension) {
         };
     } else if (o.inflow == "crossing-study-transport" || o.inflow == "crossing-3d-transport") {
         const bool three=o.inflow=="crossing-3d-transport"; const double bg=o.background,w=o.pulse_width;
-        g.density=[bg](const V3&,double,const V3&){return bg/(4*pi);};
+        g.density=[bg](const V3&,double,const V3&){return bg/(4*pi);}; g.constant_density=bg/(4*pi);
         g.atoms=[three,w](const V3&x,double t){auto p=[w](const V3&d){return std::exp(-d.squaredNorm()/(2*w*w));};
             std::vector<Atom> a{{V3::UnitX(),p(x-t*V3::UnitX()-V3(.3,.5,three?.5:0))},{V3::UnitY(),p(x-t*V3::UnitY()-V3(.5,.3,three?.5:0))}};
             if(three)a.push_back({V3::UnitZ(),p(x-t*V3::UnitZ()-V3(.5,.5,.3))}); return a;};
@@ -388,6 +406,10 @@ void write_checkpoint(const std::string &dir,const Spatial &fe,const Field &u,in
 }
 } // namespace
 int main(int argc, char **argv) {
+    // Large fields are reallocated every step; keep them in the heap and reuse
+    // their pages instead of an mmap/munmap and page-fault cycle per allocation.
+    mallopt(M_MMAP_MAX, 0);
+    mallopt(M_TRIM_THRESHOLD, 1 << 30);
 #ifdef M1PN_MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
@@ -397,6 +419,8 @@ int main(int argc, char **argv) {
         exact::environment();
         double begin = seconds();
         Options o = parse(argc, argv);
+        if (o.cuda_explicit)
+            cuda_set_requested(o.cuda_on);
         world.deterministic = o.deterministic;
 #ifdef _OPENMP
         omp_set_num_threads(o.threads);
@@ -421,6 +445,8 @@ int main(int argc, char **argv) {
             require(o.inflow=="vacuum", "lattice-paul requires vacuum inflow");
             require(o.sigma_a==0 && o.sigma_s==0 && o.source==0 && !o.jump && o.anisotropy==0,
                     "lattice-paul owns its material and source coefficients");
+            require(std::abs(o.background - 1e-10) <= 1e-16,
+                    "lattice-paul requires the Paul initial density --background 1e-10");
             auto scaled=make_mesh(o.mesh);
             for(int i=0;i<scaled->GetNV();++i){double *v=scaled->GetVertex(i);v[0]*=7;v[1]*=7;}
             o.mesh.file=o.output+"/input.mesh";
@@ -580,7 +606,11 @@ int main(int argc, char **argv) {
                    << ",\"reaction_discretization\":\"nodal_HG_exponential_Strang\",\"memory_"
                       "budget_bytes\":"
                    << o.num.budget.bytes << ",\"max_steps\":" << o.max_steps
-                   << ",\"threads\":" << o.threads << ",\"mpi_ranks\":" << world.size
+                   << ",\"threads\":" << o.threads
+                   << ",\"cuda\":" << (cuda_requested() ? "true" : "false")
+                   << ",\"ledger_stride\":" << o.num.ledger_stride
+                   << ",\"fast_mass_correction_path\":" << (tr.fast_mc ? "true" : "false")
+                   << ",\"mpi_ranks\":" << world.size
                    << ",\"parallel_layout\":\"replicated_mesh_state_partitioned_pairs_faces\","
                       "\"deterministic\":"
                    << (o.deterministic ? "true" : "false")
@@ -608,7 +638,7 @@ int main(int argc, char **argv) {
                min_margin = std::numeric_limits<double>::infinity();
         double max_mass_residual = 0, max_sync_work = 0, min_sync_work = 0;
         long active_pair_total = 0, active_face_total = 0, stage_total = 0;
-        long closure_evaluations_total = 0;
+        long closure_evaluations_total = 0, lazy_certified_total = 0, lazy_fallback_total = 0;
         double density_clip_total = 0, momentum_redirection_total = 0, density_retention_total = 0;
         double minimum_density_observed = std::numeric_limits<double>::infinity();
         double minimum_cone_margin_observed = std::numeric_limits<double>::infinity();
@@ -652,21 +682,21 @@ int main(int argc, char **argv) {
             bool accepted = false;
             for (int attempt = 0; attempt <= 12; ++attempt) {
                 try {
-                    candidate = u;
-                    trial_reaction = Field::Zero(fe.nodes, pn.q);
                     if (splitting) {
+                        trial_reaction = Field::Zero(fe.nodes, pn.q);
                         candidate = reaction(u, src, absorption, scattering, o.anisotropy, dt / 2);
                         trial_reaction += fe.mass.asDiagonal() * (candidate - u);
                     }
+                    const Field &stage_input = splitting ? candidate : u;
                     const double step_start = seconds();
                     if (pn_only) {
-                        pn_only_step = advance_pn_only(tr, control, t, dt, candidate);
+                        pn_only_step = advance_pn_only(tr, control, t, dt, stage_input);
                         step = pn_only_step.step;
                     } else {
-                        step = advance(tr, control, t, dt, candidate);
+                        step = advance(tr, control, t, dt, stage_input);
                     }
                     solver_seconds += seconds() - step_start;
-                    candidate = step.state;
+                    candidate = std::move(step.state);
                     if (splitting) {
                         Field after =
                             reaction(candidate, src, absorption, scattering, o.anisotropy, dt / 2);
@@ -674,7 +704,7 @@ int main(int argc, char **argv) {
                         candidate = std::move(after);
                     }
                     if (pn_only) pn_only_require_finite(candidate, fe, pn);
-                    else tr.check_state(candidate);
+                    else if (splitting) tr.check_state(candidate);
                     accepted = true;
                     break;
                 } catch (const StepRejected &error) {
@@ -717,7 +747,7 @@ int main(int argc, char **argv) {
                 pn_only_rate_residual_max = std::max(pn_only_rate_residual_max,
                                                       step.rate_residual);
             }
-            reaction_ledger += trial_reaction;
+            if (splitting) reaction_ledger += trial_reaction;
             boundary += step.integrated_boundary;
             selected = std::min(selected, dt);
             const double corrected_dt = dt - time_compensation;
@@ -733,8 +763,13 @@ int main(int argc, char **argv) {
             ++steps;
             max_balance = std::max(max_balance, step.ledger_residual);
             min_margin = std::min(min_margin, step.minimum_margin);
-            for (int i = 0; i < fe.nodes; ++i)
-                min_margin = std::min(min_margin, margin(project(u.row(i).transpose())));
+            if (pn_only || splitting) {
+                double smallest = std::numeric_limits<double>::infinity();
+#pragma omp parallel for schedule(static) reduction(min : smallest)
+                for (int i = 0; i < fe.nodes; ++i)
+                    smallest = std::min(smallest, margin(project(u.row(i).transpose())));
+                min_margin = std::min(min_margin, smallest);
+            }
             for (const auto &d : step.stages) {
                 max_mass_residual = std::max(max_mass_residual, d.mass_residual);
                 max_sync_work = std::max(max_sync_work, d.sync_work);
@@ -749,6 +784,8 @@ int main(int argc, char **argv) {
                 pair_scalar_fallback_total += d.pair_scalar_fallbacks;
                 base_bar_reevaluation_total += d.base_bar_reevaluations;
                 closure_evaluations_total += d.closure_evaluations;
+                lazy_certified_total += d.lazy_certified_pairs;
+                lazy_fallback_total += d.lazy_fallback_pairs;
                 ++stage_total;
                 min_margin = std::min(min_margin, d.minimum_state);
             }
@@ -849,6 +886,9 @@ int main(int argc, char **argv) {
                    << ",\"pair_rounding_fallbacks\":" << pair_rounding_fallback_total
                    << ",\"pair_scalar_fallbacks\":" << pair_scalar_fallback_total
                    << ",\"base_bar_reevaluations\":" << base_bar_reevaluation_total
+                   << ",\"lazy_certified_pairs\":" << lazy_certified_total
+                   << ",\"lazy_fallback_pairs\":" << lazy_fallback_total
+                   << ",\"mcl_mode\":" << std::quoted(o.num.lazy ? "lazy" : "eager")
                    << ",\"active_pair_fraction\":"
                    << (stage_total ? double(active_pair_total) / (stage_total * fe.pairs.size())
                                    : 0.)

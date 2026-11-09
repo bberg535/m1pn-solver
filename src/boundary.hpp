@@ -15,6 +15,9 @@ struct Inflow {
     // Optional admissible M1 exterior, supplied independently of the kinetic data.
     std::function<Four(const V3 &, double)> exterior_m1;
     std::function<Four(const V3 &, double, const V3 &, const Four &)> exterior_state;
+    // Set when `density` does not depend on x, t or the direction. The angular
+    // quadrature of the kinetic data can then be evaluated once per normal.
+    std::optional<double> constant_density;
 };
 // Copy the interior reduced velocity only at positive interior density.
 // Positive exterior density at interior vacuum requires explicit velocity data.
@@ -41,6 +44,8 @@ struct Boundary {
     V3 n;
     Eigen::Matrix3d frame;
     Mat D, Rplus, Rminus, homogeneous, llf_homogeneous;
+    // LLF flux is affine in (trace, datum): flux = llf_homogeneous*u + llf_datum*d.
+    Mat llf_datum;
     double llf_norm = 0;
     std::vector<AngularPoint> rule;
     // data() consumes one angular quadrature row at a time.

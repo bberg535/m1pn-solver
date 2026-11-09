@@ -1,6 +1,32 @@
 #pragma once
 #include "cone.hpp"
 namespace m1pn {
+// Smallest root in (0,1] of rho(a)^2-|J(a)|^2 for b+a*d, where b lies in the
+// cone. Only an initial guess; returns -1 if the quadratic gives none.
+inline double cone_exit_fraction(const Four &b, const Four &d) {
+    const double bj = std::sqrt(b[1] * b[1] + b[2] * b[2] + b[3] * b[3]);
+    const double c = (b[0] - bj) * (b[0] + bj);
+    if (!(c > 0) || !std::isfinite(c))
+        return -1;
+    const double a = d[0] * d[0] - (d[1] * d[1] + d[2] * d[2] + d[3] * d[3]);
+    const double h = b[0] * d[0] - (b[1] * d[1] + b[2] * d[2] + b[3] * d[3]);
+    const double disc = h * h - a * c;
+    if (!(disc >= 0) || !std::isfinite(disc))
+        return -1;
+    const double s = std::sqrt(disc), t = -(h + (h >= 0 ? s : -s));
+    double best = -1;
+    if (a != 0) {
+        const double r = t / a;
+        if (r > 0)
+            best = r;
+    }
+    if (t != 0) {
+        const double r = c / t;
+        if (r > 0 && (best < 0 || r < best))
+            best = r;
+    }
+    return best;
+}
 inline double segment(const Four &b, const Four &d, bool both = false) {
     cone_require(exact::cone(b), "Low-order base bar outside the stored binary64 cone");
     auto valid = [&](double a) {
@@ -9,6 +35,25 @@ inline double segment(const Four &b, const Four &d, bool both = false) {
     };
     if (valid(1))
         return 1;
+    // Closed-form exit fraction brackets the bisection result to ~1e-15, so the
+    // 60 iterations of exact predicates collapse to a handful. The exact cone
+    // check at the bracket ends keeps the returned alpha exactly admissible.
+    double guess = cone_exit_fraction(b, d);
+    if (both)
+        guess = std::min(guess, cone_exit_fraction(b, Four(-d)));
+    if (guess > 0 && guess <= 1) {
+        double lo = guess * (1 - 8e-14), hi = std::min(1., guess * (1 + 8e-14));
+        if (valid(lo) && !valid(hi)) {
+            for (int k = 0; k < 8; ++k) {
+                const double mid = (lo + hi) / 2;
+                if (valid(mid))
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+            return lo;
+        }
+    }
     double lo = 0, hi = 1;
     for (int k = 0; k < 60; ++k) {
         double mid = (lo + hi) / 2;
@@ -162,11 +207,14 @@ struct Levermore {
         }
         long double v = 1 - j2;
         const long double near_beam = 64 * std::numeric_limits<long double>::epsilon();
-        if (v <= near_beam)
+        // v above near_beam (64 long-double epsilons) already proves a positive
+        // exact gap; the 68-word exact evaluation runs only for a near-beam state.
+        if (v <= near_beam) {
             v = exact::normalized_gap(u);
-        if (exact::squared_gap(u) == 0) {
-            beam = true;
-            return;
+            if (exact::squared_gap(u) == 0) {
+                beam = true;
+                return;
+            }
         }
         const double s = std::sqrt(1 + 3 * double(v));
         gap = 12 * double(v) / ((s + 1) * (s + 2));

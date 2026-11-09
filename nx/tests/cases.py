@@ -15,7 +15,7 @@ def run(label,case,dim,grid,extra=(),time=.0001):
              '--pn-order','3','--model','r2','--time-integrator','ssprk3',
              '--stabilization','m1pn_mass_correction','--pn-viscosity-scale','1',
              '--mass-mode','lumped',
-             '--kv-gamma','.05','--background','.001' if case!='lattice-paul' else '.000001',
+             '--kv-gamma','.05','--background','.001' if case!='lattice-paul' else '1e-10',
              '--pulse-width','.1','--time',str(time),'--cfl','.2','--threads','1',
              '--output',str(folder),*extra]
     proc=subprocess.run(command,capture_output=True,text=True,timeout=60)
@@ -55,6 +55,7 @@ values=[mass.sum(),mass@material[:,3],mass@material[:,1],mass@material[:,2]]
 assert np.max(np.abs(np.array(values)-[49,1,110,38]))<1e-10,values
 assert np.max(field(folder,'initial.csv')[:,1:3])==7
 initial=field(folder,'initial.csv')[:,4]*math.sqrt(4*math.pi)
+assert np.max(np.abs(initial-1e-10))<1e-16,'Paul lattice initial density must be 1e-10'
 final=field(folder,'final.csv')[:,4]*math.sqrt(4*math.pi)
 assert mass@(final-initial)>9e-5,'central source failed to inject particles'
 assert np.all(material[:,1:]>=0),'FE material average must be nonnegative'

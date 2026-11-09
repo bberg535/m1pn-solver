@@ -35,13 +35,13 @@ inline double seconds() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-inline double maxabs(const Mat &a) {
-    return a.size() ? a.cwiseAbs().maxCoeff() : 0.;
+template <class Derived> inline double maxabs(const Eigen::MatrixBase<Derived> &a) {
+    return a.size() ? a.eval().cwiseAbs().maxCoeff() : 0.;
 }
 inline int index(int l, int m) {
     return l * l + l + m;
 }
-inline Four project(const Vec &u) {
+template <class Derived> inline Four project(const Eigen::MatrixBase<Derived> &u) {
     return Four(std::sqrt(4 * pi) * u[0], std::sqrt(4 * pi / 3) * u[3],
                 std::sqrt(4 * pi / 3) * u[1], std::sqrt(4 * pi / 3) * u[2]);
 }
@@ -52,6 +52,10 @@ inline void set_low(Eigen::Ref<Vec> u, const Four &v) {
     u[2] = v[3] / std::sqrt(4 * pi / 3);
 }
 inline double margin(const Four &u) {
+    // std::hypot(x,y,z) is ~10x slower here; only the scale-safe branch needs it.
+    const double s = u[1] * u[1] + u[2] * u[2] + u[3] * u[3];
+    if (s > 1e-280 && s < 1e280)
+        return u[0] - std::sqrt(s);
     return u[0] - std::hypot(u[1], u[2], u[3]);
 }
 struct Budget {
@@ -64,5 +68,10 @@ struct Budget {
 struct Timings {
     double mass = 0, biharmonic = 0, boundary = 0, mcl = 0, communication = 0;
     double pn_predictor = 0, pn_mass_correction = 0;
+    // Diagnostic phase totals. Updated only while M1PN_PHASE_LOG=1.
+    double phase_check = 0, phase_advection = 0, phase_angular = 0, phase_spatial = 0;
+    double phase_closure = 0, phase_gather = 0, phase_finalize = 0, phase_evaluate = 0;
+    double phase_fast_angular = 0;
+    int phase_angular_mismatch = 0;
 };
 } // namespace m1pn
