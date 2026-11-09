@@ -76,7 +76,9 @@ deshalb nur als Vergleich innerhalb der Tabelle aussagekräftig.
 
 - Nur uniforme kartesische Gitter und der materialfreie Crossing-Fall.
   `lattice` (Streuung, Absorption) fehlt.
-- Kein Vergleich mit der bestehenden Standardvariante B.
+- Vergleich mit Variante B und Filter siehe
+  `results/element_weno/filter_comparison_20261109/REPORT.md`. Dort ist p>1 auf
+  16² und 32² schlechter als p=1; die Tabelle oben gilt nur für 96 Intervalle.
 - Mit Gewicht 1e-3 ist der Sensor im Crossing fast wirkungslos; `ρ_max` und L²
   liegen praktisch bei `γ=1`.
 - Der Limiter ist in 41–43 % der Element-Stufen aktiv, mit Faktor bis 0.

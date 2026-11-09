@@ -9,6 +9,7 @@ namespace {
 struct Args {
     int pn = 3, degree = 2, dimension = 1, elements = 32;
     double time = .1, cfl = .9, dt = 0, width = .07, background = .001, weno_linear = 1e-3, weno_q = 1;
+    int sample_grid = 0;
     std::string problem = "smooth", output = "tmp/element_weno";
     bool weno = true, limit = true, stabilize = true;
 };
@@ -31,6 +32,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--background") a.background = std::stod(next());
         else if (key == "--weno-linear") a.weno_linear = std::stod(next());
         else if (key == "--weno-q") a.weno_q = std::stod(next());
+        else if (key == "--sample-grid") a.sample_grid = std::stoi(next());
         else if (key == "--problem") a.problem = next();
         else if (key == "--output") a.output = next();
         else if (key == "--no-weno") a.weno = false;
@@ -105,16 +107,23 @@ int main(int argc, char **argv) {
         std::filesystem::create_directories(args.output);
         {
             std::ofstream csv(args.output + "/final.csv");
-            csv << "x,y,z,density\n" << std::setprecision(15);
-            const int n = args.elements * args.degree + 1, ny = args.dimension > 1 ? n : 1, nz = args.dimension > 2 ? n : 1;
+            csv << "x,y,z,density,jx,jy,jz\n" << std::setprecision(15);
+            const int n = (args.sample_grid > 0 ? args.sample_grid : args.elements * args.degree) + 1, ny = args.dimension > 1 ? n : 1, nz = args.dimension > 2 ? n : 1;
             for (int k = 0; k < nz; ++k)
                 for (int j = 0; j < ny; ++j)
                     for (int i = 0; i < n; ++i) {
                         V3 x(double(i) / (n - 1), args.dimension > 1 ? double(j) / (n - 1) : 0,
                              args.dimension > 2 ? double(k) / (n - 1) : 0);
                         const Four u = project(scheme.evaluate(a, x));
-                        csv << x[0] << ',' << x[1] << ',' << x[2] << ',' << u[0] << '\n';
+                        csv << x[0] << ',' << x[1] << ',' << x[2] << ',' << u[0] << ',' << u[1] << ',' << u[2] << ',' << u[3] << '\n';
                     }
+        }
+        double min_coefficient_density = std::numeric_limits<double>::infinity();
+        double min_coefficient_margin = min_coefficient_density;
+        for (int i = 0; i < scheme.nodes; ++i) {
+            const Four u = project(a.row(i).transpose());
+            min_coefficient_density = std::min(min_coefficient_density, u[0]);
+            min_coefficient_margin = std::min(min_coefficient_margin, margin(u));
         }
         double total = 0;
         for (int i = 0; i < scheme.nodes; ++i)
@@ -125,6 +134,8 @@ int main(int argc, char **argv) {
                 << ",\"dimension\":" << args.dimension << ",\"steps\":" << steps << ",\"dt\":" << dt
                 << ",\"dt_bound\":" << scheme.dt_bound << ",\"wall_seconds\":" << wall
                 << ",\"l2_density_error\":" << error << ",\"final_mass\":" << total
+                << ",\"min_coefficient_density\":" << min_coefficient_density
+                << ",\"min_coefficient_margin\":" << min_coefficient_margin
                 << ",\"min_gamma\":" << stats.min_gamma << ",\"min_limiter\":" << stats.min_limiter
                 << ",\"min_boundary_limiter\":" << stats.min_boundary_limiter
                 << ",\"limited_elements\":" << stats.limited_elements
