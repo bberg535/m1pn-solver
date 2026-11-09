@@ -1,0 +1,16 @@
+q=3 p=3 n=16: 5.244e-07 1-g=2.0e-12
+q=3 p=3 n=32: 5.685e-08 EOC 3.21 1-g=0.0e+00
+q=3 p=3 n=64: 4.990e-09 EOC 3.51 1-g=0.0e+00
+q=3 p=3 n=128: 3.599e-10 EOC 3.79 1-g=0.0e+00
+p=1 n=96 w1e-3: steps=487 wall=77.0s minrho=1.08e-04 maxrho=1.511 L2(vs kinetic)=8.648e-02 min_gamma=0.421 min_lim=0.000 lim_el=5489399 bd_lim=0 nudged=0
+p=1 n=96 w0.2: steps=487 wall=76.7s minrho=1.03e-04 maxrho=1.376 L2(vs kinetic)=8.413e-02 min_gamma=0.000 min_lim=0.000 lim_el=5558431 bd_lim=0 nudged=0
+p=1 n=96 noWENOsensor: steps=487 wall=69.5s minrho=1.08e-04 maxrho=1.512 L2(vs kinetic)=8.650e-02 min_gamma=1.000 min_lim=0.000 lim_el=5488904 bd_lim=0 nudged=0
+p=1 n=96 noStab: steps=487 wall=54.5s minrho=1.08e-04 maxrho=1.575 L2(vs kinetic)=8.681e-02 min_gamma=1.000 min_lim=0.000 lim_el=5509754 bd_lim=0 nudged=0
+p=2 n=48 w1e-3: steps=371 wall=38.6s minrho=1.29e-04 maxrho=1.320 L2(vs kinetic)=7.975e-02 min_gamma=0.680 min_lim=0.000 lim_el=1058180 bd_lim=0 nudged=0
+p=2 n=48 w0.2: steps=371 wall=39.8s minrho=1.19e-04 maxrho=1.269 L2(vs kinetic)=7.719e-02 min_gamma=0.000 min_lim=0.000 lim_el=1077449 bd_lim=0 nudged=0
+p=2 n=48 noWENOsensor: steps=371 wall=36.8s minrho=1.29e-04 maxrho=1.320 L2(vs kinetic)=7.976e-02 min_gamma=1.000 min_lim=0.000 lim_el=1057968 bd_lim=0 nudged=0
+p=2 n=48 noStab: steps=371 wall=27.8s minrho=1.16e-04 maxrho=1.316 L2(vs kinetic)=7.797e-02 min_gamma=1.000 min_lim=0.000 lim_el=1256061 bd_lim=528 nudged=0
+p=3 n=32 w1e-3: steps=332 wall=28.6s minrho=1.81e-04 maxrho=1.248 L2(vs kinetic)=7.474e-02 min_gamma=0.798 min_lim=0.001 lim_el=436580 bd_lim=0 nudged=0
+p=3 n=32 w0.2: steps=332 wall=29.2s minrho=1.61e-04 maxrho=1.115 L2(vs kinetic)=6.932e-02 min_gamma=0.000 min_lim=0.001 lim_el=439589 bd_lim=433 nudged=0
+p=3 n=32 noWENOsensor: steps=332 wall=28.2s minrho=1.81e-04 maxrho=1.248 L2(vs kinetic)=7.476e-02 min_gamma=1.000 min_lim=0.001 lim_el=436617 bd_lim=0 nudged=0
+p=3 n=32 noStab: steps=332 wall=20.6s minrho=1.96e-04 maxrho=1.237 L2(vs kinetic)=7.352e-02 min_gamma=1.000 min_lim=0.001 lim_el=528754 bd_lim=0 nudged=0
