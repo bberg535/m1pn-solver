@@ -3,6 +3,7 @@
 #include "cuda_path.hpp"
 #include "pn_uncoupled.hpp"
 #include "filter.hpp"
+#include "element_weno.hpp"
 #include <filesystem>
 #include <malloc.h>
 #include <fstream>
@@ -26,12 +27,28 @@ struct Options {
     double pulse_width = .07, background = .001;
     bool jump = false, deterministic = false, mass_mode_explicit = false, pn_only_self_test = false;
     bool cuda_explicit = false, cuda_on = false;
+    bool rk_explicit = false;
+    // --stabilization element-weno (Bernstein Q_p, element-based limiting)
+    int degree = 2;
+    double weno_linear = 1e-3, weno_q = 1;
+    bool weno = true, element_limit = true;
     std::string problem = "smooth", inflow = "vacuum", output = std::string(PN_AFC_ROOT) + "/tmp/run", pair_limiter = "scalar", coupling = "m1pn";
 };
 Options parse(int argc, char **argv) {
     Options o;
     o.num.ledger_stride = 64;
     o.num.r2 = true;
+#ifdef M1PN_FAST_DEFAULTS
+    // m1pn_fast: production settings of the 512-element runs are the default.
+    o.rk = 2;
+    o.cfl = 1;
+    o.num.stabilization = "m1pn_mass_correction";
+    o.num.mass_mode = "lumped";
+    o.num.kv_gamma = 0;
+#ifdef _OPENMP
+    o.threads = omp_get_max_threads();
+#endif
+#endif
     for (int i = 1; i < argc; ++i) {
         std::string key = argv[i];
         if (key == "--help") {
@@ -58,7 +75,14 @@ Options parse(int argc, char **argv) {
                    " --memory-mib M --pn-norm-max-dofs K --threads T --ledger-stride S --deterministic --output "
                    "DIR\n"
                    " --cuda on|off --mcl-mode eager|lazy\n"
-                   " --filter off|constant|nn --filter-strength S --filter-model FILE\n";
+                   " --filter off|constant|nn --filter-strength S --filter-model FILE\n"
+                   " --stabilization element-weno --degree p --weno on|off --weno-linear W --weno-q Q\n"
+                   "   --element-limit on|off (uniform Cartesian hex mesh, SSPRK3, constant filter only)\n"
+#ifdef M1PN_FAST_DEFAULTS
+                   "defaults: --stabilization m1pn_mass_correction --time-integrator ssprk2 --cfl 1 --dt 0\n"
+                   "  --mass-mode lumped --kv-gamma 0 --threads <OpenMP maximum>\n"
+#endif
+                   ;
             std::exit(0);
         }
         if (key == "--periodic") {
@@ -117,13 +141,14 @@ Options parse(int argc, char **argv) {
         } else if (key == "--time-integrator") {
             require(v == "ssprk2" || v == "ssprk3", "Invalid time integrator");
             o.rk = v == "ssprk2" ? 2 : 3;
+            o.rk_explicit = true;
         } else if (key == "--model") {
             require(v == "r2" || v == "legacy", "Invalid model");
             o.num.r2 = v == "r2";
         } else if (key == "--stabilization") {
             require(v == "gradient-defect" || v == "biharmonic-original" ||
                     v == "biharmonic-corrected" || v == "m1pn_ghost_local_projected_p4" ||
-                    v == "m1pn_mass_correction", "Invalid stabilization");
+                    v == "m1pn_mass_correction" || v == "element-weno", "Invalid stabilization");
             o.num.stabilization = v;
         } else if (key == "--pn-viscosity-scale")
             o.num.pn_viscosity_scale = real();
@@ -198,6 +223,15 @@ Options parse(int argc, char **argv) {
             require(v == "on" || v == "off", "--cuda must be on or off");
             o.cuda_explicit = true;
             o.cuda_on = v == "on";
+        } else if (key == "--degree") {
+            o.degree = integer();
+        } else if (key == "--weno-linear") {
+            o.weno_linear = real();
+        } else if (key == "--weno-q") {
+            o.weno_q = real();
+        } else if (key == "--weno" || key == "--element-limit") {
+            require(v == "on" || v == "off", key + " must be on or off");
+            (key == "--weno" ? o.weno : o.element_limit) = v == "on";
         } else if (key == "--mcl-mode") {
             require(v == "eager" || v == "lazy", "Invalid MCL mode");
             o.num.lazy = v == "lazy";
@@ -207,10 +241,19 @@ Options parse(int argc, char **argv) {
     require(o.filter_mode == "off" || o.filter_mode == "constant" || o.filter_mode == "nn",
             "Invalid --filter mode");
     require(o.filter_strength >= 0, "Negative filter strength");
+    const bool element_weno = o.num.stabilization == "element-weno";
     if (o.filter_mode != "off") {
-        require(o.mesh.dimension == 2 && o.num.r2 && o.num.stabilization == "m1pn_mass_correction",
-                "This filter experiment requires 2D R2 standard B mass correction");
+        require(o.mesh.dimension == 2 && o.num.r2, "The filter requires 2D R2");
         require(!o.cuda_on, "Filter experiment requires CPU evolution");
+        require(!element_weno || o.filter_mode == "constant",
+                "element-weno supports only the constant filter");
+    }
+    if (element_weno) {
+        if (!o.rk_explicit) o.rk = 3;
+        require(o.rk == 3, "element-weno uses SSPRK3");
+        require(o.coupling == "m1pn", "element-weno has no pn-only coupling");
+        require(o.degree >= 1 && o.degree <= 12, "element-weno degree must lie in [1,12]");
+        require(o.weno_linear > 0 && o.weno_linear < .5 && o.weno_q >= 1, "Invalid WENO weights");
     }
     if (o.filter_model.empty())
         o.filter_model = std::string(NN_FILTER_ROOT) + "/models/model_N" + std::to_string(o.order) + ".txt";
@@ -321,10 +364,8 @@ Inflow make_inflow(const Options &o, int dimension) {
         throw std::runtime_error("Unknown inflow: " + o.inflow);
     return g;
 }
-Field initial(const Options &o, const Spatial &f, const Angular &pn) {
-    Field u = Field::Zero(f.nodes, pn.q);
-    for (int i = 0; i < f.nodes; ++i) {
-        V3 x = f.coordinates.row(i).transpose();
+Vec initial_point(const Options &o, const V3 &x, int i, int dimension, const Angular &pn) {
+    {
         Vec a = Vec::Zero(pn.q);
         if (o.problem == "vacuum") {
         } else if (o.problem == "isotropic")
@@ -352,7 +393,7 @@ Field initial(const Options &o, const Spatial &f, const Angular &pn) {
             a = 1.5 * harmonics(pn.order, V3::UnitX());
             set_low(a, Four(1.5, 1.5, 0, 0));
         } else if (o.problem == "beam" || o.problem == "crossing") {
-            const double z = f.dimension == 2 && o.problem == "crossing" ? 0. : .5;
+            const double z = dimension == 2 && o.problem == "crossing" ? 0. : .5;
             a[0] = .01 / std::sqrt(4 * pi);
             a += std::exp(-50 * (x - V3(.3, .5, z)).squaredNorm()) *
                  harmonics(pn.order, V3::UnitX());
@@ -367,7 +408,7 @@ Field initial(const Options &o, const Spatial &f, const Angular &pn) {
             a += p(x-V3(.5,.3,z))*harmonics(pn.order,V3::UnitY());
             if(three)a += p(x-V3(.5,.5,.3))*harmonics(pn.order,V3::UnitZ());
         } else if (o.problem == "crossing-three") {
-            const double z = f.dimension == 2 ? 0. : .5;
+            const double z = dimension == 2 ? 0. : .5;
             auto pulse=[&](const V3 &d){return std::exp(-d.squaredNorm()/(2*o.pulse_width*o.pulse_width));};
             a[0] = o.background / std::sqrt(4 * pi);
             a += pulse(x-V3(.32,.5,z)) * harmonics(pn.order, V3::UnitX());
@@ -379,8 +420,13 @@ Field initial(const Options &o, const Spatial &f, const Angular &pn) {
             a[0] = (o.problem=="lattice-paul"?o.background:.01) / std::sqrt(4 * pi);
         else
             throw std::runtime_error("Unknown case: " + o.problem);
-        u.row(i) = a.transpose();
+        return a;
     }
+}
+Field initial(const Options &o, const Spatial &f, const Angular &pn) {
+    Field u = Field::Zero(f.nodes, pn.q);
+    for (int i = 0; i < f.nodes; ++i)
+        u.row(i) = initial_point(o, f.coordinates.row(i).transpose(), i, f.dimension, pn).transpose();
     return u;
 }
 std::string beam_metadata(const Options &o,int dimension) {
@@ -422,6 +468,141 @@ void write_checkpoint(const std::string &dir,const Spatial &fe,const Field &u,in
       f << std::setprecision(17) << "{\"step\":" << step << ",\"time\":" << time << "}\n"; }
     std::filesystem::rename(meta_tmp,meta);
 }
+// Element-based limiting with CG-WENO target on tensor Bernstein elements.
+// Writes the same field files as the Q1 path; the Bernstein solution is
+// evaluated on a uniform sample grid (nodes of Q1 with elements*degree cells).
+int run_element_weno(const Options &o, const Angular &pn, double begin) {
+    const int dim = o.mesh.dimension;
+    require(o.mesh.file.empty() && !o.mesh.tetrahedra && !o.mesh.single_tet,
+            "element-weno needs the generated Cartesian hex mesh");
+    require(o.problem != "lattice" && o.problem != "lattice-paul" && o.problem != "shadow" &&
+                o.sigma_a == 0 && o.sigma_s == 0 && o.source == 0 && !o.jump && o.anisotropy == 0,
+            "element-weno has no material or source terms yet");
+    if (o.problem == "crossing-study" || o.inflow == "crossing-study-transport")
+        require(dim == 2, "crossing-study is 2D");
+    ElementWenoOptions eo;
+    eo.degree = o.degree;
+    eo.dimension = dim;
+    eo.elements = o.mesh.elements;
+    eo.periodic = o.mesh.periodic;
+    eo.weno = o.weno;
+    eo.limit = o.element_limit;
+    eo.weno_linear = o.weno_linear;
+    eo.weno_q = o.weno_q;
+    eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
+    ElementWeno scheme(pn, eo, make_inflow(o, dim));
+    Field a(scheme.nodes, pn.q);
+    for (int i = 0; i < scheme.nodes; ++i) {
+        a.row(i) = initial_point(o, scheme.node_position(i), i, dim, pn).transpose();
+        cone_require(exact::cone(project(a.row(i).transpose())), "Initial Bernstein coefficient outside the M1 cone");
+    }
+    const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.dt_bound;
+    require(selected <= scheme.dt_bound * (1 + 1e-12), "Requested dt violates the element realizability bound");
+    // Uniform sample grid (Q1 nodes of elements*degree cells per axis).
+    const int cells_axis = o.mesh.elements * o.degree, points_axis = cells_axis + (o.mesh.periodic ? 0 : 1);
+    int samples = 1;
+    for (int d = 0; d < dim; ++d) samples *= points_axis;
+    std::vector<V3> where(samples);
+    Vec sample_mass(samples);
+    for (int s = 0; s < samples; ++s) {
+        V3 x = V3::Zero();
+        double m = 1;
+        int k = s;
+        for (int d = 0; d < dim; ++d, k /= points_axis) {
+            const int index = k % points_axis;
+            x[d] = double(index) / cells_axis;
+            const bool edge = !o.mesh.periodic && (index == 0 || index == cells_axis);
+            m *= (edge ? .5 : 1.) / cells_axis;
+        }
+        where[s] = x;
+        sample_mass[s] = m;
+    }
+    auto write_samples = [&](const std::string &file, const Field &state) {
+        std::ofstream f(file);
+        require(bool(f), "Cannot write field");
+        f << std::setprecision(17) << "node,x,y,z";
+        for (int k = 0; k < pn.q; ++k) f << ",u" << k;
+        f << "\n";
+        for (int s = 0; s < samples; ++s) {
+            const Vec u = scheme.evaluate(state, where[s]);
+            f << s << "," << where[s][0] << "," << where[s][1] << "," << where[s][2];
+            for (int k = 0; k < pn.q; ++k) f << "," << u[k];
+            f << "\n";
+        }
+    };
+    write_samples(o.output + "/initial.csv", a);
+    {
+        std::ofstream masses(o.output + "/nodal_mass.csv");
+        masses << std::setprecision(17) << "node,mass\n";
+        for (int s = 0; s < samples; ++s) masses << s << "," << sample_mass[s] << "\n";
+        std::ofstream config(o.output + "/config.json");
+        config << std::setprecision(17) << "{\n\"method\":\"element-weno\",\"model\":\"r2\",\"coupling\":\"m1pn\""
+               << ",\"stabilization\":\"element-weno\",\"pn_target\":\"consistent_mass_cg_weno\""
+               << ",\"basis\":\"tensor_bernstein\",\"degree\":" << o.degree
+               << ",\"weno\":" << (o.weno ? "true" : "false") << ",\"weno_linear\":" << o.weno_linear
+               << ",\"weno_q\":" << o.weno_q << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
+               << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength
+               << ",\"pn_order\":" << pn.order << ",\"Q\":" << pn.q << ",\"dimension\":" << dim
+               << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << scheme.nodes
+               << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis
+               << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":3"
+               << ",\"case\":" << std::quoted(o.problem) << ",\"inflow\":" << std::quoted(o.inflow)
+               << ",\"final_time\":" << o.final_time << ",\"dt_requested\":" << o.dt << ",\"dt_selected\":" << selected
+               << ",\"cfl_safety\":" << o.cfl << ",\"element_dt_bound\":" << scheme.dt_bound
+               << ",\"threads\":" << o.threads << beam_metadata(o, dim)
+               << ",\"compiler\":" << std::quoted(__VERSION__) << "\n}\n";
+    }
+    auto progress = [&](const char *status, double time, int count) {
+        const std::string tmp = o.output + "/progress.json.tmp", dst = o.output + "/progress.json";
+        std::ofstream f(tmp);
+        f << std::setprecision(17) << "{\"status\":" << std::quoted(status) << ",\"time\":" << time
+          << ",\"steps\":" << count << ",\"dt\":" << selected << ",\"wall_seconds\":" << seconds() - begin << "}\n";
+        f.close();
+        std::filesystem::rename(tmp, dst);
+    };
+    ElementWenoStats stats;
+    double t = 0, solver_seconds = 0, min_density = std::numeric_limits<double>::infinity(), min_margin = min_density;
+    int steps = 0;
+    const double initialization = seconds() - begin;
+    progress("running", t, steps);
+    while (t < o.final_time) {
+        require(steps < o.max_steps, "Maximum step count exceeded");
+        double dt = std::min(selected, o.final_time - t);
+        const double start = seconds();
+        a = scheme.advance_ssprk3(t, dt, a, &stats);
+        solver_seconds += seconds() - start;
+        t = (o.final_time - (t + dt) <= 8 * std::numeric_limits<double>::epsilon() * o.final_time) ? o.final_time : t + dt;
+        ++steps;
+        if (steps % 10 == 0) progress("running", t, steps);
+    }
+    for (int i = 0; i < scheme.nodes; ++i) {
+        const Four u = project(a.row(i).transpose());
+        min_density = std::min(min_density, u[0]);
+        min_margin = std::min(min_margin, margin(u));
+    }
+    write_samples(o.output + "/final.csv", a);
+    progress("completed", t, steps);
+    double mass0 = 0;
+    for (int i = 0; i < scheme.nodes; ++i) mass0 += scheme.lumped[i] * project(a.row(i).transpose())[0];
+    struct rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    std::ofstream result(o.output + "/summary.json");
+    result << std::setprecision(17) << "{\"status\":\"completed\",\"method\":\"element-weno\",\"steps\":" << steps
+           << ",\"time\":" << t << ",\"total_seconds\":" << seconds() - begin << ",\"solver_seconds\":" << solver_seconds
+           << ",\"initialization_seconds\":" << initialization << ",\"peak_rss_kib_rank0\":" << usage.ru_maxrss
+           << ",\"minimum_coefficient_density\":" << min_density << ",\"minimum_cone_margin\":" << min_margin
+           << ",\"final_density_mass\":" << mass0 << ",\"min_weno_gamma\":" << stats.min_gamma
+           << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements
+           << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states
+           << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
+           << ",\"phase_seconds\":{\"closure\":" << stats.t_closure << ",\"weno\":" << stats.t_weno
+           << ",\"stabilization\":" << stats.t_stabilization << ",\"residual\":" << stats.t_residual
+           << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass << ",\"limiter\":" << stats.t_limiter
+           << ",\"finish\":" << stats.t_finish << "}}\n";
+    std::cout << "Completed " << steps << " steps, P" << pn.order << ", element-weno p=" << o.degree << ", "
+              << scheme.nodes << " coefficients\n";
+    return 0;
+}
 } // namespace
 int main(int argc, char **argv) {
     // Large fields are reallocated every step; keep them in the heap and reuse
@@ -452,6 +633,14 @@ int main(int argc, char **argv) {
             std::filesystem::create_directories(o.output);
         }
         Angular pn(o.order, o.num.budget);
+        if (o.num.stabilization == "element-weno") {
+            require(world.size == 1, "element-weno runs on a single MPI rank");
+            const int code = run_element_weno(o, pn, begin);
+#ifdef M1PN_MPI
+            MPI_Finalize();
+#endif
+            return code;
+        }
         const bool lattice=o.problem=="lattice-paul";
         if(lattice){
             require(o.mesh.elements>0 && o.mesh.elements%7==0, "lattice-paul requires elements-per-axis divisible by 7");

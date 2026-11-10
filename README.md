@@ -27,6 +27,29 @@ gekoppeltem M1PN auf 128²](results/pn_comparisons/20261105_123328/README.md)
 zeigt die Wirkung der abgeschalteten M1-Kopplung bei gleichen Anfangsdaten
 und gleicher Schrittweite.
 
+## Standardprogramm `m1pn_fast`
+
+`m1pn_fast` ist das Standardprogramm (Quelle `nn_filter/src/main.cpp`, gebaut mit
+`M1PN_FAST_DEFAULTS`). Ohne weitere Optionen rechnet es mit den Einstellungen der
+schnellen 512er-Läufe: Massenkorrektur (`m1pn_mass_correction`), gelumpte Masse,
+SSPRK2, `--cfl 1 --dt 0`, `--kv-gamma 0` und allen OpenMP-Threads. Der Q1-Pfad ist
+bitgleich zur bisherigen `m1pn_nn_filter` mit diesen expliziten Flags.
+
+Wählbar über Optionen:
+
+| Verfahren | Option |
+|---|---|
+| Massenkorrektur (Standard) | `--stabilization m1pn_mass_correction` |
+| Biharmonik | `--stabilization biharmonic-corrected` bzw. `biharmonic-original`, `--biharmonic-gamma G` |
+| Element-WENO (Bernstein `Q_p`, elementbasiertes Limiting) | `--stabilization element-weno --degree p` |
+| Winkelfilter | `--filter constant --filter-strength S` oder `--filter nn` (nicht mit Element-WENO) |
+
+Element-WENO läuft auf generierten kartesischen Gittern ohne Material und nutzt
+SSPRK3. Die Felddateien enthalten dieselben Spalten wie der Q1-Pfad, ausgewertet
+auf einem gleichmäßigen Gitter mit `elements*degree` Zellen pro Achse. Details in
+[docs/ELEMENT_WENO.md](docs/ELEMENT_WENO.md). Die bisherige `m1pn_nn_filter`
+behält ihre alten Defaults, damit bestehende Studien reproduzierbar bleiben.
+
 ## Bauen und testen
 
 Vorhandene MFEM/MPI/Eigen-Installation verwenden; es wird nichts installiert:

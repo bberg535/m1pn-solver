@@ -86,6 +86,15 @@ deshalb nur als Vergleich innerhalb der Tabelle aussagekräftig.
 - Puffer pro Element brauchen `Elemente × Knoten × q` Doubles pro Stufe. Für
   hohe PN-Ordnung auf feinen Gittern ist das zu teuer.
 
+## Laufzeit
+
+Optimierungen vom 10.11.2026: paralleles Sammeln über eine Knoten-Inzidenzliste,
+zeilenweise LDLᵀ-Linienlösungen für alle PN-Komponenten, parallele Randfaces mit
+einmal ausgewerteter konstanter Einstrahldichte, vorab summierte Viskositäten.
+128²-Knoten, P7, p=2: 0.411 → 0.227 s/Schritt (1 Thread), 0.213 → 0.095 s/Schritt
+(8 Threads); Ergebnis gleich bis auf 1e-13. Zum Vergleich braucht die
+Massenkorrektur mit Produktionseinstellungen auf 128²/P7 etwa 0.025 s/Schritt (8 Threads).
+
 ## Bauen und ausführen
 
     cmake --build tmp/build --target m1pn_element_weno m1pn_element_weno_tests
