@@ -138,6 +138,42 @@ int main() {
             check(worst <= 0, "filter damps degree one and matches exp(-tau sigma (l/(N+1))^4)", worst);
             check(cone, "filtered states stay in the cone");
         }
+        {
+            // Scattering and absorption: exact factors per degree, cone kept.
+            Angular pn(5);
+            ElementWenoOptions o;
+            o.degree = 2; o.dimension = 2; o.elements = 4; o.sigma_s = 2; o.sigma_a = .5;
+            ElementWeno scheme(pn, o);
+            const Field a = scheme.interpolate([&](const V3 &x) { return state(pn, x); });
+            const double tau = .03;
+            const Field f = scheme.angular_filter(a, tau);
+            double worst = 0; bool cone = true;
+            for (int i = 0; i < scheme.nodes; ++i) {
+                worst = std::max(worst, std::abs(f(i, 0) - std::exp(-tau * .5) * a(i, 0)));
+                for (int k = 1; k < pn.q; ++k)
+                    worst = std::max(worst, std::abs(f(i, k) - std::exp(-tau * 2.5) * a(i, k)));
+                cone = cone && exact::cone(project(f.row(i).transpose()));
+            }
+            check(worst < 1e-15, "scattering/absorption factors exp(-tau(sa+ss[l>0]))", worst);
+            check(cone, "scattered and absorbed states stay in the cone");
+            // Spatially uniform periodic state: transport vanishes, one full
+            // SSPRK3 step must reproduce the exact relaxation.
+            o.periodic = true; o.sigma_a = 0;
+            ElementWeno uniform(pn, o);
+            Vec u0 = Vec::Zero(pn.q);
+            set_low(u0, Four(1, .4, -.2, 0));
+            for (int k = 4; k < pn.q; ++k) u0[k] = .02 * std::cos(k);
+            const Field b = uniform.interpolate([&](const V3 &) { return u0; });
+            const double dt = .01;
+            const Field c = uniform.advance_ssprk3(0, dt, b);
+            double err = 0;
+            for (int i = 0; i < uniform.nodes; ++i) {
+                err = std::max(err, std::abs(c(i, 0) - b(i, 0)));
+                for (int k = 1; k < pn.q; ++k)
+                    err = std::max(err, std::abs(c(i, k) - std::exp(-2 * dt) * b(i, k)));
+            }
+            check(err < 1e-12, "uniform state: SSPRK3 step equals exact scattering relaxation", err);
+        }
     } catch (const std::exception &e) {
         std::cerr << "exception: " << e.what() << "\n";
         return 1;

@@ -25,6 +25,11 @@ struct ElementWenoOptions {
     // Constant angular filter of nn_filter: d a_lm/dt = -sigma (l/(N+1))^4 a_lm,
     // half a step before and after each SSPRK3 step. Zero switches it off.
     double filter_strength = 0;
+    // Constant isotropic scattering and absorption (unit speed):
+    // d a_lm/dt = -(sigma_a + sigma_s [l >= 1]) a_lm. Integrated exactly together
+    // with the filter in the same two half steps; the density is kept by
+    // scattering and the M1 cone is preserved.
+    double sigma_s = 0, sigma_a = 0;
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -53,6 +58,7 @@ public:
                ElementWenoDebug * = nullptr) const;
     Field advance_ssprk3(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
     Vec weno_gamma(const Field &a) const;
+    // Exact local reaction exp(-tau R): filter, isotropic scattering, absorption.
     Field angular_filter(const Field &a, double tau) const;
     // Linear stability of the high-order target under SSPRK3: 0.9*sqrt(3)/rho with
     // rho the spectral radius of M^-1(-C.A - S_gamma), estimated by power

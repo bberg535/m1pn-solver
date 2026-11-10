@@ -67,6 +67,8 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     require(o.positivity_fraction > 0 && o.positivity_fraction < 1, "epsilon must lie in (0,1)");
     require(o.element_theta > 0 && o.element_theta < 1, "theta must lie in (0,1)");
     require(o.filter_strength >= 0 && std::isfinite(o.filter_strength), "Invalid filter strength");
+    require(o.sigma_s >= 0 && o.sigma_a >= 0 && std::isfinite(o.sigma_s) && std::isfinite(o.sigma_a),
+            "Invalid scattering or absorption coefficient");
     const int p = degree, one = p + 1;
     h = 1. / elements;
     per_direction = elements * p + (o.periodic ? 0 : 1);
@@ -842,12 +844,13 @@ double ElementWeno::high_order_step() const {
     return high_order_step_;
 }
 Field ElementWeno::angular_filter(const Field &a, double tau) const {
-    if (options.filter_strength == 0)
+    if (options.filter_strength == 0 && options.sigma_s == 0 && options.sigma_a == 0)
         return a;
     Vec decay(pn.q);
     for (int l = 0; l <= pn.order; ++l)
         decay.segment(l * l, 2 * l + 1).setConstant(
-            std::exp(-tau * options.filter_strength * std::pow(double(l) / (pn.order + 1), 4)));
+            std::exp(-tau * (options.filter_strength * std::pow(double(l) / (pn.order + 1), 4) +
+                             options.sigma_a + (l > 0 ? options.sigma_s : 0.))));
     return a * decay.asDiagonal();
 }
 Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, ElementWenoStats *stats) const {
