@@ -10,10 +10,10 @@
 #SBATCH --time=01:00:00
 #SBATCH --no-requeue
 set -Eeuo pipefail
-W=/home/warehouse15/bberg/phd/03_projects/M1PN_MassCorrection_20261104/.claude/worktrees/element-weno
+W=${M1PN_ROOT:-/home/warehouse15/bberg/phd/03_projects/M1PN_Solver}
 source "$W/nx/scripts/nx_common.sh"
 nx_setup
-B=$W/tmp/build_nx
+B=${M1PN_BUILD:-$W/tmp/build_nx}
 "$TASK_CMAKE" -S "$W" -B "$B" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_COMPILER="$TASK_CXX" -DMPI_CXX_COMPILER="$TASK_CXX" -DMFEM_CONFIG="$TASK_MFEM_CONFIG" \
   -DENABLE_MPI=ON -DENABLE_OPENMP=ON -DBUILD_TESTING=ON \

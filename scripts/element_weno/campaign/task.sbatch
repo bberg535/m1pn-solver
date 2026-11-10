@@ -10,7 +10,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --no-requeue
 set -Eeuo pipefail
-W=/home/warehouse15/bberg/phd/03_projects/M1PN_MassCorrection_20261104/.claude/worktrees/element-weno
+W=${M1PN_ROOT:-/home/warehouse15/bberg/phd/03_projects/M1PN_Solver}
 CAMPAIGN=${1:?campaign directory}
 source "$W/nx/scripts/nx_common.sh"
 nx_setup
@@ -23,6 +23,6 @@ rm -rf "$OUT"
 mkdir -p "$CAMPAIGN/runs"
 echo "$NAME: $ARGS"
 # shellcheck disable=SC2086
-"$W/tmp/build_nx/m1pn_fast" $ARGS --threads "$SLURM_CPUS_PER_TASK" --output "$OUT"
+"${M1PN_BUILD:-$W/tmp/build_nx}/m1pn_fast" $ARGS --threads "$SLURM_CPUS_PER_TASK" --output "$OUT"
 rm -rf "$TMPDIR"
 echo TASK_DONE
