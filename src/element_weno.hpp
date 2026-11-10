@@ -22,11 +22,18 @@ struct ElementWenoOptions {
     double element_theta = .999;       // theta of report Section 6.2
     double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
     double viscosity_scale = 1;
+    // Constant angular filter of nn_filter: d a_lm/dt = -sigma (l/(N+1))^4 a_lm,
+    // half a step before and after each SSPRK3 step. Zero switches it off.
+    double filter_strength = 0;
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
     double max_raw_zero_sum = 0, max_limited_zero_sum = 0;
     long limited_elements = 0, limited_boundary_nodes = 0, nudged_states = 0;
+    // Wall seconds per phase of rate(), accumulated over all calls.
+    double t_closure = 0, t_weno = 0, t_stabilization = 0, t_residual = 0, t_boundary = 0;
+    double t_mass = 0, t_limiter = 0, t_finish = 0;
+    double t_gradient_local = 0, t_gradient_gather = 0, t_gradient_solve = 0, t_stab_local = 0;
 };
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
@@ -46,7 +53,8 @@ public:
                ElementWenoDebug * = nullptr) const;
     Field advance_ssprk3(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
     Vec weno_gamma(const Field &a) const;
-    Field stabilization_load(const Field &a, const Vec &gamma) const; // sum_e s_h^e(phi_i, a)
+    Field angular_filter(const Field &a, double tau) const;
+    Field stabilization_load(const Field &a, const Vec &gamma, ElementWenoStats * = nullptr) const; // s_h^e(phi_i, a) per element
     Field solve_mass(Field rhs) const;
     Field interpolate(const std::function<Vec(const V3 &)> &) const;
     Field project_l2(const std::function<Vec(const V3 &)> &) const;
@@ -68,11 +76,19 @@ private:
     std::array<Mat, 3> convection_;
     std::array<std::array<Mat, 2>, 3> extension_;
     std::vector<int> connectivity_, neighbors_;
+    // Node -> (element * local_nodes + local) incidence, for parallel gathers.
+    std::vector<int> node_offsets_, node_entries_;
+    Vec total_viscosity_;
+    std::array<Incoming, 6> density_inflow_;
+    bool cached_density_ = false;
     std::vector<BoundaryFace> faces_;
     std::array<FaceRule, 6> rules_;
     std::unique_ptr<CanonicalC1> canonical_;
     std::array<std::unique_ptr<Boundary>, 6> boundaries_;
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> mass_1d_;
+    // The same LDL^T factor in plain arrays, for row-wise multi-component solves.
+    std::vector<int> factor_outer_, factor_inner_, factor_perm_;
+    std::vector<double> factor_values_, factor_diagonal_;
     int stride(int direction) const;
     void element_origin(int element, V3 &origin) const;
     void add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,

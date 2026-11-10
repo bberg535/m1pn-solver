@@ -10,6 +10,7 @@ struct Args {
     int pn = 3, degree = 2, dimension = 1, elements = 32;
     double time = .1, cfl = .9, dt = 0, width = .07, background = .001, weno_linear = 1e-3, weno_q = 1;
     int sample_grid = 0;
+    double filter_strength = 0;
     std::string problem = "smooth", output = "tmp/element_weno";
     bool weno = true, limit = true, stabilize = true;
 };
@@ -33,6 +34,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--weno-linear") a.weno_linear = std::stod(next());
         else if (key == "--weno-q") a.weno_q = std::stod(next());
         else if (key == "--sample-grid") a.sample_grid = std::stoi(next());
+        else if (key == "--filter-strength") a.filter_strength = std::stod(next());
         else if (key == "--problem") a.problem = next();
         else if (key == "--output") a.output = next();
         else if (key == "--no-weno") a.weno = false;
@@ -57,6 +59,7 @@ int main(int argc, char **argv) {
         options.stabilize = args.stabilize;
         options.weno_linear = args.weno_linear;
         options.weno_q = args.weno_q;
+        options.filter_strength = args.filter_strength;
         const bool smooth = args.problem == "smooth";
         options.periodic = smooth;
         Inflow inflow;
@@ -142,7 +145,13 @@ int main(int argc, char **argv) {
                 << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes
                 << ",\"nudged_states\":" << stats.nudged_states
                 << ",\"max_raw_zero_sum\":" << stats.max_raw_zero_sum
-                << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum << "}";
+                << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
+                << ",\"seconds\":{\"closure\":" << stats.t_closure << ",\"weno\":" << stats.t_weno
+                << ",\"stabilization\":" << stats.t_stabilization << ",\"residual\":" << stats.t_residual
+                << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass
+                << ",\"limiter\":" << stats.t_limiter << ",\"gradient_local\":" << stats.t_gradient_local
+                << ",\"gradient_gather\":" << stats.t_gradient_gather << ",\"gradient_solve\":" << stats.t_gradient_solve
+                << ",\"stab_local\":" << stats.t_stab_local << ",\"finish\":" << stats.t_finish << "}}";
         std::ofstream(args.output + "/summary.json") << summary.str() << "\n";
         std::cout << summary.str() << std::endl;
     } catch (const std::exception &e) {

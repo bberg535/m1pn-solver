@@ -118,6 +118,26 @@ int main() {
         for (int p = 1; p <= 4; ++p)
             polynomial(p);
         rough_cone();
+        {
+            Angular pn(5);
+            ElementWenoOptions o;
+            o.degree = 2; o.dimension = 2; o.elements = 4; o.filter_strength = 27.27;
+            ElementWeno scheme(pn, o);
+            const Field a = scheme.interpolate([&](const V3 &x) { return state(pn, x); });
+            const Field f = scheme.angular_filter(a, .01);
+            double density = 0, worst = 0; bool cone = true;
+            for (int i = 0; i < scheme.nodes; ++i) {
+                density = std::max(density, std::abs(f(i, 0) - a(i, 0)));
+                const double lhs = f.row(i).segment(1, 3).norm(), rhs = a.row(i).segment(1, 3).norm();
+                worst = std::max(worst, lhs - rhs);
+                cone = cone && exact::cone(project(f.row(i).transpose()));
+                const double expected = std::exp(-.01 * 27.27 * std::pow(5. / 6, 4));
+                worst = std::max(worst, std::abs(f(i, 35) - expected * a(i, 35)) - 1e-15);
+            }
+            check(density == 0, "filter keeps the density coefficient bitwise", density);
+            check(worst <= 0, "filter damps degree one and matches exp(-tau sigma (l/(N+1))^4)", worst);
+            check(cone, "filtered states stay in the cone");
+        }
     } catch (const std::exception &e) {
         std::cerr << "exception: " << e.what() << "\n";
         return 1;
