@@ -54,6 +54,12 @@ public:
     Field advance_ssprk3(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
     Vec weno_gamma(const Field &a) const;
     Field angular_filter(const Field &a, double tau) const;
+    // Linear stability of the high-order target under SSPRK3: 0.9*sqrt(3)/rho with
+    // rho the spectral radius of M^-1(-C.A - S_gamma), estimated by power
+    // iteration for gamma = 0 and gamma = 1 without boundary terms. Cached.
+    double high_order_step() const;
+    // Step limit used by the drivers: min(realizability bound, high_order_step).
+    double step_bound() const { return std::min(dt_bound, high_order_step()); }
     Field stabilization_load(const Field &a, const Vec &gamma, ElementWenoStats * = nullptr) const; // s_h^e(phi_i, a) per element
     Field solve_mass(Field rhs) const;
     Field interpolate(const std::function<Vec(const V3 &)> &) const;
@@ -95,6 +101,8 @@ private:
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
                       Field &bar) const;
     Field gather_load(const Field &local) const;
+    Field linear_operator(const Field &x, double gamma) const;
+    mutable double high_order_step_ = -1;
 };
 // Exact PN solution for the periodic density sine wave of the accuracy study.
 Vec element_weno_smooth_exact(const Angular &, const V3 &x, double t);

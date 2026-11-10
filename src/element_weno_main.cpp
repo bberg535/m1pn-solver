@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
                 return s;
             });
         }
-        const double step_limit = args.cfl * scheme.dt_bound;
+        const double step_limit = args.cfl * scheme.step_bound();
         const double requested = args.dt > 0 ? std::min(args.dt, step_limit) : step_limit;
         const int steps = std::max(1, int(std::ceil(args.time / requested - 1e-12)));
         const double dt = args.time / steps;
@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
         summary << std::setprecision(12) << "{\"problem\":\"" << args.problem << "\",\"pn_order\":" << args.pn
                 << ",\"degree\":" << args.degree << ",\"elements\":" << args.elements
                 << ",\"dimension\":" << args.dimension << ",\"steps\":" << steps << ",\"dt\":" << dt
-                << ",\"dt_bound\":" << scheme.dt_bound << ",\"wall_seconds\":" << wall
+                << ",\"dt_bound\":" << scheme.dt_bound << ",\"high_order_step\":" << scheme.high_order_step() << ",\"wall_seconds\":" << wall
                 << ",\"l2_density_error\":" << error << ",\"final_mass\":" << total
                 << ",\"min_coefficient_density\":" << min_coefficient_density
                 << ",\"min_coefficient_margin\":" << min_coefficient_margin

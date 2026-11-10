@@ -2,6 +2,7 @@
 #include "base_bar.hpp"
 #include "parallel.hpp"
 #include <atomic>
+#include <random>
 #include <Eigen/Eigenvalues>
 namespace m1pn {
 namespace {
@@ -787,6 +788,58 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
         stats->limited_boundary_nodes += limited_boundary;
     }
     return out;
+}
+Field ElementWeno::linear_operator(const Field &x, double gamma_value) const {
+    const int q = x.cols();
+    std::array<Field, 3> flux;
+    const int block_rows = 256, blocks = (nodes + block_rows - 1) / block_rows;
+    for (int d = 0; d < dimension; ++d) {
+        flux[d].resize(nodes, q);
+        parallel_for(blocks, [&](int b) {
+            const int first = b * block_rows, count = std::min(block_rows, nodes - first);
+            flux[d].middleRows(first, count).noalias() = x.middleRows(first, count) * pn.A[d];
+        });
+    }
+    const Field stabilization = options.stabilize ? stabilization_load(x, Vec::Constant(cells, gamma_value)) : Field();
+    Field local(cells, local_nodes * q);
+    parallel_for(cells, [&](int e) {
+        Mat r = Mat::Zero(local_nodes, q);
+        for (int d = 0; d < dimension; ++d) {
+            Mat f(local_nodes, q);
+            for (int l = 0; l < local_nodes; ++l)
+                f.row(l) = flux[d].row(connectivity_[e * local_nodes + l]);
+            r.noalias() -= convection_[d] * f;
+        }
+        for (int l = 0; l < local_nodes; ++l)
+            for (int c = 0; c < q; ++c)
+                local(e, l * q + c) = r(l, c) - (options.stabilize ? stabilization(e, l * q + c) : 0.);
+    });
+    return solve_mass(gather_load(local));
+}
+double ElementWeno::high_order_step() const {
+    if (high_order_step_ > 0)
+        return high_order_step_;
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<double> uniform(-1, 1);
+    double radius = 0;
+    for (double gamma_value : {0., 1.}) {
+        Field x(nodes, pn.q);
+        for (int i = 0; i < nodes; ++i)
+            for (int c = 0; c < pn.q; ++c)
+                x(i, c) = uniform(rng);
+        x /= x.norm();
+        const int iterations = 60;
+        for (int k = 0; k < iterations; ++k) {
+            Field y = linear_operator(x, gamma_value);
+            const double growth = y.norm();
+            require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed");
+            if (k >= iterations - 15)
+                radius = std::max(radius, growth);
+            x = y / growth;
+        }
+    }
+    high_order_step_ = .9 * std::sqrt(3.) / radius;
+    return high_order_step_;
 }
 Field ElementWeno::angular_filter(const Field &a, double tau) const {
     if (options.filter_strength == 0)

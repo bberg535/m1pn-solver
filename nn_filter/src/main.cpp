@@ -496,8 +496,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         a.row(i) = initial_point(o, scheme.node_position(i), i, dim, pn).transpose();
         cone_require(exact::cone(project(a.row(i).transpose())), "Initial Bernstein coefficient outside the M1 cone");
     }
-    const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.dt_bound;
+    const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.step_bound();
     require(selected <= scheme.dt_bound * (1 + 1e-12), "Requested dt violates the element realizability bound");
+    if (selected > scheme.high_order_step())
+        std::cerr << "warning: dt exceeds the estimated high-order stability step " << scheme.high_order_step() << "\n";
     // Uniform sample grid (Q1 nodes of elements*degree cells per axis).
     const int cells_axis = o.mesh.elements * o.degree, points_axis = cells_axis + (o.mesh.periodic ? 0 : 1);
     int samples = 1;
@@ -549,6 +551,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"case\":" << std::quoted(o.problem) << ",\"inflow\":" << std::quoted(o.inflow)
                << ",\"final_time\":" << o.final_time << ",\"dt_requested\":" << o.dt << ",\"dt_selected\":" << selected
                << ",\"cfl_safety\":" << o.cfl << ",\"element_dt_bound\":" << scheme.dt_bound
+               << ",\"high_order_step\":" << scheme.high_order_step()
                << ",\"threads\":" << o.threads << beam_metadata(o, dim)
                << ",\"compiler\":" << std::quoted(__VERSION__) << "\n}\n";
     }
