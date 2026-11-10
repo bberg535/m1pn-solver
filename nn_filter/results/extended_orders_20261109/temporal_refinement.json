@@ -1,0 +1,50 @@
+{
+  "status": "passed",
+  "purpose": "P5/P9 coupled NN time-step sensitivity at dt/2; no spatial convergence claim",
+  "runs": [
+    {
+      "order": 5,
+      "coarse_steps": 584,
+      "half_dt_steps": 1168,
+      "dt": 0.00027415583988492034,
+      "density_change_mass_rel_L1": 2.5482898216723494e-06,
+      "balance_max": 8.991412561165273e-16,
+      "minimum_density": 0.00041623410239061825,
+      "minimum_cone_margin": 6.383360117745104e-05,
+      "filter_strength_min": 24.883127242903136,
+      "filter_strength_max": 25.815603072351742,
+      "filter_density_ledger_max": 0.0,
+      "rejected_attempts": 0,
+      "run": "tmp/extended_orders_20261109/half_dt_retry/m1pn_nn_n16_p5_half_dt",
+      "saved_state_sha256": {
+        "initial.csv": "a688e82e09c6acb4ab8976851966221be1a7cd9c677c06c597d89eeb63615ace",
+        "final.csv": "7d52204e819d2954994cde87416a9c74ec4b9331503cd60b8e65c15569bd74f7",
+        "filter_integral.csv": "61fa1aa0fdfbc91b6cc3bbb7b68c83e649259eeeea2fb5838c49795779094ced",
+        "filter_strength.csv": "d3d7f8f38c90fc31f4628e06ff9cc3f0ee1bbac8da67c0b7617abcc45bfac842",
+        "summary.json": "d291bf38185102c67a4fc85fbf9a2bc9069c8e370603bb12f9a180040655dd02"
+      }
+    },
+    {
+      "order": 9,
+      "coarse_steps": 610,
+      "half_dt_steps": 1220,
+      "dt": 0.00026250618386644645,
+      "density_change_mass_rel_L1": 1.4485429555856814e-06,
+      "balance_max": 1.7547763457283422e-15,
+      "minimum_density": 0.0005365484006867774,
+      "minimum_cone_margin": 0.00020894410238719743,
+      "filter_strength_min": 23.23778153728155,
+      "filter_strength_max": 25.810265311363487,
+      "filter_density_ledger_max": 0.0,
+      "rejected_attempts": 0,
+      "run": "tmp/extended_orders_20261109/half_dt_retry/m1pn_nn_n16_p9_half_dt",
+      "saved_state_sha256": {
+        "initial.csv": "0aad1ee6fd63291ccb3180a4335f9fef6ba19eba2fc2869e4018a1eccc764c5b",
+        "final.csv": "7190eec8c35c0bd811b4586fa8e8b078ec4fc2a71e07e2b140bc7d510d5c011a",
+        "filter_integral.csv": "c767bfe0a497cb49a12dea64f49271eecdb8205cdd8b34b7e404a0afe0119d2d",
+        "filter_strength.csv": "4d3e3f746e7d308ef916941a10475e6dc90a89693b6cd18927559dfb9d400818",
+        "summary.json": "09545938cc91b9e9c710ba4490d2b68d6074ae58ce7fa81449ff72f412d728c5"
+      }
+    }
+  ]
+}

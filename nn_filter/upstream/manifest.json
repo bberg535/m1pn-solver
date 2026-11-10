@@ -1,0 +1,42 @@
+{
+  "repository": "https://github.com/benplumridge/NN_FPN",
+  "commit": "dba16410a4bbb0749897b12b04119f4ca061f647",
+  "files": [
+    {
+      "path": "2D/src/funcs_common.py",
+      "git_blob_sha1": "9ad8c833fb3e7b71a190e6ffb4ba228ce90db2fd",
+      "size": 14775
+    },
+    {
+      "path": "2D/src/params_common.py",
+      "git_blob_sha1": "6a73264bcc9abe9888d2d696417f8ef79b54f71b",
+      "size": 1848
+    },
+    {
+      "path": "2D/src/test_model.py",
+      "git_blob_sha1": "741b52b5a349dc381d1ddf7045fa68d4841e7b1b",
+      "size": 13355
+    },
+    {
+      "path": "2D/trained_models/model_N3.pth",
+      "git_blob_sha1": "84fd825112846df6563136b0ad3288cb9c272a69",
+      "size": 9921
+    },
+    {
+      "path": "2D/trained_models/model_N5.pth",
+      "git_blob_sha1": "f478a0d0ab2330a090556066056cd778509beb02",
+      "size": 10497
+    },
+    {
+      "path": "2D/trained_models/model_N7.pth",
+      "git_blob_sha1": "4ab347d1d48f6dfb050e30cec373d5d6340a0399",
+      "size": 11265
+    },
+    {
+      "path": "2D/trained_models/model_N9.pth",
+      "git_blob_sha1": "d696e6d0afd46e69d63fa93e3e9d1e4f733c4d6c",
+      "size": 11969
+    }
+  ],
+  "note": "Python evidence copies retain contents with trailing blank lines normalized; original binary checkpoint blobs are byte-exact."
+}
