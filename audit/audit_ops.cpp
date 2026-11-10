@@ -169,6 +169,7 @@ void audit_stabilization() {
                              {2, 2, 3, true, 1e-3}, {2, 2, 3, false, 1e-3}, {2, 1, 6, true, .2}};
     for (const auto &cf : cfgs) {
         ElementWenoOptions o;
+        apply_env(o);
         o.degree = cf.p; o.dimension = cf.dim; o.elements = cf.E; o.periodic = cf.per; o.weno_linear = cf.lin;
         ElementWeno s(pn, o);
         const Vec one = Vec::Ones(s.cells);
@@ -241,6 +242,7 @@ void audit_stabilization_effective() {
     for (double lin : {1e-3, .2}) {
         for (int p : {1, 2, 3}) {
             ElementWenoOptions o;
+            apply_env(o);
             o.degree = p; o.dimension = 1; o.elements = 8; o.periodic = true; o.weno_linear = lin;
             ElementWeno s(pn, o);
             const Vec one = Vec::Ones(s.cells);
@@ -299,6 +301,7 @@ void audit_stabilization_effective() {
 void audit_weno_sensor_scaling() {
     Angular pn(1);
     ElementWenoOptions o;
+    apply_env(o);
     o.degree = 2; o.dimension = 1; o.elements = 16; o.periodic = false; o.weno_linear = 1e-3;
     ElementWeno s(pn, o);
     for (double scale : {1., 1e-1, 1e-2, 1e-3, 1e-4, 1e-6, 1e-9, 1e-30}) {

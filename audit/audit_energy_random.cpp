@@ -9,6 +9,7 @@ int main() {
         for (int p : {1, 2, 3}) {
             Angular pn(N);
             ElementWenoOptions o; o.degree = p; o.dimension = 2; o.elements = 3; o.periodic = false;
+            apply_env(o);
             ElementWeno s(pn, o);  // no inflow: d = 0
             double worst = -1e300, worst_face = -1e300, best = 1e300;
             for (int trial = 0; trial < 200; ++trial) {

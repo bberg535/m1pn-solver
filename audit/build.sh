@@ -19,5 +19,9 @@ mkdir -p "$HERE/build"
 python3 "$HERE/make_audit_source.py" "$ROOT/src/element_weno.cpp" "$HERE/build/element_weno_audit.cpp"
 $CXX $FLAGS -c "$HERE/build/element_weno_audit.cpp" -o "$HERE/build/element_weno_audit.o"
 for t in "$@"; do
-  $CXX $FLAGS "$HERE/audit_$t.cpp" "$HERE/build/element_weno_audit.o" -o "$HERE/build/audit_$t" $LIBS
+  if [[ "$t" == tests/* ]]; then   # existing repository test, linked against the (patched copy of the) current element_weno.cpp
+    $CXX $FLAGS "$ROOT/$t.cpp" "$HERE/build/element_weno_audit.o" -o "$HERE/build/$(basename "$t")" $LIBS
+  else
+    $CXX $FLAGS "$HERE/audit_$t.cpp" "$HERE/build/element_weno_audit.o" -o "$HERE/build/audit_$t" $LIBS
+  fi
 done

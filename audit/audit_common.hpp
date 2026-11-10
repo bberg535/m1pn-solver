@@ -44,3 +44,21 @@ inline bool nudge(Four &v, long *ulps = nullptr) {
     if (!exact::cone(v)) throw std::runtime_error("State left cone beyond 256 ulps");
     return true;
 }
+
+// AUDIT_FIX=legacy | new | sign=0/1,ghost=0/1,c1=0/1,wenoscale=0/1,sym=0/1 (comma list; unset = production defaults)
+inline void apply_env(ElementWenoOptions &o) {
+    const char *env = std::getenv("AUDIT_FIX");
+    if (!env) return;
+    const std::string v = env;
+    if (v == "legacy") { o.vacuum_sign_limit = o.outward_bar_rounding = o.fullsphere_ghost = o.scale_invariant_weno = o.symmetric_residual = false; return; }
+    if (v == "new") return;
+    std::stringstream ss(v);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        const auto eq = tok.find('=');
+        const std::string k = tok.substr(0, eq);
+        const bool on = tok.substr(eq + 1) != "0";
+        if (k == "sign") o.vacuum_sign_limit = on; else if (k == "ghost") o.fullsphere_ghost = on; else if (k == "c1") o.outward_bar_rounding = on;
+        else if (k == "wenoscale") o.scale_invariant_weno = on; else if (k == "sym") o.symmetric_residual = on;
+    }
+}

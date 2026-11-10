@@ -265,6 +265,18 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 V3 normal = V3::Zero();
                 normal[d] = side ? 1 : -1;
                 boundaries_[2 * d + side] = std::make_unique<Boundary>(pn, *canonical_, normal, false);
+                // Outgoing hemisphere rule (local z in (0,1)), rotated to the global frame: C6 ghost state.
+                OutRule &out = out_rules_[2 * d + side];
+                const auto points = sphere_rule(2 * pn.order + 1, +1);
+                out.omega.resize(points.size(), 3);
+                out.weight.resize(points.size());
+                out.harmonics.resize(points.size(), pn.q);
+                for (std::size_t k = 0; k < points.size(); ++k) {
+                    const V3 w = boundaries_[2 * d + side]->frame * points[k].omega;
+                    out.omega.row(k) = w.transpose();
+                    out.weight[k] = points[k].weight;
+                    out.harmonics.row(k) = harmonics(pn.order, w).transpose();
+                }
             }
     }
     // Forward Euler bound of report (19), including the boundary bar states.
@@ -410,8 +422,18 @@ Vec ElementWeno::weno_gamma(const Field &a) const {
         linear.assign(m + 1, options.weno_linear);
         linear[0] = 1 - m * options.weno_linear;
         Vec weights(m + 1);
+        // C5: epsilon relative to the stencil scale makes gamma invariant under u -> s u (s > 0). The scale is
+        // the largest candidate seminorm^r; it is positive here because ||own|| > 0. Exact vacuum or constant
+        // density in the element (scale == 0) returns gamma = 1 above, by definition.
+        double epsilon = options.weno_epsilon;
+        if (options.scale_invariant_weno) {
+            double stencil = 0;
+            for (int l = 0; l <= m; ++l)
+                stencil = std::max(stencil, std::pow(norm(candidates[l]), options.weno_r));
+            epsilon *= stencil;
+        }
         for (int l = 0; l <= m; ++l)
-            weights[l] = linear[l] / (std::pow(norm(candidates[l]), options.weno_r) + options.weno_epsilon);
+            weights[l] = linear[l] / (std::pow(norm(candidates[l]), options.weno_r) + epsilon);
         weights /= weights.sum();
         Vec star = Vec::Zero(local_nodes);
         for (int l = 0; l <= m; ++l)
@@ -444,6 +466,49 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, ElementW
         gradient[d] = solve_mass(std::move(gathered));
         lap(timing.t_gradient_solve);
     }
+    if (options.symmetric_residual) {
+        // Symmetric residual form (docs/BOUNDARY_FIXES.md, L3):
+        //   s_sym(v,u) = sum_e nu_e [ (1-gamma_e) (grad v, grad u)_e + gamma_e ((I-P) grad v, (I-P) grad u)_e ]
+        // with P the global L2 projection onto the continuous space. Symmetric and PSD for every gamma_e in [0,1]
+        // and every positive nu_e; equal to the original form for gamma = 1 and uniform nu (P is an orthogonal projection).
+        std::array<Field, 3> y;
+        for (int d = 0; d < dimension; ++d) {
+            Field weighted(cells, local_nodes * q);
+            parallel_for(cells, [&](int e) {
+                Mat ae(local_nodes, q), ge(local_nodes, q);
+                for (int l = 0; l < local_nodes; ++l) {
+                    ae.row(l) = a.row(connectivity_[e * local_nodes + l]);
+                    ge.row(l) = gradient[d].row(connectivity_[e * local_nodes + l]);
+                }
+                const Mat res = (convection_[d] * ae - mass_ * ge) * (viscosity * gamma[e]);
+                for (int l = 0; l < local_nodes; ++l)
+                    for (int c = 0; c < q; ++c) weighted(e, l * q + c) = res(l, c);
+            });
+            y[d] = solve_mass(gather_load(weighted));
+        }
+        Field sym(cells, local_nodes * q);
+        parallel_for(cells, [&](int e) {
+            Mat ae(local_nodes, q);
+            for (int l = 0; l < local_nodes; ++l)
+                ae.row(l) = a.row(connectivity_[e * local_nodes + l]);
+            Mat r = stiffness_ * ae;
+            Mat second = Mat::Zero(local_nodes, q);
+            for (int d = 0; d < dimension; ++d) {
+                Mat g(local_nodes, q), ye(local_nodes, q);
+                for (int l = 0; l < local_nodes; ++l) {
+                    g.row(l) = gradient[d].row(connectivity_[e * local_nodes + l]);
+                    ye.row(l) = y[d].row(connectivity_[e * local_nodes + l]);
+                }
+                r.noalias() -= gamma[e] * convection_[d].transpose() * g;
+                second.noalias() += convection_[d].transpose() * ye;
+            }
+            r = viscosity * r - second;
+            for (int l = 0; l < local_nodes; ++l)
+                for (int c = 0; c < q; ++c) sym(e, l * q + c) = r(l, c);
+        });
+        lap(timing.t_stab_local);
+        return sym;
+    }
     Field local(cells, local_nodes * q);
     parallel_for(cells, [&](int e) {
         Mat ae(local_nodes, q);
@@ -466,11 +531,11 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, ElementW
 }
 void ElementWeno::add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                                Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                               Field &bar) const {
+                               Field &bar, Vec *inflow_rate) const {
     struct Local {
         std::vector<int> global;
         Mat high, load, bar, flux_area;
-        Vec area;
+        Vec area, inflow;
     };
     std::vector<Local> parts(faces_.size());
     Inflow atoms_only;
@@ -488,10 +553,36 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         part.bar = Mat::Zero(nf, 4);
         part.flux_area = Mat::Zero(nf, 3);
         part.area = Vec::Zero(nf);
+        part.inflow = Vec::Zero(nf);
         V3 origin;
         element_origin(f.element, origin);
         for (int n = 0; n < nf; ++n)
             part.global[n] = connectivity_[f.element * local_nodes + rule.local[n]];
+        // C6: outgoing half-range moments of the positive part of the nodal PN trace (point independent).
+        std::vector<Four> outgoing(nf, Four::Zero());
+        if (options.fullsphere_ghost) {
+            const OutRule &out = out_rules_[side_id];
+            for (int n = 0; n < nf; ++n) {
+                const Vec psi = out.harmonics * a.row(part.global[n]).transpose();
+                Four m = Four::Zero();
+                for (int k = 0; k < psi.size(); ++k) {
+                    const double v = std::max(0., psi[k]) * out.weight[k];
+                    m[0] += v;
+                    m[1] += v * out.omega(k, 0);
+                    m[2] += v * out.omega(k, 1);
+                    m[3] += v * out.omega(k, 2);
+                }
+                // Low-order vacuum outflow property: B^L = -(b - a_ext)/2 <= 0 needs a_ext <= b, where
+                // b = rho + n.J of the node (>= 0 in the cone) and a_ext = rho_o - n.J_o >= 0 of the ghost part.
+                // For a nonnegative PN trace a <= b holds automatically (mu > 0 on the outgoing hemisphere);
+                // a PN trace with negative lobes can violate it, then the outgoing part is scaled by b/a (a cone scaling).
+                const double b_node = low(part.global[n], 0) + b.n[0] * low(part.global[n], 1) + b.n[1] * low(part.global[n], 2) + b.n[2] * low(part.global[n], 3);
+                const double a_ext = m[0] - b.n.dot(m.tail<3>());
+                if (a_ext > b_node)
+                    m *= b_node > 0 ? b_node / a_ext : 0.;
+                outgoing[n] = m;
+            }
+        }
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
             for (int d = 0; d < dimension; ++d)
@@ -522,10 +613,17 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 const int i = part.global[n];
                 part.high.row(n) += weight * integrand.transpose();
                 const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
-                const Four ext = inflow.exterior_state ? inflow.exterior_state(x, time, b.n, ui)
-                                 : inflow.exterior_m1  ? inflow.exterior_m1(x, time)
-                                                       : data.moments;
+                Four ext = inflow.exterior_state ? inflow.exterior_state(x, time, b.n, ui)
+                           : inflow.exterior_m1  ? inflow.exterior_m1(x, time)
+                                                 : data.moments;
+                if (options.fullsphere_ghost && !inflow.exterior_state && !inflow.exterior_m1) {
+                    // Sum of two cone elements is in the cone; outward ulp rounding only for binary64 sums.
+                    ext += outgoing[n];
+                    for (int k = 0; k < 64 && !exact::cone(ext); ++k)
+                        ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
+                }
                 cone_require(exact::cone(ext), "M1 exterior state outside cone");
+                part.inflow[n] += weight * std::max(0., -data.kinetic[0]);
                 Four own = Four::Zero();
                 for (int d = 0; d < dimension; ++d)
                     own += b.n[d] * block(low_flux, i, d);
@@ -547,6 +645,8 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             bar.row(i) += part.bar.row(n);
             node_flux_area.row(i) += part.flux_area.row(n);
             area[i] += part.area[n];
+            if (inflow_rate)
+                (*inflow_rate)[i] += part.inflow[n];
         }
 }
 Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
@@ -616,10 +716,10 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     lap(timing.t_residual);
     Field boundary_high = Field::Zero(nodes, q), boundary_low = Field::Zero(nodes, 4);
     Field flux_area = Field::Zero(nodes, 3), boundary_bar = Field::Zero(nodes, 4);
-    Vec boundary_area = Vec::Zero(nodes);
+    Vec boundary_area = Vec::Zero(nodes), boundary_inflow = Vec::Zero(nodes);
     if (!faces_.empty()) {
         add_boundary(time, a, low, low_flux, boundary_high, boundary_low, flux_area, boundary_area,
-                     boundary_bar);
+                     boundary_bar, &boundary_inflow);
         residual += boundary_high;
     }
     lap(timing.t_boundary);
@@ -634,7 +734,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     if (debug)
         element_raw.resize(cells, width);
     std::vector<double> element_factor(cells, 1.), raw_sum(cells, 0.), limited_sum(cells, 0.);
-    std::vector<long> nudged(cells, 0);
+    std::vector<long> nudged(cells, 0), outward(cells, 0);
     parallel_for(cells, [&](int e) {
         const int *map = &connectivity_[e * local_nodes];
         std::vector<Four> ubar(local_nodes), contribution(local_nodes);
@@ -659,8 +759,14 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                 }
                 if (dij > 0) {
                     Four pair_bar = .5 * (ui + uj) - flux_difference / (2 * dij);
-                    if (!exact::cone(pair_bar))
-                        pair_bar = stable_base_bar(ui, uj, edge, dij);
+                    if (!exact::cone(pair_bar)) {
+                        if (options.outward_bar_rounding) {
+                            int raised = 0;
+                            pair_bar = stable_base_bar_outward(ui, uj, edge, dij, &raised);
+                            outward[e] += raised > 0;
+                        } else
+                            pair_bar = stable_base_bar(ui, uj, edge, dij);
+                    }
                     weighted += dij * pair_bar;
                     fi += dij * (ui - uj);
                 }
@@ -735,8 +841,8 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     if (debug)
         raw_load = gather_load(element_raw);
     // Boundary corrections h_i = P b^H - b^L - (int phi_i n) . G_i, limited node by node.
-    double min_boundary = 1;
-    long limited_boundary = 0;
+    double min_boundary = 1, min_sign = 1;
+    long limited_boundary = 0, sign_limited = 0;
     if (!faces_.empty())
         for (int i = 0; i < nodes; ++i) {
             if (boundary_area[i] <= 0)
@@ -753,6 +859,25 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                 const Four g = correction / boundary_area[i];
                 if (!exact::cone(bar + g))
                     theta = options.element_theta * segment(bar, g);
+                if (options.vacuum_sign_limit) {
+                    // C2: accepted mass rate B_i = L_i + theta*h_i[0] with the low-order rate
+                    //   L_i = A_i (bar_i - u_i)[0] - (int phi_i n).F^L_i[0]   (geometric corner/edge terms included)
+                    // must not exceed max(L_i, inflow_i): theta*h_i[0] <= max(0, inflow_i - L_i) =: allowance.
+                    // In vacuum (inflow 0) L_i = -q^L_i <= 0, so B_i <= 0 (outflow only). theta is only reduced,
+                    // and bar + theta*g stays in the cone by convexity of the cone.
+                    double lo_rate = boundary_area[i] * (bar[0] - low(i, 0));
+                    for (int d = 0; d < dimension; ++d)
+                        lo_rate -= flux_area(i, d) * low_flux(i, 4 * d);
+                    const double allowance = std::max(0., boundary_inflow[i] - lo_rate);
+                    if (correction[0] > allowance) {
+                        double factor = allowance / correction[0];
+                        while (factor > 0 && factor * correction[0] > allowance)
+                            factor = std::nextafter(factor, 0.);
+                        theta = std::min(theta, factor);
+                        min_sign = std::min(min_sign, factor);
+                        ++sign_limited;
+                    }
+                }
                 min_boundary = std::min(min_boundary, theta);
                 limited_boundary += theta < 1;
             }
@@ -783,8 +908,11 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             stats->max_raw_zero_sum = std::max(stats->max_raw_zero_sum, raw_sum[e]);
             stats->max_limited_zero_sum = std::max(stats->max_limited_zero_sum, limited_sum[e]);
             stats->nudged_states += nudged[e];
+            stats->outward_bars += outward[e];
         }
         stats->min_boundary_limiter = std::min(stats->min_boundary_limiter, min_boundary);
+        stats->sign_limited_nodes += sign_limited;
+        stats->min_sign_factor = std::min(stats->min_sign_factor, min_sign);
         stats->limited_boundary_nodes += limited_boundary;
     }
     return out;

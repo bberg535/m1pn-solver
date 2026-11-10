@@ -41,7 +41,7 @@ struct Energy {
            total = 0, closure_err = 0, delta_rel = 0, delta_outside_moments = 0;
     double mass_accepted = 0, mass_target = 0, mass_expected = 0, mass_resid_rel = 0, boundary_dev_L1 = 0,
            max_bnd_rho_rate = -1e300, min_bnd_rho_rate = 1e300, target_bnd_mass = 0, accepted_bnd_mass = 0;
-    double kappa_pos_defect = 0;
+    double kappa_pos_defect = 0, mass_resid_abs = 0, inflow_total = 0, excess_over_inflow = -1e300;
 };
 
 static Energy measure(const ElementWeno &s, double t, const Field &a) {
@@ -81,8 +81,8 @@ static Energy measure(const ElementWeno &s, double t, const Field &a) {
         stab1 = s.gather_load(s.stabilization_load(a, Vec::Ones(s.cells)));
     }
     Field bh = Field::Zero(n, q), bl = Field::Zero(n, 4), fa = Field::Zero(n, 3), bbar = Field::Zero(n, 4);
-    Vec area = Vec::Zero(n);
-    if (!s.faces_.empty()) s.add_boundary(t, a, low, low_flux, bh, bl, fa, area, bbar);
+    Vec area = Vec::Zero(n), inflow_rate = Vec::Zero(n);
+    if (!s.faces_.empty()) s.add_boundary(t, a, low, low_flux, bh, bl, fa, area, bbar, &inflow_rate);
     const Field high_rate = s.solve_mass(Field(Rvol - stab + bh));
     en.N2 = dotf(a, apply_mass(s, a));
     en.vol = dotf(a, Rvol);
@@ -137,6 +137,10 @@ static Energy measure(const ElementWeno &s, double t, const Field &a) {
             scale += std::abs(bl(i, 0)) + std::abs(fl_term) + std::abs(corr[0]);
         }
     }
+    en.mass_resid_abs = std::abs(en.mass_accepted - en.mass_expected);
+    en.inflow_total = c4 * 0;
+    for (int i = 0; i < n; ++i) en.inflow_total += inflow_rate[i];
+    en.excess_over_inflow = en.mass_accepted - en.inflow_total;
     // interior cancellation: periodic meshes have no boundary term at all
     en.mass_resid_rel = std::abs(en.mass_accepted - en.mass_expected) / std::max(1e-300, scale + std::abs(en.mass_accepted));
     if (s.faces_.empty()) en.mass_resid_rel = std::abs(en.mass_accepted) / std::max(1e-300, c4 * a.col(0).cwiseAbs().maxCoeff() + 1e-300);
@@ -155,6 +159,7 @@ struct Agg {
     double cum_vol = 0, cum_stab = 0, cum_bnd = 0, cum_sync = 0, cum_sync_el = 0, cum_sync_bn = 0, cum_total = 0;
     double max_vol = -1e300, max_stab = -1e300, max_bnd = -1e300, max_sync = -1e300, max_sync_el = -1e300, max_sync_bn = -1e300,
            max_total = -1e300, max_stab_nonlin = -1e300, max_closure_err = 0, max_mass_resid = 0, max_delta_rel = 0;
+    double max_mass_resid_abs = 0, max_excess_over_inflow = -1e300, max_excess_rel = -1e300;
     double max_net_face = -1e300, mass_rate_max = -1e300, mass_rate_min = 1e300, mass_rate_target_max = -1e300, mass_rate_target_min = 1e300;
     double min_bnd_rho_rate = 1e300, max_bnd_rho_rate = -1e300, max_boundary_dev_L1 = 0, max_mass_target_minus_accepted = 0;
     long steps = 0;
@@ -229,6 +234,9 @@ struct Driver {
             g.max_net_face = std::max(g.max_net_face, (en.vol + en.bnd) / nrm);
             g.max_closure_err = std::max(g.max_closure_err, en.closure_err / nrm);
             g.max_mass_resid = std::max(g.max_mass_resid, en.mass_resid_rel);
+            g.max_mass_resid_abs = std::max(g.max_mass_resid_abs, en.mass_resid_abs);
+            g.max_excess_over_inflow = std::max(g.max_excess_over_inflow, en.excess_over_inflow);
+            g.max_excess_rel = std::max(g.max_excess_rel, en.excess_over_inflow / std::max(1e-300, std::abs(en.mass_accepted) + en.inflow_total + en.mass_resid_abs));
             g.max_delta_rel = std::max(g.max_delta_rel, en.delta_rel);
             if (!s.faces_.empty()) {
                 g.min_bnd_rho_rate = std::min(g.min_bnd_rho_rate, en.min_bnd_rho_rate);
@@ -310,7 +318,8 @@ static void emit_run(const std::string &test, const std::string &label, const El
         .add("energy_integral_total", g.cum_total)
         .add("energy_budget_closure_err_rel", g.max_closure_err)
         .add("sync_defect_rel_norm_max", g.max_delta_rel)
-        .add("mass_balance_resid_rel_max", g.max_mass_resid)
+        .add("mass_balance_resid_rel_max", g.max_mass_resid).add("mass_balance_resid_abs_max", g.max_mass_resid_abs)
+        .add("accepted_mass_rate_minus_kinetic_inflow_max", g.max_excess_over_inflow).add("accepted_mass_rate_minus_kinetic_inflow_max_rel", g.max_excess_rel)
         .add("global_mass_rate_accepted_max", g.mass_rate_max).add("global_mass_rate_accepted_min", g.mass_rate_min)
         .add("global_mass_rate_pn_target_max", g.mass_rate_target_max).add("global_mass_rate_pn_target_min", g.mass_rate_target_min)
         .add("accepted_boundary_rho_rate_min", g.min_bnd_rho_rate).add("accepted_boundary_rho_rate_max", g.max_bnd_rho_rate)
@@ -328,6 +337,7 @@ static void T1_isotropic() {
     Angular pn(3);
     for (bool low : {false, true}) {
         ElementWenoOptions o; o.degree = 2; o.dimension = 2; o.elements = 4; o.periodic = false;
+        apply_env(o);
         Inflow in; in.density = [](const V3 &, double, const V3 &) { return 1. / (4 * pi); }; in.constant_density = 1. / (4 * pi);
         ElementWeno s(pn, o, in);
         audit_low_order = low;
@@ -364,6 +374,7 @@ static void T2_vacuum() {
     for (auto cs : {Case{"corner_outflow_J", 0, V3(-.5, -.5, 0) / std::sqrt(2.) * 1.5}, Case{"corner_inflow_J", 0, V3(.5, .5, 0) / std::sqrt(2.) * 1.5},
                     Case{"corner_cone_boundary_J", 0, V3(-1, 0, 0)}, Case{"interior_node", -1, V3(.6, 0, 0)}, Case{"edge_node", -2, V3(0, -.9, 0)}}) {
         ElementWenoOptions o; o.degree = 1; o.dimension = 2; o.elements = 8; o.periodic = false;
+        apply_env(o);
         ElementWeno s(pn, o);
         const int node = cs.node == -1 ? 4 + 4 * s.per_direction : cs.node == -2 ? 4 : cs.node;
         Field a = Field::Zero(s.nodes, pn.q);
@@ -390,6 +401,7 @@ static void T3_polynomial_beam() {
         const Vec c = psi_coeffs(pn, psi);
         const Four P = project(c);
         ElementWenoOptions o; o.degree = 2; o.dimension = 2; o.elements = 4; o.periodic = false;
+        apply_env(o);
         Inflow in; in.density = [&](const V3 &, double, const V3 &om) { return psi(om); };
         ElementWeno s(pn, o, in);
         Field a = s.interpolate([&](const V3 &) { return c; });
@@ -442,6 +454,7 @@ static void T6_convergence() {
         double prev_b = 0, prev_i = 0;
         for (int E : {4, 8, 16}) {
             ElementWenoOptions o; o.degree = 2; o.dimension = 2; o.elements = E; o.periodic = false; o.weno = v.weno; o.limit = v.limit;
+            apply_env(o);
             Inflow in;
             in.density = [&](const V3 &x, double t, const V3 &om) { return harmonics(pn.order, om).dot(exact_pn(pn, x, t, kappa)); };
             ElementWeno s(pn, o, in);
@@ -496,6 +509,7 @@ static void T7_steep_near_boundary() {
     Inflow in; in.density = [bg](const V3 &, double, const V3 &) { return bg / (4 * pi); }; in.constant_density = bg / (4 * pi);
     auto run_case = [&](int E, double x0, Field *out_field, ElementWeno **keep) {
         ElementWenoOptions o; o.degree = 2; o.dimension = 2; o.elements = E; o.periodic = false;
+        apply_env(o);
         auto *s = new ElementWeno(pn, o, in);
         Field a = bump_state(*s, x0, .5, w, bg, 1);
         auto *dr = new Driver(*s);
@@ -535,6 +549,7 @@ static void T7_steep_near_boundary() {
 static void T8_scaling() {
     Angular pn(3);
     ElementWenoOptions o; o.degree = 2; o.dimension = 2; o.elements = 8; o.periodic = false;
+    apply_env(o);
     ElementWeno s(pn, o);  // no inflow: vacuum inflow, so the problem is homogeneous of degree 1
     Field base = bump_state(s, .5, .5, .1, .05, 1);
     base += bump_state(s, .3, .6, .08, .0, 0);
@@ -565,6 +580,7 @@ static void T8_scaling() {
 static void crossing(int E, int p, int N, const std::string &variant, double cfl, Field *keep, Field *ref_full, ElementWeno **keep_scheme) {
     Angular pn(N);
     ElementWenoOptions o; o.degree = p; o.dimension = 2; o.elements = E; o.periodic = false;
+    apply_env(o);
     o.weno = variant != "no_weno"; o.limit = variant != "no_limit_diagnostic";
     const double bg = .001, w = .07;
     Inflow in;
@@ -590,6 +606,11 @@ static void crossing(int E, int p, int N, const std::string &variant, double cfl
     std::map<std::string, double> extra;
     if (ref_full && ref_full->size() > 0) {
         extra["rel_L2_density_diff_to_full"] = std::sqrt(((f.col(0) - ref_full->col(0)).array().square() * s->lumped.array()).sum() / ((ref_full->col(0).array().square()) * s->lumped.array()).sum());
+    }
+    if (const char *dump = std::getenv("AUDIT_DUMP")) {
+        std::ofstream out(std::string(dump) + "_" + variant + ".txt");
+        out << std::setprecision(17);
+        for (int i = 0; i < s->nodes; ++i) out << project(f.row(i).transpose())[0] << "\n";
     }
     // density field extrema over nodes and within the beam region
     emit_run("CROSSING", variant + (err.empty() ? "" : "_ABORTED:" + err), *s, dr.g, f, .32, extra);
@@ -618,6 +639,7 @@ int main(int argc, char **argv) {
             const int E = argc > 2 ? std::atoi(argv[2]) : 64, p = argc > 3 ? std::atoi(argv[3]) : 1, N = argc > 4 ? std::atoi(argv[4]) : 7;
             Field full; ElementWeno *s = nullptr;
             for (const std::string v : {"full", "no_weno", "low_order_control", "no_limit_diagnostic"}) {
+                if (const char *only = std::getenv("AUDIT_ONLY")) if (v != only) continue;
                 Field f; ElementWeno *sk = nullptr;
                 crossing(E, p, N, v, .5, &f, v == "full" ? nullptr : &full, &sk);
                 if (v == "full") { full = f; s = sk; } else delete sk;

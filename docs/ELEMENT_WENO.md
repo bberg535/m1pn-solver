@@ -101,3 +101,8 @@ Massenkorrektur mit Produktionseinstellungen auf 128²/P7 etwa 0.025 s/Schritt (
     tmp/build/m1pn_element_weno_tests
     tmp/build/m1pn_element_weno --problem crossing-study --dimension 2 \
       --pn-order 3 --degree 3 --elements 32 --time .32 --cfl .5 --weno-linear .2
+
+## Randkorrekturen (Branch fix/element-weno-boundary-c1-c6)
+
+Vorzeichenlimiter am Rand, nach außen gerundeter Bar-State, positive Vollkugel-Ghost-Zustände, skaleninvarianter WENO-Sensor und die symmetrische Residualform
+sind in [BOUNDARY_FIXES.md](BOUNDARY_FIXES.md) mit Herleitung und Vorher/Nachher-Tests dokumentiert. Option `--legacy-boundary` reproduziert Commit 8efe517.
