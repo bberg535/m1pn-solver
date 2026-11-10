@@ -25,6 +25,8 @@ struct Options {
     int order = 3, rk = 3, max_steps = 100000, norm_max = 512, threads = 1, checkpoint_stride = 0;
     double final_time = .01, dt = 0, cfl = .8, sigma_a = 0, sigma_s = 0, anisotropy = 0, source = 0;
     double pulse_width = .07, background = .001;
+    // line-source: generated square [0.5-L/2, 0.5+L/2]^2, source at its centre.
+    double domain_length = 1;
     bool jump = false, deterministic = false, mass_mode_explicit = false, pn_only_self_test = false;
     bool cuda_explicit = false, cuda_on = false;
     bool rk_explicit = false;
@@ -59,7 +61,7 @@ Options parse(int argc, char **argv) {
                    "natural|masked\n"
                    " --boundary onsager-c1|characteristic-c0 --time-integrator ssprk2|ssprk3\n"
                    " --case "
-                   "smooth|stress|isotropic|vacuum|pure-beam|beam|crossing|plane-source|shadow|"
+                   "smooth|stress|isotropic|vacuum|pure-beam|beam|crossing|plane-source|line-source|shadow|"
                    "lattice|lattice-paul|smooth-beam|vacuum-beam|oblique-beam|crossing-three|crossing-study|crossing-3d\n"
                    " --model r2|legacy --stabilization gradient-defect|biharmonic-original|biharmonic-corrected\n"
                    " --stabilization m1pn_ghost_local_projected_p4 --ghost-gamma G (open Cartesian Q1 only)\n"
@@ -71,6 +73,7 @@ Options parse(int argc, char **argv) {
                    " --time T --dt DT --cfl C --anchor-scale 1|2 --mass-tolerance TOL\n"
                    " --mass-mode consistent|lumped|lumped_afc --mass-corrections R\n"
                    " --pulse-width W --background B --checkpoint-stride S\n"
+                   " --domain-length L (line-source only: square of side L centred at (0.5,0.5))\n"
                    " --sigma-a A --sigma-s S --anisotropy g --source-density Q --material-jump\n"
                    " --memory-mib M --pn-norm-max-dofs K --threads T --ledger-stride S --deterministic --output "
                    "DIR\n"
@@ -213,6 +216,8 @@ Options parse(int argc, char **argv) {
             o.pulse_width = real();
         else if (key == "--background")
             o.background = real();
+        else if (key == "--domain-length")
+            o.domain_length = real();
         else if (key == "--threads")
             o.threads = integer();
         else if (key == "--ledger-stride") {
@@ -290,6 +295,12 @@ Options parse(int argc, char **argv) {
             "--pn-only-self-test requires --coupling pn-only");
     require(o.num.r2 || o.num.mass_mode == "consistent", "Lumped modes require --model r2");
     require(o.pulse_width > 0 && o.background >= 0, "Invalid pulse width/background");
+    require(o.domain_length > 0 && std::isfinite(o.domain_length), "Invalid domain length");
+    if (o.problem == "line-source")
+        require(o.mesh.dimension == 2 && o.inflow == "vacuum", "line-source is 2D with vacuum inflow");
+    if (o.domain_length != 1)
+        require(o.problem == "line-source" && o.mesh.file.empty() && !o.mesh.periodic && !element_weno,
+                "--domain-length needs line-source on a generated open mesh (not element-weno)");
     require(o.num.r2 || o.num.stabilization != "m1pn_ghost_local_projected_p4",
             "Local projected ghost stabilization requires --model r2");
     if (o.num.r2) {
@@ -416,6 +427,12 @@ Vec initial_point(const Options &o, const V3 &x, int i, int dimension, const Ang
             a += pulse(x-V3(.68,.5,z)) * harmonics(pn.order, -V3::UnitX());
         } else if (o.problem == "plane-source")
             a[0] = std::exp(-200 * (x[0] - .5) * (x[0] - .5)) / std::sqrt(4 * pi);
+        else if (o.problem == "line-source") {
+            // Garrett-Hauck line source: unit-mass Gaussian of width W plus floor B.
+            const double r2 = (x[0] - .5) * (x[0] - .5) + (x[1] - .5) * (x[1] - .5);
+            const double w2 = o.pulse_width * o.pulse_width;
+            a[0] = (o.background + std::exp(-r2 / (2 * w2)) / (2 * pi * w2)) / std::sqrt(4 * pi);
+        }
         else if (o.problem == "shadow" || o.problem == "lattice" || o.problem == "lattice-paul")
             a[0] = (o.problem=="lattice-paul"?o.background:.01) / std::sqrt(4 * pi);
         else
@@ -476,8 +493,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     require(o.mesh.file.empty() && !o.mesh.tetrahedra && !o.mesh.single_tet,
             "element-weno needs the generated Cartesian hex mesh");
     require(o.problem != "lattice" && o.problem != "lattice-paul" && o.problem != "shadow" &&
-                o.sigma_a == 0 && o.sigma_s == 0 && o.source == 0 && !o.jump && o.anisotropy == 0,
-            "element-weno has no material or source terms yet");
+                o.source == 0 && !o.jump && o.anisotropy == 0,
+            "element-weno supports only constant isotropic scattering and absorption, no sources");
     if (o.problem == "crossing-study" || o.inflow == "crossing-study-transport")
         require(dim == 2, "crossing-study is 2D");
     ElementWenoOptions eo;
@@ -490,6 +507,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     eo.weno_linear = o.weno_linear;
     eo.weno_q = o.weno_q;
     eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
+    eo.sigma_s = o.sigma_s;
+    eo.sigma_a = o.sigma_a;
     ElementWeno scheme(pn, eo, make_inflow(o, dim));
     Field a(scheme.nodes, pn.q);
     for (int i = 0; i < scheme.nodes; ++i) {
@@ -544,6 +563,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"weno\":" << (o.weno ? "true" : "false") << ",\"weno_linear\":" << o.weno_linear
                << ",\"weno_q\":" << o.weno_q << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
                << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength
+               << ",\"sigma_s\":" << o.sigma_s << ",\"sigma_a\":" << o.sigma_a
+               << ",\"reaction_integration\":\"exact_exponential_half_steps_around_ssprk3\""
                << ",\"pn_order\":" << pn.order << ",\"Q\":" << pn.q << ",\"dimension\":" << dim
                << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << scheme.nodes
                << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis
@@ -662,6 +683,13 @@ int main(int argc, char **argv) {
             for(int i=0;i<scaled->GetNV();++i){double *v=scaled->GetVertex(i);v[0]*=7;v[1]*=7;}
             o.mesh.file=o.output+"/input.mesh";
             if(world.rank==0){std::ofstream mf(o.mesh.file); require(bool(mf),"Cannot write scaled lattice mesh"); scaled->Print(mf); mf.close();}
+            world.barrier();
+        }
+        if(o.domain_length!=1){
+            auto scaled=make_mesh(o.mesh); const double L=o.domain_length;
+            for(int i=0;i<scaled->GetNV();++i){double *v=scaled->GetVertex(i);v[0]=.5+L*(v[0]-.5);v[1]=.5+L*(v[1]-.5);}
+            o.mesh.file=o.output+"/input.mesh";
+            if(world.rank==0){std::ofstream mf(o.mesh.file); require(bool(mf),"Cannot write scaled line-source mesh"); scaled->Print(mf); mf.close();}
             world.barrier();
         }
         if(o.problem=="crossing-study" || o.inflow=="crossing-study-transport") require(o.mesh.dimension==2,"crossing-study is 2D");
@@ -797,7 +825,7 @@ int main(int argc, char **argv) {
                    << ",\"length_scale\":\"maximum_element_diameter_in_node_star\",\"boundary\":"
                    << std::quoted(o.num.c0 ? "characteristic-c0" : "onsager-c1")
                    << ",\"anchor_scale\":" << o.num.anchor << ",\"rk\":" << o.rk
-                   << ",\"case\":" << std::quoted(o.problem) << ",\"geometry_policy\":" << std::quoted(lattice?"lattice_paul_floor_cells_domain_0_7":"unit_domain") << ",\"material_average_policy\":" << std::quoted(lattice?"positive_fe_quadrature_average_order6":"nodal_constant") << ",\"lattice_material_policy\":" << std::quoted(lattice?"absorber_sigma_a_10_else_sigma_s_1_source_unit_on_3_4_square":"none") << ",\"lattice_integrated_expected\":" << (lattice?"{\"domain_mass\":49,\"source_mass\":1,\"sigma_a_mass\":110,\"sigma_s_mass\":38}":"null")
+                   << ",\"case\":" << std::quoted(o.problem) << ",\"geometry_policy\":" << std::quoted(lattice?"lattice_paul_floor_cells_domain_0_7":(o.domain_length!=1?"centred_square_side_domain_length":"unit_domain")) << ",\"domain_length\":" << o.domain_length << ",\"material_average_policy\":" << std::quoted(lattice?"positive_fe_quadrature_average_order6":"nodal_constant") << ",\"lattice_material_policy\":" << std::quoted(lattice?"absorber_sigma_a_10_else_sigma_s_1_source_unit_on_3_4_square":"none") << ",\"lattice_integrated_expected\":" << (lattice?"{\"domain_mass\":49,\"source_mass\":1,\"sigma_a_mass\":110,\"sigma_s_mass\":38}":"null")
                    << ",\"pair_limiter\":" << std::quoted(o.num.r2 ? "cone-only" : o.pair_limiter)
                    << ",\"inflow\":" << std::quoted(o.inflow) << ",\"final_time\":" << o.final_time
                    << ",\"time_accumulation\":\"kahan_compensated_accepted_dt_with_8ulp_endpoint_snap\""

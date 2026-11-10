@@ -74,8 +74,14 @@ deshalb nur als Vergleich innerhalb der Tabelle aussagekräftig.
 
 ## Grenzen
 
-- Nur uniforme kartesische Gitter und der materialfreie Crossing-Fall.
-  `lattice` (Streuung, Absorption) fehlt.
+- Nur uniforme kartesische Gitter auf `[0,1]^d`. Konstante isotrope Streuung
+  (`--sigma-s`) und Absorption (`--sigma-a`) werden seit 10.11.2026 exakt
+  integriert: `a_lm *= exp(-τ(σ_a + σ_s[l≥1]))`, je ein halber Schritt vor und
+  nach SSPRK3 zusammen mit dem Filter (Strang). Erhält Dichte (Streuung) und
+  M1-Kegel. Quellen, Materialsprünge und `lattice` fehlen weiterhin.
+- Line Source (Garrett–Hauck) läuft für Element-WENO exakt skaliert auf dem
+  Einheitsquadrat (`σ_s=3`, `T=1/3`, Filter ×3); Auswertung in
+  `scripts/line_source/analyze.py`.
 - Vergleich mit Variante B und Filter siehe
   `results/element_weno/filter_comparison_20261109/REPORT.md`. Dort ist p>1 auf
   16² und 32² schlechter als p=1; die Tabelle oben gilt nur für 96 Intervalle.

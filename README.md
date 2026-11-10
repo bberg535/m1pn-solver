@@ -43,9 +43,10 @@ Wählbar über Optionen:
 | Biharmonik | `--stabilization biharmonic-corrected` bzw. `biharmonic-original`, `--biharmonic-gamma G` |
 | Element-WENO (Bernstein `Q_p`, elementbasiertes Limiting) | `--stabilization element-weno --degree p` |
 | Winkelfilter | `--filter constant --filter-strength S` oder `--filter nn` (nicht mit Element-WENO) |
+| Line Source (Garrett–Hauck) | `--case line-source --domain-length 3 --pulse-width .03 --background 1e-4 --sigma-s 1 --time 1` (nur B; Referenz `scripts/line_source/reference.py`) |
 
-Element-WENO läuft auf generierten kartesischen Gittern ohne Material und nutzt
-SSPRK3. Die Felddateien enthalten dieselben Spalten wie der Q1-Pfad, ausgewertet
+Element-WENO läuft auf generierten kartesischen Gittern (konstante isotrope Streuung
+und Absorption möglich, keine Quellen) und nutzt SSPRK3. Die Felddateien enthalten dieselben Spalten wie der Q1-Pfad, ausgewertet
 auf einem gleichmäßigen Gitter mit `elements*degree` Zellen pro Achse. Details in
 [docs/ELEMENT_WENO.md](docs/ELEMENT_WENO.md). Die bisherige `m1pn_nn_filter`
 behält ihre alten Defaults, damit bestehende Studien reproduzierbar bleiben.
