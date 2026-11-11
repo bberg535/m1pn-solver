@@ -334,8 +334,12 @@ def run(ns) -> int:
             for name in ("l2_density_error", "final_mass", "min_coefficient_margin"):
                 if not math.isfinite(float(summary[name])):
                     raise ValueError("invalid standalone summary " + name)
-            if abs(float(summary["dt"])) <= 0:
+            if not (math.isfinite(float(summary["dt"])) and float(summary["dt"]) > 0):
                 raise ValueError("standalone dt invalid")
+            if any(int(summary[k]) != t[v] for k, v in
+                   (("pn_order", "pn_order"), ("degree", "degree"),
+                    ("elements", "elements"), ("dimension", "dim"))):
+                raise ValueError("standalone solver metadata mismatch")
         else:
             config = load(output / "config.json")
             if summary.get("status") != "completed" or config.get("case") != t["case"]:
@@ -346,6 +350,21 @@ def run(ns) -> int:
                 raise ValueError("Bernstein degree mismatch")
             if abs(float(summary["time"]) - t["time"]) > 1e-10:
                 raise ValueError("end time mismatch")
+            if int(config.get("pn_order", -1)) != t["pn_order"] or \
+               int(config.get("elements_per_axis", -1)) != t["elements"] or \
+               int(config.get("dimension", -1)) != t["dim"]:
+                raise ValueError("grid or PN order mismatch")
+            if t.get("stabilization", "element-weno") == "element-weno":
+                if config.get("method") != "element-weno" or \
+                   config.get("weno") is not t["weno"] or \
+                   config.get("element_limit") is not t["limiter"]:
+                    raise ValueError("element-WENO configuration mismatch")
+                if abs(float(config.get("sigma_s", -1)) - t["sigma_s"]) > 1e-12 or \
+                   abs(float(config.get("sigma_a", -1)) - t["sigma_a"]) > 1e-12:
+                    raise ValueError("reaction coefficients mismatch")
+                expected_filter = "constant" if t["filter_strength"] else "off"
+                if config.get("filter_mode") != expected_filter:
+                    raise ValueError("filter mode mismatch")
             if t["kind"] == "temporal" and abs(float(config["dt_selected"]) - dt) > 1e-12 * max(1., dt):
                 raise ValueError("requested temporal dt changed")
         outcome["status"] = "completed"
@@ -514,6 +533,28 @@ def collect(ns) -> int:
                         err, interpolated[:, 0], coarse["mass"])["L2"]
                 except Exception as error:
                     failures.append((coarse["t"]["label"], "spatial interpolation: " + str(error)))
+    # Paired dt at finest smooth grid: detect temporal contamination rather
+    # than interpreting an SSPRK3 time plateau as spatial Qp convergence.
+    for candidate in data.values():
+        if candidate["t"]["family"] != "smoothdt2":
+            continue
+        t = candidate["t"]
+        original = next((x for x in data.values()
+                         if x["t"]["family"] == "smooth" and
+                         x["t"]["pn_order"] == t["pn_order"] and
+                         x["t"]["degree"] == t["degree"] and
+                         x["t"]["elements"] == t["elements"]), None)
+        if original is None:
+            failures.append((t["label"], "missing matching full-dt smooth run"))
+            continue
+        if not np.allclose(candidate["coords"], original["coords"], atol=1e-13):
+            failures.append((t["label"], "smooth time-check grids differ"))
+            continue
+        delta = original["physical"][:, 0] - candidate["physical"][:, 0]
+        time_err = float(np.sqrt(np.mean(delta * delta)))
+        original["row"]["smooth_dt_half_rms_difference"] = time_err
+        original["row"]["smooth_time_warning"] = bool(
+            time_err > .1 * original["row"]["error_exact_PN_L2"])
     # Experimental order of convergence only for comparisons with the SAME reference definition.
     for field, families in [
         ("error_exact_PN_L2", ["smooth"]),
@@ -593,6 +634,9 @@ def submit(ns) -> int:
     jobids = []
     if ns.execute and not shutil.which("sbatch"):
         raise RuntimeError("sbatch missing; run submit --execute on the NX login node")
+    if ns.execute:
+        atomic(lock, {"status": "submitting", "jobids": [],
+                      "commands": [], "warning": "partial submissions may be live"})
     for path, _ in files:
         cmd = [sbatch, "--parsable", "--chdir=" + str(campaign),
                "--export=ALL,TASKFILE=" + str(path) + ",REPO=" + str(campaign),
@@ -602,6 +646,8 @@ def submit(ns) -> int:
         if ns.execute:
             proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
             jobids.append(proc.stdout.strip().split(";")[0])
+            atomic(lock, {"status": "submitting", "jobids": jobids,
+                          "commands": commands})
     if jobids:
         wrap = shlex.join([sys.executable, str(campaign / "study.py"),
                            "collect", "--campaign", str(campaign)])
@@ -613,7 +659,7 @@ def submit(ns) -> int:
         commands.append(cmd)
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
         jobids.append(proc.stdout.strip().split(";")[0])
-        atomic(lock, {"jobids": jobids, "commands": commands,
+        atomic(lock, {"status": "submitted", "jobids": jobids, "commands": commands,
                       "submitted_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
     for cmd in commands:
         print(shlex.join(cmd))
@@ -644,7 +690,7 @@ def main() -> int:
     p.set_defaults(action=collect)
     p = sub.add_parser("submit")
     p.add_argument("--campaign", type=Path, required=True)
-    p.add_argument("--tasks-per-job", type=int, default=8)
+    p.add_argument("--tasks-per-job", type=int, default=4)
     p.add_argument("--task-timeout", type=int, default=25200)
     p.add_argument("--execute", action="store_true", help="Actually call sbatch")
     p.set_defaults(action=submit)
