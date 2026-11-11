@@ -675,8 +675,15 @@ def submit(ns) -> int:
     if ns.execute:
         atomic(lock, {"status": "submitting", "jobids": [],
                       "commands": [], "warning": "partial submissions may be live"})
-    for path, _ in files:
-        cmd = [sbatch, "--parsable", "--chdir=" + str(campaign),
+    for index, (path, _) in enumerate(files):
+        # Conservative dependency chain: no more than max_concurrent_packs
+        # whole-node pack jobs may be eligible simultaneously.
+        dependencies = []
+        if index >= ns.max_concurrent_packs:
+            predecessor = (jobids[index - ns.max_concurrent_packs]
+                           if ns.execute else "PACK_JOB_" + str(index - ns.max_concurrent_packs))
+            dependencies = ["--dependency=afterany:" + predecessor]
+        cmd = [sbatch, "--parsable", *dependencies, "--chdir=" + str(campaign),
                "--export=ALL,TASKFILE=" + str(path) + ",REPO=" + str(campaign) + ",OPENBLAS_NUM_THREADS=1,MKL_NUM_THREADS=1",
                "--output=" + str(campaign / "packs" / (path.stem + "-%j.log")),
                str(batch_script)]
@@ -729,6 +736,7 @@ def main() -> int:
     p = sub.add_parser("submit")
     p.add_argument("--campaign", type=Path, required=True)
     p.add_argument("--tasks-per-job", type=int, default=4)
+    p.add_argument("--max-concurrent-packs", type=int, default=1)
     p.add_argument("--task-timeout", type=int, default=25200)
     p.add_argument("--execute", action="store_true", help="Actually call sbatch")
     p.set_defaults(action=submit)
@@ -737,6 +745,8 @@ def main() -> int:
         parser.error("--threads must be positive")
     if hasattr(ns, "tasks_per_job") and ns.tasks_per_job < 1:
         parser.error("--tasks-per-job must be positive")
+    if hasattr(ns, "max_concurrent_packs") and ns.max_concurrent_packs < 1:
+        parser.error("--max-concurrent-packs must be positive")
     return ns.action(ns)
 
 
