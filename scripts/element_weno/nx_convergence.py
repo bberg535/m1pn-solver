@@ -230,6 +230,7 @@ def prepare(ns) -> int:
         shutil.copy2(path, campaign / "bin" / key)
     sources = {
         HERE / "nx_convergence.py": campaign / "study.py",
+        HERE / "nx_plot_convergence.py": campaign / "plot.py",
         repo / "nx/scripts/analysis.py": campaign / "analysis.py",
         repo / "scripts/line_source/reference.py": campaign / "reference.py",
         repo / "scripts/element_weno/pack_node.py": campaign / "scripts/element_weno/pack_node.py",
@@ -240,7 +241,7 @@ def prepare(ns) -> int:
         shutil.copy2(source, target)
     atomic(campaign / "tasks.json", tasks)
     hashes = {}
-    for relative in ["tasks.json", "study.py", "analysis.py", "reference.py",
+    for relative in ["tasks.json", "study.py", "plot.py", "analysis.py", "reference.py",
                      "bin/fast", "bin/standalone",
                      "scripts/element_weno/pack_node.py",
                      "nx/batches/element_weno_pack.sbatch"]:
@@ -560,6 +561,7 @@ def collect(ns) -> int:
         headings += ["## Failed or missing jobs", ""]
         headings += [f"- {a}: {b}" for a, b in failures]
     (campaign / "REPORT.md").write_text("\n".join(headings) + "\n")
+    subprocess.run([sys.executable, str(campaign / "plot.py"), "--campaign", str(campaign)], check=True)
     print("completed", len(rows), "of", len(tasks), "; failures", len(failures))
     return 0 if not failures else 2
 
