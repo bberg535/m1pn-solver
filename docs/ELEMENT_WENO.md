@@ -311,3 +311,8 @@ Kampagnen ist die Packung einfacher und schon effizienter.
 
 Vorzeichenlimiter am Rand, nach außen gerundeter Bar-State, positive Vollkugel-Ghost-Zustände, skaleninvarianter WENO-Sensor und die symmetrische Residualform
 sind in [BOUNDARY_FIXES.md](BOUNDARY_FIXES.md) mit Herleitung und Vorher/Nachher-Tests dokumentiert. Option `--legacy-boundary` reproduziert Commit 8efe517.
+
+## Heterogene Reaktionen, Lattice und 3D (11.11.2026)
+
+Ortsabhängige σ_a, σ_s, Quelle, exakter Reaktionsschritt, Bilanzbuch, Elementzahl pro Achse, Lattice (Paul),
+3D-Shadow, eigener 3D-Lattice und Effizienzschleife: [ELEMENT_HETEROGENEOUS.md](ELEMENT_HETEROGENEOUS.md).

@@ -106,3 +106,27 @@ python3 -m unittest discover -s tests -p 'test_nx_convergence.py' -v
 ~~~
 
 The scripts intentionally do **not** modify production solver code, change default integrators, add a new third-order reaction splitting, or launch automatically. For any publication figure, retain the frozen campaign and its git SHA.
+
+## 5. Heterogeneous and 3D profiles (format nx_convergence_v2)
+
+`--profile hetero-smoke` (5 tasks) and `--profile hetero-paper` (63 tasks) add the lattice (Paul (44)-(47)), the
+3D shadow (Weih et al. 4.2.1 geometry, own beam profile) and the own 3D lattice extension; see
+`docs/ELEMENT_HETEROGENEOUS.md`. The v1 profiles `smoke`/`paper` and their task matrices are unchanged.
+
+~~~bash
+python3 scripts/element_weno/nx_convergence.py plan --profile hetero-paper      # resource estimate, no files
+python3 scripts/element_weno/nx_convergence.py prepare --profile hetero-paper \
+  --campaign "$PWD/nx/tmp/ew_hetero_paper"
+python3 nx/tmp/ew_hetero_paper/study.py submit --campaign "$PWD/nx/tmp/ew_hetero_paper"            # DRY RUN
+python3 nx/tmp/ew_hetero_paper/study.py submit --campaign "$PWD/nx/tmp/ew_hetero_paper" --execute
+# smoke on the short partition:
+python3 <campaign>/study.py submit --campaign <campaign> --partition short --time 00:30:00 --execute
+~~~
+
+Validation per run: material integrals against the expected values (lattice 49/1/110/38, 3D lattice
+343/1/620/429, shadow sphere within 5e-3), expected mirror directions, particle balance (|relative| <= 1e-9),
+numerical cone margin. Recorded metadata: affinity, NUMA nodes, OMP variables, compiler, moments, dofs, dt, steps,
+RSS, phase times (incl. reaction), ledger. `submit` packs tasks by slot class (`slot_cores` 16 or 32 from the
+cost model); `--partition`/`--time` override the pack defaults. `collect` writes `results.csv/json` and `REPORT.md`
+with lattice deviations from Schotthoefer/Hauck (Table 1 / 2 pi) and shadow Beer-Lambert metrics from `slices.csv`.
+Historical path-B lattice runs used an older binary; `lattice_B_*_B_new` recomputes them with the current one.
