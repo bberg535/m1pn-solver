@@ -475,6 +475,11 @@ def collect(ns) -> int:
                     raise ValueError("sample weights do not sum to unit domain volume")
                 row["dt"] = float(config["dt_selected"])
                 row["minimum_cone_margin"] = float(summary["minimum_cone_margin"])
+                row["nudged_states"] = int(summary.get("nudged_states", 0))
+                row["max_limited_zero_sum"] = float(summary.get("max_limited_zero_sum", 0))
+                if (t.get("stabilization", "element-weno") == "element-weno"
+                        and t["limiter"] and row["minimum_cone_margin"] < -1e-10):
+                    raise ValueError("negative Bernstein coefficient cone margin")
                 row["min_element_factor"] = float(summary.get("min_element_factor", 1.))
                 row["min_weno_gamma"] = float(summary.get("min_weno_gamma", 1.))
                 row["limited_element_stages"] = int(summary.get("limited_element_stages", 0))
