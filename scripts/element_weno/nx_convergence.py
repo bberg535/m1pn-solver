@@ -370,6 +370,16 @@ def run(ns) -> int:
         outcome["status"] = "completed"
         outcome["summary_sha256"] = digest(output / "summary.json")
         outcome["final_sha256"] = digest(output / "final.csv")
+        outcome["file_sha256"] = {
+            name: digest(output / name)
+            for name in ("summary.json", "final.csv", "config.json",
+                         "initial.csv", "nodal_mass.csv")
+            if (output / name).is_file()
+        }
+        required = ("summary.json", "final.csv") if t["binary"] == "standalone" else (
+            "summary.json", "final.csv", "config.json", "initial.csv", "nodal_mass.csv")
+        if not all(name in outcome["file_sha256"] for name in required):
+            raise ValueError("required saved-field files are missing")
     except Exception as error:
         outcome["error"] = str(error)
     atomic(status, outcome)
@@ -417,6 +427,9 @@ def collect(ns) -> int:
             failures.append((label, status.get("error", status.get("status"))))
             continue
         try:
+            for name, expected in status.get("file_sha256", {}).items():
+                if digest(output / name) != expected:
+                    raise ValueError("saved field changed after run: " + name)
             if digest(output / "summary.json") != status["summary_sha256"] or \
                digest(output / "final.csv") != status["final_sha256"]:
                 raise ValueError("saved field changed after run")
@@ -639,7 +652,7 @@ def submit(ns) -> int:
                       "commands": [], "warning": "partial submissions may be live"})
     for path, _ in files:
         cmd = [sbatch, "--parsable", "--chdir=" + str(campaign),
-               "--export=ALL,TASKFILE=" + str(path) + ",REPO=" + str(campaign),
+               "--export=ALL,TASKFILE=" + str(path) + ",REPO=" + str(campaign) + ",OPENBLAS_NUM_THREADS=1,MKL_NUM_THREADS=1",
                "--output=" + str(campaign / "packs" / (path.stem + "-%j.log")),
                str(batch_script)]
         commands.append(cmd)
