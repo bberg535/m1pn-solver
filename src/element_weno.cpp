@@ -109,6 +109,8 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     require(o.filter_strength >= 0 && std::isfinite(o.filter_strength), "Invalid filter strength");
     require(o.sigma_s >= 0 && o.sigma_a >= 0 && std::isfinite(o.sigma_s) && std::isfinite(o.sigma_a),
             "Invalid scattering or absorption coefficient");
+    require(!o.material || (o.sigma_s == 0 && o.sigma_a == 0),
+            "Space-dependent material and constant sigma_s/sigma_a are exclusive");
     const int p = degree, one = p + 1;
     require(o.length > 0 && std::isfinite(o.length), "Invalid element WENO domain length");
     h = o.length / elements;
@@ -420,6 +422,62 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int i = 0; i < nodes; ++i)
             if ((i / stride(d)) % nodes_per_axis[d] == removed)
                 mirror_nodes_[d].push_back(i);
+    }
+    // Nodal reaction data: positive averages int c phi_i / int phi_i by composite Gauss quadrature.
+    node_sigma_a = node_sigma_s = node_source = Vec::Zero(nodes);
+    if (o.material) {
+        const ElementWenoMaterial &mat = *o.material;
+        require(mat.subcells >= 1 && mat.points >= 0, "Invalid material quadrature");
+        const auto [gx, gw] = unit_gauss(mat.points > 0 ? mat.points : p + 4);
+        const int sub = mat.subcells, per = gx.size() * sub;
+        Vec x1(per), w1(per);
+        for (int c = 0; c < sub; ++c)
+            for (int k = 0; k < gx.size(); ++k) {
+                x1[c * gx.size() + k] = (c + gx[k]) / sub;
+                w1[c * gx.size() + k] = gw[k] / sub;
+            }
+        Mat shape1(one, per); // 1D Bernstein values at the composite points
+        for (int k = 0; k < per; ++k)
+            for (int i = 0; i < one; ++i)
+                shape1(i, k) = bernstein(i, p, 0, x1[k]);
+        int points = 1;
+        for (int d = 0; d < dimension; ++d)
+            points *= per;
+        const double volume = std::pow(h, dimension);
+        std::vector<double> sa(nodes, 0.), ss(nodes, 0.), sq(nodes, 0.), sm(nodes, 0.);
+        double ia = 0, is = 0, iq = 0, iv = 0;
+        for (int e = 0; e < cells; ++e) {
+            V3 origin;
+            element_origin(e, origin);
+            for (int point = 0; point < points; ++point) {
+                V3 x = origin;
+                double w = volume;
+                std::array<int, 3> idx{0, 0, 0};
+                for (int d = 0, k = point; d < dimension; ++d, k /= per) {
+                    idx[d] = k % per;
+                    x[d] += h * x1[idx[d]];
+                    w *= w1[idx[d]];
+                }
+                const double ca = mat.sigma_a ? mat.sigma_a(x) : 0., cs = mat.sigma_s ? mat.sigma_s(x) : 0.,
+                             cq = mat.source ? mat.source(x) : 0.;
+                require(ca >= 0 && cs >= 0 && cq >= 0 && std::isfinite(ca + cs + cq),
+                        "Material coefficients must be finite and nonnegative");
+                ia += w * ca, is += w * cs, iq += w * cq, iv += w;
+                for (int l = 0; l < local_nodes; ++l) {
+                    double phi = 1;
+                    for (int d = 0, v = l; d < dimension; ++d, v /= one)
+                        phi *= shape1(v % one, idx[d]);
+                    const int i = connectivity_[e * local_nodes + l];
+                    sa[i] += w * phi * ca, ss[i] += w * phi * cs, sq[i] += w * phi * cq, sm[i] += w * phi;
+                }
+            }
+        }
+        for (int i = 0; i < nodes; ++i) {
+            node_sigma_a[i] = sa[i] / sm[i];
+            node_sigma_s[i] = ss[i] / sm[i];
+            node_source[i] = sq[i] / sm[i];
+        }
+        integral_sigma_a = ia, integral_sigma_s = is, integral_source = iq, integral_volume = iv;
     }
     if (!o.periodic) {
         const auto [fx, fw] = unit_gauss(p + pn.order + 3);
@@ -1251,7 +1309,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     if (debug)
         raw_load = gather_load(element_raw);
     // Boundary corrections h_i = P b^H - b^L - (int phi_i n) . G_i, limited node by node.
-    double min_boundary = 1, min_sign = 1;
+    double min_boundary = 1, min_sign = 1, boundary_mass_rate = 0;
     long limited_boundary = 0, sign_limited = 0;
     if (!faces_.empty())
         for (int i = 0; i < nodes; ++i) {
@@ -1294,6 +1352,11 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
             const Four base = boundary_area[i] * (bar - ui);
             load.row(i) += (base + theta * correction).transpose();
+            // Total mass rate of node i: the gathered low-order element terms contain the lumped boundary flux
+            // -(int phi_i n).F^L_i (only the antidiffusive element contributions sum to zero), plus base + h_i.
+            boundary_mass_rate += base[0] + theta * correction[0];
+            for (int d = 0; d < dimension; ++d)
+                boundary_mass_rate -= flux_area(i, d) * low_flux(i, 4 * d);
             if (debug)
                 raw_load.row(i) += (base + correction).transpose();
         }
@@ -1328,6 +1391,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             stats->outward_bars += outward[e];
         }
         stats->min_boundary_limiter = std::min(stats->min_boundary_limiter, min_boundary);
+        stats->last_boundary_mass_rate = boundary_mass_rate;
         stats->sign_limited_nodes += sign_limited;
         stats->min_sign_factor = std::min(stats->min_sign_factor, min_sign);
         stats->limited_boundary_nodes += limited_boundary;
@@ -1386,21 +1450,82 @@ Field ElementWeno::angular_filter(const Field &a, double tau) const {
     }
     return a * decay.asDiagonal();
 }
+// Exact solution of the local reaction ODE over tau, node by node (no spatial coupling):
+//   d rho / dt = -sigma_a rho + q0,  d a_lm / dt = -(sigma_a + sigma_s [l >= 1] + f (l/(N+1))^4) a_lm  (l >= 1),
+// with f the constant angular filter. rho(tau) = e^{-sigma_a tau} rho + q0 tau phi1(-sigma_a tau),
+// phi1(z) = expm1(z) / z (phi1(0) = 1), so sigma_a -> 0 is exact. Without material this reduces to
+// angular_filter() bit for bit. Absorbed mass m_i sigma_a int rho dt = m_i [rho (1 - e^{-sigma_a tau})
+// + q0 tau (1 - phi1)] is computed analytically, not as a difference. Realizability: rho(tau) >= e^{-sigma_a tau}
+// rho >= e^{-sigma_a tau} |J| >= e^{-(sigma_a + sigma_s + f_1) tau} |J| = |J(tau)| (q0 >= 0, phi1 > 0);
+// binary64 rounding is corrected by the same ulp nudge as after the transport stages (counted in the ledger).
+Field ElementWeno::react(const Field &a, double tau, ElementWenoStats *stats) const {
+    if (!options.material) {
+        if (stats && options.sigma_a > 0) { // ledger only; the state update is angular_filter() as before
+            const double loss = -std::expm1(-options.sigma_a * tau);
+            for (int i = 0; i < nodes; ++i)
+                stats->absorbed += lumped[i] * loss * std::sqrt(4 * pi) * a(i, 0);
+        }
+        Field out = angular_filter(a, tau);
+        return options.filter_strength == 0 && options.sigma_s == 0 && options.sigma_a == 0
+                   ? out
+                   : admissible_rows_public(std::move(out), stats);
+    }
+    const double start = seconds();
+    const int q = a.cols();
+    require(q == moments && a.rows() == nodes, "react: state size mismatch");
+    std::vector<int> degree_of(q);
+    std::vector<double> filter(q);
+    for (int k = 0; k < q; ++k) {
+        degree_of[k] = int(std::sqrt(double(active[k]) + .5));
+        filter[k] = options.filter_strength * std::pow(double(degree_of[k]) / (pn.order + 1), 4);
+    }
+    Field out(nodes, q);
+    std::vector<double> absorbed(nodes), injected(nodes);
+    const double c0 = 1 / std::sqrt(4 * pi);
+    parallel_for(nodes, [&](int i) {
+        const double sa = node_sigma_a[i], ss = node_sigma_s[i], q0 = node_source[i];
+        const double z = -sa * tau, decay0 = std::exp(z), phi1 = z == 0 ? 1. : std::expm1(z) / z;
+        const double *in = &a.coeffRef(i, 0);
+        double *o = &out.coeffRef(i, 0);
+        const double rho = in[0] / c0;
+        o[0] = decay0 * in[0] + c0 * q0 * tau * phi1;
+        for (int k = 1; k < q; ++k)
+            o[k] = std::exp(-tau * (sa + ss + filter[k])) * in[k];
+        absorbed[i] = lumped[i] * (-std::expm1(z) * rho + q0 * tau * (1 - phi1));
+        injected[i] = lumped[i] * q0 * tau;
+    });
+    if (stats) {
+        for (int i = 0; i < nodes; ++i)
+            stats->absorbed += absorbed[i], stats->injected += injected[i];
+        stats->t_reaction += seconds() - start;
+    }
+    return admissible_rows_public(std::move(out), stats);
+}
 namespace {
 // Nudges the stored low moments of every node into the M1 cone (rounding only).
-Field admissible_rows(Field x, int nodes, ElementWenoStats *stats) {
+Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lumped) {
+    // Rounding fix only: raise the stored density coefficient by ulps until the stored row itself projects into
+    // the M1 cone (coefficient level, so no set_low() round trip can move it out again).
     std::atomic<long> nudged{0};
+    std::vector<double> added(nodes, 0.);
+    const int q = x.cols();
     parallel_for(nodes, [&](int i) {
-        Four u = project(x.row(i).transpose());
-        if (nudge_into_cone(u)) {
-            Vec row = x.row(i).transpose();
-            set_low(row, u);
-            x.row(i) = row.transpose();
-            ++nudged;
-        }
+        double *row = &x.coeffRef(i, 0);
+        const Eigen::Map<const Vec> view(row, q);
+        if (exact::cone(project(view)))
+            return;
+        const double before = row[0];
+        for (int k = 0; k < 4096 && !exact::cone(project(view)); ++k)
+            row[0] = std::nextafter(row[0], std::numeric_limits<double>::infinity());
+        cone_require(exact::cone(project(view)), "State left the M1 cone beyond rounding");
+        added[i] = lumped[i] * std::sqrt(4 * pi) * (row[0] - before);
+        ++nudged;
     });
-    if (stats)
+    if (stats && nudged.load()) {
         stats->nudged_states += nudged.load();
+        for (double v : added)
+            stats->nudge_mass += v;
+    }
     return x;
 }
 // r <- old * a + fresh * (x + tau * r), row-parallel (the Eigen expression ran on one thread).
@@ -1420,34 +1545,43 @@ void combine(Field &r, const Field &x, const Field &a, double old, double fresh,
 } // namespace
 Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, ElementWenoStats *stats) const {
     // Without filter and reactions the input is used in place (no copy).
-    const Field filtered = reacts() ? angular_filter(input, .5 * dt) : Field();
+    const Field filtered = reacts() ? react(input, .5 * dt, stats) : Field();
     const Field &a = reacts() ? filtered : input;
-    auto stage = [&](double t, const Field &x, double old, double fresh) {
+    // Effective weights of the stage rates: u^{n+1} = u^n + dt (L1 + L2 + 4 L3) / 6 (boundary mass ledger).
+    auto stage = [&](double t, const Field &x, double old, double fresh, double weight) {
         Field r = rate(t, x, stats);
+        if (stats)
+            stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
         combine(r, x, a, old, fresh, dt, nodes);
-        return admissible_rows(std::move(r), nodes, stats);
+        return admissible_rows(std::move(r), nodes, stats, lumped);
     };
-    const Field first = stage(time, a, 0, 1);
-    const Field second = stage(time + dt, first, .75, .25);
-    Field last = stage(time + .5 * dt, second, 1. / 3, 2. / 3);
-    return reacts() ? angular_filter(last, .5 * dt) : last;
+    const Field first = stage(time, a, 0, 1, 1. / 6);
+    const Field second = stage(time + dt, first, .75, .25, 1. / 6);
+    Field last = stage(time + .5 * dt, second, 1. / 3, 2. / 3, 2. / 3);
+    return reacts() ? react(last, .5 * dt, stats) : last;
 }
 // SSPRK(4,3) (Kraaijevanger; Spiteri and Ruuth): four forward Euler stages of dt/2 at times t, t+dt/2, t+dt,
 // t+dt/2; u3 = 2/3 u + 1/3 (u2 + dt/2 L(u2)). Realizable for dt <= 2 dt_bound.
 Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, ElementWenoStats *stats) const {
-    const Field filtered = reacts() ? angular_filter(input, .5 * dt) : Field();
+    const Field filtered = reacts() ? react(input, .5 * dt, stats) : Field();
     const Field &a = reacts() ? filtered : input;
     const double half = .5 * dt;
-    auto stage = [&](double t, const Field &x, double old, double fresh) {
+    // Effective weights: u^{n+1} = u^n + dt (L1 + L2 + L3 + 3 L4) / 6.
+    auto stage = [&](double t, const Field &x, double old, double fresh, double weight) {
         Field r = rate(t, x, stats);
+        if (stats)
+            stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
         combine(r, x, a, old, fresh, half, nodes);
-        return admissible_rows(std::move(r), nodes, stats);
+        return admissible_rows(std::move(r), nodes, stats, lumped);
     };
-    const Field first = stage(time, a, 0, 1);
-    const Field second = stage(time + half, first, 0, 1);
-    const Field third = stage(time + dt, second, 2. / 3, 1. / 3);
-    Field last = stage(time + half, third, 0, 1);
-    return reacts() ? angular_filter(last, .5 * dt) : last;
+    const Field first = stage(time, a, 0, 1, 1. / 6);
+    const Field second = stage(time + half, first, 0, 1, 1. / 6);
+    const Field third = stage(time + dt, second, 2. / 3, 1. / 3, 1. / 6);
+    Field last = stage(time + half, third, 0, 1, .5);
+    return reacts() ? react(last, .5 * dt, stats) : last;
+}
+Field ElementWeno::admissible_rows_public(Field x, ElementWenoStats *stats) const {
+    return admissible_rows(std::move(x), nodes, stats, lumped);
 }
 Field ElementWeno::interpolate(const std::function<Vec(const V3 &)> &f) const {
     Field a(nodes, moments);

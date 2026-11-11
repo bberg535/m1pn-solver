@@ -11,7 +11,18 @@
 #include <Eigen/SparseCholesky>
 #include <functional>
 #include <memory>
+#include <string>
 namespace m1pn {
+// Space-dependent isotropic reaction data (docs/ELEMENT_HETEROGENEOUS.md). sigma_a, sigma_s >= 0 in 1/length,
+// source = isotropic particle density rate q0(x) >= 0 (units of rho per time; PN coefficient q0 / sqrt(4 pi)).
+// Nodal values are the positive averages int sigma phi_i / int phi_i (Bernstein phi_i >= 0) by composite
+// Gauss quadrature: `subcells` sub-cells per element and direction, `points` Gauss points per sub-cell and
+// direction (0: degree + 4). Empty functions mean zero.
+struct ElementWenoMaterial {
+    std::function<double(const V3 &)> sigma_a, sigma_s, source;
+    int subcells = 1, points = 0;
+    std::string name;
+};
 struct ElementWenoOptions {
     int degree = 1, dimension = 1, elements = 16;
     bool periodic = true;
@@ -51,6 +62,8 @@ struct ElementWenoOptions {
     // box is origin + [0, h count[0]] x [0, h count[1]] x [0, h count[2]] (e.g. 150 x 50 x 50 for the shadow
     // test). Non-cubic cells are not supported.
     std::array<int, 3> elements_per_axis{0, 0, 0};
+    // Space-dependent reaction (adds to the constant sigma_s, sigma_a above, which must then be zero).
+    std::shared_ptr<const ElementWenoMaterial> material;
     // Mirror sides, index 2 * direction + side (side 0 = low end): specular reflection instead of a physical
     // boundary. For mirror-symmetric data the scheme equals the full scheme on the mirrored domain: no flux on
     // the mirror face, moments odd under the reflection vanish on the mirror plane (Dirichlet rows of the
@@ -71,6 +84,13 @@ struct ElementWenoStats {
     double t_closure = 0, t_weno = 0, t_stabilization = 0, t_residual = 0, t_boundary = 0;
     double t_mass = 0, t_limiter = 0, t_finish = 0;
     double t_gradient_local = 0, t_gradient_gather = 0, t_gradient_solve = 0, t_stab_local = 0;
+    // Mass ledger in rho units (sum_i m_i rho_i, m_i = lumped mass), accumulated by advance():
+    //   M(T) - M(0) + boundary_outflow + absorbed - injected - nudge_mass = 0 up to rounding.
+    // boundary_outflow integrates the boundary mass rate of every stage with the SSP weights; absorbed and
+    // injected come from the exact reaction step (absorbed analytically from sigma_a int rho dt).
+    double boundary_outflow = 0, absorbed = 0, injected = 0, nudge_mass = 0;
+    double last_boundary_mass_rate = 0; // of the last rate() call (sum over boundary nodes)
+    double t_reaction = 0;
 };
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
@@ -112,8 +132,19 @@ public:
     Vec weno_gamma(const Field &a) const;
     // Exact local reaction exp(-tau R): filter, isotropic scattering, absorption.
     Field angular_filter(const Field &a, double tau) const;
-    // True when angular_filter() changes anything (filter, scattering or absorption).
-    bool reacts() const { return options.filter_strength != 0 || options.sigma_s != 0 || options.sigma_a != 0; }
+    // True when the reaction step changes anything (filter, scattering, absorption or source).
+    bool reacts() const {
+        return options.filter_strength != 0 || options.sigma_s != 0 || options.sigma_a != 0 || bool(options.material);
+    }
+    // Exact local reaction over tau (filter, absorption, scattering, source), node by node; see react() in the .cpp.
+    // Adds the absorbed and injected mass to the ledger of `stats`.
+    Field react(const Field &a, double tau, ElementWenoStats * = nullptr) const;
+    // Rounding-only nudge of the low moments into the M1 cone (counted, mass recorded in the ledger).
+    Field admissible_rows_public(Field x, ElementWenoStats * = nullptr) const;
+    // Nodal reaction data (zero without material): averages int c phi_i / int phi_i, and the quadrature
+    // integrals int c dx over the computed domain.
+    Vec node_sigma_a, node_sigma_s, node_source;
+    double integral_sigma_a = 0, integral_sigma_s = 0, integral_source = 0, integral_volume = 0;
     // Linear stability of the high-order target: 0.9 * c / rho with rho the spectral radius of
     // M^-1(-C.A - S_gamma), estimated by power iteration for gamma = 0 and gamma = 1 without boundary terms,
     // and c the stability limit of the integrator on the negative real axis (SSPRK3: 2.5127, SSPRK(4,3):
