@@ -102,6 +102,31 @@ einmal ausgewerteter konstanter Einstrahldichte, vorab summierte Viskositäten.
 Massenkorrektur mit Produktionseinstellungen auf 128²/P7 etwa 0.025 s/Schritt (8 Threads).
 Eine Nachmessung am 11.11.2026 ergab dafür 0.049 s/Schritt (129² Knoten, P7, 8 Threads, Standardwerte von `m1pn_fast`).
 
+Optimierungen vom 11.11.2026 (nach den Randkorrekturen, algebraisch identische Umformungen):
+
+- `M⁻¹C_d = I ⊗ (M₁⁻¹C₁)` auf dem Tensorgitter: der projizierte Gradient `g_d` ist ein
+  Linienoperator entlang `d` (ein bandiertes Produkt, eine Linienlösung) statt
+  Elementschleife, Sammeln und `d` Linienlösungen.
+- Advektionsanteil der Hochordnungsrate direkt als `-Σ_d g_d A_d`; die Felder `a A_d`
+  und die Element-Residuen entfallen. Für `G = F^H - F^L` werden nur die vier
+  niedrigen Momente von `a A_d` gebildet.
+- `s_h` wird knotenweise ohne Elementpuffer gesammelt (Zeilenkerne ohne Kopien und
+  Allokationen); pro Element bleiben nur die vier projizierten Momente für den Limiter.
+- Rand: der PN-Flächenintegrand ist affin in (Spur, Datum),
+  `(A_n - llf_homogeneous) u - llf_datum d`; pro Face eine Flächenmassenmatrix statt
+  einer Onsager-Lösung pro Quadraturpunkt. C6-Ghost einmal pro (Seite, Randknoten).
+- WENO-Sensor, Limiter-Schleife und SSPRK3-Stufen ohne Allokationen bzw. Kopien.
+
+128²-Knoten, P7, p=2, Crossing, CPU-Zeit mit einem Thread: 0.348 → 0.149 s/Schritt
+(gemessen auf einer ausgelasteten Maschine, daher CPU- statt Wandzeit). Mit 8 Threads
+sinkt die Wandzeit eines 30-Schritte-Laufs einschließlich Aufbau von 13.3 auf 6.0 s.
+
+Abweichung der Dichte gegenüber dem Stand davor in 12 Vergleichsläufen (p=1..4,
+1D/2D/3D, `--legacy-boundary`, `--symmetric-residual`, Filter, ohne WENO/Stabilisierung):
+1e-15 bis 5e-10. Ausnahme p=3, 16², `--weno-linear .2`, T=0.32: 9e-4. Dieser Fall
+verstärkt Rundungsunterschiede; derselbe alte Code weicht ohne FMA-Kontraktion
+(`-ffp-contract=off`) von sich selbst um 1.2e-3 ab.
+
 ## Zeitschritt und SSPRK(4,3) (11.11.2026)
 
 **Hochordnungsschranke.** Bisher galt `high_order_step = 0.9·√3/ρ`, also die Grenze von SSPRK3 auf der
@@ -124,20 +149,27 @@ limitierter Euler-Schritt wie bisher; die Realisierbarkeit gilt daher für `dt �
 **Overhead.** Der serielle Test `a.allFinite()` zu Beginn von `rate()` und die seriellen Eigen-Linearkombinationen
 der Stufen kosteten mit 8 Threads etwa 25 % der Laufzeit. Beide laufen jetzt zeilenparallel.
 
-Crossing, `T = 0.32`, 129² Knoten (p = 2, 64²), 8 Threads, Standard-`dt`:
+Crossing, `T = 0.32`, 129² Knoten (p = 2, 64²), Gesamtstand mit Randkorrekturen und den Optimierungen
+vom 11.11. (Abschnitt oben), Standard-`dt`. Die Massenkorrektur (Q1, 128², SSPRK2, Standardwerte von `m1pn_fast`)
+steht zum Vergleich darunter.
 
-| Variante | PN | Schritte | dt | Rechenzeit | L1 gegen Kinetik | Abweichung zu vorher |
-|---|---|---:|---:|---:|---:|---:|
-| SSPRK3, alte Schranke (70fe8bd) | P7 | 394 | 8.14e-4 | 33.9 s | 0.11170 | – |
-| SSPRK3, gleiches dt, neuer Code | P7 | 394 | 8.14e-4 | 28.1 s | 0.11170 | 5e-14 |
-| SSPRK3, neue Schranke | P7 | 271 | 1.18e-3 | 19.1 s | 0.11170 | 5e-6 |
-| SSPRK(4,3) | P7 | 133 | 2.42e-3 | 12.4 s | 0.11170 | 2e-5 |
-| SSPRK3, alte Schranke (70fe8bd) | P3 | 393 | 8.16e-4 | 14.3 s | 0.50783 | – |
-| SSPRK3, neue Schranke | P3 | 271 | 1.18e-3 | 9.0 s | 0.50784 | 7e-5 |
-| SSPRK(4,3) | P3 | 132 | 2.43e-3 | 5.9 s | 0.50784 | 1e-4 |
+| Variante | PN | Threads | Schritte | dt | Rechenzeit | L1 gegen Kinetik | Abweichung |
+|---|---|---:|---:|---:|---:|---:|---:|
+| SSPRK3, alte Schranke, Code vor dieser Änderung | P7 | 8 | 394 | 8.14e-4 | 17.2 s | 0.11169 | – |
+| SSPRK3, gleiches dt | P7 | 8 | 394 | 8.14e-4 | 13.2 s | 0.11169 | 1e-11 |
+| SSPRK3, neue Schranke | P7 | 8 | 271 | 1.18e-3 | 9.2 s | 0.11169 | 5e-6 |
+| SSPRK(4,3) | P7 | 8 | 133 | 2.42e-3 | 5.9 s | 0.11169 | 2e-5 |
+| Massenkorrektur | P7 | 8 | 325 | 9.86e-4 | 16.0 s | 0.12439 | |
+| SSPRK(4,3) | P7 | 1 | 133 | 2.42e-3 | 22.7 s | 0.11169 | |
+| Massenkorrektur | P7 | 1 | 325 | 9.86e-4 | 59.5 s | 0.12439 | |
+| SSPRK3, alte Schranke, Code vor dieser Änderung | P3 | 8 | 393 | 8.16e-4 | 10.8 s | 0.50633 | – |
+| SSPRK3, neue Schranke | P3 | 8 | 271 | 1.18e-3 | 6.0 s | 0.50635 | 7e-5 |
+| SSPRK(4,3) | P3 | 8 | 132 | 2.43e-3 | 3.9 s | 0.50634 | 1e-4 |
+| Massenkorrektur | P3 | 8 | 325 | 9.86e-4 | 14.4 s | 0.52416 | |
 
-Die Abweichung ist die relative L1-Differenz der Dichte zum alten Lauf. Sie ist 3 bis 4 Größenordnungen
-kleiner als der Fehler gegen die kinetische Lösung, der Zeitfehler spielt also keine Rolle.
+Abweichung: relative L1-Differenz der Dichte zum alten Lauf. Sie ist 3 bis 4 Größenordnungen kleiner als der
+Fehler gegen die kinetische Lösung; der Zeitfehler spielt keine Rolle. Mit Streuung und Absorption
+(P3, 32², σ_s = 2, σ_a = 0.5) stimmt der Stand bei gleichem dt bis auf 4e-12 mit Merge 60a9343 überein.
 Mit dem Standard-`dt` ändern sich alle bisherigen SSPRK3-Läufe (größerer Schritt); mit `--dt` lassen sie sich
 reproduzieren.
 

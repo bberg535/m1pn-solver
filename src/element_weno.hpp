@@ -47,7 +47,9 @@ struct ElementWenoStats {
     // C1/C2 counters: outward-rounded base bars; boundary nodes whose correction was reduced by the sign condition.
     long outward_bars = 0, sign_limited_nodes = 0;
     double min_sign_factor = 1;
-    // Wall seconds per phase of rate(), accumulated over all calls.
+    // Wall seconds per phase of rate(), accumulated over all calls. t_stabilization = t_gradient_solve +
+    // t_stab_local. The gradient is a line operator and s_h is gathered node by node, so t_gradient_local,
+    // t_gradient_gather and t_residual stay zero (kept for the summary format).
     double t_closure = 0, t_weno = 0, t_stabilization = 0, t_residual = 0, t_boundary = 0;
     double t_mass = 0, t_limiter = 0, t_finish = 0;
     double t_gradient_local = 0, t_gradient_gather = 0, t_gradient_solve = 0, t_stab_local = 0;
@@ -81,6 +83,8 @@ public:
     Vec weno_gamma(const Field &a) const;
     // Exact local reaction exp(-tau R): filter, isotropic scattering, absorption.
     Field angular_filter(const Field &a, double tau) const;
+    // True when angular_filter() changes anything (filter, scattering or absorption).
+    bool reacts() const { return options.filter_strength != 0 || options.sigma_s != 0 || options.sigma_a != 0; }
     // Linear stability of the high-order target: 0.9 * c / rho with rho the spectral radius of
     // M^-1(-C.A - S_gamma), estimated by power iteration for gamma = 0 and gamma = 1 without boundary terms,
     // and c the stability limit of the integrator on the negative real axis (SSPRK3: 2.5127, SSPRK(4,3):
@@ -105,6 +109,7 @@ private:
         Mat shape;       // face nodes x points
         Field points;    // points x d, element reference coordinates
         Vec weights;     // physical surface weights
+        Mat mass;        // face nodes x face nodes, sum_q w_q phi_n phi_m
     };
     struct BoundaryFace {
         int element, direction, side;
@@ -129,6 +134,7 @@ private:
     int stride(int direction) const;
     void element_origin(int element, V3 &origin) const;
     // inflow_rate (optional, nodes): kinetic mass inflow rate int phi_i (-kinetic[0]) >= 0 per boundary node.
+    // `high` is indexed by node (nodes rows) or compactly by boundary_slot_ (boundary_nodes_.size() rows).
     void add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
                       Field &bar, Vec *inflow_rate = nullptr) const;
@@ -139,7 +145,24 @@ private:
         Mat harmonics; // points x q
     };
     std::array<OutRule, 6> out_rules_;
-    Field gather_load(const Field &local) const;
+    Field gather_load(const Field &local, double scale = 1.) const;
+    // M^-1 C_d a along the grid lines of direction d, and the element loads of s_h for given gradients.
+    Field projected_gradient(const Field &a, int direction) const;
+    Field stabilization_load(const Field &a, const Vec &gamma, const std::array<Field, 3> &gradient,
+                             ElementWenoStats * = nullptr) const;
+    // Node-wise gathered -s_h(phi_i, a) plus (optionally) the projected low moments of the element loads.
+    Field stabilization_residual(const Field &a, const Vec &gamma, const std::array<Field, 3> &gradient,
+                                 Field *low, ElementWenoStats * = nullptr) const;
+    void solve_line(double *work, int q) const;
+    // Assembled 1D convection matrix, A_d^T, and row-major element tables (K_e, C_{d,e}^T) for the row kernels.
+    Sparse convection_1d_;
+    std::array<Sparse, 3> flux_t_;
+    std::vector<double> stiffness_rows_;
+    std::array<std::vector<double>, 3> convection_t_rows_;
+    std::array<Mat, 6> boundary_flux_t_; // (A_n - llf_homogeneous)^T per face side
+    // Boundary nodes (compact row index of the PN boundary load) and the distinct (side, node) pairs of the
+    // C6 ghost state; ghost_of_face_ maps (face, face node) to such a pair.
+    std::vector<int> boundary_slot_, boundary_nodes_, ghost_node_, ghost_side_, ghost_of_face_;
     mutable double spectral_radius_ = -1;
 };
 // Exact PN solution for the periodic density sine wave of the accuracy study.
