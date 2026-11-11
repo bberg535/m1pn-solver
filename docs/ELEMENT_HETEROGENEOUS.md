@@ -218,13 +218,28 @@ Einstrahlung. Hier wurde sie nicht verändert, sondern umgangen.
 δ-Strahl. Die Abweichung enthält den Winkelmodellfehler von PN/M1 bei einem δ-Strahl, die Ortsauflösung und den
 Hintergrund 10⁻⁶.
 
-Lokale Ergebnisse siehe `results/element_heterogeneous_20261111/shadow_local/shadow_table.md` (Q2, T = 1.6):
+Lokale Ergebnisse (Q2, T = 1.6, 6 Threads; vollständig in
+`results/element_heterogeneous_20261111/shadow_local/shadow_table.md`, Profile in `shadow_profiles.png`):
+
+| Kennzahl (Referenz) | P3, n=8 → 16 | P7, n=8 → 16 | P11, n=8 → 16 |
+|---|---|---|---|
+| ρ auf der Achse bei x = −0.25, freier Strahl (1), σ = 10 | 0.37 → 0.53 | 0.55 → 0.80 | 0.48 → 0.73 |
+| ρ auf der Achse bei x = 0.5, σ = 10 (exp(−2) = 0.135) | 0.051 → 0.032 | 0.099 → 0.126 | 0.097 → 0.138 |
+| ρ auf der Achse bei x = 0.5, σ = 100 (2e-9) | 0.036 → 0.014 | 0.017 → 0.077 | – |
+| ρ auf der Achse bei x = 0.5, σ = 10⁷ (0) | 0.015 → 0.007 | 0.002 → 0.025 | 0.010 (n=8) |
+| Löserzeit n = 16 | 50–55 s | 101 s | 221 s |
+
+Die relative L1-Abweichung in der Ebene z = 0 (x ∈ [0.2, 0.7]) liegt bei 0.76–1.09. Sie wird von der seitlichen
+Aufweitung des Strahls dominiert und ist auf diesen Gittern noch kein Konvergenzmaß.
 
 - **Stabilität:** Bei allen σ einschließlich 10⁷ ist die Bilanz ≤ 8e-15 und die Kegelmarge ≥ 0. Der steife Fall
   braucht keine Sonderbehandlung, weil die Reaktion exakt integriert wird.
-- **Genauigkeit:** Bei n = 8 (Strahlradius etwa 2.4 Elemente) fällt die Strahldichte auf der Achse schon im freien
-  Raum bei x = −0.25 auf 0.37 (P3) bzw. 0.52–0.55 (P7) statt 1. Der Schatten ist bei P7 deutlich tiefer als bei P3.
-  Ort und Winkelmodell dominieren; quantitative Aussagen erst ab n ≥ 32 (nx).
+- **Genauigkeit:** Bei n = 8 (Strahlradius etwa 2.4 Elemente) fällt die Strahldichte schon im freien Raum stark ab.
+  Mit n = 16 und P ≥ 7 erholt sie sich deutlich (0.80 statt 0.55). P3 bleibt bei etwa 0.53; dort begrenzt das
+  Winkelmodell. Für σ = 10 trifft P11 auf n = 16 die Beer-Lambert-Schattentiefe (0.138 gegen 0.135). Bei σ ≥ 100
+  füllt sich der Schatten seitlich auf (P7, n = 16: 0.025–0.077 statt ≈ 0); der Anteil wächst zunächst mit P, weil
+  der Strahl bei höherem P weniger zerfließt und mehr Dichte am Kugelrand vorbeiträgt. Quantitative Konvergenz erst ab
+  n ≥ 32 (nx).
 - **Stufe B:** Weih et al. zeigen einen nahezu vollständigen Schatten bei 150×50×50 (Lattice-Boltzmann, erster
   Ordnung). Ein quantitativer Vergleich ist nicht möglich (anderes Winkelmodell, Strahlprofil unbekannt) und wird
   nicht behauptet.
@@ -332,7 +347,7 @@ python3 nx/tmp/ew_hetero_paper/study.py submit --campaign "$PWD/nx/tmp/ew_hetero
 | Geometrie mit Elementzahl pro Achse | bestanden (Box = Würfel knotenweise) |
 | Lattice gegen kinetische Referenz | gemessen (P11: −1.8 / +3.4 / +2.0 %) |
 | Lattice gegen historische B-Läufe | ρ_max und Schnitt übereinstimmend; Felder nicht mehr vorhanden |
-| Shadow Stufe A gegen Beer-Lambert | lokal nur grob aufgelöst; quantitativ **nicht untersucht** (nx) |
+| Shadow Stufe A gegen Beer-Lambert | lokal bis n = 16: σ = 10 Schattentiefe P11 0.138 vs 0.135; Konvergenz **nicht untersucht** (nx) |
 | Shadow Stufe B (σ = 10⁷) stabil | bestanden; quantitative Reproduktion nicht behauptet |
 | 3D-Lattice Konvergenz | **nicht untersucht** (nx, Selbstvergleich) |
 | Manufactured Solution mit variablen Koeffizienten im vollen Solver | **nicht untersucht** (Studie §3 nur Reaktion, §4 Zeit) |
