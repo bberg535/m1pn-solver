@@ -41,7 +41,7 @@ python3 scripts/element_weno/nx_convergence.py submit \
 
 **Review `--dry-run` before using `--execute`.** Only `submit --execute` invokes `sbatch`; no automatic background jobs are created by code generation or repository checkout.
 
-The current pack script requests `--constraint=nx`, `--partition=med`, one exclusive 64-core node, 256 GiB and eight hours. It uses four NUMA-aware 16-core slots, two per socket. `--tasks-per-job 4` by default. Source code and executables are copied into each immutable campaign folder and SHA256-checked before every task; commit and exact command arguments are recorded.
+The current pack script requests `--constraint=nx`, `--partition=med`, one exclusive 64-core node, 256 GiB and eight hours. It uses four NUMA-aware 16-core slots, two per socket. `--tasks-per-job 4` by default. To avoid flooding NX with whole-node reservations, the submitter defaults to **one active pack job at a time** using `afterany` dependency chains; `--max-concurrent-packs 2` explicitly opts into two concurrent node-sized packs. Source code and executables are copied into each immutable campaign folder and SHA256-checked before every task; commit and exact command arguments are recorded.
 
 To inspect a single run or reprocess results without cluster submission:
 
@@ -57,7 +57,7 @@ python3 nx/tmp/ew_convergence_smoke/study.py collect \
 
 ## 2. Scientific matrix
 
-The full profile contains 81 independent tasks, organised into:
+The full profile contains **81 independent tasks** (21 in smoke mode), organised into:
 
 | Family | Variable | Reference / caveat |
 |---|---|---|
@@ -95,11 +95,13 @@ Each campaign contains:
 - `REPORT.md`: completion and methodology notes; missing tasks marked explicitly.
 - `figures/*.pdf`, `figures/*.png`, `tables.tex`: publication figures and tables, subject to verifying the classification.
 
-Only runs whose saved checksums, metadata and conical sampled moments validate are admitted to the aggregate tables. Validation is a numerical check, not a proof of exact real-arithmetic cone preservation.
+Only runs whose saved checksums, metadata, Bernstein-coefficient cone margin and conical sampled moments validate are admitted to the aggregate tables. Validation is a numerical check, not a proof of exact real-arithmetic cone preservation.
 
 ## 4. Testing and extension
 
 ~~~bash
+python3 -m py_compile scripts/element_weno/nx_convergence.py \
+  scripts/element_weno/nx_plot_convergence.py tests/test_nx_convergence.py
 python3 -m unittest discover -s tests -p 'test_nx_convergence.py' -v
 ~~~
 
