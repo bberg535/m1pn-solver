@@ -30,6 +30,9 @@ struct ElementWenoOptions {
     // with the filter in the same two half steps; the density is kept by
     // scattering and the M1 cone is preserved.
     double sigma_s = 0, sigma_a = 0;
+    // Time integrator: false = SSPRK3 (Shu-Osher, SSP coefficient 1), true = SSPRK(4,3) (four forward Euler
+    // stages of dt/2, SSP coefficient 2). Both are third order; the filter/reaction half steps are the same.
+    bool ssprk43 = false;
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -57,15 +60,28 @@ public:
     Field rate(double time, const Field &a, ElementWenoStats * = nullptr,
                ElementWenoDebug * = nullptr) const;
     Field advance_ssprk3(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
+    Field advance_ssprk43(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
+    // One step of the integrator selected by options.ssprk43.
+    Field advance(double time, double dt, const Field &a, ElementWenoStats *stats = nullptr) const {
+        return options.ssprk43 ? advance_ssprk43(time, dt, a, stats) : advance_ssprk3(time, dt, a, stats);
+    }
+    // SSP coefficient of the integrator: every stage is a forward Euler step of size dt / ssp_coefficient().
+    double ssp_coefficient() const { return options.ssprk43 ? 2. : 1.; }
+    // Realizability bound of a full step: ssp_coefficient() * dt_bound.
+    double realizability_step() const { return ssp_coefficient() * dt_bound; }
     Vec weno_gamma(const Field &a) const;
     // Exact local reaction exp(-tau R): filter, isotropic scattering, absorption.
     Field angular_filter(const Field &a, double tau) const;
-    // Linear stability of the high-order target under SSPRK3: 0.9*sqrt(3)/rho with
-    // rho the spectral radius of M^-1(-C.A - S_gamma), estimated by power
-    // iteration for gamma = 0 and gamma = 1 without boundary terms. Cached.
+    // Linear stability of the high-order target: 0.9 * c / rho with rho the spectral radius of
+    // M^-1(-C.A - S_gamma), estimated by power iteration for gamma = 0 and gamma = 1 without boundary terms,
+    // and c the stability limit of the integrator on the negative real axis (SSPRK3: 2.5127, SSPRK(4,3):
+    // 5.1495). The largest eigenvalues of the stabilized target are dissipative (close to the negative real
+    // axis); the periodic amplification test in tests/element_weno.cpp checks this. Cached per integrator.
     double high_order_step() const;
     // Step limit used by the drivers: min(realizability bound, high_order_step).
-    double step_bound() const { return std::min(dt_bound, high_order_step()); }
+    double step_bound() const { return std::min(realizability_step(), high_order_step()); }
+    // M^-1(-C.A - S_gamma) a with constant gamma and without boundary terms (the operator of high_order_step).
+    Field linear_operator(const Field &x, double gamma) const;
     Field stabilization_load(const Field &a, const Vec &gamma, ElementWenoStats * = nullptr) const; // s_h^e(phi_i, a) per element
     Field solve_mass(Field rhs) const;
     Field interpolate(const std::function<Vec(const V3 &)> &) const;
@@ -107,8 +123,7 @@ private:
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
                       Field &bar) const;
     Field gather_load(const Field &local) const;
-    Field linear_operator(const Field &x, double gamma) const;
-    mutable double high_order_step_ = -1;
+    mutable double spectral_radius_ = -1;
 };
 // Exact PN solution for the periodic density sine wave of the accuracy study.
 Vec element_weno_smooth_exact(const Angular &, const V3 &x, double t);

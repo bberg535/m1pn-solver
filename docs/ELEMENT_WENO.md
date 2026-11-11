@@ -100,6 +100,46 @@ einmal ausgewerteter konstanter Einstrahldichte, vorab summierte Viskositäten.
 128²-Knoten, P7, p=2: 0.411 → 0.227 s/Schritt (1 Thread), 0.213 → 0.095 s/Schritt
 (8 Threads); Ergebnis gleich bis auf 1e-13. Zum Vergleich braucht die
 Massenkorrektur mit Produktionseinstellungen auf 128²/P7 etwa 0.025 s/Schritt (8 Threads).
+Eine Nachmessung am 11.11.2026 ergab dafür 0.049 s/Schritt (129² Knoten, P7, 8 Threads, Standardwerte von `m1pn_fast`).
+
+## Zeitschritt und SSPRK(4,3) (11.11.2026)
+
+**Hochordnungsschranke.** Bisher galt `high_order_step = 0.9·√3/ρ`, also die Grenze von SSPRK3 auf der
+imaginären Achse. Das ist um den Faktor 1.6 zu vorsichtig. Potenziteration auf dem Verstärkungsoperator
+`R(dt·L)` des periodischen Hochordnungsziels (p = 1..4, P3/P7, γ = 0 und 1) zeigt: Die betragsgrößten
+Eigenwerte sind dissipativ und liegen nahe der negativen reellen Achse. SSPRK3 kippt genau bei `2.5127/ρ`,
+der Grenze von `R₃` auf der reellen Achse. Neu gilt `high_order_step = 0.9·c/ρ` mit `c = 2.5127` (SSPRK3)
+bzw. `c = 5.1495` (SSPRK(4,3)). Der Test `high_order_stability` in `tests/element_weno.cpp` prüft beides:
+kein Wachstum bei `high_order_step`, Wachstum beim 1.25-Fachen der Grenze.
+
+Hinweis: Die Potenziteration läuft auf dem offenen Gitter ohne Randterme. Dieser Operator ist selbst nicht
+dissipativ (scheinbares Wachstum auch bei kleinem dt). Für ρ spielt das keine Rolle, ein Stabilitätstest muss
+aber periodisch rechnen.
+
+**SSPRK(4,3)** (Kraaijevanger; Spiteri und Ruuth), `--time-integrator ssprk43` (`m1pn_fast`) bzw. `--ssprk43`
+(`m1pn_element_weno`): vier Euler-Stufen der Länge dt/2, SSP-Koeffizient 2, dritte Ordnung. Jede Stufe ist ein
+limitierter Euler-Schritt wie bisher; die Realisierbarkeit gilt daher für `dt ≤ 2·dt_bound`
+(`realizability_step()`). Filter, Streuung und Absorption bleiben halbe Schritte vor und nach dem Zeitschritt.
+
+**Overhead.** Der serielle Test `a.allFinite()` zu Beginn von `rate()` und die seriellen Eigen-Linearkombinationen
+der Stufen kosteten mit 8 Threads etwa 25 % der Laufzeit. Beide laufen jetzt zeilenparallel.
+
+Crossing, `T = 0.32`, 129² Knoten (p = 2, 64²), 8 Threads, Standard-`dt`:
+
+| Variante | PN | Schritte | dt | Rechenzeit | L1 gegen Kinetik | Abweichung zu vorher |
+|---|---|---:|---:|---:|---:|---:|
+| SSPRK3, alte Schranke (70fe8bd) | P7 | 394 | 8.14e-4 | 33.9 s | 0.11170 | – |
+| SSPRK3, gleiches dt, neuer Code | P7 | 394 | 8.14e-4 | 28.1 s | 0.11170 | 5e-14 |
+| SSPRK3, neue Schranke | P7 | 271 | 1.18e-3 | 19.1 s | 0.11170 | 5e-6 |
+| SSPRK(4,3) | P7 | 133 | 2.42e-3 | 12.4 s | 0.11170 | 2e-5 |
+| SSPRK3, alte Schranke (70fe8bd) | P3 | 393 | 8.16e-4 | 14.3 s | 0.50783 | – |
+| SSPRK3, neue Schranke | P3 | 271 | 1.18e-3 | 9.0 s | 0.50784 | 7e-5 |
+| SSPRK(4,3) | P3 | 132 | 2.43e-3 | 5.9 s | 0.50784 | 1e-4 |
+
+Die Abweichung ist die relative L1-Differenz der Dichte zum alten Lauf. Sie ist 3 bis 4 Größenordnungen
+kleiner als der Fehler gegen die kinetische Lösung, der Zeitfehler spielt also keine Rolle.
+Mit dem Standard-`dt` ändern sich alle bisherigen SSPRK3-Läufe (größerer Schritt); mit `--dt` lassen sie sich
+reproduzieren.
 
 ## Bauen und ausführen
 

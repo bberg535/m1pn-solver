@@ -553,7 +553,22 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
 }
 Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                         ElementWenoDebug *debug) const {
-    require(a.rows() == nodes && a.cols() == pn.q && a.allFinite(), "Invalid element WENO state");
+    require(a.rows() == nodes && a.cols() == pn.q, "Invalid element WENO state");
+    {
+        // Parallel finiteness check; the serial a.allFinite() cost a quarter of the run time on 8 threads.
+        std::atomic<bool> finite{true};
+        const double *data = a.data();
+        const std::size_t total = std::size_t(nodes) * std::size_t(a.cols()), chunk = 4096;
+        parallel_for(int((total + chunk - 1) / chunk), [&](int k) {
+            const std::size_t begin = std::size_t(k) * chunk, end = std::min(total, begin + chunk);
+            bool ok = true;
+            for (std::size_t i = begin; i < end; ++i)
+                ok &= std::isfinite(data[i]);
+            if (!ok)
+                finite = false;
+        });
+        require(finite.load(), "Invalid element WENO state");
+    }
     const int q = pn.q;
     double clock = seconds();
     ElementWenoStats scratch;
@@ -819,29 +834,31 @@ Field ElementWeno::linear_operator(const Field &x, double gamma_value) const {
     return solve_mass(gather_load(local));
 }
 double ElementWeno::high_order_step() const {
-    if (high_order_step_ > 0)
-        return high_order_step_;
-    std::mt19937 rng(12345);
-    std::uniform_real_distribution<double> uniform(-1, 1);
-    double radius = 0;
-    for (double gamma_value : {0., 1.}) {
-        Field x(nodes, pn.q);
-        for (int i = 0; i < nodes; ++i)
-            for (int c = 0; c < pn.q; ++c)
-                x(i, c) = uniform(rng);
-        x /= x.norm();
-        const int iterations = 60;
-        for (int k = 0; k < iterations; ++k) {
-            Field y = linear_operator(x, gamma_value);
-            const double growth = y.norm();
-            require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed");
-            if (k >= iterations - 15)
-                radius = std::max(radius, growth);
-            x = y / growth;
+    if (spectral_radius_ <= 0) {
+        std::mt19937 rng(12345);
+        std::uniform_real_distribution<double> uniform(-1, 1);
+        double radius = 0;
+        for (double gamma_value : {0., 1.}) {
+            Field x(nodes, pn.q);
+            for (int i = 0; i < nodes; ++i)
+                for (int c = 0; c < pn.q; ++c)
+                    x(i, c) = uniform(rng);
+            x /= x.norm();
+            const int iterations = 60;
+            for (int k = 0; k < iterations; ++k) {
+                Field y = linear_operator(x, gamma_value);
+                const double growth = y.norm();
+                require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed");
+                if (k >= iterations - 15)
+                    radius = std::max(radius, growth);
+                x = y / growth;
+            }
         }
+        spectral_radius_ = radius;
     }
-    high_order_step_ = .9 * std::sqrt(3.) / radius;
-    return high_order_step_;
+    // Negative real axis limits: roots of 1 + z + z^2/2 + z^3/6 = -1 and of 1 + z/2 + z^2/6 + z^3/48 = 0.
+    const double limit = options.ssprk43 ? 5.149486147 : 2.512745327;
+    return .9 * limit / spectral_radius_;
 }
 Field ElementWeno::angular_filter(const Field &a, double tau) const {
     if (options.filter_strength == 0 && options.sigma_s == 0 && options.sigma_a == 0)
@@ -853,27 +870,63 @@ Field ElementWeno::angular_filter(const Field &a, double tau) const {
                              options.sigma_a + (l > 0 ? options.sigma_s : 0.))));
     return a * decay.asDiagonal();
 }
+namespace {
+// Nudges the stored low moments of every node into the M1 cone (rounding only).
+Field admissible_rows(Field x, int nodes, ElementWenoStats *stats) {
+    std::atomic<long> nudged{0};
+    parallel_for(nodes, [&](int i) {
+        Four u = project(x.row(i).transpose());
+        if (nudge_into_cone(u)) {
+            Vec row = x.row(i).transpose();
+            set_low(row, u);
+            x.row(i) = row.transpose();
+            ++nudged;
+        }
+    });
+    if (stats)
+        stats->nudged_states += nudged.load();
+    return x;
+}
+// r <- old * a + fresh * (x + tau * r), row-parallel (the Eigen expression ran on one thread).
+void combine(Field &r, const Field &x, const Field &a, double old, double fresh, double tau, int nodes) {
+    const int q = r.cols();
+    parallel_for(nodes, [&](int i) {
+        double *ri = &r.coeffRef(i, 0);
+        const double *xi = &x.coeffRef(i, 0), *ai = &a.coeffRef(i, 0);
+        if (old == 0)
+            for (int c = 0; c < q; ++c)
+                ri[c] = fresh * (xi[c] + tau * ri[c]);
+        else
+            for (int c = 0; c < q; ++c)
+                ri[c] = old * ai[c] + fresh * (xi[c] + tau * ri[c]);
+    });
+}
+} // namespace
 Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, ElementWenoStats *stats) const {
     const Field a = angular_filter(input, .5 * dt);
-    auto euler = [&](double t, const Field &x) { return Field(x + dt * rate(t, x, stats)); };
-    auto admissible = [&](Field x) {
-        std::atomic<long> nudged{0};
-        parallel_for(nodes, [&](int i) {
-            Four u = project(x.row(i).transpose());
-            if (nudge_into_cone(u)) {
-                Vec row = x.row(i).transpose();
-                set_low(row, u);
-                x.row(i) = row.transpose();
-                ++nudged;
-            }
-        });
-        if (stats)
-            stats->nudged_states += nudged.load();
-        return x;
+    auto stage = [&](double t, const Field &x, double old, double fresh) {
+        Field r = rate(t, x, stats);
+        combine(r, x, a, old, fresh, dt, nodes);
+        return admissible_rows(std::move(r), nodes, stats);
     };
-    const Field first = admissible(euler(time, a));
-    const Field second = admissible(.75 * a + .25 * euler(time + dt, first));
-    return angular_filter(admissible((1. / 3) * a + (2. / 3) * euler(time + .5 * dt, second)), .5 * dt);
+    const Field first = stage(time, a, 0, 1);
+    const Field second = stage(time + dt, first, .75, .25);
+    return angular_filter(stage(time + .5 * dt, second, 1. / 3, 2. / 3), .5 * dt);
+}
+// SSPRK(4,3) (Kraaijevanger; Spiteri and Ruuth): four forward Euler stages of dt/2 at times t, t+dt/2, t+dt,
+// t+dt/2; u3 = 2/3 u + 1/3 (u2 + dt/2 L(u2)). Realizable for dt <= 2 dt_bound.
+Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, ElementWenoStats *stats) const {
+    const Field a = angular_filter(input, .5 * dt);
+    const double half = .5 * dt;
+    auto stage = [&](double t, const Field &x, double old, double fresh) {
+        Field r = rate(t, x, stats);
+        combine(r, x, a, old, fresh, half, nodes);
+        return admissible_rows(std::move(r), nodes, stats);
+    };
+    const Field first = stage(time, a, 0, 1);
+    const Field second = stage(time + half, first, 0, 1);
+    const Field third = stage(time + dt, second, 2. / 3, 1. / 3);
+    return angular_filter(stage(time + half, third, 0, 1), .5 * dt);
 }
 Field ElementWeno::interpolate(const std::function<Vec(const V3 &)> &f) const {
     Field a(nodes, pn.q);

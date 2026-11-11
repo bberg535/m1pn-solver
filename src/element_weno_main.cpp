@@ -12,7 +12,7 @@ struct Args {
     int sample_grid = 0;
     double filter_strength = 0;
     std::string problem = "smooth", output = "tmp/element_weno";
-    bool weno = true, limit = true, stabilize = true;
+    bool weno = true, limit = true, stabilize = true, ssprk43 = false;
 };
 Args parse(int argc, char **argv) {
     Args a;
@@ -39,6 +39,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--output") a.output = next();
         else if (key == "--no-weno") a.weno = false;
         else if (key == "--no-limit") a.limit = false;
+        else if (key == "--ssprk43") a.ssprk43 = true; // SSPRK(4,3) instead of SSPRK3
         else if (key == "--no-stabilization") a.stabilize = false;
         else throw std::runtime_error("Unknown option " + key);
     }
@@ -60,6 +61,7 @@ int main(int argc, char **argv) {
         options.weno_linear = args.weno_linear;
         options.weno_q = args.weno_q;
         options.filter_strength = args.filter_strength;
+        options.ssprk43 = args.ssprk43;
         const bool smooth = args.problem == "smooth";
         options.periodic = smooth;
         Inflow inflow;
@@ -96,7 +98,7 @@ int main(int argc, char **argv) {
         const double start = seconds();
         double t = 0;
         for (int n = 0; n < steps; ++n) {
-            a = scheme.advance_ssprk3(t, dt, a, &stats);
+            a = scheme.advance(t, dt, a, &stats);
             t += dt;
         }
         const double wall = seconds() - start;

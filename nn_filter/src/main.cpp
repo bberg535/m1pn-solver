@@ -59,7 +59,7 @@ Options parse(int argc, char **argv) {
                    "hex|tet|single-tet\n"
                    " --periodic | --mesh FILE --biharmonic-gamma G --biharmonic-boundary "
                    "natural|masked\n"
-                   " --boundary onsager-c1|characteristic-c0 --time-integrator ssprk2|ssprk3\n"
+                   " --boundary onsager-c1|characteristic-c0 --time-integrator ssprk2|ssprk3|ssprk43 (ssprk43: element-weno only)\n"
                    " --case "
                    "smooth|stress|isotropic|vacuum|pure-beam|beam|crossing|plane-source|line-source|shadow|"
                    "lattice|lattice-paul|smooth-beam|vacuum-beam|oblique-beam|crossing-three|crossing-study|crossing-3d\n"
@@ -142,8 +142,8 @@ Options parse(int argc, char **argv) {
             require(v == "onsager-c1" || v == "characteristic-c0", "Invalid boundary model");
             o.num.c0 = v == "characteristic-c0";
         } else if (key == "--time-integrator") {
-            require(v == "ssprk2" || v == "ssprk3", "Invalid time integrator");
-            o.rk = v == "ssprk2" ? 2 : 3;
+            require(v == "ssprk2" || v == "ssprk3" || v == "ssprk43", "Invalid time integrator");
+            o.rk = v == "ssprk2" ? 2 : (v == "ssprk3" ? 3 : 4); // 4 = SSPRK(4,3), element-weno only
             o.rk_explicit = true;
         } else if (key == "--model") {
             require(v == "r2" || v == "legacy", "Invalid model");
@@ -255,7 +255,7 @@ Options parse(int argc, char **argv) {
     }
     if (element_weno) {
         if (!o.rk_explicit) o.rk = 3;
-        require(o.rk == 3, "element-weno uses SSPRK3");
+        require(o.rk == 3 || o.rk == 4, "element-weno uses SSPRK3 or SSPRK(4,3)");
         require(o.coupling == "m1pn", "element-weno has no pn-only coupling");
         require(o.degree >= 1 && o.degree <= 12, "element-weno degree must lie in [1,12]");
         require(o.weno_linear > 0 && o.weno_linear < .5 && o.weno_q >= 1, "Invalid WENO weights");
@@ -509,6 +509,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
     eo.sigma_s = o.sigma_s;
     eo.sigma_a = o.sigma_a;
+    eo.ssprk43 = o.rk == 4;
     ElementWeno scheme(pn, eo, make_inflow(o, dim));
     Field a(scheme.nodes, pn.q);
     for (int i = 0; i < scheme.nodes; ++i) {
@@ -516,7 +517,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         cone_require(exact::cone(project(a.row(i).transpose())), "Initial Bernstein coefficient outside the M1 cone");
     }
     const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.step_bound();
-    require(selected <= scheme.dt_bound * (1 + 1e-12), "Requested dt violates the element realizability bound");
+    require(selected <= scheme.realizability_step() * (1 + 1e-12), "Requested dt violates the element realizability bound");
     if (selected > scheme.high_order_step())
         std::cerr << "warning: dt exceeds the estimated high-order stability step " << scheme.high_order_step() << "\n";
     // Uniform sample grid (Q1 nodes of elements*degree cells per axis).
@@ -564,14 +565,16 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"weno_q\":" << o.weno_q << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
                << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength
                << ",\"sigma_s\":" << o.sigma_s << ",\"sigma_a\":" << o.sigma_a
-               << ",\"reaction_integration\":\"exact_exponential_half_steps_around_ssprk3\""
+               << ",\"reaction_integration\":\"exact_exponential_half_steps_around_ssprk\""
                << ",\"pn_order\":" << pn.order << ",\"Q\":" << pn.q << ",\"dimension\":" << dim
                << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << scheme.nodes
                << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis
                << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":3"
+               << ",\"time_integrator\":" << (eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\"")
                << ",\"case\":" << std::quoted(o.problem) << ",\"inflow\":" << std::quoted(o.inflow)
                << ",\"final_time\":" << o.final_time << ",\"dt_requested\":" << o.dt << ",\"dt_selected\":" << selected
                << ",\"cfl_safety\":" << o.cfl << ",\"element_dt_bound\":" << scheme.dt_bound
+               << ",\"realizability_step\":" << scheme.realizability_step()
                << ",\"high_order_step\":" << scheme.high_order_step()
                << ",\"threads\":" << o.threads << beam_metadata(o, dim)
                << ",\"compiler\":" << std::quoted(__VERSION__) << "\n}\n";
@@ -593,7 +596,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         require(steps < o.max_steps, "Maximum step count exceeded");
         double dt = std::min(selected, o.final_time - t);
         const double start = seconds();
-        a = scheme.advance_ssprk3(t, dt, a, &stats);
+        a = scheme.advance(t, dt, a, &stats);
         solver_seconds += seconds() - start;
         t = (o.final_time - (t + dt) <= 8 * std::numeric_limits<double>::epsilon() * o.final_time) ? o.final_time : t + dt;
         ++steps;
