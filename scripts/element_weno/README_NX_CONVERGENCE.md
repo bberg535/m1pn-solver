@@ -41,7 +41,7 @@ python3 scripts/element_weno/nx_convergence.py submit \
 
 **Review `--dry-run` before using `--execute`.** Only `submit --execute` invokes `sbatch`; no automatic background jobs are created by code generation or repository checkout.
 
-The current pack script requests `--constraint=nx`, `--partition=med`, one exclusive 64-core node, 256 GiB and eight hours. It uses four NUMA-aware 16-core slots, two per socket. `--tasks-per-job 8` by default. Source code and executables are copied into each immutable campaign folder and SHA256-checked before every task; commit and exact command arguments are recorded.
+The current pack script requests `--constraint=nx`, `--partition=med`, one exclusive 64-core node, 256 GiB and eight hours. It uses four NUMA-aware 16-core slots, two per socket. `--tasks-per-job 4` by default. Source code and executables are copied into each immutable campaign folder and SHA256-checked before every task; commit and exact command arguments are recorded.
 
 To inspect a single run or reprocess results without cluster submission:
 
@@ -57,7 +57,7 @@ python3 nx/tmp/ew_convergence_smoke/study.py collect \
 
 ## 2. Scientific matrix
 
-The full profile contains approximately 80 independent tasks, organised into:
+The full profile contains 81 independent tasks, organised into:
 
 | Family | Variable | Reference / caveat |
 |---|---|---|
@@ -67,8 +67,8 @@ The full profile contains approximately 80 independent tasks, organised into:
 | Crossing Beams | P3,P7; Q1,Q2,Q3; E=8,16,32,64 | Kinetic density **and** fixed-PN next-grid self difference reported separately |
 | GHS Line Source | P3,P7; Q1,Q2; E=32,64,128 | Exact infinite-medium reference with documented rescaling: sigma_s=3, T=1/3, Gaussian width 0.01, background 9e-4 |
 | Temporal splitting | Smooth periodic with sigma_s=2,sigma_a=0.5; crossing with sigma_s=2,sigma_a=0.5, filter 0.15 | Fixed grid/PN, dt through dt/16; finest solution is **self reference** |
-| Ablation | WENO on/off; limiter on/off; SSPRK3 vs SSPRK(4,3) | No-limiter failures are valid findings, not silently excluded |
-| Baseline | `m1pn_mass_correction` coupled vs `pn-only`, SSPRK3 | **Different spatial scheme**; interpret cautiously; no unimplemented pure-M1 claim |
+| Ablation | WENO on/off and 1e-3 vs 0.2 weights; limiter on/off; SSPRK3 vs SSPRK(4,3) | No-limiter failures are valid findings, not silently excluded |
+| Baseline | `m1pn_mass_correction` coupled vs `pn-only`, SSPRK3 | **Q1 / 128 elements vs element-WENO Q2 / 64 elements:** same 129² sample points, different spatial scheme; no unimplemented pure-M1 claim |
 
 Production studies use SSPRK(4,3) **explicitly**, `--angular-reduction off` and `--mirror-reduction off` for transparent comparability (optimized variants can be compared in a separate performance campaign). Typical `--cfl .2` and the solver's current feasibility/stability step bound are used; time refinement makes a separate zero-time probe to determine a consistent sequence.
 
