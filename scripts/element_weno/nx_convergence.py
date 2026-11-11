@@ -491,6 +491,17 @@ def collect(ns) -> int:
                         reference, _ = ana.beam_exact(coords, t["time"], config["beam_geometry"])
                         row["error_kinetic_L2"] = rel_norm(physical[:, 0] - reference, reference, mass)["L2"]
                         row["reference"] = "analytic kinetic density (includes PN truncation)"
+                if t["family"] == "line":
+                    ih, initial = read_field(output / "initial.csv")
+                    if ih[:4] != head[:4] or not np.array_equal(
+                            initial[:, :4], final[:, :4]):
+                        raise ValueError("line-source initial/final coordinate mismatch")
+                    initial_rho = ana.physical_low(initial[:, 4:])[:, 0]
+                    # Integral of the Gaussian + background on [0,1]^2,
+                    # exponentially close to 1 + .0009 for width .01.
+                    row["initial_mass_ratio"] = float(
+                        np.sum(mass * initial_rho) / (1. + .0009))
+                    row["initial_mass_relative_error"] = row["initial_mass_ratio"] - 1.
                 if t["family"] == "boundary":
                     z = 2 * math.pi * t["time"]
                     reference = 1. + .2 * np.sin(2 * math.pi * coords[:, 0]) * np.sinc(z / math.pi)
