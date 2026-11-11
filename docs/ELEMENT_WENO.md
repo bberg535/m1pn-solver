@@ -219,6 +219,42 @@ reduzierten Raum ein um bis zu 7e-4 anderes ρ schätzt. Mit gleichem `--dt` sin
 Daten genügt die Stabilität im geraden Teilraum, das kleinere ρ ist also korrekt. Der glatte 1D-Fall
 (P7, p = 3) liefert mit und ohne Reduktion denselben L2-Fehler auf 10 Stellen.
 
+## Spiegelränder und Halb-/Viertelgebiet (11.11.2026)
+
+`ElementWenoOptions::origin`, `length` erlauben das Gebiet `origin + [0, length]^d`. `mirror[2d + side]`
+macht eine Seite zum Spiegel (spekulare Reflexion). Für spiegelsymmetrische Lösungen ist das Galerkin-Verfahren
+auf dem halben Gebiet mit symmetrischen Testfunktionen äquivalent zum vollen Gebiet. Daraus folgt:
+
+- **Keine Randterme an der Spiegelfläche.** Spiegelknoten haben die halbe Masse und den halben Beitrag.
+- **Ungerade Momente auf der Spiegelebene sind null.** Für die Momente, die unter `x_d → −x_d` ungerade sind,
+  wird die konsistente Masse entlang `d` mit Dirichlet-Zeile am Spiegelknoten gelöst (eigene LDLᵀ-Faktorisierung
+  ohne diesen Knoten), für die geraden natürlich. Beim projizierten Gradienten `g_d` ist die Parität vertauscht.
+  Tangentiale Gradienten brauchen nichts, weil die ungeraden Komponenten am Spiegel schon null sind.
+- **Limiter und Low-Order** bleiben elementweise. An Spiegelknoten wird die Rate auf die geraden Momente
+  projiziert. Das Weglassen von `J_d` verkleinert |J| und erhält den Kegel; die Realisierbarkeit gilt also
+  weiter mit derselben Schranke `dt_bound`.
+- **WENO-Sensor:** Der Nachbar hinter dem Spiegel ist das eigene, in `d` gespiegelte Element.
+
+`m1pn_fast --mirror-reduction auto|off` (Standard `auto`): Ist das Netz offen, die Einstrahlung `vacuum`,
+die Elementzahl gerade und sind die Anfangsdaten an allen Knoten des vollen Gitters in jeder Richtung um ½
+spiegelsymmetrisch (`reflect_pn`, Toleranz 1e-14 relativ), rechnet `m1pn_fast` auf `[½, 1]^d` mit halber
+Elementzahl. Das betrifft Line Source (Viertel) und Plane Source (Hälfte), nicht aber das Crossing (Einstrahlung).
+`initial.csv`/`final.csv` werden auf das volle Gitter zurückgespiegelt, `final_density_mass` gilt für das volle
+Gebiet. In `config.json` stehen `mirror_reduction`, `mirror_asymmetry` und `computed_elements_per_axis`.
+
+Tests (`mirror_quarter`): Viertelgebiet gegen Vollgebiet [0,1]² mit symmetrischen, den Limiter aktivierenden Daten:
+gleiche `dt_bound` (2e-16), Rate auf allen gemeinsamen Knoten bis 8e-15, vier SSPRK-Schritte bis 2e-16, Masse
+genau ein Viertel. Auch mit Winkelreduktion, Streuung und SSPRK(4,3).
+
+| Fall | voll | Spiegel | Faktor | Abweichung bei gleichem `--dt` |
+|---|---:|---:|---:|---:|
+| Line Source (GHS), P7, 64 Intervalle | 0.40 s | 0.15 s | 2.7 | 1e-12 |
+| Line Source (GHS), P11, 128 Intervalle | 5.24 s | 1.34 s | 3.9 | – |
+| Plane Source 1D, P7 | 0.056 s | 0.044 s | 1.3 | 5e-12 |
+
+Ohne `--dt` schätzt die Potenziteration auf dem kleineren Gebiet ein etwas anderes ρ (Abweichung der Dichte
+dann 1e-4).
+
 ## Bauen und ausführen
 
     cmake --build tmp/build --target m1pn_element_weno m1pn_element_weno_tests

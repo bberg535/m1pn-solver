@@ -249,6 +249,69 @@ void angular_reduction(int dimension, bool periodic, double filter, double sigma
         check(tilted.dropped_inflow(0) > 1e-3, tag + "out-of-plane beam is detected as odd", tilted.dropped_inflow(0));
     }
 }
+
+// Mirror sides: the quarter domain [1/2,1]^2 with mirrors at x = 1/2 and y = 1/2 reproduces the full domain
+// [0,1]^2 on mirror-symmetric data (rate on every shared node and full SSPRK steps).
+Vec radial_beam(const Angular &pn, const V3 &x) {
+    const V3 r(x[0] - .5, x[1] - .5, 0);
+    const double g = .8 * r.squaredNorm() / (.02 + r.squaredNorm()) * std::exp(-r.squaredNorm() / .1);
+    Vec a = Vec::Zero(pn.q);
+    a[0] = 1e-3 / std::sqrt(4 * pi); // thin background: the limiter is active
+    if (g > 0)
+        a += g * harmonics(pn.order, r.normalized());
+    return a;
+}
+void mirror_quarter(bool reduce, double sigma_s, bool ssprk43) {
+    Angular pn(5);
+    ElementWenoOptions o;
+    o.degree = 2;
+    o.dimension = 2;
+    o.elements = 8;
+    o.periodic = false;
+    o.reduce_angular = reduce;
+    o.sigma_s = sigma_s;
+    o.ssprk43 = ssprk43;
+    ElementWeno full(pn, o);
+    o.elements = 4;
+    o.origin = V3(.5, .5, 0);
+    o.length = .5;
+    o.mirror[0] = o.mirror[2] = true;
+    ElementWeno quarter(pn, o);
+    const std::string tag = std::string("mirror quarter") + (reduce ? " +reduction" : "") +
+                            (sigma_s > 0 ? " +scattering" : "") + (ssprk43 ? " SSPRK(4,3)" : "") + ": ";
+    check(std::abs(quarter.dt_bound / full.dt_bound - 1) < 1e-14, tag + "same realizability bound",
+          quarter.dt_bound / full.dt_bound - 1);
+    Field a = full.interpolate([&](const V3 &x) { return radial_beam(pn, x); });
+    Field b = quarter.interpolate([&](const V3 &x) { return radial_beam(pn, x); });
+    const int shift = full.per_direction / 2;
+    auto compare = [&](const Field &f, const Field &g) {
+        double worst = 0;
+        for (int j = 0; j < quarter.per_direction; ++j)
+            for (int i = 0; i < quarter.per_direction; ++i)
+                worst = std::max(worst, (f.row((j + shift) * full.per_direction + i + shift) -
+                                         g.row(j * quarter.per_direction + i)).cwiseAbs().maxCoeff());
+        return worst;
+    };
+    const double scale = maxabs(a);
+    ElementWenoStats stats;
+    const double rate_error = compare(full.rate(0, a, &stats), quarter.rate(0, b));
+    check(rate_error < 1e-11 * std::max(1., scale), tag + "rate equals the full domain on shared nodes", rate_error);
+    check(stats.limited_elements > 0, tag + "the limiter is active in the test", double(stats.limited_elements));
+    const double dt = .5 * std::min(full.step_bound(), quarter.step_bound());
+    for (int n = 0; n < 4; ++n) {
+        a = full.advance(n * dt, dt, a);
+        b = quarter.advance(n * dt, dt, b);
+    }
+    const double step_error = compare(a, b);
+    check(step_error < 1e-11 * std::max(1., scale), tag + "four steps equal the full domain", step_error);
+    double mass_full = 0, mass_quarter = 0;
+    for (int i = 0; i < full.nodes; ++i)
+        mass_full += full.lumped[i] * a(i, 0);
+    for (int i = 0; i < quarter.nodes; ++i)
+        mass_quarter += quarter.lumped[i] * b(i, 0);
+    check(std::abs(mass_full - 4 * mass_quarter) < 1e-13 * mass_full, tag + "quarter mass is a quarter of the total",
+          std::abs(mass_full - 4 * mass_quarter));
+}
 } // namespace
 int main() {
     try {
@@ -266,6 +329,9 @@ int main() {
         angular_reduction(2, true, 0, 0);
         angular_reduction(1, true, 0, 0);
         angular_reduction(2, false, 20, 2);
+        mirror_quarter(false, 0, false);
+        mirror_quarter(true, 0, false);
+        mirror_quarter(true, 3, true);
         for (int p = 1; p <= 4; ++p) {
             high_order_stability(p, false);
             high_order_stability(p, true);

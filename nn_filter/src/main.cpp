@@ -21,6 +21,7 @@ namespace {
 struct Options {
     std::string filter_mode = "off", filter_model;
     std::string angular_reduction = "auto"; // element-weno: auto|on|off (parity reduction in 1D/2D)
+    std::string mirror_reduction = "auto";  // element-weno: auto|off (half/quarter domain for mirror-symmetric cases)
     double filter_strength = 0;
     MeshSpec mesh;
     Numerics num;
@@ -85,6 +86,8 @@ Options parse(int argc, char **argv) {
                    "   --element-limit on|off (uniform Cartesian hex mesh, SSPRK3, constant filter only)\n"
                    "   --angular-reduction auto|on|off (1D/2D: drop PN moments odd in the unresolved directions;\n"
                    "     auto = on when initial and inflow data are even, otherwise off)\n"
+                   "   --mirror-reduction auto|off (open mesh, vacuum inflow, even elements, initial data mirror-\n"
+                   "     symmetric about x_d = 1/2 in every direction: compute on [1/2,1]^d with mirror sides)\n"
 #ifdef M1PN_FAST_DEFAULTS
                    "defaults: --stabilization m1pn_mass_correction --time-integrator ssprk2 --cfl 1 --dt 0\n"
                    "  --mass-mode lumped --kv-gamma 0 --threads <OpenMP maximum>\n"
@@ -236,6 +239,9 @@ Options parse(int argc, char **argv) {
             o.degree = integer();
         } else if (key == "--weno-linear") {
             o.weno_linear = real();
+        } else if (key == "--mirror-reduction") {
+            require(v == "auto" || v == "off", "Invalid --mirror-reduction");
+            o.mirror_reduction = v;
         } else if (key == "--angular-reduction") {
             require(v == "auto" || v == "on" || v == "off", "Invalid --angular-reduction");
             o.angular_reduction = v;
@@ -517,6 +523,42 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     eo.sigma_s = o.sigma_s;
     eo.sigma_a = o.sigma_a;
     eo.ssprk43 = o.rk == 4;
+    // Mirror reduction: the solution is symmetric about x_d = 1/2 in every direction when the initial data are
+    // (checked at every node of the full grid, with the reflected PN moments) and the inflow is vacuum. Then
+    // [1/2,1]^d with mirror sides at x_d = 1/2 gives the full solution (tests/element_weno.cpp, mirror_quarter).
+    bool mirrored = false;
+    double mirror_asymmetry = 0;
+    if (o.mirror_reduction == "auto" && !o.mesh.periodic && o.inflow == "vacuum" && o.mesh.elements % 2 == 0 &&
+        o.sigma_s >= 0) {
+        const int per = o.mesh.elements * o.degree + 1;
+        int total = 1;
+        for (int d = 0; d < dim; ++d) total *= per;
+        double scale = 0;
+        for (int i = 0; i < total; ++i) {
+            V3 x = V3::Zero();
+            for (int d = 0, k = i; d < dim; ++d, k /= per) x[d] = double(k % per) / (per - 1);
+            const Vec u = initial_point(o, x, i, dim, pn);
+            scale = std::max(scale, u.cwiseAbs().maxCoeff());
+            for (int d = 0; d < dim; ++d) {
+                V3 y = x;
+                y[d] = 1 - x[d];
+                mirror_asymmetry = std::max(mirror_asymmetry,
+                                            (reflect_pn(pn, initial_point(o, y, i, dim, pn), d) - u).cwiseAbs().maxCoeff());
+            }
+        }
+        mirrored = mirror_asymmetry <= 1e-14 * std::max(1., scale);
+        if (mirrored) {
+            eo.elements = o.mesh.elements / 2;
+            eo.length = .5;
+            for (int d = 0; d < dim; ++d) {
+                eo.origin[d] = .5;
+                eo.mirror[2 * d] = true;
+            }
+        } else
+            std::cerr << "note: mirror reduction off (initial data asymmetry " << mirror_asymmetry << ")\n";
+    }
+    double domain_factor = 1; // full mass / computed mass
+    for (int d = 0; d < dim && mirrored; ++d) domain_factor *= 2;
     // Angular parity reduction: exact when the initial and inflow data are even in the unresolved directions.
     // auto checks both (initial coefficients of every node, inflow datum term at nine times in [0, T]).
     eo.reduce_angular = dim < 3 && o.angular_reduction != "off";
@@ -581,9 +623,16 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         for (int k = 0; k < pn.q; ++k) f << ",u" << k;
         f << "\n";
         for (int s = 0; s < samples; ++s) {
-            const Vec active_values = scheme.evaluate(state, where[s]);
+            // Mirror reduction: evaluate at the reflected point and reflect the moments back.
+            V3 x = where[s];
+            std::array<bool, 3> flip{};
+            for (int d = 0; d < dim && mirrored; ++d)
+                if (x[d] < .5) x[d] = 1 - x[d], flip[d] = true;
+            const Vec active_values = scheme.evaluate(state, x);
             Vec u = Vec::Zero(pn.q);
             for (int k = 0; k < scheme.moments; ++k) u[scheme.active[k]] = active_values[k];
+            for (int d = 0; d < dim; ++d)
+                if (flip[d]) u = reflect_pn(pn, u, d);
             f << s << "," << where[s][0] << "," << where[s][1] << "," << where[s][2];
             for (int k = 0; k < pn.q; ++k) f << "," << u[k];
             f << "\n";
@@ -604,6 +653,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"sigma_s\":" << o.sigma_s << ",\"sigma_a\":" << o.sigma_a
                << ",\"reaction_integration\":\"exact_exponential_half_steps_around_ssprk\""
                << ",\"pn_order\":" << pn.order << ",\"Q\":" << pn.q << ",\"dimension\":" << dim
+               << ",\"mirror_reduction\":" << (mirrored ? "true" : "false")
+               << ",\"mirror_reduction_mode\":" << std::quoted(o.mirror_reduction)
+               << ",\"mirror_asymmetry\":" << mirror_asymmetry << ",\"computed_elements_per_axis\":" << eo.elements
                << ",\"angular_reduction\":" << (eo.reduce_angular ? "true" : "false")
                << ",\"angular_reduction_mode\":" << std::quoted(o.angular_reduction)
                << ",\"active_moments\":" << scheme.moments << ",\"odd_initial_fraction\":" << odd_initial
@@ -652,6 +704,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     progress("completed", t, steps);
     double mass0 = 0;
     for (int i = 0; i < scheme.nodes; ++i) mass0 += scheme.lumped[i] * project(a.row(i).transpose())[0];
+    mass0 *= domain_factor;
     struct rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
     std::ofstream result(o.output + "/summary.json");

@@ -105,7 +105,8 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     require(o.sigma_s >= 0 && o.sigma_a >= 0 && std::isfinite(o.sigma_s) && std::isfinite(o.sigma_a),
             "Invalid scattering or absorption coefficient");
     const int p = degree, one = p + 1;
-    h = 1. / elements;
+    require(o.length > 0 && std::isfinite(o.length), "Invalid element WENO domain length");
+    h = o.length / elements;
     per_direction = elements * p + (o.periodic ? 0 : 1);
     nodes = cells = local_nodes = 1;
     for (int d = 0; d < dimension; ++d) {
@@ -149,6 +150,31 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     std::vector<int> slot(pn.q, -1);
     for (int k = 0; k < moments; ++k)
         slot[active[k]] = k;
+    // Parity of every active moment under x_d -> -x_d, for the mirror sides.
+    for (int d = 0; d < dimension; ++d) {
+        require(!(o.mirror[2 * d] && o.mirror[2 * d + 1]), "At most one mirror side per direction");
+        if (o.mirror[2 * d] || o.mirror[2 * d + 1]) {
+            require(!o.periodic && !o.symmetric_residual, "Mirror sides need an open mesh and the standard residual");
+            mirror_index_[d] = o.mirror[2 * d] ? 0 : -2; // the high end is set once per_direction is known
+        }
+        reflect_odd_[d].assign(moments, 0);
+        double even = 0, odd = 0;
+        for (const V3 &w : {V3(.37, -.52, .77), V3(-.61, .29, .44), V3(.13, .81, -.35)}) {
+            const V3 u = w.normalized();
+            V3 m = u;
+            m[d] = -m[d];
+            const Vec y = harmonics(pn.order, u), r = harmonics(pn.order, m);
+            for (int k = 0; k < moments; ++k) {
+                const double e = std::abs(y[active[k]] + r[active[k]]), od = std::abs(y[active[k]] - r[active[k]]);
+                reflect_odd_[d][k] = reflect_odd_[d][k] || (e < od);
+                even = std::max(even, std::min(e, od) / std::max(e, od));
+                (void)odd;
+            }
+        }
+        require(even < 1e-12, "Spherical harmonic without definite reflection parity");
+    }
+    for (int side = 2 * dimension; side < 6; ++side)
+        require(!o.mirror[side], "Mirror side beyond the dimension");
     // Restriction of a full q x q matrix to the active moments. Exactness needs that the matrix never couples
     // even and odd moments (odd ones vanish for even data, including the kept odd M1 moments).
     auto restrict_square = [&](const Mat &full, const char *what) {
@@ -257,6 +283,8 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 else if (o.periodic)
                     neighbors_[e * 2 * dimension + 2 * d + side] =
                         e + ((next + elements) % elements - id[d]) * powers[d];
+                else if (o.mirror[2 * d + side])
+                    neighbors_[e * 2 * dimension + 2 * d + side] = -2; // the mirrored element itself
                 else
                     faces_.push_back({e, d, side});
             }
@@ -327,14 +355,66 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     {
         Eigen::SparseMatrix<double> L = mass_1d_.matrixL();
         L.makeCompressed();
-        factor_outer_.assign(L.outerIndexPtr(), L.outerIndexPtr() + per_direction + 1);
-        factor_inner_.assign(L.innerIndexPtr(), L.innerIndexPtr() + L.nonZeros());
-        factor_values_.assign(L.valuePtr(), L.valuePtr() + L.nonZeros());
+        natural_.n = per_direction;
+        natural_.outer.assign(L.outerIndexPtr(), L.outerIndexPtr() + per_direction + 1);
+        natural_.inner.assign(L.innerIndexPtr(), L.innerIndexPtr() + L.nonZeros());
+        natural_.values.assign(L.valuePtr(), L.valuePtr() + L.nonZeros());
         const Vec diagonal = mass_1d_.vectorD(); // returned by value
-        factor_diagonal_.assign(diagonal.data(), diagonal.data() + per_direction);
-        factor_perm_.resize(per_direction);
+        natural_.diagonal.assign(diagonal.data(), diagonal.data() + per_direction);
+        natural_.perm.resize(per_direction);
+        natural_.line.resize(per_direction);
+        for (int k = 0; k < per_direction; ++k) {
+            natural_.perm[k] = mass_1d_.permutationP().indices()[k];
+            natural_.line[k] = k;
+        }
+    }
+    // Mirror directions: the same 1D mass without the row and column of the mirror node (Dirichlet rows for the
+    // components that are odd under the reflection), the mirror nodes and the mirrored local numbering.
+    for (int d = 0; d < dimension; ++d) {
+        reflected_local_[d].resize(local_nodes);
+        for (int l = 0; l < local_nodes; ++l) {
+            int x = l, mirrored = 0, scale = 1;
+            for (int k = 0; k < dimension; ++k, x /= one, scale *= one)
+                mirrored += (k == d ? p - x % one : x % one) * scale;
+            reflected_local_[d][l] = mirrored;
+        }
+        if (mirror_index_[d] == -1)
+            continue;
+        if (mirror_index_[d] == -2)
+            mirror_index_[d] = per_direction - 1;
+        const int removed = mirror_index_[d];
+        std::vector<int> keep;
         for (int k = 0; k < per_direction; ++k)
-            factor_perm_[k] = mass_1d_.permutationP().indices()[k];
+            if (k != removed)
+                keep.push_back(k);
+        const Mat dense = Mat(m1d);
+        Eigen::SparseMatrix<double> reduced_mass(keep.size(), keep.size());
+        {
+            std::vector<Eigen::Triplet<double>> entries;
+            for (std::size_t a = 0; a < keep.size(); ++a)
+                for (std::size_t b = 0; b < keep.size(); ++b)
+                    if (dense(keep[a], keep[b]) != 0)
+                        entries.emplace_back(a, b, dense(keep[a], keep[b]));
+            reduced_mass.setFromTriplets(entries.begin(), entries.end());
+        }
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> factor(reduced_mass);
+        require(factor.info() == Eigen::Success, "Dirichlet Bernstein mass factorization failed");
+        Eigen::SparseMatrix<double> L = factor.matrixL();
+        L.makeCompressed();
+        LineFactor &f = dirichlet_[d];
+        f.n = keep.size();
+        f.outer.assign(L.outerIndexPtr(), L.outerIndexPtr() + f.n + 1);
+        f.inner.assign(L.innerIndexPtr(), L.innerIndexPtr() + L.nonZeros());
+        f.values.assign(L.valuePtr(), L.valuePtr() + L.nonZeros());
+        const Vec diagonal = factor.vectorD();
+        f.diagonal.assign(diagonal.data(), diagonal.data() + f.n);
+        f.perm.resize(f.n);
+        f.line = keep;
+        for (int k = 0; k < f.n; ++k)
+            f.perm[k] = factor.permutationP().indices()[k];
+        for (int i = 0; i < nodes; ++i)
+            if ((i / stride(d)) % per_direction == removed)
+                mirror_nodes_[d].push_back(i);
     }
     if (!o.periodic) {
         const auto [fx, fw] = unit_gauss(p + pn.order + 3);
@@ -477,61 +557,97 @@ void ElementWeno::element_origin(int element, V3 &origin) const {
     origin = V3::Zero();
     int x = element;
     for (int d = 0; d < dimension; ++d, x /= elements)
-        origin[d] = (x % elements) * h;
+        origin[d] = options.origin[d] + (x % elements) * h;
 }
 V3 ElementWeno::node_position(int node) const {
     V3 x = V3::Zero();
     int value = node;
     for (int d = 0; d < dimension; ++d, value /= per_direction)
-        x[d] = (value % per_direction) * h / degree;
+        x[d] = options.origin[d] + (value % per_direction) * h / degree;
     return x;
 }
 // P^T L D L^T P x = b for one grid line, applied to whole rows (all PN components) at once.
 // On entry work[perm[k]] holds b_k, on exit x_k.
-void ElementWeno::solve_line(double *work, int q) const {
-    for (int j = 0; j < per_direction; ++j) {
+void ElementWeno::solve_line(const LineFactor &f, double *work, int q) const {
+    for (int j = 0; j < f.n; ++j) {
         const double *yj = &work[std::size_t(j) * q];
-        for (int k = factor_outer_[j]; k < factor_outer_[j + 1]; ++k) {
-            const int i = factor_inner_[k];
+        for (int k = f.outer[j]; k < f.outer[j + 1]; ++k) {
+            const int i = f.inner[k];
             if (i == j) continue;
-            const double l = factor_values_[k];
+            const double l = f.values[k];
             double *yi = &work[std::size_t(i) * q];
             for (int c = 0; c < q; ++c) yi[c] -= l * yj[c];
         }
     }
-    for (int j = 0; j < per_direction; ++j) {
-        const double inv = 1. / factor_diagonal_[j];
+    for (int j = 0; j < f.n; ++j) {
+        const double inv = 1. / f.diagonal[j];
         double *yj = &work[std::size_t(j) * q];
         for (int c = 0; c < q; ++c) yj[c] *= inv;
     }
-    for (int j = per_direction - 1; j >= 0; --j) {
+    for (int j = f.n - 1; j >= 0; --j) {
         double *yj = &work[std::size_t(j) * q];
-        for (int k = factor_outer_[j]; k < factor_outer_[j + 1]; ++k) {
-            const int i = factor_inner_[k];
+        for (int k = f.outer[j]; k < f.outer[j + 1]; ++k) {
+            const int i = f.inner[k];
             if (i == j) continue;
-            const double l = factor_values_[k];
+            const double l = f.values[k];
             const double *yi = &work[std::size_t(i) * q];
             for (int c = 0; c < q; ++c) yj[c] -= l * yi[c];
         }
     }
 }
-Field ElementWeno::solve_mass(Field b) const {
-    require(b.rows() == nodes, "Mass solve size mismatch");
-    const int q = b.cols();
-    for (int d = 0; d < dimension; ++d) {
-        const int s = stride(d), lines = nodes / per_direction;
+void ElementWeno::solve_lines(Field &b, int d, bool gradient) const {
+    const int q = b.cols(), s = stride(d), lines = nodes / per_direction;
+    if (mirror_index_[d] < 0 || q != moments) {
         parallel_for(lines, [&](int line) {
-            int low = line % s, high = (line / s) * (s * per_direction);
-            const int start = high + low;
+            const int start = (line / s) * (s * per_direction) + line % s;
             thread_local std::vector<double> work;
             work.resize(std::size_t(per_direction) * q);
             for (int k = 0; k < per_direction; ++k)
-                std::copy_n(&b.coeffRef(start + k * s, 0), q, &work[std::size_t(factor_perm_[k]) * q]);
-            solve_line(work.data(), q);
+                std::copy_n(&b.coeffRef(start + k * s, 0), q, &work[std::size_t(natural_.perm[k]) * q]);
+            solve_line(natural_, work.data(), q);
             for (int k = 0; k < per_direction; ++k)
-                std::copy_n(&work[std::size_t(factor_perm_[k]) * q], q, &b.coeffRef(start + k * s, 0));
+                std::copy_n(&work[std::size_t(natural_.perm[k]) * q], q, &b.coeffRef(start + k * s, 0));
         });
+        return;
     }
+    std::array<std::vector<int>, 2> groups; // [0] natural (even), [1] Dirichlet at the mirror node (odd)
+    for (int c = 0; c < q; ++c)
+        groups[bool(reflect_odd_[d][c]) != gradient].push_back(c);
+    parallel_for(lines, [&](int line) {
+        const int start = (line / s) * (s * per_direction) + line % s;
+        thread_local std::vector<double> work;
+        for (int g = 0; g < 2; ++g) {
+            const std::vector<int> &comps = groups[g];
+            const int width = comps.size();
+            if (width == 0)
+                continue;
+            const LineFactor &f = g ? dirichlet_[d] : natural_;
+            work.resize(std::size_t(f.n) * width);
+            for (int r = 0; r < f.n; ++r) {
+                const double *row = &b.coeffRef(start + f.line[r] * s, 0);
+                double *w = &work[std::size_t(f.perm[r]) * width];
+                for (int k = 0; k < width; ++k)
+                    w[k] = row[comps[k]];
+            }
+            solve_line(f, work.data(), width);
+            for (int r = 0; r < f.n; ++r) {
+                double *row = &b.coeffRef(start + f.line[r] * s, 0);
+                const double *w = &work[std::size_t(f.perm[r]) * width];
+                for (int k = 0; k < width; ++k)
+                    row[comps[k]] = w[k];
+            }
+            if (g) {
+                double *row = &b.coeffRef(start + mirror_index_[d] * s, 0);
+                for (int c : comps)
+                    row[c] = 0;
+            }
+        }
+    });
+}
+Field ElementWeno::solve_mass(Field b) const {
+    require(b.rows() == nodes, "Mass solve size mismatch");
+    for (int d = 0; d < dimension; ++d)
+        solve_lines(b, d, false);
     return b;
 }
 // Consistent L2 projection of d u_h / d x_d. Mass and convection matrices are tensor products of the
@@ -543,12 +659,29 @@ Field ElementWeno::projected_gradient(const Field &a, int d) const {
     const int *outer = convection_1d_.outerIndexPtr(), *inner = convection_1d_.innerIndexPtr();
     const double *value = convection_1d_.valuePtr();
     const double *data = a.data();
+    if (mirror_index_[d] >= 0 && q == moments) {
+        // Mirror in d: the banded product C_1d along d, then the split natural/Dirichlet solve.
+        parallel_for(lines, [&](int line) {
+            const int start = (line / s) * (s * per_direction) + line % s;
+            for (int k = 0; k < per_direction; ++k) {
+                double *__restrict y = &out.coeffRef(start + k * s, 0);
+                std::fill_n(y, q, 0.);
+                for (int e = outer[k]; e < outer[k + 1]; ++e) {
+                    const double c = value[e];
+                    const double *x = data + std::size_t(start + inner[e] * s) * q;
+                    for (int j = 0; j < q; ++j) y[j] += c * x[j];
+                }
+            }
+        });
+        solve_lines(out, d, true);
+        return out;
+    }
     parallel_for(lines, [&](int line) {
         const int start = (line / s) * (s * per_direction) + line % s;
         thread_local std::vector<double> work;
         work.resize(std::size_t(per_direction) * q);
         for (int k = 0; k < per_direction; ++k) {
-            double *__restrict y = &work[std::size_t(factor_perm_[k]) * q];
+            double *__restrict y = &work[std::size_t(natural_.perm[k]) * q];
             std::fill_n(y, q, 0.);
             for (int e = outer[k]; e < outer[k + 1]; ++e) {
                 const double c = value[e];
@@ -557,9 +690,9 @@ Field ElementWeno::projected_gradient(const Field &a, int d) const {
                 for (int j = 0; j < q; ++j) y[j] += c * x[j];
             }
         }
-        solve_line(work.data(), q);
+        solve_line(natural_, work.data(), q);
         for (int k = 0; k < per_direction; ++k)
-            std::copy_n(&work[std::size_t(factor_perm_[k]) * q], q, &out.coeffRef(start + k * s, 0));
+            std::copy_n(&work[std::size_t(natural_.perm[k]) * q], q, &out.coeffRef(start + k * s, 0));
     });
     return out;
 }
@@ -606,10 +739,10 @@ Vec ElementWeno::weno_gamma(const Field &a) const {
         for (int d = 0; d < dimension; ++d)
             for (int side = 0; side < 2; ++side) {
                 const int next = neighbors_[e * 2 * dimension + 2 * d + side];
-                if (next < 0)
+                if (next == -1)
                     continue;
-                for (int l = 0; l < n; ++l)
-                    other[l] = density[connectivity_[next * n + l]];
+                for (int l = 0; l < n; ++l) // -2: mirror side, the neighbour is this element reflected in d
+                    other[l] = density[next >= 0 ? connectivity_[next * n + l] : connectivity_[e * n + reflected_local_[d][l]]];
                 candidates.col(++m).noalias() = extension_[d][side] * other;
             }
         Eigen::Matrix<double, Eigen::Dynamic, 1, 0, 7, 1> smoothness(m + 1), weights(m + 1);
@@ -1156,6 +1289,16 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     parallel_for(nodes, [&](int i) {
         set_low(Eigen::Map<Vec>(&high_rate.coeffRef(i, 0), q), Four(load.row(i).transpose()) / lumped[i]);
     });
+    // Mirror planes: moments odd under the reflection vanish (the full scheme's two mirrored halves cancel).
+    // Dropping J_d from a cone state keeps it in the cone, so the realizability argument is unchanged.
+    for (int d = 0; d < dimension; ++d)
+        if (mirror_index_[d] >= 0)
+            parallel_for(int(mirror_nodes_[d].size()), [&](int k) {
+                double *row = &high_rate.coeffRef(mirror_nodes_[d][k], 0);
+                for (int c = 0; c < q; ++c)
+                    if (reflect_odd_[d][c])
+                        row[c] = 0;
+            });
     lap(timing.t_finish);
     if (debug) {
         debug->ho_moment_rate = moment_rate;
@@ -1379,7 +1522,7 @@ Vec ElementWeno::evaluate(const Field &a, const V3 &x) const {
     int element = 0, scale = 1;
     Vec ref(dimension);
     for (int d = 0; d < dimension; ++d, scale *= elements) {
-        double s = x[d] / h;
+        double s = (x[d] - options.origin[d]) / h;
         int id = std::min(elements - 1, std::max(0, int(std::floor(s))));
         ref[d] = s - id;
         element += id * scale;
@@ -1417,6 +1560,27 @@ double ElementWeno::l2_density_error(const Field &a, const std::function<double(
         }
     }
     return std::sqrt(sum);
+}
+Vec reflect_pn(const Angular &pn, const Vec &full, int direction) {
+    require(full.size() == pn.q && direction >= 0 && direction < 3, "reflect_pn: invalid input");
+    static thread_local std::vector<std::vector<double>> cache(3);
+    static thread_local int cached_order = -1;
+    if (cached_order != pn.order) {
+        for (int d = 0; d < 3; ++d) {
+            cache[d].assign(pn.q, 1.);
+            const V3 u = V3(.37, -.52, .77).normalized();
+            V3 m = u;
+            m[d] = -m[d];
+            const Vec y = harmonics(pn.order, u), r = harmonics(pn.order, m);
+            for (int k = 0; k < pn.q; ++k)
+                cache[d][k] = std::abs(y[k] - r[k]) > std::abs(y[k] + r[k]) ? -1. : 1.;
+        }
+        cached_order = pn.order;
+    }
+    Vec out = full;
+    for (int k = 0; k < pn.q; ++k)
+        out[k] *= cache[direction][k];
+    return out;
 }
 Vec element_weno_smooth_exact(const Angular &pn, const V3 &x, double t) {
     Eigen::SelfAdjointEigenSolver<Mat> eig(pn.normal(V3::UnitX()));

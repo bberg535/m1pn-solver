@@ -44,6 +44,15 @@ struct ElementWenoOptions {
     // the resolved directions never couple even and odd moments (checked at construction). The moments with
     // l <= 1 are always kept, so the M1 part (closure, limiter, boundary bar states) is unchanged.
     bool reduce_angular = false;
+    // Domain origin + [0, length]^d (default: the unit cube).
+    V3 origin = V3::Zero();
+    double length = 1;
+    // Mirror sides, index 2 * direction + side (side 0 = low end): specular reflection instead of a physical
+    // boundary. For mirror-symmetric data the scheme equals the full scheme on the mirrored domain: no flux on
+    // the mirror face, moments odd under the reflection vanish on the mirror plane (Dirichlet rows of the
+    // consistent mass for those components), and the WENO neighbour across the mirror is the mirrored element.
+    // At most one mirror side per direction; not with periodic meshes or the symmetric residual form.
+    std::array<bool, 6> mirror{};
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -142,9 +151,23 @@ private:
     std::unique_ptr<CanonicalC1> canonical_;
     std::array<std::unique_ptr<Boundary>, 6> boundaries_;
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> mass_1d_;
-    // The same LDL^T factor in plain arrays, for row-wise multi-component solves.
-    std::vector<int> factor_outer_, factor_inner_, factor_perm_;
-    std::vector<double> factor_values_, factor_diagonal_;
+    // LDL^T factors of the 1D mass in plain arrays, for row-wise multi-component line solves. `line[r]` is the
+    // position on the grid line of factor row r. natural_: all nodes; dirichlet_[d]: without the mirror node.
+    struct LineFactor {
+        int n = 0;
+        std::vector<int> outer, inner, perm, line;
+        std::vector<double> values, diagonal;
+    };
+    LineFactor natural_;
+    std::array<LineFactor, 3> dirichlet_;
+    std::array<int, 3> mirror_index_{-1, -1, -1};   // grid-line position of the mirror node per direction
+    std::array<std::vector<char>, 3> reflect_odd_;  // per active moment: odd under x_d -> -x_d
+    std::array<std::vector<int>, 3> mirror_nodes_;  // nodes on the mirror plane of direction d
+    std::array<std::vector<int>, 3> reflected_local_; // local node index mirrored in direction d
+    void solve_line(const LineFactor &, double *work, int q) const;
+    // In place along direction d: natural solve, or (mirror in d) Dirichlet solve for the components that are
+    // odd under the reflection; `gradient` flips the parity (d/dx_d of an even field is odd).
+    void solve_lines(Field &b, int direction, bool gradient) const;
     int stride(int direction) const;
     void element_origin(int element, V3 &origin) const;
     // inflow_rate (optional, nodes): kinetic mass inflow rate int phi_i (-kinetic[0]) >= 0 per boundary node.
@@ -167,7 +190,6 @@ private:
     // Node-wise gathered -s_h(phi_i, a) plus (optionally) the projected low moments of the element loads.
     Field stabilization_residual(const Field &a, const Vec &gamma, const std::array<Field, 3> &gradient,
                                  Field *low, ElementWenoStats * = nullptr) const;
-    void solve_line(double *work, int q) const;
     // Assembled 1D convection matrix, A_d^T, and row-major element tables (K_e, C_{d,e}^T) for the row kernels.
     Sparse convection_1d_;
     std::array<Sparse, 3> flux_t_;
@@ -181,6 +203,8 @@ private:
     std::vector<int> boundary_slot_, boundary_nodes_, ghost_node_, ghost_side_, ghost_of_face_;
     mutable double spectral_radius_ = -1;
 };
+// PN moments of the reflected distribution psi(R_d omega): moments odd under x_d -> -x_d change sign.
+Vec reflect_pn(const Angular &, const Vec &full, int direction);
 // Exact PN solution for the periodic density sine wave of the accuracy study.
 Vec element_weno_smooth_exact(const Angular &, const V3 &x, double t);
 } // namespace m1pn
