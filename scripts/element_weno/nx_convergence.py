@@ -282,8 +282,11 @@ def hetero_flags(t: dict, output: Path, threads: int, end, dt, cfl):
         if t.get("skip_fields"):
             args.append("--skip-fields")
     else:
+        # Path B checks an internal memory budget (default too small for P11 on 112^2; ew_hetero_paper failed
+        # with "Memory budget exceeded"); 48 GiB as in the line-source campaign, below the 64 GiB per 16-core slot.
         args += ["--coupling", t.get("coupling", "m1pn"), "--mass-mode", "lumped",
-                 "--pn-viscosity-scale", "1", "--kv-gamma", "0", "--biharmonic-gamma", "0"]
+                 "--pn-viscosity-scale", "1", "--kv-gamma", "0", "--biharmonic-gamma", "0",
+                 "--memory-mib", "49152"]
     return args
 
 
@@ -336,6 +339,12 @@ def flags(t: dict, output: Path, threads: int, *, end=None, dt=None, cfl=None):
 
 def prepare(ns) -> int:
     tasks = make_tasks(ns.profile)
+    if getattr(ns, "only", None):
+        # Supplementary campaign (e.g. recovery of failed tasks): a subset of the profile, same labels and settings.
+        unknown = set(ns.only) - {t["label"] for t in tasks}
+        if unknown:
+            raise ValueError("unknown task labels: " + ", ".join(sorted(unknown)))
+        tasks = [t for t in tasks if t["label"] in set(ns.only)]
     print(f"{ns.profile}: {len(tasks)} tasks; groups: "
           + ", ".join(sorted(set(t["family"] for t in tasks))))
     if ns.dry_run:
@@ -1068,6 +1077,7 @@ def main() -> int:
     p.add_argument("--fast-bin", type=Path, default=ROOT / "tmp/build/m1pn_fast")
     p.add_argument("--standalone-bin", type=Path, default=ROOT / "tmp/build/m1pn_element_weno")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--only", nargs="+", help="freeze only these task labels (supplementary/recovery campaign)")
     p.set_defaults(action=prepare)
     p = sub.add_parser("plan", help="resource plan of a profile (dry, no files)")
     p.add_argument("--profile", choices=["smoke", "paper", *HETERO_PROFILES], default="hetero-paper")

@@ -134,6 +134,12 @@ class HeterogeneousProfiles(unittest.TestCase):
             self.assertGreater(t["estimate_core_hours"], 0)
             self.assertIn(t["slot_cores"], (16, 32))
 
+    def test_path_b_tasks_carry_memory_budget(self):
+        for t in study.make_tasks("hetero-paper"):
+            opts = study.flags(t, Path("/tmp/out"), 16)
+            if t["stabilization"] == "m1pn_mass_correction":
+                self.assertEqual(opts[opts.index("--memory-mib") + 1], "49152", t["label"])
+
     def test_required_files(self):
         shadow = next(t for t in study.make_tasks("hetero-smoke") if t["kind"] == "shadow")
         self.assertIn("slices.csv", study.required_files(shadow))
