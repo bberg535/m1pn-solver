@@ -67,7 +67,8 @@ def task(family: str, binary: str, case: str, inflow: str, dim: int,
          n: int, p: int, pn: int, end: float, *, kind="spatial",
          sigma_s=0., sigma_a=0., filter_strength=0., weno=True,
          limiter=True, rk="ssprk43", periodic=False, dt_level=None,
-         reference=False, linear=1e-3, tag="", cfl=.2):
+         reference=False, linear=1e-3, tag="", cfl=.2,
+         stabilization="element-weno"):
     label = "_".join(str(x) for x in
                      (family, f"P{pn}", f"p{p}", f"E{n}",
                       ("dt" + str(dt_level)) if dt_level is not None else
@@ -77,7 +78,7 @@ def task(family: str, binary: str, case: str, inflow: str, dim: int,
                 pn_order=pn, time=end, sigma_s=sigma_s, sigma_a=sigma_a,
                 filter_strength=filter_strength, weno=weno, limiter=limiter,
                 rk=rk, periodic=periodic, dt_level=dt_level, reference=reference,
-                weno_linear=linear, cfl=cfl)
+                weno_linear=linear, cfl=cfl, stabilization=stabilization)
 
 
 def make_tasks(profile: str) -> list[dict]:
@@ -192,7 +193,9 @@ def flags(t: dict, output: Path, threads: int, *, end=None, dt=None, cfl=None):
         args += ["--pulse-width", ".07", "--background", ".001"]
     if t["case"] == "line-source":
         args += ["--pulse-width", ".01", "--background", ".0009"]
-    if t.get("stabilization") == "element-weno":
+    # Every task carries "stabilization" explicitly (smoke 2026-11-11: a missing key silently dropped
+    # --weno/--element-limit/--weno-linear and passed mass-correction options to element-WENO runs).
+    if t["stabilization"] == "element-weno":
         args += ["--weno", "on" if t["weno"] else "off",
                  "--element-limit", "on" if t["limiter"] else "off",
                  "--weno-linear", str(t["weno_linear"])]
@@ -363,6 +366,8 @@ def run(ns) -> int:
                    config.get("weno") is not t["weno"] or \
                    config.get("element_limit") is not t["limiter"]:
                     raise ValueError("element-WENO configuration mismatch")
+                if abs(float(config.get("weno_linear", -1)) - float(t["weno_linear"])) > 1e-15:
+                    raise ValueError("WENO linear weight mismatch")
                 if abs(float(config.get("sigma_s", -1)) - t["sigma_s"]) > 1e-12 or \
                    abs(float(config.get("sigma_a", -1)) - t["sigma_a"]) > 1e-12:
                     raise ValueError("reaction coefficients mismatch")

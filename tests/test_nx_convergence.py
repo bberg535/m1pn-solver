@@ -75,6 +75,23 @@ class CampaignPlan(unittest.TestCase):
         opts = study.flags(weno[0], Path("/tmp/results"), 16)
         self.assertEqual(opts[opts.index("--weno-linear") + 1], "0.2")
 
+    def test_every_element_weno_task_passes_its_weno_flags(self):
+        # Regression of the 2026-11-11 smoke failure: element-WENO options must reach the solver for all tasks.
+        for profile in ("smoke", "paper"):
+            for t in study.make_tasks(profile):
+                if t["binary"] != "fast":
+                    continue
+                opts = study.flags(t, Path("/tmp/out"), 16)
+                if t["stabilization"] == "element-weno":
+                    self.assertEqual(opts[opts.index("--weno") + 1], "on" if t["weno"] else "off", t["label"])
+                    self.assertEqual(opts[opts.index("--element-limit") + 1],
+                                     "on" if t["limiter"] else "off", t["label"])
+                    self.assertEqual(float(opts[opts.index("--weno-linear") + 1]), t["weno_linear"], t["label"])
+                    self.assertNotIn("--mass-mode", opts, t["label"])
+                else:
+                    self.assertNotIn("--weno", opts, t["label"])
+                    self.assertIn("--mass-mode", opts, t["label"])
+
     def test_solver_flags_split_reaction(self):
         t = next(t for t in study.make_tasks("paper") if t["family"] == "time_crossing")
         opts = study.flags(t, Path("/tmp/output"), 16, end=0.,
