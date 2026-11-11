@@ -22,6 +22,12 @@ struct ElementWenoOptions {
     double element_theta = .999;       // theta of report Section 6.2
     double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
     double viscosity_scale = 1;
+    // Boundary/sensor corrections of docs/BOUNDARY_FIXES.md. All false reproduces commit 8efe517 bit for bit.
+    bool vacuum_sign_limit = true;      // C2: accepted boundary mass rate may not exceed max(low-order rate, kinetic inflow)
+    bool outward_bar_rounding = true;   // C1: directed (outward) rounding of the stable base bar, counted, <= 8 ulp, never a floor
+    bool fullsphere_ghost = true;       // C6: M1 ghost = incoming kinetic moments + outgoing moments of the positive PN trace
+    bool scale_invariant_weno = true;   // C5: epsilon of the WENO weights is relative to the stencil scale
+    bool symmetric_residual = false;    // L3 alternative: symmetric PSD residual form of s_h (changes the operator for varying gamma)
     // Constant angular filter of nn_filter: d a_lm/dt = -sigma (l/(N+1))^4 a_lm,
     // half a step before and after each SSPRK3 step. Zero switches it off.
     double filter_strength = 0;
@@ -38,6 +44,9 @@ struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
     double max_raw_zero_sum = 0, max_limited_zero_sum = 0;
     long limited_elements = 0, limited_boundary_nodes = 0, nudged_states = 0;
+    // C1/C2 counters: outward-rounded base bars; boundary nodes whose correction was reduced by the sign condition.
+    long outward_bars = 0, sign_limited_nodes = 0;
+    double min_sign_factor = 1;
     // Wall seconds per phase of rate(), accumulated over all calls.
     double t_closure = 0, t_weno = 0, t_stabilization = 0, t_residual = 0, t_boundary = 0;
     double t_mass = 0, t_limiter = 0, t_finish = 0;
@@ -119,9 +128,17 @@ private:
     std::vector<double> factor_values_, factor_diagonal_;
     int stride(int direction) const;
     void element_origin(int element, V3 &origin) const;
+    // inflow_rate (optional, nodes): kinetic mass inflow rate int phi_i (-kinetic[0]) >= 0 per boundary node.
     void add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                      Field &bar) const;
+                      Field &bar, Vec *inflow_rate = nullptr) const;
+    // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state.
+    struct OutRule {
+        Field omega;   // points x 3
+        Vec weight;
+        Mat harmonics; // points x q
+    };
+    std::array<OutRule, 6> out_rules_;
     Field gather_load(const Field &local) const;
     mutable double spectral_radius_ = -1;
 };

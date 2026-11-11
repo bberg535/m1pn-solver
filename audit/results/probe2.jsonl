@@ -1,0 +1,6 @@
+{"test":"PROBE2_T3_faces","face":0,"n_x":-1,"n_y":0,"ext_minus_u":1.3787683045469437e-14,"u":10.718793371050857,"integrand_norm":1.0124920177682069e-14}
+{"test":"PROBE2_T3_faces","face":1,"n_x":1,"n_y":0,"ext_minus_u":9.9028315187519768e-15,"u":10.718793371050857,"integrand_norm":6.9024317965341074e-15}
+{"test":"PROBE2_T3_faces","face":2,"n_x":0,"n_y":-1,"ext_minus_u":0.077827767874439013,"u":10.718793371050857,"integrand_norm":0.064389000898224441}
+{"test":"PROBE2_T3_faces","face":3,"n_x":0,"n_y":1,"ext_minus_u":0.077827767874438403,"u":10.718793371050857,"integrand_norm":0.064389000898223941}
+{"test":"PROBE2_T3_boundary_high","max_abs_bh":0.00758831652816018,"max_abs_bl":0.68067840827778991}
+{"test":"PROBE2_T3_rate","max_abs_rate":1.5426601130190509,"max_abs_ho_moment_rate":2.1643291099457516,"max_abs_ho_rate_rows_ge4":0}

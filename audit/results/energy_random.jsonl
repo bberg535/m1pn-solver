@@ -1,0 +1,9 @@
+{"test":"A_discrete_face_energy_random","pn_order":3,"degree":1,"max_rate_over_N2":-0.90722339067959179,"max_rate_over_trace_L2":-0.24112381500395774,"min_rate_over_trace_L2":-0.37471434982813395}
+{"test":"A_discrete_face_energy_random","pn_order":3,"degree":2,"max_rate_over_N2":-1.4505987504981606,"max_rate_over_trace_L2":-0.25012192993462773,"min_rate_over_trace_L2":-0.37694724982278222}
+{"test":"A_discrete_face_energy_random","pn_order":3,"degree":3,"max_rate_over_N2":-1.9260290506108133,"max_rate_over_trace_L2":-0.23855159373340223,"min_rate_over_trace_L2":-0.36630079265144289}
+{"test":"A_discrete_face_energy_random","pn_order":5,"degree":1,"max_rate_over_N2":-1.1001128300294976,"max_rate_over_trace_L2":-0.29151409807559159,"min_rate_over_trace_L2":-0.38568013839521403}
+{"test":"A_discrete_face_energy_random","pn_order":5,"degree":2,"max_rate_over_N2":-1.640480736835725,"max_rate_over_trace_L2":-0.29663158301140702,"min_rate_over_trace_L2":-0.3858304382315883}
+{"test":"A_discrete_face_energy_random","pn_order":5,"degree":3,"max_rate_over_N2":-1.6447609612603706,"max_rate_over_trace_L2":-0.28565888558872271,"min_rate_over_trace_L2":-0.37393743243082295}
+{"test":"A_discrete_face_energy_random","pn_order":7,"degree":1,"max_rate_over_N2":-1.0743836510910192,"max_rate_over_trace_L2":-0.30709458863127992,"min_rate_over_trace_L2":-0.39189315737020619}
+{"test":"A_discrete_face_energy_random","pn_order":7,"degree":2,"max_rate_over_N2":-1.7451859077708667,"max_rate_over_trace_L2":-0.31364560618595666,"min_rate_over_trace_L2":-0.38545384629829738}
+{"test":"A_discrete_face_energy_random","pn_order":7,"degree":3,"max_rate_over_N2":-1.8297094307073987,"max_rate_over_trace_L2":-0.31646111746176797,"min_rate_over_trace_L2":-0.38958861839087483}

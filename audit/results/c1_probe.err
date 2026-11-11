@@ -1,0 +1,2 @@
+terminate called after throwing an instance of 'm1pn::StepRejected'
+  what():  Stable M1 base bar outside stored binary64 cone

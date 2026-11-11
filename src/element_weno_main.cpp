@@ -12,7 +12,7 @@ struct Args {
     int sample_grid = 0;
     double filter_strength = 0;
     std::string problem = "smooth", output = "tmp/element_weno";
-    bool weno = true, limit = true, stabilize = true, ssprk43 = false;
+    bool weno = true, limit = true, stabilize = true, legacy_boundary = false, symmetric_residual = false, ssprk43 = false;
 };
 Args parse(int argc, char **argv) {
     Args a;
@@ -41,6 +41,8 @@ Args parse(int argc, char **argv) {
         else if (key == "--no-limit") a.limit = false;
         else if (key == "--ssprk43") a.ssprk43 = true; // SSPRK(4,3) instead of SSPRK3
         else if (key == "--no-stabilization") a.stabilize = false;
+        else if (key == "--legacy-boundary") a.legacy_boundary = true; // commit 8efe517 behaviour (docs/BOUNDARY_FIXES.md)
+        else if (key == "--symmetric-residual") a.symmetric_residual = true;
         else throw std::runtime_error("Unknown option " + key);
     }
     require(a.problem == "smooth" || a.problem == "crossing-study", "Problem must be smooth or crossing-study");
@@ -60,6 +62,9 @@ int main(int argc, char **argv) {
         options.stabilize = args.stabilize;
         options.weno_linear = args.weno_linear;
         options.weno_q = args.weno_q;
+        if (args.legacy_boundary)
+            options.vacuum_sign_limit = options.outward_bar_rounding = options.fullsphere_ghost = options.scale_invariant_weno = false;
+        options.symmetric_residual = args.symmetric_residual;
         options.filter_strength = args.filter_strength;
         options.ssprk43 = args.ssprk43;
         const bool smooth = args.problem == "smooth";
