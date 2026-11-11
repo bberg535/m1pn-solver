@@ -367,7 +367,6 @@ def run(ns) -> int:
                     raise ValueError("filter mode mismatch")
             if t["kind"] == "temporal" and abs(float(config["dt_selected"]) - dt) > 1e-12 * max(1., dt):
                 raise ValueError("requested temporal dt changed")
-        outcome["status"] = "completed"
         outcome["summary_sha256"] = digest(output / "summary.json")
         outcome["final_sha256"] = digest(output / "final.csv")
         outcome["file_sha256"] = {
@@ -380,7 +379,9 @@ def run(ns) -> int:
             "summary.json", "final.csv", "config.json", "initial.csv", "nodal_mass.csv")
         if not all(name in outcome["file_sha256"] for name in required):
             raise ValueError("required saved-field files are missing")
+        outcome["status"] = "completed"
     except Exception as error:
+        outcome["status"] = "failed"
         outcome["error"] = str(error)
     atomic(status, outcome)
     print(t["label"], outcome["status"], "in", round(elapsed, 2), "s")
@@ -427,7 +428,11 @@ def collect(ns) -> int:
             failures.append((label, status.get("error", status.get("status"))))
             continue
         try:
-            for name, expected in status.get("file_sha256", {}).items():
+            required = {"summary.json", "final.csv"} if t["binary"] == "standalone" else {
+                "summary.json", "final.csv", "config.json", "initial.csv", "nodal_mass.csv"}
+            if not required.issubset(status.get("file_sha256", {})):
+                raise ValueError("missing saved-field digests")
+            for name, expected in status["file_sha256"].items():
                 if digest(output / name) != expected:
                     raise ValueError("saved field changed after run: " + name)
             if digest(output / "summary.json") != status["summary_sha256"] or \
