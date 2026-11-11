@@ -5,6 +5,7 @@
 #include "filter.hpp"
 #include "element_weno.hpp"
 #include "hardware.hpp"
+#include "benchmark_cases.hpp"
 #include <memory>
 #include <filesystem>
 #include <malloc.h>
@@ -12,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <random>
 #include <sstream>
 #include <sys/resource.h>
 #ifdef _OPENMP
@@ -22,7 +24,11 @@ namespace {
 struct Options {
     std::string filter_mode = "off", filter_model;
     std::string angular_reduction = "auto"; // element-weno: auto|on|off (parity reduction in 1D/2D)
-    std::string mirror_reduction = "auto";  // element-weno: auto|off (half/quarter domain for mirror-symmetric cases)
+    std::string mirror_reduction = "auto";
+    // Heterogeneous element-WENO cases (lattice-paul, lattice-3d, shadow-weih).
+    double shadow_sigma = 1e7, beam_density = 1;
+    int material_subcells = 0, history_stride = 0;
+    bool skip_fields = false;  // element-weno: auto|off (half/quarter domain for mirror-symmetric cases)
     double filter_strength = 0;
     MeshSpec mesh;
     Numerics num;
@@ -89,6 +95,9 @@ Options parse(int argc, char **argv) {
                    "   --element-limit on|off (uniform Cartesian hex mesh, SSPRK3, constant filter only)\n"
                    "   --angular-reduction auto|on|off (1D/2D: drop PN moments odd in the unresolved directions;\n"
                    "     auto = on when initial and inflow data are even, otherwise off)\n"
+                   "   cases lattice-paul (2D, (0,7)^2), lattice-3d (3D, (0,7)^3), shadow-weih (3D, --inflow shadow-beam)\n"
+                   "   --shadow-sigma S (sphere absorption, default 1e7) --beam-density B --material-subcells K\n"
+                   "   --history-stride S (ledger rows) --skip-fields (no initial/final sample fields)\n"
                    "   --mirror-reduction auto|off (open mesh, vacuum inflow, even elements, initial data mirror-\n"
                    "     symmetric about x_d = 1/2 in every direction: compute on [1/2,1]^d with mirror sides)\n"
 #ifdef M1PN_FAST_DEFAULTS
@@ -105,6 +114,10 @@ Options parse(int argc, char **argv) {
         }
         if (key == "--material-jump") {
             o.jump = true;
+            continue;
+        }
+        if (key == "--skip-fields") {
+            o.skip_fields = true;
             continue;
         }
         if (key == "--deterministic") {
@@ -246,6 +259,17 @@ Options parse(int argc, char **argv) {
             o.degree = integer();
         } else if (key == "--weno-linear") {
             o.weno_linear = real();
+        } else if (key == "--shadow-sigma") {
+            o.shadow_sigma = std::stod(v);
+            require(o.shadow_sigma >= 0 && std::isfinite(o.shadow_sigma), "Invalid --shadow-sigma");
+        } else if (key == "--beam-density") {
+            o.beam_density = std::stod(v);
+            require(o.beam_density >= 0 && std::isfinite(o.beam_density), "Invalid --beam-density");
+        } else if (key == "--material-subcells") {
+            o.material_subcells = std::stoi(v);
+            require(o.material_subcells >= 0, "Invalid --material-subcells");
+        } else if (key == "--history-stride") {
+            o.history_stride = std::stoi(v);
         } else if (key == "--mirror-reduction") {
             require(v == "auto" || v == "off", "Invalid --mirror-reduction");
             o.mirror_reduction = v;
@@ -374,6 +398,13 @@ Inflow make_inflow(const Options &o, int dimension) {
         g.atoms=[three,w](const V3&x,double t){auto p=[w](const V3&d){return std::exp(-d.squaredNorm()/(2*w*w));};
             std::vector<Atom> a{{V3::UnitX(),p(x-t*V3::UnitX()-V3(.3,.5,three?.5:0))},{V3::UnitY(),p(x-t*V3::UnitY()-V3(.5,.3,three?.5:0))}};
             if(three)a.push_back({V3::UnitZ(),p(x-t*V3::UnitZ()-V3(.5,.5,.3))}); return a;};
+    } else if (o.inflow == "shadow-beam") {
+        // Plane wave along +x (density beam_density) over the whole boundary; it enters only through x = -0.75
+        // (w.n < 0 there, w.n = 0 on the side faces); isotropic background density o.background elsewhere.
+        const double bg = o.background, rho_b = o.beam_density;
+        g.density = [bg](const V3 &, double, const V3 &) { return bg / (4 * pi); };
+        g.constant_density = bg / (4 * pi);
+        g.atoms = [rho_b](const V3 &, double) { return std::vector<Atom>{{V3::UnitX(), rho_b}}; };
     } else if (o.inflow == "matching") {
         Vec u = matching(o.order);
         g.density = [u, n = o.order](const V3 &, double, const V3 &w) {
@@ -455,6 +486,8 @@ Vec initial_point(const Options &o, const V3 &x, int i, int dimension, const Ang
         }
         else if (o.problem == "shadow" || o.problem == "lattice" || o.problem == "lattice-paul")
             a[0] = (o.problem=="lattice-paul"?o.background:.01) / std::sqrt(4 * pi);
+        else if (o.problem == "lattice-3d" || o.problem == "shadow-weih")
+            a[0] = o.background / std::sqrt(4 * pi); // isotropic background, no initial beam
         else
             throw std::runtime_error("Unknown case: " + o.problem);
         return a;
@@ -512,15 +545,73 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     const int dim = o.mesh.dimension;
     require(o.mesh.file.empty() && !o.mesh.tetrahedra && !o.mesh.single_tet,
             "element-weno needs the generated Cartesian hex mesh");
-    require(o.problem != "lattice" && o.problem != "lattice-paul" && o.problem != "shadow" &&
-                o.source == 0 && !o.jump && o.anisotropy == 0,
-            "element-weno supports only constant isotropic scattering and absorption, no sources");
+    require(o.problem != "lattice" && o.problem != "shadow" && o.source == 0 && !o.jump && o.anisotropy == 0,
+            "element-weno: use lattice-paul, lattice-3d or shadow-weih for heterogeneous material; no other sources");
     if (o.problem == "crossing-study" || o.inflow == "crossing-study-transport")
         require(dim == 2, "crossing-study is 2D");
+    // ---- Case geometry and material (src/benchmark_cases.hpp; docs/ELEMENT_HETEROGENEOUS.md) -------------------
+    // Box origin + h (count_x, count_y, count_z) with cubic cells; `--elements n` is the count per unit-cube axis,
+    // per length-7 axis (lattices) or per 0.5 (shadow, whose x axis then has 3n elements).
+    V3 origin = V3::Zero();
+    std::array<int, 3> counts{o.mesh.elements, dim > 1 ? o.mesh.elements : 1, dim > 2 ? o.mesh.elements : 1};
+    double length_x = 1;
+    std::shared_ptr<ElementWenoMaterial> material;
+    std::string expected_integrals = "null";
+    const bool lattice2d = o.problem == "lattice-paul", lattice3d = o.problem == "lattice-3d",
+               shadow = o.problem == "shadow-weih";
+    if (lattice2d || lattice3d || shadow)
+        require(o.sigma_s == 0 && o.sigma_a == 0, "This case owns its material coefficients");
+    if (lattice2d) {
+        require(dim == 2 && o.mesh.elements % 7 == 0, "lattice-paul is 2D with elements divisible by 7");
+        require(o.inflow == "vacuum" && std::abs(o.background - 1e-10) <= 1e-16,
+                "lattice-paul: vacuum inflow and Paul's initial density --background 1e-10 ((47))");
+        length_x = 7;
+        material = std::make_shared<ElementWenoMaterial>();
+        material->sigma_a = [](const V3 &x) { return cases::lattice_paul_absorber(x[0], x[1]) ? 10. : 0.; };
+        material->sigma_s = [](const V3 &x) { return cases::lattice_paul_absorber(x[0], x[1]) ? 0. : 1.; };
+        material->source = [](const V3 &x) { return cases::lattice_paul_source(x[0], x[1]) ? 1. : 0.; };
+        material->name = "lattice-paul (44)-(45)";
+        expected_integrals = "{\"volume\":49,\"source\":1,\"sigma_a\":110,\"sigma_s\":38}";
+    } else if (lattice3d) {
+        require(dim == 3 && o.mesh.elements % 7 == 0, "lattice-3d is 3D with elements divisible by 7");
+        require(o.inflow == "vacuum", "lattice-3d uses vacuum inflow");
+        length_x = 7;
+        material = std::make_shared<ElementWenoMaterial>();
+        material->sigma_a = cases::lattice3d_sigma_a;
+        material->sigma_s = cases::lattice3d_sigma_s;
+        material->source = cases::lattice3d_source;
+        material->name = "lattice-3d extension";
+        const auto c = cases::lattice3d_counts();
+        std::ostringstream e;
+        e << std::setprecision(17) << "{\"volume\":" << c.volume << ",\"source\":" << c.source << ",\"sigma_a\":" << c.sigma_a
+          << ",\"sigma_s\":" << c.sigma_s << ",\"absorbing_cells\":" << c.absorbing
+          << ",\"strong_scattering_cells\":" << c.strong_scattering << ",\"scattering_cells\":" << c.scattering << "}";
+        expected_integrals = e.str();
+    } else if (shadow) {
+        require(dim == 3, "shadow-weih is 3D");
+        require(o.inflow == "shadow-beam", "shadow-weih uses --inflow shadow-beam");
+        origin = V3(cases::shadow_x0, -.25, -.25);
+        counts = {3 * o.mesh.elements, o.mesh.elements, o.mesh.elements};
+        length_x = 1.5;
+        material = std::make_shared<ElementWenoMaterial>();
+        const double sigma = o.shadow_sigma;
+        material->sigma_a = [sigma](const V3 &x) { return cases::shadow_inside(x) ? sigma : 0.; };
+        material->name = "shadow-weih sphere";
+        std::ostringstream e;
+        e << std::setprecision(17) << "{\"volume\":0.375,\"source\":0,\"sigma_a\":" << sigma * 4 * pi / 3 * std::pow(.1, 3)
+          << ",\"sigma_s\":0}";
+        expected_integrals = e.str();
+    }
+    if (material)
+        material->subcells = o.material_subcells > 0 ? o.material_subcells : (shadow ? 4 : 1);
     ElementWenoOptions eo;
     eo.degree = o.degree;
     eo.dimension = dim;
-    eo.elements = o.mesh.elements;
+    eo.elements = counts[0];
+    eo.elements_per_axis = {counts[0], dim > 1 ? counts[1] : 0, dim > 2 ? counts[2] : 0};
+    eo.origin = origin;
+    eo.length = length_x;
+    eo.material = material;
     eo.periodic = o.mesh.periodic;
     eo.weno = o.weno;
     eo.limit = o.element_limit;
@@ -530,47 +621,144 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     eo.sigma_s = o.sigma_s;
     eo.sigma_a = o.sigma_a;
     eo.ssprk43 = o.rk == 4;
-    // Mirror reduction: the solution is symmetric about x_d = 1/2 in every direction when the initial data are
-    // (checked at every node of the full grid, with the reflected PN moments) and the inflow is vacuum. Then
-    // [1/2,1]^d with mirror sides at x_d = 1/2 gives the full solution (tests/element_weno.cpp, mirror_quarter).
-    bool mirrored = false;
+    const double h = length_x / counts[0];
+    V3 extent = V3::Zero(), center = V3::Zero();
+    for (int d = 0; d < dim; ++d) extent[d] = h * counts[d], center[d] = origin[d] + .5 * extent[d];
+    const Inflow inflow = make_inflow(o, dim);
+    // ---- Mirror reduction per direction about the box centre ----------------------------------------------------
+    // Exact for mirror-symmetric problems (tests/element_weno.cpp, mirror_quarter). Required per direction d:
+    // even element count, open mesh, initial data symmetric at every node of the full grid (reflected PN moments),
+    // material sigma_a, sigma_s, q0 symmetric at every point of the material quadrature (or a dense sample), and
+    // inflow data symmetric: density(Rx, t, R w) = density(x, t, w) and atoms(Rx, t) = R atoms(x, t) on all faces.
+    std::array<bool, 3> mirror_dir{};
+    std::array<std::string, 3> mirror_reason{"", "", ""};
     double mirror_asymmetry = 0;
-    if (o.mirror_reduction == "auto" && !o.mesh.periodic && o.inflow == "vacuum" && o.mesh.elements % 2 == 0 &&
-        o.sigma_s >= 0) {
-        const int per = o.mesh.elements * o.degree + 1;
-        int total = 1;
-        for (int d = 0; d < dim; ++d) total *= per;
-        double scale = 0;
-        for (int i = 0; i < total; ++i) {
+    if (o.mirror_reduction == "auto" && !o.mesh.periodic) {
+        const int pd = o.degree;
+        std::array<int, 3> per{1, 1, 1};
+        long total = 1;
+        for (int d = 0; d < dim; ++d) per[d] = counts[d] * pd + 1, total *= per[d];
+        auto node_x = [&](long i) {
             V3 x = V3::Zero();
-            for (int d = 0, k = i; d < dim; ++d, k /= per) x[d] = double(k % per) / (per - 1);
-            const Vec u = initial_point(o, x, i, dim, pn);
-            scale = std::max(scale, u.cwiseAbs().maxCoeff());
+            long k = i;
             for (int d = 0; d < dim; ++d) {
-                V3 y = x;
-                y[d] = 1 - x[d];
-                mirror_asymmetry = std::max(mirror_asymmetry,
-                                            (reflect_pn(pn, initial_point(o, y, i, dim, pn), d) - u).cwiseAbs().maxCoeff());
+                x[d] = origin[d] + extent[d] * double(k % per[d]) / (per[d] - 1);
+                k /= per[d];
+            }
+            return x;
+        };
+        // Material sample: composite quadrature points of the material rule (capped; above the cap a deterministic
+        // pseudo-random sample of 2e6 points is used and recorded).
+        std::vector<V3> material_points;
+        std::string material_check = "none";
+        if (material) {
+            const auto [gx, gw] = gauss(o.degree + 4);
+            const int sub = material->subcells, pts = int(gx.size()) * sub;
+            long elements_total = 1;
+            for (int d = 0; d < dim; ++d) elements_total *= counts[d];
+            long points_total = elements_total;
+            for (int d = 0; d < dim; ++d) points_total *= pts;
+            auto point = [&](long e, long qp) {
+                V3 x = V3::Zero();
+                for (int d = 0; d < dim; ++d) {
+                    const int ie = int(e % counts[d]), iq = int(qp % pts);
+                    e /= counts[d], qp /= pts;
+                    x[d] = origin[d] + h * (ie + (iq / int(gx.size()) + (gx[iq % gx.size()] + 1) / 2) / sub);
+                }
+                return x;
+            };
+            long per_element = points_total / elements_total;
+            if (points_total <= 20000000) {
+                material_check = "full_quadrature";
+                for (long e = 0; e < elements_total; ++e)
+                    for (long qp = 0; qp < per_element; ++qp) material_points.push_back(point(e, qp));
+            } else {
+                material_check = "sampled_2e6";
+                std::mt19937_64 rng(2026);
+                std::uniform_int_distribution<long> pe(0, elements_total - 1), pq(0, per_element - 1);
+                for (int k = 0; k < 2000000; ++k) material_points.push_back(point(pe(rng), pq(rng)));
             }
         }
-        mirrored = mirror_asymmetry <= 1e-14 * std::max(1., scale);
-        if (mirrored) {
-            eo.elements = o.mesh.elements / 2;
-            eo.length = .5;
-            for (int d = 0; d < dim; ++d) {
-                eo.origin[d] = .5;
+        const std::vector<double> times{0., .25 * o.final_time, .5 * o.final_time, o.final_time};
+        for (int d = 0; d < dim; ++d) {
+            auto reflect = [&](V3 x) { x[d] = 2 * center[d] - x[d]; return x; };
+            if (counts[d] % 2) { mirror_reason[d] = "odd element count"; continue; }
+            double asym = 0, scale = 0;
+            for (long i = 0; i < total; ++i) {
+                const V3 x = node_x(i);
+                const Vec u = initial_point(o, x, int(i), dim, pn);
+                scale = std::max(scale, u.cwiseAbs().maxCoeff());
+                asym = std::max(asym, (reflect_pn(pn, initial_point(o, reflect(x), int(i), dim, pn), d) - u).cwiseAbs().maxCoeff());
+            }
+            if (asym > 1e-14 * std::max(1., scale)) { mirror_reason[d] = "initial data"; mirror_asymmetry = std::max(mirror_asymmetry, asym); continue; }
+            bool symmetric = true;
+            if (material)
+                for (const V3 &x : material_points) {
+                    const V3 y = reflect(x);
+                    auto same = [&](const std::function<double(const V3 &)> &f) { return !f || f(x) == f(y); };
+                    if (!same(material->sigma_a) || !same(material->sigma_s) || !same(material->source)) { symmetric = false; break; }
+                }
+            if (!symmetric) { mirror_reason[d] = "material"; continue; }
+            // Inflow on every face: 7^(dim-1) points per face, 4 times, 26 directions.
+            std::vector<V3> directions;
+            for (int a = -1; a <= 1; ++a) for (int b = -1; b <= 1; ++b) for (int c = -1; c <= 1; ++c)
+                if (a || b || c) directions.push_back(V3(a, b, c).normalized());
+            for (int f = 0; f < 2 * dim && symmetric; ++f) {
+                const int fd = f / 2;
+                const int samples = dim == 1 ? 1 : (dim == 2 ? 7 : 49);
+                for (int s = 0; s < samples && symmetric; ++s) {
+                    V3 x = origin;
+                    for (int e = 0, k = s; e < dim; ++e) {
+                        if (e == fd) { x[e] = f % 2 ? origin[e] + extent[e] : origin[e]; continue; }
+                        x[e] = origin[e] + extent[e] * (k % 7 + .5) / 7;
+                        k /= 7;
+                    }
+                    const V3 y = reflect(x);
+                    for (double t : times) {
+                        if (inflow.density)
+                            for (const V3 &w : directions) {
+                                V3 rw = w;
+                                rw[d] = -rw[d];
+                                if (std::abs(inflow.density(x, t, w) - inflow.density(y, t, rw)) > 1e-14) { symmetric = false; break; }
+                            }
+                        if (inflow.atoms && symmetric) {
+                            auto ax = inflow.atoms(x, t), ay = inflow.atoms(y, t);
+                            if (ax.size() != ay.size()) { symmetric = false; break; }
+                            for (auto &atom : ay) atom.direction[d] = -atom.direction[d];
+                            for (const auto &atom : ax) {
+                                bool found = false;
+                                for (const auto &other : ay)
+                                    found = found || ((atom.direction - other.direction).norm() < 1e-14 &&
+                                                      std::abs(atom.mass - other.mass) <= 1e-14 * std::max(1., std::abs(atom.mass)));
+                                if (!found) { symmetric = false; break; }
+                            }
+                        }
+                        if (inflow.exterior_m1 || inflow.exterior_state) symmetric = false; // not checked: refuse
+                    }
+                }
+            }
+            if (!symmetric) { mirror_reason[d] = "inflow"; continue; }
+            mirror_dir[d] = true;
+            mirror_reason[d] = material ? "symmetric (" + material_check + ")" : "symmetric";
+        }
+        for (int d = 0; d < dim; ++d)
+            if (mirror_dir[d]) {
+                counts[d] /= 2;
+                origin[d] = center[d];
                 eo.mirror[2 * d] = true;
             }
-        } else
-            std::cerr << "note: mirror reduction off (initial data asymmetry " << mirror_asymmetry << ")\n";
+        eo.origin = origin;
+        eo.elements = counts[0];
+        eo.elements_per_axis = {counts[0], dim > 1 ? counts[1] : 0, dim > 2 ? counts[2] : 0};
+        eo.length = h * counts[0];
     }
+    const bool mirrored = mirror_dir[0] || mirror_dir[1] || mirror_dir[2];
     double domain_factor = 1; // full mass / computed mass
-    for (int d = 0; d < dim && mirrored; ++d) domain_factor *= 2;
-    // Angular parity reduction: exact when the initial and inflow data are even in the unresolved directions.
-    // auto checks both (initial coefficients of every node, inflow datum term at nine times in [0, T]).
+    for (int d = 0; d < dim; ++d) if (mirror_dir[d]) domain_factor *= 2;
+    // ---- Angular parity reduction (1D/2D) --------------------------------------------------------------------------
     eo.reduce_angular = dim < 3 && o.angular_reduction != "off";
     require(!(o.angular_reduction == "on" && dim == 3), "--angular-reduction on needs dimension 1 or 2");
-    auto scheme_ptr = std::make_unique<ElementWeno>(pn, eo, make_inflow(o, dim));
+    auto scheme_ptr = std::make_unique<ElementWeno>(pn, eo, inflow);
     std::vector<Vec> initial(scheme_ptr->nodes);
     for (int i = 0; i < scheme_ptr->nodes; ++i) {
         initial[i] = initial_point(o, scheme_ptr->node_position(i), i, dim, pn);
@@ -592,7 +780,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         if (!even) {
             std::cerr << "note: angular reduction off (odd data: initial " << odd_initial << ", inflow " << odd_inflow << ")\n";
             eo.reduce_angular = false;
-            scheme_ptr = std::make_unique<ElementWeno>(pn, eo, make_inflow(o, dim));
+            scheme_ptr = std::make_unique<ElementWeno>(pn, eo, inflow);
         }
     }
     const ElementWeno &scheme = *scheme_ptr;
@@ -604,21 +792,29 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     require(selected <= scheme.realizability_step() * (1 + 1e-12), "Requested dt violates the element realizability bound");
     if (selected > scheme.high_order_step())
         std::cerr << "warning: dt exceeds the estimated high-order stability step " << scheme.high_order_step() << "\n";
-    // Uniform sample grid (Q1 nodes of elements*degree cells per axis).
-    const int cells_axis = o.mesh.elements * o.degree, points_axis = cells_axis + (o.mesh.periodic ? 0 : 1);
-    int samples = 1;
-    for (int d = 0; d < dim; ++d) samples *= points_axis;
+    // ---- Uniform sample grid on the full box (Q1 nodes of count*degree cells per axis) -----------------------------
+    std::array<int, 3> cells_axis{1, 1, 1}, points_axis{1, 1, 1};
+    long samples = 1;
+    for (int d = 0; d < dim; ++d) {
+        cells_axis[d] = (mirror_dir[d] ? 2 : 1) * counts[d] * o.degree;
+        points_axis[d] = cells_axis[d] + (o.mesh.periodic ? 0 : 1);
+        samples *= points_axis[d];
+    }
+    const double hs = h / o.degree;
+    V3 full_origin = origin;
+    for (int d = 0; d < dim; ++d) if (mirror_dir[d]) full_origin[d] = center[d] - .5 * extent[d];
     std::vector<V3> where(samples);
     Vec sample_mass(samples);
-    for (int s = 0; s < samples; ++s) {
+    for (long s = 0; s < samples; ++s) {
         V3 x = V3::Zero();
         double m = 1;
-        int k = s;
-        for (int d = 0; d < dim; ++d, k /= points_axis) {
-            const int index = k % points_axis;
-            x[d] = double(index) / cells_axis;
-            const bool edge = !o.mesh.periodic && (index == 0 || index == cells_axis);
-            m *= (edge ? .5 : 1.) / cells_axis;
+        long k = s;
+        for (int d = 0; d < dim; ++d) {
+            const int index = int(k % points_axis[d]);
+            k /= points_axis[d];
+            x[d] = full_origin[d] + hs * index;
+            const bool edge = !o.mesh.periodic && (index == 0 || index == cells_axis[d]);
+            m *= (edge ? .5 : 1.) * hs;
         }
         where[s] = x;
         sample_mass[s] = m;
@@ -629,12 +825,12 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         f << std::setprecision(17) << "node,x,y,z";
         for (int k = 0; k < pn.q; ++k) f << ",u" << k;
         f << "\n";
-        for (int s = 0; s < samples; ++s) {
+        for (long s = 0; s < samples; ++s) {
             // Mirror reduction: evaluate at the reflected point and reflect the moments back.
             V3 x = where[s];
             std::array<bool, 3> flip{};
-            for (int d = 0; d < dim && mirrored; ++d)
-                if (x[d] < .5) x[d] = 1 - x[d], flip[d] = true;
+            for (int d = 0; d < dim; ++d)
+                if (mirror_dir[d] && x[d] < center[d]) x[d] = 2 * center[d] - x[d], flip[d] = true;
             const Vec active_values = scheme.evaluate(state, x);
             Vec u = Vec::Zero(pn.q);
             for (int k = 0; k < scheme.moments; ++k) u[scheme.active[k]] = active_values[k];
@@ -645,11 +841,25 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
             f << "\n";
         }
     };
-    write_samples(o.output + "/initial.csv", a);
+    if (!o.skip_fields) write_samples(o.output + "/initial.csv", a);
+    auto mass_of = [&](const Field &state) {
+        double m = 0;
+        for (int i = 0; i < scheme.nodes; ++i) m += scheme.lumped[i] * project(state.row(i).transpose())[0];
+        return m * domain_factor;
+    };
+    auto absorption_rate = [&](const Field &state) { // int sigma_a rho dx with nodal sigma_a and lumped mass
+        double r = 0;
+        for (int i = 0; i < scheme.nodes; ++i)
+            r += scheme.lumped[i] * (scheme.node_sigma_a[i] + o.sigma_a) * project(state.row(i).transpose())[0];
+        return r * domain_factor;
+    };
+    const double initial_mass = mass_of(a);
     {
-        std::ofstream masses(o.output + "/nodal_mass.csv");
-        masses << std::setprecision(17) << "node,mass\n";
-        for (int s = 0; s < samples; ++s) masses << s << "," << sample_mass[s] << "\n";
+        if (!o.skip_fields) {
+            std::ofstream masses(o.output + "/nodal_mass.csv");
+            masses << std::setprecision(17) << "node,mass\n";
+            for (long s = 0; s < samples; ++s) masses << s << "," << sample_mass[s] << "\n";
+        }
         std::ofstream config(o.output + "/config.json");
         config << std::setprecision(17) << "{\n\"method\":\"element-weno\",\"model\":\"r2\",\"coupling\":\"m1pn\""
                << ",\"stabilization\":\"element-weno\",\"pn_target\":\"consistent_mass_cg_weno\""
@@ -659,19 +869,37 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength
                << ",\"sigma_s\":" << o.sigma_s << ",\"sigma_a\":" << o.sigma_a
                << ",\"reaction_integration\":\"exact_exponential_half_steps_around_ssprk\""
+               << ",\"reaction_model\":" << (material ? "\"nodal_average_int_sigma_phi_over_int_phi\"" : "\"constant\"")
+               << ",\"material\":" << std::quoted(material ? material->name : std::string("none"))
+               << ",\"material_subcells\":" << (material ? material->subcells : 0)
+               << ",\"material_integrals\":{\"volume\":" << scheme.integral_volume * domain_factor
+               << ",\"source\":" << scheme.integral_source * domain_factor
+               << ",\"sigma_a\":" << scheme.integral_sigma_a * domain_factor
+               << ",\"sigma_s\":" << scheme.integral_sigma_s * domain_factor << "}"
+               << ",\"material_expected\":" << expected_integrals
+               << ",\"domain_origin\":[" << full_origin[0] << "," << full_origin[1] << "," << full_origin[2] << "]"
+               << ",\"domain_extent\":[" << extent[0] << "," << extent[1] << "," << extent[2] << "]"
+               << ",\"cell_size\":" << h
                << ",\"pn_order\":" << pn.order << ",\"Q\":" << pn.q << ",\"dimension\":" << dim
                << ",\"mirror_reduction\":" << (mirrored ? "true" : "false")
+               << ",\"mirror_directions\":[" << mirror_dir[0] << "," << mirror_dir[1] << "," << mirror_dir[2] << "]"
+               << ",\"mirror_reasons\":[" << std::quoted(mirror_reason[0]) << "," << std::quoted(mirror_reason[1]) << ","
+               << std::quoted(mirror_reason[2]) << "]"
                << ",\"mirror_reduction_mode\":" << std::quoted(o.mirror_reduction)
-               << ",\"mirror_asymmetry\":" << mirror_asymmetry << ",\"computed_elements_per_axis\":" << eo.elements
+               << ",\"mirror_asymmetry\":" << mirror_asymmetry
+               << ",\"computed_elements_per_axis\":" << counts[0]
+               << ",\"computed_counts\":[" << counts[0] << "," << counts[1] << "," << counts[2] << "]"
                << ",\"angular_reduction\":" << (eo.reduce_angular ? "true" : "false")
                << ",\"angular_reduction_mode\":" << std::quoted(o.angular_reduction)
                << ",\"active_moments\":" << scheme.moments << ",\"odd_initial_fraction\":" << odd_initial
                << ",\"odd_inflow_fraction\":" << odd_inflow
                << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << scheme.nodes
-               << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis
+               << ",\"spatial_dofs_full_domain\":" << long(std::llround(scheme.nodes * domain_factor))
+               << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis[0]
                << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":3"
                << ",\"time_integrator\":" << (eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\"")
                << ",\"case\":" << std::quoted(o.problem) << ",\"inflow\":" << std::quoted(o.inflow)
+               << ",\"background\":" << o.background << ",\"shadow_sigma\":" << (shadow ? o.shadow_sigma : 0.)
                << ",\"final_time\":" << o.final_time << ",\"dt_requested\":" << o.dt << ",\"dt_selected\":" << selected
                << ",\"thread_policy\":" << std::quoted(o.thread_policy)
                << ",\"cfl_safety\":" << o.cfl << ",\"element_dt_bound\":" << scheme.dt_bound
@@ -690,9 +918,21 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     };
     ElementWenoStats stats;
     double t = 0, solver_seconds = 0, min_density = std::numeric_limits<double>::infinity(), min_margin = min_density;
+    double min_margin_steps = min_density;
     int steps = 0;
     const double initialization = seconds() - begin;
     progress("running", t, steps);
+    std::ofstream history(o.output + "/history.csv");
+    history << std::setprecision(17) << "step,time,mass,absorption_rate,injected,absorbed,boundary_outflow,nudge_mass,min_margin\n";
+    auto record = [&](int step) {
+        double mm = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < scheme.nodes; ++i) mm = std::min(mm, margin(project(a.row(i).transpose())));
+        min_margin_steps = std::min(min_margin_steps, mm);
+        history << step << "," << t << "," << mass_of(a) << "," << absorption_rate(a) << ","
+                << stats.injected * domain_factor << "," << stats.absorbed * domain_factor << ","
+                << stats.boundary_outflow * domain_factor << "," << stats.nudge_mass * domain_factor << "," << mm << "\n";
+    };
+    record(0);
     while (t < o.final_time) {
         require(steps < o.max_steps, "Maximum step count exceeded");
         double dt = std::min(selected, o.final_time - t);
@@ -702,17 +942,21 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         t = (o.final_time - (t + dt) <= 8 * std::numeric_limits<double>::epsilon() * o.final_time) ? o.final_time : t + dt;
         ++steps;
         if (steps % 10 == 0) progress("running", t, steps);
+        if (o.history_stride > 0 && steps % o.history_stride == 0) record(steps);
     }
+    if (o.history_stride <= 0 || steps % o.history_stride) record(steps);
     for (int i = 0; i < scheme.nodes; ++i) {
         const Four u = project(a.row(i).transpose());
         min_density = std::min(min_density, u[0]);
         min_margin = std::min(min_margin, margin(u));
     }
-    write_samples(o.output + "/final.csv", a);
+    if (!o.skip_fields) write_samples(o.output + "/final.csv", a);
     progress("completed", t, steps);
-    double mass0 = 0;
-    for (int i = 0; i < scheme.nodes; ++i) mass0 += scheme.lumped[i] * project(a.row(i).transpose())[0];
-    mass0 *= domain_factor;
+    const double final_mass = mass_of(a);
+    const double injected = stats.injected * domain_factor, absorbed = stats.absorbed * domain_factor,
+                 outflow = stats.boundary_outflow * domain_factor, nudge = stats.nudge_mass * domain_factor;
+    const double balance = final_mass - initial_mass + outflow + absorbed - injected - nudge;
+    const double balance_scale = std::max({std::abs(initial_mass), injected, absorbed, std::abs(outflow), 1e-300});
     struct rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
     std::ofstream result(o.output + "/summary.json");
@@ -720,14 +964,21 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
            << ",\"time\":" << t << ",\"total_seconds\":" << seconds() - begin << ",\"solver_seconds\":" << solver_seconds
            << ",\"initialization_seconds\":" << initialization << ",\"peak_rss_kib_rank0\":" << usage.ru_maxrss
            << ",\"minimum_coefficient_density\":" << min_density << ",\"minimum_cone_margin\":" << min_margin
-           << ",\"final_density_mass\":" << mass0 << ",\"min_weno_gamma\":" << stats.min_gamma
+           << ",\"minimum_cone_margin_recorded_steps\":" << min_margin_steps
+           << ",\"final_density_mass\":" << final_mass << ",\"initial_density_mass\":" << initial_mass
+           << ",\"ledger\":{\"injected\":" << injected << ",\"absorbed\":" << absorbed << ",\"boundary_outflow\":" << outflow
+           << ",\"nudge_mass\":" << nudge << ",\"balance_residual\":" << balance
+           << ",\"balance_relative\":" << balance / balance_scale << "}"
+           << ",\"absorption_rate_final\":" << absorption_rate(a)
+           << ",\"min_weno_gamma\":" << stats.min_gamma
            << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states
            << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
            << ",\"phase_seconds\":{\"closure\":" << stats.t_closure << ",\"weno\":" << stats.t_weno
-           << ",\"stabilization\":" << stats.t_stabilization << ",\"residual\":" << stats.t_residual
+           << ",\"stabilization\":" << stats.t_stabilization << ",\"gradient_solve\":" << stats.t_gradient_solve
+           << ",\"stab_local\":" << stats.t_stab_local << ",\"residual\":" << stats.t_residual
            << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass << ",\"limiter\":" << stats.t_limiter
-           << ",\"finish\":" << stats.t_finish << "}}\n";
+           << ",\"finish\":" << stats.t_finish << ",\"reaction\":" << stats.t_reaction << "}}\n";
     std::cout << "Completed " << steps << " steps, P" << pn.order << ", element-weno p=" << o.degree << ", "
               << scheme.nodes << " coefficients\n";
     return 0;
@@ -860,8 +1111,8 @@ int main(int argc, char **argv) {
                 const auto &ir=mfem::IntRules.Get(el->GetGeomType(),6);
                 for(int q=0;q<ir.GetNPoints();++q){const auto &ip=ir.IntPoint(q); mfem::Vector x(fe.dimension); T->SetIntPoint(&ip); T->Transform(ip,x); el->CalcShape(ip,shape);
                     const int ix=int(std::floor(x[0])),iy=int(std::floor(x[1]));
-                    const bool absorber=((ix==1||ix==5)&&(iy==1||iy==3||iy==5))||((ix==2||ix==4)&&(iy==2||iy==4))||(ix==3&&iy==1);
-                    const double w=ip.weight*T->Weight(); const bool srcbox=x[0]>=3&&x[0]<=4&&x[1]>=3&&x[1]<=4;
+                    const bool absorber=cases::lattice_paul_absorber_cell(ix,iy); // shared with element WENO
+                    const double w=ip.weight*T->Weight(); const bool srcbox=cases::lattice_paul_source(x[0],x[1]);
                     for(int j=0;j<el->GetDof();++j){int n=vdofs[j]; absorption[n]+=w*shape[j]*(absorber?10:0); scattering[n]+=w*shape[j]*(absorber?0:1); source_density[n]+=w*shape[j]*(srcbox?1:0);}
                 }
             }
