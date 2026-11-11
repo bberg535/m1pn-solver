@@ -47,6 +47,10 @@ struct ElementWenoOptions {
     // Domain origin + [0, length]^d (default: the unit cube).
     V3 origin = V3::Zero();
     double length = 1;
+    // Optional element counts per axis (0 = `elements`). Cells stay cubic with h = length / count[0], so the
+    // box is origin + [0, h count[0]] x [0, h count[1]] x [0, h count[2]] (e.g. 150 x 50 x 50 for the shadow
+    // test). Non-cubic cells are not supported.
+    std::array<int, 3> elements_per_axis{0, 0, 0};
     // Mirror sides, index 2 * direction + side (side 0 = low end): specular reflection instead of a physical
     // boundary. For mirror-symmetric data the scheme equals the full scheme on the mirrored domain: no flux on
     // the mirror face, moments odd under the reflection vanish on the mirror plane (Dirichlet rows of the
@@ -78,6 +82,8 @@ public:
     ElementWenoOptions options;
     Inflow inflow;
     int degree, dimension, elements, per_direction, nodes, cells, local_nodes;
+    // Elements and nodes per axis (elements = count[0], per_direction = nodes_per_axis[0]).
+    std::array<int, 3> count{1, 1, 1}, nodes_per_axis{1, 1, 1};
     // Active PN moments per node (pn.q without reduction) and their index in the full basis.
     int moments;
     std::vector<int> active;
@@ -150,7 +156,6 @@ private:
     std::array<FaceRule, 6> rules_;
     std::unique_ptr<CanonicalC1> canonical_;
     std::array<std::unique_ptr<Boundary>, 6> boundaries_;
-    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> mass_1d_;
     // LDL^T factors of the 1D mass in plain arrays, for row-wise multi-component line solves. `line[r]` is the
     // position on the grid line of factor row r. natural_: all nodes; dirichlet_[d]: without the mirror node.
     struct LineFactor {
@@ -158,7 +163,7 @@ private:
         std::vector<int> outer, inner, perm, line;
         std::vector<double> values, diagonal;
     };
-    LineFactor natural_;
+    std::array<LineFactor, 3> natural_;
     std::array<LineFactor, 3> dirichlet_;
     std::array<int, 3> mirror_index_{-1, -1, -1};   // grid-line position of the mirror node per direction
     std::array<std::vector<char>, 3> reflect_odd_;  // per active moment: odd under x_d -> -x_d
@@ -191,7 +196,7 @@ private:
     Field stabilization_residual(const Field &a, const Vec &gamma, const std::array<Field, 3> &gradient,
                                  Field *low, ElementWenoStats * = nullptr) const;
     // Assembled 1D convection matrix, A_d^T, and row-major element tables (K_e, C_{d,e}^T) for the row kernels.
-    Sparse convection_1d_;
+    std::array<Sparse, 3> convection_1d_;
     std::array<Sparse, 3> flux_t_;
     std::vector<double> stiffness_rows_;
     std::array<std::vector<double>, 3> convection_t_rows_;

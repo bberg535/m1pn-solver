@@ -1,6 +1,7 @@
 // Structural checks of the element-based WENO variant.
 #include "element_weno.hpp"
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <random>
 using namespace m1pn;
@@ -312,6 +313,55 @@ void mirror_quarter(bool reduce, double sigma_s, bool ssprk43) {
     check(std::abs(mass_full - 4 * mass_quarter) < 1e-13 * mass_full, tag + "quarter mass is a quarter of the total",
           std::abs(mass_full - 4 * mass_quarter));
 }
+
+// Per-axis element counts (cubic cells): data that depend on x only give the same solution on a 12 x 4 (2D) or
+// 6 x 2 x 3 (3D) periodic box as on the cube, node by node along x.
+Vec x_wave(const Angular &pn, const V3 &x) {
+    Vec a = Vec::Zero(pn.q);
+    const double rho = 1 + .3 * std::sin(2 * pi * x[0] / .5);
+    set_low(a, Four(rho, .2 * rho * std::cos(2 * pi * x[0] / .5), 0, 0));
+    for (int k = 4; k < pn.q; ++k)
+        a[k] = .02 * std::sin(2 * pi * x[0] / .5 + k);
+    return a;
+}
+void per_axis_counts(int dimension) {
+    Angular pn(3);
+    ElementWenoOptions o;
+    o.degree = 2;
+    o.dimension = dimension;
+    o.periodic = true;
+    o.elements = dimension == 2 ? 12 : 6;
+    o.length = .5;
+    ElementWeno cube(pn, o);
+    o.elements_per_axis = dimension == 2 ? std::array<int, 3>{12, 4, 0} : std::array<int, 3>{6, 2, 3};
+    ElementWeno box(pn, o);
+    const std::string tag = "per-axis counts d=" + std::to_string(dimension) + ": ";
+    check(box.nodes * (dimension == 2 ? 3 : 6) == cube.nodes, tag + "node count", box.nodes);
+    Field a = cube.interpolate([&](const V3 &x) { return x_wave(pn, x); });
+    Field b = box.interpolate([&](const V3 &x) { return x_wave(pn, x); });
+    auto compare = [&](const Field &f, const Field &g) {
+        double worst = 0;
+        for (int i = 0; i < box.nodes; ++i) {
+            // Same (ix, iy, iz) index in both meshes.
+            int k = i, j = 0, scale = 1;
+            for (int d = 0; d < dimension; ++d) {
+                j += (k % box.nodes_per_axis[d]) * scale;
+                k /= box.nodes_per_axis[d];
+                scale *= cube.nodes_per_axis[d];
+            }
+            worst = std::max(worst, (f.row(j) - g.row(i)).cwiseAbs().maxCoeff());
+        }
+        return worst;
+    };
+    check(compare(cube.rate(0, a), box.rate(0, b)) < 1e-11, tag + "rate equals the cube", compare(cube.rate(0, a), box.rate(0, b)));
+    const double dt = .5 * cube.step_bound();
+    for (int n = 0; n < 3; ++n) {
+        a = cube.advance(n * dt, dt, a);
+        b = box.advance(n * dt, dt, b);
+    }
+    check(compare(a, b) < 1e-11, tag + "three steps equal the cube", compare(a, b));
+    check(std::abs(box.dt_bound / cube.dt_bound - 1) < 1e-13, tag + "same realizability bound", box.dt_bound / cube.dt_bound - 1);
+}
 } // namespace
 int main() {
     try {
@@ -332,6 +382,8 @@ int main() {
         mirror_quarter(false, 0, false);
         mirror_quarter(true, 0, false);
         mirror_quarter(true, 3, true);
+        per_axis_counts(2);
+        per_axis_counts(3);
         for (int p = 1; p <= 4; ++p) {
             high_order_stability(p, false);
             high_order_stability(p, true);
