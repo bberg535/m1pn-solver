@@ -22,6 +22,7 @@ class CampaignPlan(unittest.TestCase):
             self.assertEqual([t["id"] for t in tasks], list(range(len(tasks))))
             self.assertEqual(len({t["label"] for t in tasks}), len(tasks))
             self.assertEqual(tasks, study.make_tasks(profile))
+            self.assertEqual(len(tasks), 21 if profile == "smoke" else 81)
 
     def test_scientific_families(self):
         tasks = study.make_tasks("paper")
@@ -65,6 +66,14 @@ class CampaignPlan(unittest.TestCase):
             f.write_text("changed")
             with self.assertRaises(ValueError):
                 study.check_manifest(root)
+
+    def test_nonlinear_weno_weight_is_represented(self):
+        tasks = study.make_tasks("paper")
+        weno = [t for t in tasks if t["family"] == "ablation"
+                and t["weno_linear"] == .2]
+        self.assertEqual(len(weno), 1)
+        opts = study.flags(weno[0], Path("/tmp/results"), 16)
+        self.assertEqual(opts[opts.index("--weno-linear") + 1], "0.2")
 
     def test_solver_flags_split_reaction(self):
         t = next(t for t in study.make_tasks("paper") if t["family"] == "time_crossing")
