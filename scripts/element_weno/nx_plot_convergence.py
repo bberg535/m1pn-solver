@@ -57,6 +57,22 @@ def main():
         fig.savefig(output / (name + ".png"), dpi=180)
         plt.close(fig)
         created.append(name)
+    benchmarks = [r for r in rows if r["family"] in ("ablation", "baseline")]
+    if benchmarks:
+        labels = [r["label"].replace("ablation_", "").replace("baseline_", "")
+                  for r in benchmarks]
+        seconds = [r["elapsed_seconds"] for r in benchmarks]
+        fig, ax = plt.subplots(figsize=(8., max(3.8, .44 * len(labels) + 1.)))
+        ax.barh(labels, seconds)
+        ax.invert_yaxis()
+        ax.set_xlabel("Wall-clock seconds")
+        ax.set_title("Crossing ablation: measured run times")
+        ax.grid(True, axis="x", alpha=.25)
+        fig.tight_layout()
+        fig.savefig(output / "ablation_wall_seconds.pdf")
+        fig.savefig(output / "ablation_wall_seconds.png", dpi=180)
+        plt.close(fig)
+        created.append("ablation_wall_seconds")
     # Reusable compact LaTeX table: values are reported as they are;
     # time and space self-reference errors are not relabelled as exact.
     columns = ["family", "pn", "p", "elements", "dt", "error_exact_PN_L2",
