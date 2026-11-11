@@ -103,5 +103,71 @@ class CampaignPlan(unittest.TestCase):
         self.assertEqual(opts[opts.index("--time") + 1], "0")
 
 
+class HeterogeneousProfiles(unittest.TestCase):
+    def test_profiles_are_separate_and_unique(self):
+        for profile in study.HETERO_PROFILES:
+            tasks = study.make_tasks(profile)
+            labels = [t["label"] for t in tasks]
+            self.assertEqual(len(labels), len(set(labels)))
+            self.assertTrue({"lattice", "shadow", "lattice3d"} <= {t["kind"] for t in tasks})
+        # the frozen v1 matrices are unchanged by the new profiles
+        self.assertEqual(len(study.make_tasks("paper")), 81)
+        self.assertEqual(len(study.make_tasks("smoke")), 21)
+
+    def test_flags_and_expectations(self):
+        for t in study.make_tasks("hetero-paper"):
+            opts = study.flags(t, Path("/tmp/out"), 16)
+            self.assertEqual(opts[opts.index("--case") + 1], t["case"], t["label"])
+            self.assertEqual(float(opts[opts.index("--background") + 1]), t["background"])
+            if t["stabilization"] == "element-weno":
+                self.assertEqual(opts[opts.index("--weno-linear") + 1], str(t["weno_linear"]))
+                self.assertEqual("--skip-fields" in opts, bool(t["skip_fields"]))
+                if t["kind"] == "shadow":
+                    self.assertEqual(float(opts[opts.index("--shadow-sigma") + 1]), t["shadow_sigma"])
+                    self.assertEqual(t["expect_mirror"], [False, True, True])
+                if t["kind"] == "lattice3d":
+                    self.assertEqual(t["expect_mirror"], [False, False, False])
+            else:
+                self.assertNotIn("--weno", opts)
+            if t.get("fixed_dt"):
+                self.assertEqual(float(opts[opts.index("--dt") + 1]), study.LATTICE_B_DT)
+            self.assertGreater(t["estimate_core_hours"], 0)
+            self.assertIn(t["slot_cores"], (16, 32))
+
+    def test_required_files(self):
+        shadow = next(t for t in study.make_tasks("hetero-smoke") if t["kind"] == "shadow")
+        self.assertIn("slices.csv", study.required_files(shadow))
+        self.assertNotIn("final.csv", study.required_files(shadow))
+        lattice = next(t for t in study.make_tasks("hetero-smoke") if t["kind"] == "lattice")
+        self.assertIn("final.csv", study.required_files(lattice))
+
+    def test_validation_accepts_and_rejects(self):
+        t = next(t for t in study.make_tasks("hetero-smoke") if t["kind"] == "lattice" and t["elements"] == 28)
+        config = {"case": "lattice-paul", "pn_order": t["pn_order"], "dimension": 2, "method": "element-weno",
+                  "time_integrator": t["rk"], "degree": t["degree"], "elements_per_axis": t["elements"],
+                  "weno": True, "element_limit": True, "weno_linear": t["weno_linear"], "dt_selected": .01,
+                  "material_expected": {"volume": 49, "source": 1, "sigma_a": 110, "sigma_s": 38},
+                  "material_integrals": {"volume": 49., "source": 1., "sigma_a": 110., "sigma_s": 38.},
+                  "mirror_directions": [1, 0, 0]}
+        summary = {"status": "completed", "time": 3.2, "final_density_mass": 2.,
+                   "ledger": {"balance_relative": 1e-13}, "minimum_cone_margin": 1e-12}
+        study.validate_hetero(t, config, summary)
+        for key, bad in (("material_integrals", {"volume": 49., "source": 1., "sigma_a": 109., "sigma_s": 38.}),
+                         ("mirror_directions", [1, 1, 0])):
+            broken = dict(config, **{key: bad})
+            with self.assertRaises(ValueError):
+                study.validate_hetero(t, broken, summary)
+        with self.assertRaises(ValueError):
+            study.validate_hetero(t, config, dict(summary, ledger={"balance_relative": 1e-6}))
+        with self.assertRaises(ValueError):
+            study.validate_hetero(t, config, dict(summary, minimum_cone_margin=-1e-9))
+
+    def test_plan_runs(self):
+        import contextlib, io
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(study.plan(type("NS", (), {"profile": "hetero-paper"})()), 0)
+        self.assertIn("core-hours", buffer.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

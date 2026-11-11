@@ -26,6 +26,16 @@ import time
 HERE = Path(__file__).resolve().parent
 ROOT = (HERE.parents[1] if HERE.name == "element_weno" else Path(os.environ.get("M1PN_ROOT", HERE))).resolve()
 FROZEN = "nx_convergence_v1"
+# v2: heterogeneous/3D profiles (hetero-smoke, hetero-paper); v1 campaigns stay readable and unchanged.
+FROZEN_V2 = "nx_convergence_v2"
+FORMATS = (FROZEN, FROZEN_V2)
+HETERO_PROFILES = ("hetero-smoke", "hetero-paper")
+# Schotthoefer/Hauck (arXiv:2505.17284) Table 1, converted to rho units by 1/(2 pi) (hemisphere concentration;
+# mass + absorption = 2 pi * 3.2 confirms the factor): mass at T, total absorption, absorption rate at T.
+LATTICE_KINETIC = {"mass": 13.07 / (2 * math.pi), "absorbed": 7.034 / (2 * math.pi),
+                   "absorption_rate": 4.597 / (2 * math.pi)}
+# Historical path-B lattice time step of the 15 NX runs (older binary).
+LATTICE_B_DT = 0.0005209181181832981
 
 
 def digest(p: Path) -> str:
@@ -68,7 +78,8 @@ def task(family: str, binary: str, case: str, inflow: str, dim: int,
          sigma_s=0., sigma_a=0., filter_strength=0., weno=True,
          limiter=True, rk="ssprk43", periodic=False, dt_level=None,
          reference=False, linear=1e-3, tag="", cfl=.2,
-         stabilization="element-weno"):
+         stabilization="element-weno", background=None, shadow_sigma=None,
+         skip_fields=False, expect_mirror=None, fixed_dt=None):
     label = "_".join(str(x) for x in
                      (family, f"P{pn}", f"p{p}", f"E{n}",
                       ("dt" + str(dt_level)) if dt_level is not None else
@@ -78,13 +89,72 @@ def task(family: str, binary: str, case: str, inflow: str, dim: int,
                 pn_order=pn, time=end, sigma_s=sigma_s, sigma_a=sigma_a,
                 filter_strength=filter_strength, weno=weno, limiter=limiter,
                 rk=rk, periodic=periodic, dt_level=dt_level, reference=reference,
-                weno_linear=linear, cfl=cfl, stabilization=stabilization)
+                weno_linear=linear, cfl=cfl, stabilization=stabilization,
+                background=background, shadow_sigma=shadow_sigma, skip_fields=skip_fields,
+                expect_mirror=expect_mirror, fixed_dt=fixed_dt)
+
+
+def make_hetero_tasks(profile: str) -> list[dict]:
+    """Heterogeneous/3D families (docs/ELEMENT_HETEROGENEOUS.md). Q1/112, Q2/56, Q3/35, Q4/28 have 113 (Q3: 106)
+    control points per axis; mirror expectations are part of the validation."""
+    smoke = profile == "hetero-smoke"
+    out = []
+    lat = dict(background=1e-10, expect_mirror=[True, False, False])
+    # 2D lattice, Paul (44)-(47), T = 3.2.
+    for pn in ([3] if smoke else [3, 7, 11]):
+        for p, n in ([(1, 28), (2, 14)] if smoke else [(1, 112), (2, 56), (3, 35), (4, 28)]):
+            t = task("lattice", "fast", "lattice-paul", "vacuum", 2, n, p, pn, 3.2, kind="lattice", **lat)
+            if n % 2:
+                t["expect_mirror"] = [False, False, False]
+            out.append(t)
+    if not smoke:
+        for pn in (7, 11):  # spatial refinement at fixed P_N
+            for p, n in ((1, 224), (2, 112)):
+                out.append(task("lattice", "fast", "lattice-paul", "vacuum", 2, n, p, pn, 3.2,
+                                kind="lattice", tag="fine", **lat))
+            # same dt as the historical path-B runs (equal time step comparison)
+            out.append(task("lattice", "fast", "lattice-paul", "vacuum", 2, 112, 1, pn, 3.2, kind="lattice",
+                            tag="dtB", fixed_dt=LATTICE_B_DT, **lat))
+        for pn in (3, 7, 11):  # path B with the current binary (new measurement, not the historical runs)
+            row = task("lattice_B", "fast", "lattice-paul", "vacuum", 2, 112, 1, pn, 3.2, kind="lattice",
+                       tag="B_new", background=1e-10, fixed_dt=LATTICE_B_DT,
+                       stabilization="m1pn_mass_correction", rk="ssprk3")
+            row["coupling"] = "m1pn"
+            out.append(row)
+    # 3D shadow, stage A (moderate, Beer-Lambert reference) and stage B (sigma = 1e7, Weih et al.).
+    sh = dict(background=1e-6, skip_fields=True, expect_mirror=[False, True, True])
+    for sigma in ([10.] if smoke else [1., 10., 100.]):
+        for pn in ([3] if smoke else [3, 7, 11]):
+            for n in ([4] if smoke else [8, 16, 32]):
+                out.append(task("shadowA", "fast", "shadow-weih", "shadow-beam", 3, n, 2, pn, 1.6,
+                                kind="shadow", tag=f"s{sigma:g}", shadow_sigma=sigma, **sh))
+    for pn in ([3] if smoke else [3, 7, 11]):
+        for n in ([4] if smoke else [16, 32, 50]):
+            out.append(task("shadowB", "fast", "shadow-weih", "shadow-beam", 3, n, 2, pn, 1.6,
+                            kind="shadow", tag="s1e7", shadow_sigma=1e7, **sh))
+    # Own 3D lattice extension (asymmetric: no mirror).
+    for pn in ([3] if smoke else [3, 7]):
+        for p, n in ([(1, 14)] if smoke else [(1, 28), (2, 14), (2, 28)]):
+            out.append(task("lattice3d", "fast", "lattice-3d", "vacuum", 3, n, p, pn, 1. if smoke else 3.2,
+                            kind="lattice3d", background=1e-10, skip_fields=True,
+                            expect_mirror=[False, False, False]))
+    return out
 
 
 def make_tasks(profile: str) -> list[dict]:
+    if profile in HETERO_PROFILES:
+        out = make_hetero_tasks(profile)
+        seen = set()
+        for number, t in enumerate(out):
+            if t["label"] in seen:
+                raise ValueError("duplicate task label: " + t["label"])
+            seen.add(t["label"])
+            t["id"] = number
+            t.update(cost_model(t))
+        return out
     smoke = profile == "smoke"
     if profile not in ("smoke", "paper"):
-        raise ValueError("profile must be smoke or paper")
+        raise ValueError("profile must be smoke, paper, hetero-smoke or hetero-paper")
     out = []
     # True P_N smooth exact solution is built into the standalone executable.
     for p in ([1, 2] if smoke else [1, 2, 3, 4]):
@@ -161,11 +231,69 @@ def make_tasks(profile: str) -> list[dict]:
     return out
 
 
+def active_moments(t: dict) -> int:
+    n = t["pn_order"]
+    return (n + 1) * (n + 2) // 2 + 1 if t["dim"] == 2 else (n + 1) ** 2
+
+
+def cost_model(t: dict) -> dict:
+    """Resource estimate (docs/ELEMENT_HETEROGENEOUS.md, Sec. 10), calibrated on the i5-12500 workstation
+    (6 threads, 11.11.2026): core-seconds = (a + b * moments) * nodes * stages with a = 1.65e-6 (2D) / 5.0e-6 (3D),
+    b = 4.5e-8; dt / h = c_p from the local runs (2D: 0.25, 0.15, 0.08, 0.05 for p = 1..4; 3D: x 0.67).
+    Uncertainty about a factor 2; NX cores are not calibrated separately. Memory ~ 30 fields of nodes x moments."""
+    p, dim = t["degree"], t["dim"]
+    lengths = {"lattice-paul": 7., "lattice-3d": 7., "shadow-weih": .5}.get(t["case"], 1.)
+    h = lengths / t["elements"]
+    counts = [t["elements"]] * dim
+    if t["case"] == "shadow-weih":
+        counts[0] *= 3
+    mirror = t.get("expect_mirror") or [False] * 3
+    nodes = 1
+    for d in range(dim):
+        n = counts[d] * p + 1
+        nodes *= (n + 1) // 2 if mirror[d] else n
+    moments = active_moments(t) if t.get("stabilization", "element-weno") == "element-weno" else (t["pn_order"] + 1) ** 2
+    c = {1: .25, 2: .15, 3: .08, 4: .05}.get(p, .05) * (.67 if dim == 3 else 1)
+    dt = t.get("fixed_dt") or c * h
+    stages = 4 * math.ceil(t["time"] / dt)
+    a = 5.0e-6 if dim == 3 else 1.65e-6
+    core_seconds = (a + 4.5e-8 * moments) * nodes * stages
+    memory_gb = 30 * nodes * moments * 8 / 1e9 + .2
+    slot = 32 if memory_gb > 48 or core_seconds > 16 * 6 * 3600 else 16
+    return dict(estimate_nodes=nodes, estimate_moments=moments, estimate_steps=stages // 4,
+                estimate_core_hours=core_seconds / 3600, estimate_memory_gb=memory_gb,
+                estimate_wall_hours=core_seconds / 3600 / slot, slot_cores=slot)
+
+
+def hetero_flags(t: dict, output: Path, threads: int, end, dt, cfl):
+    args = ["--dimension", str(t["dim"]), "--mesh-type", "hex",
+            "--elements", str(t["elements"]), "--degree", str(t["degree"]),
+            "--pn-order", str(t["pn_order"]), "--case", t["case"], "--inflow", t["inflow"],
+            "--model", "r2", "--stabilization", t["stabilization"], "--time-integrator", t["rk"],
+            "--cfl", str(cfl), "--dt", f"{(t.get('fixed_dt') or 0.) if dt is None else dt:.17g}",
+            "--time", f"{end:.17g}", "--threads", str(threads), "--output", str(output),
+            "--background", f"{t['background']:.17g}"]
+    if t["stabilization"] == "element-weno":
+        args += ["--weno", "on" if t["weno"] else "off", "--element-limit", "on" if t["limiter"] else "off",
+                 "--weno-linear", str(t["weno_linear"]), "--history-stride", "50",
+                 "--angular-reduction", "auto", "--mirror-reduction", "auto"]
+        if t.get("shadow_sigma") is not None:
+            args += ["--shadow-sigma", f"{t['shadow_sigma']:.17g}"]
+        if t.get("skip_fields"):
+            args.append("--skip-fields")
+    else:
+        args += ["--coupling", t.get("coupling", "m1pn"), "--mass-mode", "lumped",
+                 "--pn-viscosity-scale", "1", "--kv-gamma", "0", "--biharmonic-gamma", "0"]
+    return args
+
+
 def flags(t: dict, output: Path, threads: int, *, end=None, dt=None, cfl=None):
     if end is None:
         end = t["time"]
     if cfl is None:
         cfl = t["cfl"]
+    if t.get("kind") in ("lattice", "shadow", "lattice3d"):
+        return hetero_flags(t, output, threads, end, dt, cfl)
     if t["binary"] == "standalone":
         args = ["--problem", "smooth", "--dimension", "1",
                 "--pn-order", str(t["pn_order"]), "--degree", str(t["degree"]),
@@ -254,7 +382,8 @@ def prepare(ns) -> int:
                      "nx/batches/element_weno_pack.sbatch"]:
         hashes[relative] = digest(campaign / relative)
     atomic(campaign / "manifest.json",
-           {"format": FROZEN, "profile": ns.profile,
+           {"format": FROZEN_V2 if ns.profile in HETERO_PROFILES else FROZEN, "profile": ns.profile,
+            "mfem_version": mfem_version(repo), "compiler_from": "config.json of every run",
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "repository": "bberg535/m1pn-solver", "git_head": commit(),
             "root": str(repo), "task_count": len(tasks),
@@ -264,9 +393,36 @@ def prepare(ns) -> int:
     return 0
 
 
+def mfem_version(repo: Path) -> str:
+    """MFEM version from the build cache of the repository (MFEM_CONFIG -> config.mk), 'unknown' otherwise."""
+    for cache in (repo / "tmp/build/CMakeCache.txt",):
+        try:
+            for line in cache.read_text().splitlines():
+                if line.startswith("MFEM_CONFIG:"):
+                    for entry in Path(line.split("=", 1)[1]).read_text().splitlines():
+                        if entry.startswith("MFEM_VERSION_STRING") or entry.startswith("MFEM_VERSION "):
+                            return entry.split("=", 1)[1].strip()
+        except OSError:
+            pass
+    return "unknown"
+
+
+def runtime_environment() -> dict:
+    """Threads, CPU affinity, NUMA nodes of the allowed CPUs and OpenMP variables of this task."""
+    cpus = sorted(os.sched_getaffinity(0))
+    nodes = set()
+    for cpu in cpus:
+        for entry in Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*"):
+            nodes.add(int(entry.name[4:]))
+    return {"host": os.uname().nodename, "affinity_cpus": len(cpus),
+            "affinity": f"{cpus[0]}-{cpus[-1]}" if cpus else "", "numa_nodes": sorted(nodes),
+            "slurm_job": os.environ.get("SLURM_JOB_ID", ""),
+            "omp": {k: v for k, v in os.environ.items() if k.startswith(("OMP_", "OPENBLAS_", "MKL_"))}}
+
+
 def check_manifest(campaign: Path) -> list[dict]:
     meta = load(campaign / "manifest.json")
-    if meta.get("format") != FROZEN:
+    if meta.get("format") not in FORMATS:
         raise ValueError("invalid campaign format")
     for relative, expected in meta["checksums"].items():
         file = checked_within(campaign / relative, campaign)
@@ -347,6 +503,9 @@ def run(ns) -> int:
                    (("pn_order", "pn_order"), ("degree", "degree"),
                     ("elements", "elements"), ("dimension", "dim"))):
                 raise ValueError("standalone solver metadata mismatch")
+        elif t.get("kind") in ("lattice", "shadow", "lattice3d"):
+            config = load(output / "config.json")
+            validate_hetero(t, config, summary)
         else:
             config = load(output / "config.json")
             if summary.get("status") != "completed" or config.get("case") != t["case"]:
@@ -377,15 +536,25 @@ def run(ns) -> int:
             if t["kind"] == "temporal" and abs(float(config["dt_selected"]) - dt) > 1e-12 * max(1., dt):
                 raise ValueError("requested temporal dt changed")
         outcome["summary_sha256"] = digest(output / "summary.json")
-        outcome["final_sha256"] = digest(output / "final.csv")
+        if (output / "final.csv").is_file():
+            outcome["final_sha256"] = digest(output / "final.csv")
         outcome["file_sha256"] = {
             name: digest(output / name)
             for name in ("summary.json", "final.csv", "config.json",
-                         "initial.csv", "nodal_mass.csv")
+                         "initial.csv", "nodal_mass.csv", "history.csv", "slices.csv")
             if (output / name).is_file()
         }
-        required = ("summary.json", "final.csv") if t["binary"] == "standalone" else (
-            "summary.json", "final.csv", "config.json", "initial.csv", "nodal_mass.csv")
+        required = required_files(t)
+        outcome["environment"] = runtime_environment()
+        if t["binary"] == "fast":
+            cfg = load(output / "config.json")
+            outcome["metadata"] = {k: cfg.get(k) for k in (
+                "compiler", "threads", "thread_policy", "pn_order", "Q", "active_moments", "degree",
+                "coefficients", "spatial_dofs_full_domain", "dt_selected", "time_integrator",
+                "mirror_directions", "angular_reduction")}
+            outcome["metadata"].update({k: summary.get(k) for k in (
+                "steps", "solver_seconds", "total_seconds", "peak_rss_kib_rank0", "phase_seconds", "ledger",
+                "minimum_cone_margin", "nudged_states", "limited_element_stages")})
         if not all(name in outcome["file_sha256"] for name in required):
             raise ValueError("required saved-field files are missing")
         outcome["status"] = "completed"
@@ -395,6 +564,50 @@ def run(ns) -> int:
     atomic(status, outcome)
     print(t["label"], outcome["status"], "in", round(elapsed, 2), "s")
     return 0 if outcome["status"] == "completed" else 2
+
+
+def required_files(t: dict) -> tuple:
+    if t["binary"] == "standalone":
+        return ("summary.json", "final.csv")
+    if t.get("kind") in ("lattice", "shadow", "lattice3d") and t.get("stabilization") == "element-weno":
+        files = ["summary.json", "config.json", "history.csv"]
+        files += ["slices.csv"] if t["dim"] == 3 else []
+        files += [] if t.get("skip_fields") else ["final.csv", "initial.csv", "nodal_mass.csv"]
+        return tuple(files)
+    return ("summary.json", "final.csv", "config.json", "initial.csv", "nodal_mass.csv")
+
+
+def validate_hetero(t: dict, config: dict, summary: dict) -> None:
+    """Heterogeneous/3D runs: case, configuration, material integrals, ledger balance, cone margin, mirrors."""
+    if summary.get("status") != "completed" or config.get("case") != t["case"]:
+        raise ValueError("solver did not complete requested case")
+    if abs(float(summary["time"]) - t["time"]) > 1e-10:
+        raise ValueError("end time mismatch")
+    if int(config.get("pn_order", -1)) != t["pn_order"] or int(config.get("dimension", -1)) != t["dim"]:
+        raise ValueError("PN order or dimension mismatch")
+    if t.get("fixed_dt") and abs(float(config["dt_selected"]) - t["fixed_dt"]) > 1e-12 * t["fixed_dt"]:
+        raise ValueError("fixed dt not used")
+    if t["stabilization"] != "element-weno":
+        return  # path B: its own checks (material integrals are part of its config)
+    if config.get("method") != "element-weno" or config.get("time_integrator") != t["rk"] or \
+       int(config.get("degree", -1)) != t["degree"] or int(config.get("elements_per_axis", -1)) != t["elements"]:
+        raise ValueError("element-WENO configuration mismatch")
+    if config.get("weno") is not t["weno"] or config.get("element_limit") is not t["limiter"] or \
+       abs(float(config.get("weno_linear", -1)) - float(t["weno_linear"])) > 1e-15:
+        raise ValueError("WENO/limiter configuration mismatch")
+    expected, got = config.get("material_expected") or {}, config["material_integrals"]
+    tolerance = {"lattice": 1e-10, "lattice3d": 1e-10, "shadow": 5e-3}[t["kind"]]
+    for key in ("volume", "source", "sigma_a", "sigma_s"):
+        if key in expected and abs(got[key] - expected[key]) > tolerance * max(1., abs(expected[key])):
+            raise ValueError(f"material integral {key}: {got[key]} vs {expected[key]}")
+    if t.get("expect_mirror") is not None and [bool(v) for v in config["mirror_directions"]] != list(t["expect_mirror"]):
+        raise ValueError(f"mirror directions {config['mirror_directions']} != expected {t['expect_mirror']}")
+    ledger = summary["ledger"]
+    if not abs(float(ledger["balance_relative"])) <= 1e-9:
+        raise ValueError("particle balance does not close: " + str(ledger["balance_relative"]))
+    # Numerical cone check of the stored coefficients (rounding tolerance only; not a proof).
+    if not float(summary["minimum_cone_margin"]) >= -1e-14 * max(1., float(summary["final_density_mass"])):
+        raise ValueError("cone margin negative")
 
 
 def read_field(path: Path):
@@ -418,10 +631,104 @@ def rel_norm(error, exact, mass):
                 Linf=float(np.max(np.abs(error))))
 
 
+def shadow_metrics(run: Path, sigma: float) -> dict:
+    """Stage-A diagnostics from slices.csv (plane z = 0): L1 error of rho against the uncollided Beer-Lambert
+    density of the collimated beam (radial profile of cases::shadow_beam_profile) behind the sphere front, x in [0.2, 0.7] (shadow region and its neighbourhood),
+    centre-line density at x = 0.5 and transverse shadow width. The kinetic reference is exact for the collimated
+    beam; the PN/M1 angular model and the background 1e-6 are part of the deviation."""
+    import numpy as np
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    rows = [r for r in csv.DictReader(open(run / "slices.csv")) if r["plane"] == "2"]
+    x = np.array([float(r["x"]) for r in rows]); y = np.array([float(r["y"]) for r in rows])
+    rho = np.array([float(r["rho"]) for r in rows])
+    R = .1
+    def chord(px, py):
+        r2 = py * py
+        half = np.sqrt(np.maximum(R * R - r2, 0))
+        a = np.maximum(-half, -.75); b = np.minimum(half, px)
+        return np.where(r2 < R * R, np.maximum(0, b - a), 0.)
+    r = np.abs(y)  # plane z = 0
+    prof = np.where(r <= .15, 1., np.where(r >= .2, 0., np.cos(.5 * np.pi * (r - .15) / .05) ** 2))
+    ref = prof * np.exp(-sigma * chord(x, y))
+    mask = (x >= .2) & (x <= .7)
+    l1 = float(np.sum(np.abs(rho[mask] - ref[mask])) / np.sum(ref[mask]))
+    centre = rho[(np.abs(y) < 1e-12)]
+    cx = x[(np.abs(y) < 1e-12)]
+    at = float(np.interp(.5, cx, centre)) if len(cx) else float("nan")
+    line = mask & (np.abs(x - .5) == np.min(np.abs(x[mask] - .5)))
+    # width of the shadow: extent in y (|y| < 0.15, inside the beam core) where rho < 0.5 on the line x ~ 0.5
+    core = line & (np.abs(y) < .15)
+    width = float(np.sum(rho[core] < .5) * (np.ptp(y[line]) / max(1, line.sum() - 1)))
+    return dict(shadow_L1_plane=l1, shadow_centre_x05=at, shadow_centre_ref=float(np.exp(-sigma * 2 * R)),
+                shadow_width_half_density=width, shadow_width_ref=2 * R)
+
+
+def collect_hetero(campaign: Path, tasks: list[dict]) -> int:
+    rows, failures = [], []
+    for t in tasks:
+        label, output = t["label"], campaign / "runs" / t["label"]
+        status_file = campaign / "status" / (label + ".json")
+        if not status_file.is_file():
+            failures.append((label, "missing status")); continue
+        status = load(status_file)
+        if status.get("status") != "completed":
+            failures.append((label, status.get("error", status.get("status")))); continue
+        try:
+            for name, expected in status["file_sha256"].items():
+                if digest(output / name) != expected:
+                    raise ValueError("saved file changed after run: " + name)
+            summary, config = load(output / "summary.json"), load(output / "config.json")
+            row = dict(label=label, family=t["family"], kind=t["kind"], pn=t["pn_order"], p=t["degree"],
+                       elements=t["elements"], stabilization=t["stabilization"], steps=summary.get("steps"),
+                       dt=config.get("dt_selected"), solver_seconds=summary.get("solver_seconds"),
+                       total_seconds=summary.get("total_seconds"), rss_mb=summary.get("peak_rss_kib_rank0", 0) / 1024,
+                       threads=status.get("environment", {}).get("affinity_cpus"),
+                       numa=status.get("environment", {}).get("numa_nodes"),
+                       moments=config.get("active_moments", (t["pn_order"] + 1) ** 2),
+                       dofs=config.get("spatial_dofs_full_domain", config.get("coefficients")),
+                       mass=summary.get("final_density_mass"), rho_min=summary.get("minimum_coefficient_density"),
+                       cone_margin=summary.get("minimum_cone_margin"), estimate_core_hours=t.get("estimate_core_hours"))
+            if "ledger" in summary:
+                row.update({"ledger_" + k: v for k, v in summary["ledger"].items()})
+                row["absorption_rate"] = summary.get("absorption_rate_final")
+                for k, v in (summary.get("phase_seconds") or {}).items():
+                    row["phase_" + k] = v
+            if t["kind"] == "lattice" and t["stabilization"] == "element-weno":
+                row["dev_mass_kinetic"] = row["mass"] / LATTICE_KINETIC["mass"] - 1
+                row["dev_absorbed_kinetic"] = row["ledger_absorbed"] / LATTICE_KINETIC["absorbed"] - 1
+                row["dev_absorption_rate_kinetic"] = row["absorption_rate"] / LATTICE_KINETIC["absorption_rate"] - 1
+            if t["kind"] == "shadow":
+                row["shadow_sigma"] = t["shadow_sigma"]
+                row.update(shadow_metrics(output, t["shadow_sigma"]))
+            rows.append(row)
+        except Exception as error:  # report, never fabricate
+            failures.append((label, str(error)))
+    keys = sorted({k for r in rows for k in r}, key=lambda k: (k not in ("label", "family", "kind"), k))
+    with open(campaign / "results.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(rows)
+    atomic(campaign / "results.json", rows)
+    lines = ["# Heterogeneous / 3D element-WENO campaign", "",
+             f"Completed {len(rows)} / {len(tasks)} tasks; failures: {len(failures)}.", "",
+             "- Lattice deviations are against Schotthoefer/Hauck Table 1 / (2 pi) (kinetic, S22, different initial",
+             "  density 0 and inflow model); historical path-B NX runs used an older binary (not timed here).",
+             "- Shadow stage A compares with the uncollided Beer-Lambert density of a plane wave; the PN/M1 model,",
+             "  the background and the beam profile (own choice, not specified by Weih et al.) are part of it.",
+             "- lattice-3d is an own test case; no literature reference exists.", ""]
+    if failures:
+        lines += ["## Failed or missing", ""] + [f"- {a}: {b}" for a, b in failures]
+    (campaign / "REPORT.md").write_text("\n".join(lines) + "\n")
+    print("completed", len(rows), "of", len(tasks), "; failures", len(failures))
+    return 0 if not failures else 2
+
+
 def collect(ns) -> int:
     import numpy as np
     campaign = ns.campaign.resolve(strict=True)
     tasks = check_manifest(campaign)
+    if load(campaign / "manifest.json").get("profile") in HETERO_PROFILES:
+        return collect_hetero(campaign, tasks)
     sys.path.insert(0, str(campaign))
     import analysis as ana  # frozen nx/scripts/analysis.py
     data, rows, failures = {}, [], []
@@ -656,21 +963,26 @@ def submit(ns) -> int:
     lock = campaign / "submission.json"
     if lock.exists():
         raise FileExistsError("campaign already submitted/recorded; inspect " + str(lock))
-    slot = 16
-    batch_size = max(1, ns.tasks_per_job)
+    # Slot classes (v2): tasks with slot_cores 32 go to packs of two 32-core slots (one per socket), all others
+    # to packs of four 16-core slots. v1 campaigns have no slot_cores and keep the 16-core packs.
+    groups = {}
+    for t in tasks:
+        groups.setdefault(int(t.get("slot_cores", 16)), []).append(t)
     files = []
-    for batch in range(0, len(tasks), batch_size):
-        selected = tasks[batch: batch + batch_size]
-        path = campaign / "packs" / f"tasks_{batch//batch_size:03}.tsv"
-        lines = []
-        for t in selected:
-            command = [sys.executable, str(campaign / "study.py"), "run",
-                       "--campaign", str(campaign), "--task", t["label"],
-                       "--threads", str(slot), "--timeout", str(ns.task_timeout)]
-            lines.append(t["label"] + "\t" + shlex.join(command))
-        if ns.execute:
-            path.write_text("\n".join(lines) + "\n")
-        files.append((path, lines))
+    for slot, members in sorted(groups.items()):
+        batch_size = max(1, ns.tasks_per_job if slot == 16 else max(1, ns.tasks_per_job // 2))
+        for batch in range(0, len(members), batch_size):
+            selected = members[batch: batch + batch_size]
+            path = campaign / "packs" / f"tasks_s{slot}_{batch//batch_size:03}.tsv"
+            lines = []
+            for t in selected:
+                command = [sys.executable, str(campaign / "study.py"), "run",
+                           "--campaign", str(campaign), "--task", t["label"],
+                           "--threads", str(slot), "--timeout", str(ns.task_timeout)]
+                lines.append(t["label"] + "\t" + shlex.join(command))
+            if ns.execute:
+                path.write_text("\n".join(lines) + "\n")
+            files.append((path, lines, slot))
     sbatch = shutil.which("sbatch") or "sbatch"
     batch_script = campaign / "nx/batches/element_weno_pack.sbatch"
     commands = []
@@ -680,7 +992,7 @@ def submit(ns) -> int:
     if ns.execute:
         atomic(lock, {"status": "submitting", "jobids": [],
                       "commands": [], "warning": "partial submissions may be live"})
-    for index, (path, _) in enumerate(files):
+    for index, (path, _, slot) in enumerate(files):
         # Conservative dependency chain: no more than max_concurrent_packs
         # whole-node pack jobs may be eligible simultaneously.
         dependencies = []
@@ -688,8 +1000,10 @@ def submit(ns) -> int:
             predecessor = (jobids[index - ns.max_concurrent_packs]
                            if ns.execute else "PACK_JOB_" + str(index - ns.max_concurrent_packs))
             dependencies = ["--dependency=afterany:" + predecessor]
-        cmd = [sbatch, "--parsable", *dependencies, "--chdir=" + str(campaign),
-               "--export=ALL,TASKFILE=" + str(path) + ",REPO=" + str(campaign) + ",OPENBLAS_NUM_THREADS=1,MKL_NUM_THREADS=1",
+        overrides = ([f"--partition={ns.partition}"] if ns.partition else []) + ([f"--time={ns.time}"] if ns.time else [])
+        cmd = [sbatch, "--parsable", *dependencies, *overrides, "--chdir=" + str(campaign),
+               "--export=ALL,TASKFILE=" + str(path) + ",REPO=" + str(campaign) + ",SLOT_CORES=" + str(slot)
+               + ",OPENBLAS_NUM_THREADS=1,MKL_NUM_THREADS=1",
                "--output=" + str(campaign / "packs" / (path.stem + "-%j.log")),
                str(batch_script)]
         commands.append(cmd)
@@ -718,17 +1032,45 @@ def submit(ns) -> int:
     return 0
 
 
+def plan(ns) -> int:
+    """Resource plan of a profile (no files written, no submission)."""
+    tasks = make_tasks(ns.profile)
+    if ns.profile not in HETERO_PROFILES:
+        for t in tasks:
+            t.update(cost_model(t)) if t["binary"] == "fast" else None
+    total = sum(t.get("estimate_core_hours", 0) for t in tasks)
+    print(f"{ns.profile}: {len(tasks)} tasks, estimated {total:.1f} core-hours (calibration factor ~2 uncertain)")
+    print(f"{'label':42s} {'nodes':>10s} {'mom':>4s} {'steps':>6s} {'mem GB':>7s} {'core-h':>7s} {'wall-h':>7s} {'slot':>4s}")
+    warn = 0
+    for t in tasks:
+        if "estimate_core_hours" not in t:
+            continue
+        flag = ""
+        if t["estimate_wall_hours"] > 8:
+            flag, warn = " > med 8 h: use long", warn + 1
+        print(f"{t['label']:42s} {t['estimate_nodes']:10d} {t['estimate_moments']:4d} {t['estimate_steps']:6d} "
+              f"{t['estimate_memory_gb']:7.2f} {t['estimate_core_hours']:7.2f} {t['estimate_wall_hours']:7.2f} "
+              f"{t['slot_cores']:4d}{flag}")
+    packs16 = math.ceil(sum(t.get("slot_cores", 16) == 16 for t in tasks) / 4)
+    packs32 = math.ceil(sum(t.get("slot_cores", 16) == 32 for t in tasks) / 2)
+    print(f"packs: {packs16} x (4 x 16 cores) + {packs32} x (2 x 32 cores); tasks over 8 h wall: {warn}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="operation", required=True)
     p = sub.add_parser("prepare")
-    p.add_argument("--profile", choices=["smoke", "paper"], default="paper")
+    p.add_argument("--profile", choices=["smoke", "paper", *HETERO_PROFILES], default="paper")
     p.add_argument("--repo", type=Path, default=ROOT)
     p.add_argument("--campaign", type=Path, required=True)
     p.add_argument("--fast-bin", type=Path, default=ROOT / "tmp/build/m1pn_fast")
     p.add_argument("--standalone-bin", type=Path, default=ROOT / "tmp/build/m1pn_element_weno")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(action=prepare)
+    p = sub.add_parser("plan", help="resource plan of a profile (dry, no files)")
+    p.add_argument("--profile", choices=["smoke", "paper", *HETERO_PROFILES], default="hetero-paper")
+    p.set_defaults(action=plan)
     p = sub.add_parser("run")
     p.add_argument("--campaign", type=Path, required=True)
     p.add_argument("--task", required=True)
@@ -743,6 +1085,8 @@ def main() -> int:
     p.add_argument("--tasks-per-job", type=int, default=4)
     p.add_argument("--max-concurrent-packs", type=int, default=1)
     p.add_argument("--task-timeout", type=int, default=25200)
+    p.add_argument("--partition", help="override the pack partition (e.g. short for smoke campaigns)")
+    p.add_argument("--time", help="override the pack time limit (e.g. 00:30:00)")
     p.add_argument("--execute", action="store_true", help="Actually call sbatch")
     p.set_defaults(action=submit)
     ns = parser.parse_args()

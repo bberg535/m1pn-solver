@@ -400,12 +400,15 @@ Inflow make_inflow(const Options &o, int dimension) {
             std::vector<Atom> a{{V3::UnitX(),p(x-t*V3::UnitX()-V3(.3,.5,three?.5:0))},{V3::UnitY(),p(x-t*V3::UnitY()-V3(.5,.3,three?.5:0))}};
             if(three)a.push_back({V3::UnitZ(),p(x-t*V3::UnitZ()-V3(.5,.5,.3))}); return a;};
     } else if (o.inflow == "shadow-beam") {
-        // Plane wave along +x (density beam_density) over the whole boundary; it enters only through x = -0.75
-        // (w.n < 0 there, w.n = 0 on the side faces); isotropic background density o.background elsewhere.
+        // Collimated beam along +x with the radial profile of cases::shadow_beam_profile (peak beam_density); it
+        // enters only through x = -0.75 (w.n < 0 there, w.n = 0 on the side faces, where the profile is 0);
+        // isotropic background density o.background elsewhere.
         const double bg = o.background, rho_b = o.beam_density;
         g.density = [bg](const V3 &, double, const V3 &) { return bg / (4 * pi); };
         g.constant_density = bg / (4 * pi);
-        g.atoms = [rho_b](const V3 &, double) { return std::vector<Atom>{{V3::UnitX(), rho_b}}; };
+        g.atoms = [rho_b](const V3 &x, double) {
+            return std::vector<Atom>{{V3::UnitX(), rho_b * cases::shadow_beam_profile(x[1], x[2])}};
+        };
     } else if (o.inflow == "matching") {
         Vec u = matching(o.order);
         g.density = [u, n = o.order](const V3 &, double, const V3 &w) {
@@ -956,6 +959,34 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         min_margin = std::min(min_margin, margin(u));
     }
     if (!o.skip_fields) write_samples(o.output + "/final.csv", a);
+    if (dim == 3) {
+        // Mid-plane slices through the box centre (density and |J|), written even with --skip-fields: the full 3D
+        // sample field is too large for P11 on fine meshes. plane = normal axis, (i, j) = in-plane sample indices.
+        std::ofstream sl(o.output + "/slices.csv");
+        sl << std::setprecision(17) << "plane,i,j,x,y,z,rho,jnorm\n";
+        for (int plane = 0; plane < 3; ++plane) {
+            const int u = plane == 0 ? 1 : 0, v = plane == 2 ? 1 : 2;
+            std::vector<std::array<double, 5>> rowsv(std::size_t(points_axis[u]) * points_axis[v]);
+            parallel_for(points_axis[u] * points_axis[v], [&](int k) {
+                const int i = k % points_axis[u], j = k / points_axis[u];
+                V3 x = full_origin;
+                x[plane] = center[plane];
+                x[u] = full_origin[u] + hs * i;
+                x[v] = full_origin[v] + hs * j;
+                V3 y = x;
+                for (int d = 0; d < dim; ++d)
+                    if (mirror_dir[d] && y[d] < center[d]) y[d] = 2 * center[d] - y[d];
+                const Vec values = scheme.evaluate(a, y);
+                Vec full = Vec::Zero(pn.q);
+                for (int c = 0; c < scheme.moments; ++c) full[scheme.active[c]] = values[c];
+                const Four m = project(full);
+                rowsv[k] = {x[0], x[1], x[2], m[0], m.tail<3>().norm()};
+            });
+            for (int k = 0; k < points_axis[u] * points_axis[v]; ++k)
+                sl << plane << "," << k % points_axis[u] << "," << k / points_axis[u] << "," << rowsv[k][0] << ","
+                   << rowsv[k][1] << "," << rowsv[k][2] << "," << rowsv[k][3] << "," << rowsv[k][4] << "\n";
+        }
+    }
     progress("completed", t, steps);
     const double final_mass = mass_of(a);
     const double injected = stats.injected * domain_factor, absorbed = stats.absorbed * domain_factor,

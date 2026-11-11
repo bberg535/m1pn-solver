@@ -67,9 +67,21 @@ inline Lattice3dCounts lattice3d_counts() {
 
 // --- 3D shadow, Weih et al. (MNRAS 498, 3374, 2020; arXiv:2007.05718, Sec. 4.2.1) -----------------------------------
 // D = (-0.75, 0.75) x (-0.25, 0.25)^2, absorbing sphere of radius R = 0.1 at the origin (published: kappa_a = 1e7),
-// beam injected through x = -0.75 along +x. The beam profile is not specified in the paper; here: a plane wave
-// (perfectly collimated, uniform density on the whole face x = -0.75). Own choice, documented.
-constexpr double shadow_radius = .1, shadow_x0 = -.75;
+// beam injected through x = -0.75 along +x. The beam profile is not specified in the paper; here (own choice,
+// documented): a perfectly collimated beam along +x with density profile rho_b(r), r = |(y, z)|, equal to 1 for
+// r <= 0.15, cos^2 taper to 0 at r = 0.2 and 0 beyond. It covers the sphere (R = 0.1) and stays away from the side
+// faces y, z = +-0.25: a plane wave over the whole face runs tangentially along them and is drained there by the
+// identity part of the LLF boundary flux (found in the first smoke run).
+constexpr double shadow_radius = .1, shadow_x0 = -.75, shadow_beam_radius = .15, shadow_beam_taper = .05;
+inline double shadow_beam_profile(double y, double z) {
+    const double r = std::sqrt(y * y + z * z);
+    if (r <= shadow_beam_radius)
+        return 1;
+    if (r >= shadow_beam_radius + shadow_beam_taper)
+        return 0;
+    const double c = std::cos(.5 * pi * (r - shadow_beam_radius) / shadow_beam_taper);
+    return c * c;
+}
 inline bool shadow_inside(const V3 &x) { return x.squaredNorm() < shadow_radius * shadow_radius; }
 // Length of the segment {(s, y, z) : x0 < s < x} inside the sphere (Beer-Lambert optical depth / sigma_a).
 inline double shadow_chord(double x, double y, double z) {
@@ -80,11 +92,11 @@ inline double shadow_chord(double x, double y, double z) {
     const double a = std::max(lo, shadow_x0), b = std::min(hi, x);
     return std::max(0., b - a);
 }
-// Uncollided kinetic density of the plane-wave beam for pure absorption sigma inside the sphere, density rho_b at the
-// inlet: rho = rho_b exp(-sigma chord) behind the front x < x0 + t, 0 ahead of it (plus the background, not included).
+// Uncollided kinetic density of the collimated beam for pure absorption sigma inside the sphere, peak density rho_b:
+// rho = rho_b profile(y, z) exp(-sigma chord) behind the front x < x0 + t, 0 ahead (background not included).
 inline double shadow_beer_lambert(const V3 &p, double t, double sigma, double rho_b) {
     if (p[0] > shadow_x0 + t)
         return 0;
-    return rho_b * std::exp(-sigma * shadow_chord(p[0], p[1], p[2]));
+    return rho_b * shadow_beam_profile(p[1], p[2]) * std::exp(-sigma * shadow_chord(p[0], p[1], p[2]));
 }
 } // namespace m1pn::cases

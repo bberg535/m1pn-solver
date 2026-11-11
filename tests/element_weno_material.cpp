@@ -2,6 +2,7 @@
 // averages, realizability, ledger and global particle balance.
 #include "element_weno.hpp"
 #include "time.hpp"
+#include "benchmark_cases.hpp"
 #include <iostream>
 #include <memory>
 #include <random>
@@ -264,6 +265,43 @@ void global_balance(bool ssprk43) {
     check(st.injected > 0 && st.absorbed > 0 && st.boundary_outflow >= 0, tag + "source, absorption, outflow", st.injected);
     check(cone, tag + "all nodes in the M1 cone", double(st.nudged_states));
 }
+// Own 3D lattice extension: material integrals equal the independent cell count, balance closes, cone kept.
+void lattice3d() {
+    const auto counts = cases::lattice3d_counts();
+    check(counts.absorbing == 62 && counts.strong_scattering + counts.scattering + counts.absorbing == 343,
+          "lattice-3d: 62 absorbing cells, 343 in total", counts.absorbing);
+    for (int p = 1; p <= 2; ++p) {
+        Angular pn(3);
+        ElementWenoOptions o;
+        o.degree = p, o.dimension = 3, o.elements = 7, o.length = 7, o.periodic = false, o.ssprk43 = true;
+        auto m = std::make_shared<ElementWenoMaterial>();
+        m->sigma_a = cases::lattice3d_sigma_a;
+        m->sigma_s = cases::lattice3d_sigma_s;
+        m->source = cases::lattice3d_source;
+        o.material = m;
+        ElementWeno s(pn, o);
+        const std::string tag = "lattice-3d p=" + std::to_string(p) + ": ";
+        const double worst = std::max({std::abs(s.integral_sigma_a - counts.sigma_a), std::abs(s.integral_sigma_s - counts.sigma_s),
+                                       std::abs(s.integral_source - counts.source), std::abs(s.integral_volume - 343.)});
+        check(worst < 1e-10, tag + "material integrals equal the cell count (620, 429, 1, 343)", worst);
+        Field a = s.interpolate([&](const V3 &) { Vec r = Vec::Zero(pn.q); r[0] = 1e-10 / std::sqrt(4 * pi); return r; });
+        auto mass = [&](const Field &f) {
+            double total = 0;
+            for (int i = 0; i < s.nodes; ++i) total += s.lumped[i] * project(f.row(i).transpose())[0];
+            return total;
+        };
+        const double m0 = mass(a), dt = s.step_bound();
+        ElementWenoStats st;
+        bool cone = true;
+        for (int n = 0; n < 8; ++n) {
+            a = s.advance(n * dt, dt, a, &st);
+            for (int i = 0; i < s.nodes; ++i) cone = cone && exact::cone(project(a.row(i).transpose()));
+        }
+        const double closure = mass(a) - m0 + st.boundary_outflow + st.absorbed - st.injected - st.nudge_mass;
+        check(std::abs(closure) < 1e-12 * st.injected, tag + "balance closes", closure / st.injected);
+        check(cone && st.absorbed > 0, tag + "cone kept, absorption active", st.absorbed);
+    }
+}
 } // namespace
 int main() {
     try {
@@ -274,6 +312,7 @@ int main() {
         constant_material_equals_constant_path();
         global_balance(false);
         global_balance(true);
+        lattice3d();
     } catch (const std::exception &e) {
         std::cerr << "exception: " << e.what() << "\n";
         return 1;
