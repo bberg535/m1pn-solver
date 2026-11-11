@@ -18,6 +18,9 @@ struct Inflow {
     // Set when `density` does not depend on x, t or the direction. The angular
     // quadrature of the kinetic data can then be evaluated once per normal.
     std::optional<double> constant_density;
+    // Set when the inflow data do not depend on time (vacuum, isotropic, plane-wave beams). Element WENO then
+    // evaluates the kinetic boundary data once per face quadrature point instead of in every stage.
+    bool steady = false;
 };
 // Copy the interior reduced velocity only at positive interior density.
 // Positive exterior density at interior vacuum requires explicit velocity data.

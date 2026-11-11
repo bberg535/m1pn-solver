@@ -218,6 +218,15 @@ private:
         Mat harmonics; // points x q
     };
     std::array<OutRule, 6> out_rules_;
+    // Kinetic inflow data at a face quadrature point (one code path for the steady cache and the per-stage call).
+    Incoming face_data(int side_id, const V3 &x, double time) const;
+    std::vector<Incoming> steady_data_; // per (face, point) when inflow.steady
+    std::vector<int> boundary_nodes_sorted_;
+    struct PairEntry {
+        int j;
+        double d, m, c[3], ct[3];
+    };
+    std::vector<PairEntry> pair_table_; // limiter pairs (i, j != i), row-major in i // ascending, for the deterministic parallel boundary corrections
     Field gather_load(const Field &local, double scale = 1.) const;
     // M^-1 C_d a along the grid lines of direction d, and the element loads of s_h for given gradients.
     Field projected_gradient(const Field &a, int direction) const;

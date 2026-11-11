@@ -1,6 +1,7 @@
 #include "element_weno.hpp"
 #include "base_bar.hpp"
 #include "parallel.hpp"
+#include <algorithm>
 #include <atomic>
 #include <random>
 #include <Eigen/Eigenvalues>
@@ -315,6 +316,22 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             viscosity_ij_(i, j) = value_ij;
         }
     viscosity_ij_ = viscosity_ij_.cwiseMax(Mat(viscosity_ij_.transpose()));
+    // Pair table for the limiter loop: (j, d_ij, m_ij, c_ij, c_ji) for all j != i, row by row, same values as
+    // viscosity_ij_, mass_ and convection_ (contiguous instead of dynamic-matrix lookups).
+    pair_table_.resize(std::size_t(local_nodes) * (local_nodes - 1));
+    for (int i = 0, k = 0; i < local_nodes; ++i)
+        for (int j = 0; j < local_nodes; ++j) {
+            if (j == i)
+                continue;
+            PairEntry &pe = pair_table_[k++];
+            pe.j = j;
+            pe.d = viscosity_ij_(i, j);
+            pe.m = mass_(i, j);
+            for (int d = 0; d < 3; ++d) {
+                pe.c[d] = d < dimension ? convection_[d](i, j) : 0.;
+                pe.ct[d] = d < dimension ? convection_[d](j, i) : 0.;
+            }
+        }
     // Lumped masses, one-dimensional consistent mass factor, boundary rules.
     lumped = Vec::Zero(nodes);
     const Vec row = mass_.rowwise().sum();
@@ -444,11 +461,13 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int d = 0; d < dimension; ++d)
             points *= per;
         const double volume = std::pow(h, dimension);
-        std::vector<double> sa(nodes, 0.), ss(nodes, 0.), sq(nodes, 0.), sm(nodes, 0.);
-        double ia = 0, is = 0, iq = 0, iv = 0;
-        for (int e = 0; e < cells; ++e) {
+        // Element by element in parallel into per-element buffers, then gathered in element order (deterministic,
+        // independent of the thread count).
+        std::vector<double> local(std::size_t(cells) * local_nodes * 4, 0.), element_integrals(std::size_t(cells) * 4, 0.);
+        parallel_for(cells, [&](int e) {
             V3 origin;
             element_origin(e, origin);
+            double *loc = &local[std::size_t(e) * local_nodes * 4], *ints = &element_integrals[std::size_t(e) * 4];
             for (int point = 0; point < points; ++point) {
                 V3 x = origin;
                 double w = volume;
@@ -462,14 +481,25 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                              cq = mat.source ? mat.source(x) : 0.;
                 require(ca >= 0 && cs >= 0 && cq >= 0 && std::isfinite(ca + cs + cq),
                         "Material coefficients must be finite and nonnegative");
-                ia += w * ca, is += w * cs, iq += w * cq, iv += w;
+                ints[0] += w * ca, ints[1] += w * cs, ints[2] += w * cq, ints[3] += w;
                 for (int l = 0; l < local_nodes; ++l) {
                     double phi = 1;
                     for (int d = 0, v = l; d < dimension; ++d, v /= one)
                         phi *= shape1(v % one, idx[d]);
-                    const int i = connectivity_[e * local_nodes + l];
-                    sa[i] += w * phi * ca, ss[i] += w * phi * cs, sq[i] += w * phi * cq, sm[i] += w * phi;
+                    double *c = loc + 4 * l;
+                    c[0] += w * phi * ca, c[1] += w * phi * cs, c[2] += w * phi * cq, c[3] += w * phi;
                 }
+            }
+        });
+        std::vector<double> sa(nodes, 0.), ss(nodes, 0.), sq(nodes, 0.), sm(nodes, 0.);
+        double ia = 0, is = 0, iq = 0, iv = 0;
+        for (int e = 0; e < cells; ++e) {
+            const double *ints = &element_integrals[std::size_t(e) * 4];
+            ia += ints[0], is += ints[1], iq += ints[2], iv += ints[3];
+            for (int l = 0; l < local_nodes; ++l) {
+                const int i = connectivity_[e * local_nodes + l];
+                const double *c = &local[(std::size_t(e) * local_nodes + l) * 4];
+                sa[i] += c[0], ss[i] += c[1], sq[i] += c[2], sm[i] += c[3];
             }
         }
         for (int i = 0; i < nodes; ++i) {
@@ -607,6 +637,28 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int k = 0; k < 2 * dimension; ++k)
             density_inflow_[k] = boundaries_[k]->data(density_only, V3::Zero(), 0.);
         cached_density_ = true;
+    }
+    if (!o.periodic && inflow.steady && !faces_.empty()) {
+        const std::size_t points = rules_[2 * faces_[0].direction + faces_[0].side].weights.size();
+        steady_data_.resize(faces_.size() * points);
+        parallel_for(int(faces_.size()), [&](int index) {
+            const auto &f = faces_[index];
+            const int side_id = 2 * f.direction + f.side;
+            const FaceRule &rule = rules_[side_id];
+            require(std::size_t(rule.weights.size()) == points, "Face rules of different size");
+            V3 origin;
+            element_origin(f.element, origin);
+            for (std::size_t point = 0; point < points; ++point) {
+                V3 x = origin;
+                for (int d = 0; d < dimension; ++d)
+                    x[d] += h * rule.points(point, d);
+                steady_data_[index * points + point] = face_data(side_id, x, 0.);
+            }
+        });
+    }
+    if (!o.periodic) {
+        boundary_nodes_sorted_ = boundary_nodes_;
+        std::sort(boundary_nodes_sorted_.begin(), boundary_nodes_sorted_.end());
     }
 }
 
@@ -968,6 +1020,26 @@ Field ElementWeno::stabilization_residual(const Field &a, const Vec &gamma, cons
         stats->t_stab_local += seconds() - start;
     return residual;
 }
+Incoming ElementWeno::face_data(int side_id, const V3 &x, double time) const {
+    const Boundary &b = *boundaries_[side_id];
+    Incoming data;
+    if (cached_density_) {
+        data = density_inflow_[side_id];
+        if (inflow.atoms) {
+            Inflow atoms_only;
+            atoms_only.atoms = inflow.atoms;
+            const Incoming atoms = b.data(atoms_only, x, time);
+            data.d += atoms.d;
+            data.moments += atoms.moments;
+            data.kinetic += atoms.kinetic;
+            for (int k = 0; k < 64 && !exact::cone(data.moments); ++k)
+                data.moments[0] = std::nextafter(data.moments[0], std::numeric_limits<double>::infinity());
+            cone_require(exact::cone(data.moments), "Unable to represent incoming moments in M1 cone");
+        }
+    } else
+        data = b.data(inflow, x, time);
+    return data;
+}
 void ElementWeno::add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                                Field &high, Field &low_load, Field &node_flux_area, Vec &area,
                                Field &bar, Vec *inflow_rate) const {
@@ -1028,24 +1100,18 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         for (int n = 0; n < nf; ++n)
             part.global[n] = connectivity_[f.element * local_nodes + rule.local[n]];
         const int *ghost_id = &ghost_of_face_[std::size_t(index) * nf];
+        // Memo per face node: the exterior state, its Levermore flux and the bar state depend on the point only
+        // through data.moments. For spatially uniform inflow (vacuum, plane waves, isotropic) they are evaluated
+        // once per node instead of once per (point, node); identical inputs give identical values.
+        const bool memo = !inflow.exterior_state && !inflow.exterior_m1;
+        std::vector<char> memo_valid(nf, 0);
+        std::vector<Four> memo_moments(nf), memo_state(nf);
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
             for (int d = 0; d < dimension; ++d)
                 x[d] += h * rule.points(point, d);
-            Incoming data;
-            if (cached_density_) {
-                data = density_inflow_[side_id];
-                if (inflow.atoms) {
-                    const Incoming atoms = b.data(atoms_only, x, time);
-                    data.d += atoms.d;
-                    data.moments += atoms.moments;
-                    data.kinetic += atoms.kinetic;
-                    for (int k = 0; k < 64 && !exact::cone(data.moments); ++k)
-                        data.moments[0] = std::nextafter(data.moments[0], std::numeric_limits<double>::infinity());
-                    cone_require(exact::cone(data.moments), "Unable to represent incoming moments in M1 cone");
-                }
-            } else
-                data = b.data(inflow, x, time);
+            const Incoming &data = inflow.steady ? steady_data_[std::size_t(index) * rule.weights.size() + point]
+                                                 : face_data(side_id, x, time);
             for (int n = 0; n < nf; ++n) {
                 const double weight = rule.weights[point] * rule.shape(n, point);
                 if (weight == 0)
@@ -1053,22 +1119,29 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 const int i = part.global[n];
                 datum.row(n).noalias() += weight * data.d.transpose();
                 const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
-                Four ext = inflow.exterior_state ? inflow.exterior_state(x, time, b.n, ui)
-                           : inflow.exterior_m1  ? inflow.exterior_m1(x, time)
-                                                 : data.moments;
-                if (ghost) {
-                    // Sum of two cone elements is in the cone; outward ulp rounding only for binary64 sums.
-                    ext += outgoing_moments[ghost_id[n]];
-                    for (int k = 0; k < 64 && !exact::cone(ext); ++k)
-                        ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
-                }
-                cone_require(exact::cone(ext), "M1 exterior state outside cone");
                 part.inflow[n] += weight * std::max(0., -data.kinetic[0]);
-                Four own = Four::Zero();
-                for (int d = 0; d < dimension; ++d)
-                    own += b.n[d] * block(low_flux, i, d);
-                const Four outer = Levermore(ext).flux(b.n);
-                const Four state = .5 * (ui + own) + .5 * (ext - outer);
+                Four state;
+                if (memo && memo_valid[n] && (memo_moments[n].array() == data.moments.array()).all())
+                    state = memo_state[n];
+                else {
+                    Four ext = inflow.exterior_state ? inflow.exterior_state(x, time, b.n, ui)
+                               : inflow.exterior_m1  ? inflow.exterior_m1(x, time)
+                                                     : data.moments;
+                    if (ghost) {
+                        // Sum of two cone elements is in the cone; outward ulp rounding only for binary64 sums.
+                        ext += outgoing_moments[ghost_id[n]];
+                        for (int k = 0; k < 64 && !exact::cone(ext); ++k)
+                            ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
+                    }
+                    cone_require(exact::cone(ext), "M1 exterior state outside cone");
+                    Four own = Four::Zero();
+                    for (int d = 0; d < dimension; ++d)
+                        own += b.n[d] * block(low_flux, i, d);
+                    const Four outer = Levermore(ext).flux(b.n);
+                    state = .5 * (ui + own) + .5 * (ext - outer);
+                    if (memo)
+                        memo_valid[n] = 1, memo_moments[n] = data.moments, memo_state[n] = state;
+                }
                 part.area[n] += weight;
                 part.bar.row(n) += weight * state.transpose();
                 for (int d = 0; d < dimension; ++d)
@@ -1214,16 +1287,17 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             const double *ci = &copies[std::size_t(32) * i];
             const Four ui = Quad(ci), qi = Quad(ci + 28);
             Four weighted = Four::Zero(), fi = Four::Zero();
-            for (int j = 0; j < local_nodes; ++j) {
-                if (j == i)
-                    continue;
-                const double dij = viscosity_ij_(i, j);
+            const PairEntry *pairs = &pair_table_[std::size_t(i) * (local_nodes - 1)];
+            for (int k = 0; k < local_nodes - 1; ++k) {
+                const PairEntry &pe = pairs[k];
+                const int j = pe.j;
+                const double dij = pe.d;
                 const double *cj = &copies[std::size_t(32) * j];
                 const Four uj = Quad(cj);
                 V3 edge = V3::Zero();
                 Four flux_difference = Four::Zero(), closure_term = Four::Zero();
                 for (int d = 0; d < dimension; ++d) {
-                    const double cij = convection_[d](i, j), cji = convection_[d](j, i);
+                    const double cij = pe.c[d], cji = pe.ct[d];
                     edge[d] = cij;
                     flux_difference += cij * (Quad(cj + 4 + 4 * d) - Quad(ci + 4 + 4 * d));
                     closure_term += cji * Quad(ci + 16 + 4 * d) - cij * Quad(cj + 16 + 4 * d);
@@ -1241,7 +1315,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                     weighted += dij * pair_bar;
                     fi += dij * (ui - uj);
                 }
-                fi += mass_(i, j) * (qi - Quad(cj + 28)) + closure_term;
+                fi += pe.m * (qi - Quad(cj + 28)) + closure_term;
             }
             if (options.stabilize)
                 fi -= Quad(&stabilization_low.coeffRef(e, 4 * i));
@@ -1311,10 +1385,15 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     // Boundary corrections h_i = P b^H - b^L - (int phi_i n) . G_i, limited node by node.
     double min_boundary = 1, min_sign = 1, boundary_mass_rate = 0;
     long limited_boundary = 0, sign_limited = 0;
-    if (!faces_.empty())
-        for (int i = 0; i < nodes; ++i) {
+    if (!faces_.empty()) {
+        // Node-independent, so in parallel; the reductions run afterwards in ascending node order (as before).
+        const int nb = boundary_nodes_sorted_.size();
+        std::vector<double> node_theta(nb, 1.), node_sign(nb, 1.), node_mass(nb, 0.);
+        std::vector<char> node_signed(nb, 0);
+        parallel_for(nb, [&](int k) {
+            const int i = boundary_nodes_sorted_[k];
             if (boundary_area[i] <= 0)
-                continue;
+                return;
             Four correction = project(boundary_high.row(boundary_slot_[i]).transpose()) -
                               Four(boundary_low(i, 0), boundary_low(i, 1), boundary_low(i, 2), boundary_low(i, 3));
             for (int d = 0; d < dimension; ++d)
@@ -1342,24 +1421,38 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                         while (factor > 0 && factor * correction[0] > allowance)
                             factor = std::nextafter(factor, 0.);
                         theta = std::min(theta, factor);
-                        min_sign = std::min(min_sign, factor);
-                        ++sign_limited;
+                        node_sign[k] = factor;
+                        node_signed[k] = 1;
                     }
                 }
-                min_boundary = std::min(min_boundary, theta);
-                limited_boundary += theta < 1;
             }
+            node_theta[k] = theta;
             const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
             const Four base = boundary_area[i] * (bar - ui);
             load.row(i) += (base + theta * correction).transpose();
             // Total mass rate of node i: the gathered low-order element terms contain the lumped boundary flux
             // -(int phi_i n).F^L_i (only the antidiffusive element contributions sum to zero), plus base + h_i.
-            boundary_mass_rate += base[0] + theta * correction[0];
+            double m = base[0] + theta * correction[0];
             for (int d = 0; d < dimension; ++d)
-                boundary_mass_rate -= flux_area(i, d) * low_flux(i, 4 * d);
+                m -= flux_area(i, d) * low_flux(i, 4 * d);
+            node_mass[k] = m;
             if (debug)
                 raw_load.row(i) += (base + correction).transpose();
+        });
+        for (int k = 0; k < nb; ++k) {
+            if (boundary_area[boundary_nodes_sorted_[k]] <= 0)
+                continue;
+            boundary_mass_rate += node_mass[k];
+            if (options.limit) {
+                min_boundary = std::min(min_boundary, node_theta[k]);
+                limited_boundary += node_theta[k] < 1;
+                if (node_signed[k]) {
+                    min_sign = std::min(min_sign, node_sign[k]);
+                    ++sign_limited;
+                }
+            }
         }
+    }
     parallel_for(nodes, [&](int i) {
         set_low(Eigen::Map<Vec>(&high_rate.coeffRef(i, 0), q), Four(load.row(i).transpose()) / lumped[i]);
     });
@@ -1674,11 +1767,15 @@ Vec ElementWeno::evaluate(const Field &a, const V3 &x) const {
         scale *= count[d];
     }
     Vec out = Vec::Zero(a.cols());
+    double values[3][13];
+    for (int d = 0; d < dimension; ++d)
+        for (int i = 0; i <= degree; ++i)
+            values[d][i] = bernstein(i, degree, 0, ref[d]);
     for (int l = 0; l < local_nodes; ++l) {
         int v = l;
         double phi = 1;
         for (int d = 0; d < dimension; ++d, v /= degree + 1)
-            phi *= bernstein(v % (degree + 1), degree, 0, ref[d]);
+            phi *= values[d][v % (degree + 1)];
         out += phi * a.row(connectivity_[element * local_nodes + l]).transpose();
     }
     return out;

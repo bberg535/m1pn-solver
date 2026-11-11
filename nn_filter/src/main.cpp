@@ -363,6 +363,7 @@ Vec matching(int n) {
 }
 Inflow make_inflow(const Options &o, int dimension) {
     Inflow g;
+    g.steady = o.inflow == "vacuum" || o.inflow == "isotropic" || o.inflow == "shadow-beam";
     if (o.inflow == "vacuum")
         return g;
     if (o.inflow == "isotropic")
@@ -825,7 +826,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         f << std::setprecision(17) << "node,x,y,z";
         for (int k = 0; k < pn.q; ++k) f << ",u" << k;
         f << "\n";
-        for (long s = 0; s < samples; ++s) {
+        Field values(samples, pn.q);
+        parallel_for(int(samples), [&](int s) {
             // Mirror reduction: evaluate at the reflected point and reflect the moments back.
             V3 x = where[s];
             std::array<bool, 3> flip{};
@@ -836,8 +838,11 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
             for (int k = 0; k < scheme.moments; ++k) u[scheme.active[k]] = active_values[k];
             for (int d = 0; d < dim; ++d)
                 if (flip[d]) u = reflect_pn(pn, u, d);
+            values.row(s) = u.transpose();
+        });
+        for (long s = 0; s < samples; ++s) {
             f << s << "," << where[s][0] << "," << where[s][1] << "," << where[s][2];
-            for (int k = 0; k < pn.q; ++k) f << "," << u[k];
+            for (int k = 0; k < pn.q; ++k) f << "," << values(s, k);
             f << "\n";
         }
     };
