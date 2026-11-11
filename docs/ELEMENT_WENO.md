@@ -173,6 +173,52 @@ Fehler gegen die kinetische Lösung; der Zeitfehler spielt keine Rolle. Mit Stre
 Mit dem Standard-`dt` ändern sich alle bisherigen SSPRK3-Läufe (größerer Schritt); mit `--dt` lassen sie sich
 reproduzieren.
 
+## Winkelreduktion über Parität (11.11.2026)
+
+In 1D und 2D hängt die Lösung nicht von z (2D) bzw. y, z (1D) ab. Die Transportmatrizen der aufgelösten
+Richtungen (`A_x`, in 2D auch `A_y`) und die Randmatrizen für Normalen in dieser Ebene koppeln Momente
+verschiedener Parität unter `z → −z` (1D zusätzlich `y → −y`) nicht. Sind Anfangs- und Einstromdaten gerade,
+bleiben alle ungeraden Momente für alle Zeiten exakt null. Gemessen im Crossing ohne Reduktion: |a| < 1e-17.
+
+`ElementWenoOptions::reduce_angular` rechnet daher nur mit den geraden Momenten. Die M1-Momente (l ≤ 1)
+bleiben immer erhalten, also auch J_z bzw. J_y, die dann null sind. Closure, Limiter und Bar States
+bleiben dadurch unverändert. Aktive Momente:
+
+| | volle Basis | 2D: `(N+1)(N+2)/2 + 1` | 1D: `Σ_l (⌊l/2⌋+1) + 2` |
+|---|---:|---:|---:|
+| P7 | 64 | 37 | 22 |
+| P11 | 144 | 79 | 44 |
+| P15 | 256 | 137 | 74 |
+
+- **Paritätsbestimmung:** aus den Werten der Kugelflächenfunktionen an gespiegelten Richtungen, also
+  unabhängig von der Konvention der Basis.
+- **Absicherung beim Aufbau:** `require` prüft, dass `A_d` und `A_n − llf_homogeneous` keine Einträge zwischen
+  gerader und ungerader Klasse haben (Toleranz 1e-12).
+- **Einstrahlung:** `dropped_inflow(t)` misst den ungeraden Anteil von `llf_datum·d` auf allen Randpunkten.
+- **`m1pn_fast --angular-reduction auto|on|off`** (Standard `auto`): `auto` schaltet die Reduktion in 1D/2D
+  ein, wenn die Anfangskoeffizienten aller Knoten und der Einstromterm zu neun Zeiten in [0, T] gerade sind,
+  sonst bleibt die volle Basis (Hinweis auf stderr). `config.json` enthält `angular_reduction`,
+  `active_moments` und die gemessenen ungeraden Anteile. Die Ausgabe (`final.csv`) hat immer die volle Basis.
+- **`m1pn_element_weno`:** Reduktion standardmäßig an (beide Probleme sind gerade, die Einstrahlung wird
+  geprüft), abschaltbar mit `--no-angular-reduction`.
+
+Tests (`tests/element_weno.cpp`, `angular_reduction`): `rate()` und drei SSPRK-Schritte stimmen auf geraden
+Daten mit dem vollen Schema überein (≤ 2.5e-14), in 1D periodisch, 2D periodisch, 2D offen mit Einstrahlung
+und 2D mit Filter und Streuung. Ein um 0.4 rad aus der Ebene gekippter Strahl wird als ungerade erkannt.
+
+Crossing, T = 0.32, p = 2 auf 64², SSPRK(4,3), 6 Threads:
+
+| PN | aktive Momente | ohne Reduktion | mit Reduktion | Faktor | Speicher |
+|---|---:|---:|---:|---:|---|
+| P7 | 37 / 64 | 5.84 s | 4.74 s | 1.23 | 89 → 64 MB |
+| P11 | 79 / 144 | 10.97 s | 5.92 s | 1.85 | 180 → 118 MB |
+| P15 | 137 / 256 | 21.25 s | 10.03 s | 2.12 | 351 → 201 MB |
+
+Die Dichte unterscheidet sich um 2e-6 bis 1e-5, weil die Potenziteration für `high_order_step` im
+reduzierten Raum ein um bis zu 7e-4 anderes ρ schätzt. Mit gleichem `--dt` sind es 4e-11 (P11). Für gerade
+Daten genügt die Stabilität im geraden Teilraum, das kleinere ρ ist also korrekt. Der glatte 1D-Fall
+(P7, p = 3) liefert mit und ohne Reduktion denselben L2-Fehler auf 10 Stellen.
+
 ## Bauen und ausführen
 
     cmake --build tmp/build --target m1pn_element_weno m1pn_element_weno_tests

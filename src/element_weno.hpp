@@ -39,6 +39,11 @@ struct ElementWenoOptions {
     // Time integrator: false = SSPRK3 (Shu-Osher, SSP coefficient 1), true = SSPRK(4,3) (four forward Euler
     // stages of dt/2, SSP coefficient 2). Both are third order; the filter/reaction half steps are the same.
     bool ssprk43 = false;
+    // Angular parity reduction (dimension < 3, docs/ELEMENT_WENO.md): drop the PN moments that are odd under
+    // z -> -z and, in 1D, under y -> -y. Exact for even data, because the transport and boundary matrices of
+    // the resolved directions never couple even and odd moments (checked at construction). The moments with
+    // l <= 1 are always kept, so the M1 part (closure, limiter, boundary bar states) is unchanged.
+    bool reduce_angular = false;
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -64,6 +69,15 @@ public:
     ElementWenoOptions options;
     Inflow inflow;
     int degree, dimension, elements, per_direction, nodes, cells, local_nodes;
+    // Active PN moments per node (pn.q without reduction) and their index in the full basis.
+    int moments;
+    std::vector<int> active;
+    // Full basis <-> active moments. reduce() drops the inactive entries, expand() fills them with zero.
+    Vec reduce(const Vec &full) const;
+    Field expand(const Field &a) const;
+    // Largest inactive part of the PN boundary datum term llf_datum d over all boundary points at `time`,
+    // relative to the largest active part (0 without reduction or boundaries). Used to verify even inflow.
+    double dropped_inflow(double time) const;
     double h, viscosity, dt_bound;
     Vec lumped;
     // Semi-discrete rate: PN coefficients advance by the consistent-mass WENO
@@ -159,7 +173,9 @@ private:
     std::array<Sparse, 3> flux_t_;
     std::vector<double> stiffness_rows_;
     std::array<std::vector<double>, 3> convection_t_rows_;
-    std::array<Mat, 6> boundary_flux_t_; // (A_n - llf_homogeneous)^T per face side
+    std::array<Mat, 6> boundary_flux_t_; // (A_n - llf_homogeneous)^T per face side (active moments)
+    std::vector<char> parity_odd_;       // odd under the reflections of the angular reduction (full index)
+    std::array<Mat, 6> datum_t_;         // llf_datum^T restricted to the active moments (r x moments)
     // Boundary nodes (compact row index of the PN boundary load) and the distinct (side, node) pairs of the
     // C6 ghost state; ghost_of_face_ maps (face, face node) to such a pair.
     std::vector<int> boundary_slot_, boundary_nodes_, ghost_node_, ghost_side_, ghost_of_face_;

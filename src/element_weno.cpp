@@ -114,6 +114,60 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         local_nodes *= one;
     }
     viscosity = o.viscosity_scale * h / (2. * p);
+    // Active moments: parity of every real harmonic from its values at mirrored directions (convention free).
+    {
+        std::vector<char> keep(pn.q, 1);
+        parity_odd_.assign(pn.q, 0);
+        if (o.reduce_angular) {
+            require(dimension < 3, "Angular parity reduction needs dimension 1 or 2");
+            std::vector<double> even_z(pn.q, 0.), odd_z(pn.q, 0.), even_y(pn.q, 0.), odd_y(pn.q, 0.);
+            for (const V3 &w : {V3(.37, -.52, .77), V3(-.61, .29, .44), V3(.13, .81, -.35)}) {
+                const V3 u = w.normalized();
+                const Vec y = harmonics(pn.order, u), mz = harmonics(pn.order, V3(u[0], u[1], -u[2])),
+                          my = harmonics(pn.order, V3(u[0], -u[1], u[2]));
+                for (int k = 0; k < pn.q; ++k) {
+                    even_z[k] += std::abs(y[k] + mz[k]);
+                    odd_z[k] += std::abs(y[k] - mz[k]);
+                    even_y[k] += std::abs(y[k] + my[k]);
+                    odd_y[k] += std::abs(y[k] - my[k]);
+                }
+            }
+            for (int k = 0; k < pn.q; ++k) {
+                require(std::min(even_z[k], odd_z[k]) < 1e-12 * std::max(even_z[k], odd_z[k]) &&
+                            std::min(even_y[k], odd_y[k]) < 1e-12 * std::max(even_y[k], odd_y[k]),
+                        "Spherical harmonic without definite parity");
+                const bool z_odd = even_z[k] < odd_z[k], y_odd = even_y[k] < odd_y[k];
+                parity_odd_[k] = z_odd || (dimension == 1 && y_odd);
+                keep[k] = k < 4 || !parity_odd_[k]; // the M1 moments stay (J_z, and J_y in 1D, are then zero)
+            }
+        }
+        for (int k = 0; k < pn.q; ++k)
+            if (keep[k])
+                active.push_back(k);
+        moments = active.size();
+    }
+    std::vector<int> slot(pn.q, -1);
+    for (int k = 0; k < moments; ++k)
+        slot[active[k]] = k;
+    // Restriction of a full q x q matrix to the active moments. Exactness needs that the matrix never couples
+    // even and odd moments (odd ones vanish for even data, including the kept odd M1 moments).
+    auto restrict_square = [&](const Mat &full, const char *what) {
+        Mat out(moments, moments);
+        double coupling = 0;
+        int ci = -1, cj = -1;
+        const double scale = full.cwiseAbs().maxCoeff();
+        for (int i = 0; i < pn.q; ++i)
+            for (int j = 0; j < pn.q; ++j) {
+                if (slot[i] >= 0 && slot[j] >= 0)
+                    out(slot[i], slot[j]) = full(i, j);
+                if (parity_odd_[i] != parity_odd_[j] && std::abs(full(i, j)) > coupling)
+                    coupling = std::abs(full(i, j)), ci = i, cj = j;
+            }
+        require(coupling <= 1e-12 * std::max(1., scale),
+                std::string("Angular reduction: ") + what + " couples even and odd moments (entry " +
+                    std::to_string(ci) + "," + std::to_string(cj) + " = " + std::to_string(coupling) + ")");
+        return out;
+    };
 
     // One-dimensional reference matrices on [0,1].
     const auto [xq, wq] = unit_gauss(2 * p + 4);
@@ -265,7 +319,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 convection_t_rows_[d][std::size_t(l) * local_nodes + m] = convection_[d](m, l);
         }
     for (int d = 0; d < dimension; ++d) {
-        flux_t_[d] = Sparse(pn.A[d].transpose());
+        flux_t_[d] = Mat(restrict_square(Mat(pn.A[d]), "A_d").transpose()).sparseView();
         flux_t_[d].makeCompressed();
     }
     mass_1d_.compute(m1d);
@@ -353,18 +407,27 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 normal[d] = side ? 1 : -1;
                 boundaries_[2 * d + side] = std::make_unique<Boundary>(pn, *canonical_, normal, false);
                 // Face integrand .5 (A_n - I)(u - exterior(u, datum)) = (A_n - llf_homogeneous) u - llf_datum datum.
-                boundary_flux_t_[2 * d + side] = (pn.normal(normal) - boundaries_[2 * d + side]->llf_homogeneous).transpose();
+                boundary_flux_t_[2 * d + side] =
+                    restrict_square(pn.normal(normal) - boundaries_[2 * d + side]->llf_homogeneous, "boundary flux").transpose();
+                {
+                    const Mat &datum = boundaries_[2 * d + side]->llf_datum;
+                    datum_t_[2 * d + side].resize(datum.cols(), moments);
+                    for (int k = 0; k < moments; ++k)
+                        datum_t_[2 * d + side].col(k) = datum.row(active[k]).transpose();
+                }
                 // Outgoing hemisphere rule (local z in (0,1)), rotated to the global frame: C6 ghost state.
                 OutRule &out = out_rules_[2 * d + side];
                 const auto points = sphere_rule(2 * pn.order + 1, +1);
                 out.omega.resize(points.size(), 3);
                 out.weight.resize(points.size());
-                out.harmonics.resize(points.size(), pn.q);
+                out.harmonics.resize(points.size(), moments);
                 for (std::size_t k = 0; k < points.size(); ++k) {
                     const V3 w = boundaries_[2 * d + side]->frame * points[k].omega;
                     out.omega.row(k) = w.transpose();
                     out.weight[k] = points[k].weight;
-                    out.harmonics.row(k) = harmonics(pn.order, w).transpose();
+                    const Vec y = harmonics(pn.order, w);
+                    for (int c = 0; c < moments; ++c)
+                        out.harmonics(k, c) = y[active[c]];
                 }
             }
     }
@@ -750,7 +813,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         const int nf = rule.local.size();
         Local &part = parts[index];
         part.global.resize(nf);
-        part.high = Mat::Zero(nf, pn.q);
+        part.high = Mat::Zero(nf, moments);
         part.load = Mat::Zero(nf, 4);
         part.bar = Mat::Zero(nf, 4);
         part.flux_area = Mat::Zero(nf, 3);
@@ -812,11 +875,11 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             }
         }
         // sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum], with the exact face mass matrix.
-        Mat traces(nf, pn.q);
+        Mat traces(nf, moments);
         for (int n = 0; n < nf; ++n)
             traces.row(n) = a.row(part.global[n]);
         part.high.noalias() = (rule.mass * traces) * boundary_flux_t_[side_id];
-        part.high.noalias() -= datum * b.llf_datum.transpose();
+        part.high.noalias() -= datum * datum_t_[side_id];
     });
     // `high` has one row per node or, in rate(), one row per boundary node (boundary_slot_).
     const bool compact = high.rows() != nodes;
@@ -834,7 +897,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
 }
 Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                         ElementWenoDebug *debug) const {
-    require(a.rows() == nodes && a.cols() == pn.q, "Invalid element WENO state");
+    require(a.rows() == nodes && a.cols() == moments, "Invalid element WENO state");
     {
         // Parallel finiteness check; the serial a.allFinite() cost a quarter of the run time on 8 threads.
         std::atomic<bool> finite{true};
@@ -850,7 +913,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
         });
         require(finite.load(), "Invalid element WENO state");
     }
-    const int q = pn.q;
+    const int q = moments;
     double clock = seconds();
     ElementWenoStats scratch;
     ElementWenoStats &timing = stats ? *stats : scratch;
@@ -1137,9 +1200,9 @@ double ElementWeno::high_order_step() const {
         std::uniform_real_distribution<double> uniform(-1, 1);
         double radius = 0;
         for (double gamma_value : {0., 1.}) {
-            Field x(nodes, pn.q);
+            Field x(nodes, moments);
             for (int i = 0; i < nodes; ++i)
-                for (int c = 0; c < pn.q; ++c)
+                for (int c = 0; c < moments; ++c)
                     x(i, c) = uniform(rng);
             x /= x.norm();
             const int iterations = 60;
@@ -1161,11 +1224,12 @@ double ElementWeno::high_order_step() const {
 Field ElementWeno::angular_filter(const Field &a, double tau) const {
     if (options.filter_strength == 0 && options.sigma_s == 0 && options.sigma_a == 0)
         return a;
-    Vec decay(pn.q);
-    for (int l = 0; l <= pn.order; ++l)
-        decay.segment(l * l, 2 * l + 1).setConstant(
-            std::exp(-tau * (options.filter_strength * std::pow(double(l) / (pn.order + 1), 4) +
-                             options.sigma_a + (l > 0 ? options.sigma_s : 0.))));
+    Vec decay(moments);
+    for (int k = 0; k < moments; ++k) {
+        const int l = int(std::sqrt(double(active[k]) + .5)); // full index l^2 + l + m
+        decay[k] = std::exp(-tau * (options.filter_strength * std::pow(double(l) / (pn.order + 1), 4) +
+                                    options.sigma_a + (l > 0 ? options.sigma_s : 0.)));
+    }
     return a * decay.asDiagonal();
 }
 namespace {
@@ -1232,14 +1296,56 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
     return reacts() ? angular_filter(last, .5 * dt) : last;
 }
 Field ElementWeno::interpolate(const std::function<Vec(const V3 &)> &f) const {
-    Field a(nodes, pn.q);
+    Field a(nodes, moments);
     for (int i = 0; i < nodes; ++i)
-        a.row(i) = f(node_position(i)).transpose();
+        a.row(i) = reduce(f(node_position(i))).transpose();
     return a;
+}
+Vec ElementWeno::reduce(const Vec &full) const {
+    require(full.size() == pn.q, "reduce expects a full PN vector");
+    Vec out(moments);
+    for (int k = 0; k < moments; ++k)
+        out[k] = full[active[k]];
+    return out;
+}
+Field ElementWeno::expand(const Field &a) const {
+    require(a.cols() == moments, "expand expects active moments");
+    Field out = Field::Zero(a.rows(), pn.q);
+    parallel_for(int(a.rows()), [&](int i) {
+        for (int k = 0; k < moments; ++k)
+            out(i, active[k]) = a(i, k);
+    });
+    return out;
+}
+double ElementWeno::dropped_inflow(double time) const {
+    if (moments == pn.q || faces_.empty())
+        return 0;
+    std::vector<char> is_active(pn.q, 0);
+    for (int k : active)
+        is_active[k] = 1;
+    double kept = 0, dropped = 0;
+    for (const auto &f : faces_) {
+        const int side_id = 2 * f.direction + f.side;
+        const FaceRule &rule = rules_[side_id];
+        const Boundary &b = *boundaries_[side_id];
+        V3 origin;
+        element_origin(f.element, origin);
+        for (int point = 0; point < rule.weights.size(); ++point) {
+            V3 x = origin;
+            for (int d = 0; d < dimension; ++d)
+                x[d] += h * rule.points(point, d);
+            const Vec full = b.llf_datum * b.data(inflow, x, time).d;
+            for (int k = 0; k < pn.q; ++k) {
+                double &slot_max = is_active[k] ? kept : dropped;
+                slot_max = std::max(slot_max, std::abs(full[k]));
+            }
+        }
+    }
+    return kept > 0 ? dropped / kept : dropped;
 }
 Field ElementWeno::project_l2(const std::function<Vec(const V3 &)> &f) const {
     const auto [xq, wq] = unit_gauss(2 * degree + 6);
-    Field load = Field::Zero(nodes, pn.q);
+    Field load = Field::Zero(nodes, moments);
     int points = 1;
     for (int d = 0; d < dimension; ++d)
         points *= xq.size();
@@ -1257,7 +1363,7 @@ Field ElementWeno::project_l2(const std::function<Vec(const V3 &)> &f) const {
                 w *= wq[value % xq.size()];
                 x[d] += h * ref[d];
             }
-            const Vec state = f(x);
+            const Vec state = reduce(f(x));
             for (int l = 0; l < local_nodes; ++l) {
                 int v = l;
                 double phi = 1;

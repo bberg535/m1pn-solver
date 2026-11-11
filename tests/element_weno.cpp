@@ -1,5 +1,6 @@
 // Structural checks of the element-based WENO variant.
 #include "element_weno.hpp"
+#include <algorithm>
 #include <iostream>
 #include <random>
 using namespace m1pn;
@@ -187,6 +188,67 @@ void high_order_stability(int degree, bool ssprk43) {
     const double beyond = amplification(scheme, dt / .9 * 1.25, 0., ssprk43);
     check(beyond > 1.001, tag + "growth beyond the real-axis limit", beyond);
 }
+
+// Angular parity reduction: on even data the reduced scheme reproduces the full scheme (rate and steps).
+Inflow in_plane_beams(double angle) {
+    Inflow in;
+    in.density = [](const V3 &, double, const V3 &) { return 1e-3 / (4 * pi); };
+    in.constant_density = 1e-3 / (4 * pi);
+    const V3 tilted = V3(std::cos(angle), 0, std::sin(angle)).normalized();
+    in.atoms = [tilted](const V3 &x, double t) {
+        auto p = [](const V3 &d) { return std::exp(-d.squaredNorm() / (2 * .1 * .1)); };
+        return std::vector<Atom>{{V3::UnitX(), p(x - t * V3::UnitX() - V3(.3, .5, 0))},
+                                 {tilted, p(x - V3(0, .5, 0))}};
+    };
+    return in;
+}
+void angular_reduction(int dimension, bool periodic, double filter, double sigma_s) {
+    Angular pn(7);
+    ElementWenoOptions o;
+    o.degree = 2;
+    o.dimension = dimension;
+    o.elements = dimension == 1 ? 10 : 5;
+    o.periodic = periodic;
+    o.filter_strength = filter;
+    o.sigma_s = sigma_s;
+    o.sigma_a = sigma_s / 4;
+    const Inflow in = periodic ? Inflow{} : in_plane_beams(0.);
+    ElementWeno full(pn, o, in);
+    o.reduce_angular = true;
+    ElementWeno reduced(pn, o, in);
+    const std::string tag = "reduction d=" + std::to_string(dimension) + (periodic ? " periodic" : " open") +
+                            (filter > 0 || sigma_s > 0 ? " +filter/scattering" : "") + ": ";
+    // 2D: z-even harmonics (N+1)(N+2)/2 plus J_z; 1D: y- and z-even sum_l (floor(l/2)+1) plus J_y, J_z.
+    int expected = dimension == 2 ? (pn.order + 1) * (pn.order + 2) / 2 + 1 : 2;
+    if (dimension == 1)
+        for (int l = 0; l <= pn.order; ++l)
+            expected += l / 2 + 1;
+    check(reduced.moments == expected, tag + "expected number of active moments", reduced.moments);
+    // Even data: the full state of the reduced interpolation.
+    const Field even = reduced.interpolate([&](const V3 &x) { return state(pn, x); });
+    const Field even_full = reduced.expand(even);
+    const double scale = maxabs(even_full);
+    const double rate_error = maxabs(full.rate(.05, even_full) - reduced.expand(reduced.rate(.05, even)));
+    check(rate_error < 1e-11 * std::max(1., scale), tag + "rate equals the full rate on even data", rate_error);
+    Field a = even_full, b = even;
+    for (int n = 0; n < 3; ++n) {
+        a = full.advance(.01 * n, .5 * full.step_bound(), a);
+        b = reduced.advance(.01 * n, .5 * full.step_bound(), b);
+    }
+    const double step_error = maxabs(a - reduced.expand(b));
+    check(step_error < 1e-11 * std::max(1., scale), tag + "three steps equal the full scheme", step_error);
+    double odd = 0;
+    for (int i = 0; i < full.nodes; ++i)
+        for (int k = 0; k < pn.q; ++k)
+            if (std::find(reduced.active.begin(), reduced.active.end(), k) == reduced.active.end())
+                odd = std::max(odd, std::abs(a(i, k)));
+    check(odd < 1e-14, tag + "full scheme keeps odd moments at zero", odd);
+    if (!periodic) {
+        check(reduced.dropped_inflow(.1) < 1e-12, tag + "in-plane inflow is even", reduced.dropped_inflow(.1));
+        ElementWeno tilted(pn, o, in_plane_beams(.4));
+        check(tilted.dropped_inflow(0) > 1e-3, tag + "out-of-plane beam is detected as odd", tilted.dropped_inflow(0));
+    }
+}
 } // namespace
 int main() {
     try {
@@ -200,6 +262,10 @@ int main() {
             polynomial(p);
         rough_cone();
         rough_ssprk43();
+        angular_reduction(2, false, 0, 0);
+        angular_reduction(2, true, 0, 0);
+        angular_reduction(1, true, 0, 0);
+        angular_reduction(2, false, 20, 2);
         for (int p = 1; p <= 4; ++p) {
             high_order_stability(p, false);
             high_order_stability(p, true);

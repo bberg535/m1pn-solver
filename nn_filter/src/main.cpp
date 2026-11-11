@@ -4,6 +4,7 @@
 #include "pn_uncoupled.hpp"
 #include "filter.hpp"
 #include "element_weno.hpp"
+#include <memory>
 #include <filesystem>
 #include <malloc.h>
 #include <fstream>
@@ -19,6 +20,7 @@ using namespace m1pn;
 namespace {
 struct Options {
     std::string filter_mode = "off", filter_model;
+    std::string angular_reduction = "auto"; // element-weno: auto|on|off (parity reduction in 1D/2D)
     double filter_strength = 0;
     MeshSpec mesh;
     Numerics num;
@@ -81,6 +83,8 @@ Options parse(int argc, char **argv) {
                    " --filter off|constant|nn --filter-strength S --filter-model FILE\n"
                    " --stabilization element-weno --degree p --weno on|off --weno-linear W --weno-q Q\n"
                    "   --element-limit on|off (uniform Cartesian hex mesh, SSPRK3, constant filter only)\n"
+                   "   --angular-reduction auto|on|off (1D/2D: drop PN moments odd in the unresolved directions;\n"
+                   "     auto = on when initial and inflow data are even, otherwise off)\n"
 #ifdef M1PN_FAST_DEFAULTS
                    "defaults: --stabilization m1pn_mass_correction --time-integrator ssprk2 --cfl 1 --dt 0\n"
                    "  --mass-mode lumped --kv-gamma 0 --threads <OpenMP maximum>\n"
@@ -232,6 +236,9 @@ Options parse(int argc, char **argv) {
             o.degree = integer();
         } else if (key == "--weno-linear") {
             o.weno_linear = real();
+        } else if (key == "--angular-reduction") {
+            require(v == "auto" || v == "on" || v == "off", "Invalid --angular-reduction");
+            o.angular_reduction = v;
         } else if (key == "--weno-q") {
             o.weno_q = real();
         } else if (key == "--weno" || key == "--element-limit") {
@@ -510,12 +517,40 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     eo.sigma_s = o.sigma_s;
     eo.sigma_a = o.sigma_a;
     eo.ssprk43 = o.rk == 4;
-    ElementWeno scheme(pn, eo, make_inflow(o, dim));
-    Field a(scheme.nodes, pn.q);
-    for (int i = 0; i < scheme.nodes; ++i) {
-        a.row(i) = initial_point(o, scheme.node_position(i), i, dim, pn).transpose();
-        cone_require(exact::cone(project(a.row(i).transpose())), "Initial Bernstein coefficient outside the M1 cone");
+    // Angular parity reduction: exact when the initial and inflow data are even in the unresolved directions.
+    // auto checks both (initial coefficients of every node, inflow datum term at nine times in [0, T]).
+    eo.reduce_angular = dim < 3 && o.angular_reduction != "off";
+    require(!(o.angular_reduction == "on" && dim == 3), "--angular-reduction on needs dimension 1 or 2");
+    auto scheme_ptr = std::make_unique<ElementWeno>(pn, eo, make_inflow(o, dim));
+    std::vector<Vec> initial(scheme_ptr->nodes);
+    for (int i = 0; i < scheme_ptr->nodes; ++i) {
+        initial[i] = initial_point(o, scheme_ptr->node_position(i), i, dim, pn);
+        cone_require(exact::cone(project(initial[i])), "Initial Bernstein coefficient outside the M1 cone");
     }
+    double odd_initial = 0, odd_inflow = 0;
+    if (eo.reduce_angular) {
+        double scale = 0, dropped = 0;
+        std::vector<char> kept(pn.q, 0);
+        for (int k : scheme_ptr->active) kept[k] = 1;
+        for (const Vec &u : initial)
+            for (int k = 0; k < pn.q; ++k) (kept[k] ? scale : dropped) = std::max(kept[k] ? scale : dropped, std::abs(u[k]));
+        odd_initial = scale > 0 ? dropped / scale : dropped;
+        for (int k = 0; k <= 8; ++k)
+            odd_inflow = std::max(odd_inflow, scheme_ptr->dropped_inflow(o.final_time * k / 8.));
+        const bool even = odd_initial <= 1e-13 && odd_inflow <= 1e-12;
+        require(even || o.angular_reduction != "on",
+                "--angular-reduction on: initial or inflow data are not even in the unresolved directions");
+        if (!even) {
+            std::cerr << "note: angular reduction off (odd data: initial " << odd_initial << ", inflow " << odd_inflow << ")\n";
+            eo.reduce_angular = false;
+            scheme_ptr = std::make_unique<ElementWeno>(pn, eo, make_inflow(o, dim));
+        }
+    }
+    const ElementWeno &scheme = *scheme_ptr;
+    Field a(scheme.nodes, scheme.moments);
+    for (int i = 0; i < scheme.nodes; ++i)
+        a.row(i) = scheme.reduce(initial[i]).transpose();
+    std::vector<Vec>().swap(initial);
     const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.step_bound();
     require(selected <= scheme.realizability_step() * (1 + 1e-12), "Requested dt violates the element realizability bound");
     if (selected > scheme.high_order_step())
@@ -546,7 +581,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         for (int k = 0; k < pn.q; ++k) f << ",u" << k;
         f << "\n";
         for (int s = 0; s < samples; ++s) {
-            const Vec u = scheme.evaluate(state, where[s]);
+            const Vec active_values = scheme.evaluate(state, where[s]);
+            Vec u = Vec::Zero(pn.q);
+            for (int k = 0; k < scheme.moments; ++k) u[scheme.active[k]] = active_values[k];
             f << s << "," << where[s][0] << "," << where[s][1] << "," << where[s][2];
             for (int k = 0; k < pn.q; ++k) f << "," << u[k];
             f << "\n";
@@ -567,6 +604,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"sigma_s\":" << o.sigma_s << ",\"sigma_a\":" << o.sigma_a
                << ",\"reaction_integration\":\"exact_exponential_half_steps_around_ssprk\""
                << ",\"pn_order\":" << pn.order << ",\"Q\":" << pn.q << ",\"dimension\":" << dim
+               << ",\"angular_reduction\":" << (eo.reduce_angular ? "true" : "false")
+               << ",\"angular_reduction_mode\":" << std::quoted(o.angular_reduction)
+               << ",\"active_moments\":" << scheme.moments << ",\"odd_initial_fraction\":" << odd_initial
+               << ",\"odd_inflow_fraction\":" << odd_inflow
                << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << scheme.nodes
                << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis
                << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":3"

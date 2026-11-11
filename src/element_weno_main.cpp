@@ -1,6 +1,7 @@
 // Stand-alone driver for the element-based WENO variant.
 #include "element_weno.hpp"
 #include <filesystem>
+#include <malloc.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -12,7 +13,8 @@ struct Args {
     int sample_grid = 0;
     double filter_strength = 0;
     std::string problem = "smooth", output = "tmp/element_weno";
-    bool weno = true, limit = true, stabilize = true, legacy_boundary = false, symmetric_residual = false, ssprk43 = false;
+    bool weno = true, limit = true, stabilize = true, legacy_boundary = false, symmetric_residual = false, ssprk43 = false,
+         reduce_angular = true;
 };
 Args parse(int argc, char **argv) {
     Args a;
@@ -40,6 +42,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--no-weno") a.weno = false;
         else if (key == "--no-limit") a.limit = false;
         else if (key == "--ssprk43") a.ssprk43 = true; // SSPRK(4,3) instead of SSPRK3
+        else if (key == "--no-angular-reduction") a.reduce_angular = false; // both problems are even in 1D/2D
         else if (key == "--no-stabilization") a.stabilize = false;
         else if (key == "--legacy-boundary") a.legacy_boundary = true; // commit 8efe517 behaviour (docs/BOUNDARY_FIXES.md)
         else if (key == "--symmetric-residual") a.symmetric_residual = true;
@@ -50,6 +53,9 @@ Args parse(int argc, char **argv) {
 }
 } // namespace
 int main(int argc, char **argv) {
+    // Large fields are reallocated every stage; keep them in the heap (as m1pn_fast does).
+    mallopt(M_MMAP_MAX, 0);
+    mallopt(M_TRIM_THRESHOLD, 1 << 30);
     try {
         const Args args = parse(argc, argv);
         Angular pn(args.pn);
@@ -67,6 +73,7 @@ int main(int argc, char **argv) {
         options.symmetric_residual = args.symmetric_residual;
         options.filter_strength = args.filter_strength;
         options.ssprk43 = args.ssprk43;
+        options.reduce_angular = args.reduce_angular && args.dimension < 3;
         const bool smooth = args.problem == "smooth";
         options.periodic = smooth;
         Inflow inflow;
@@ -82,6 +89,8 @@ int main(int argc, char **argv) {
             };
         }
         ElementWeno scheme(pn, options, inflow);
+        for (int k = 0; k <= 8; ++k) // both problems have data even in the unresolved directions; verify the inflow
+            require(scheme.dropped_inflow(args.time * k / 8.) <= 1e-12, "Inflow is not even; use --no-angular-reduction");
         Field a;
         if (smooth) {
             a = scheme.project_l2([&](const V3 &x) { return element_weno_smooth_exact(pn, x, 0); });
