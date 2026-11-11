@@ -139,9 +139,13 @@ def make_tasks(profile: str) -> list[dict]:
                         2, 7, .32, kind="ablation", tag=key, weno=weno,
                         limiter=limit, rk=rk))
     if not smoke:
+        out.append(task("ablation", "fast", "crossing-study",
+                        "crossing-study-transport", 2, 64, 2, 7, .32,
+                        kind="ablation", tag="weno_weight_02", linear=.2))
+        # Same 129x129 sample-grid size as Q2/E64 element WENO, not same FE degree.
         for coupling in ("m1pn", "pn-only"):
             row = task("baseline", "fast", "crossing-study",
-                       "crossing-study-transport", 2, 64, 1, 7, .32,
+                       "crossing-study-transport", 2, 128, 1, 7, .32,
                        kind="baseline", tag=coupling)
             row["stabilization"] = "m1pn_mass_correction"
             row["coupling"] = coupling
