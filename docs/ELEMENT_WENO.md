@@ -255,6 +255,51 @@ genau ein Viertel. Auch mit Winkelreduktion, Streuung und SSPRK(4,3).
 Ohne `--dt` schätzt die Potenziteration auf dem kleineren Gebiet ein etwas anderes ρ (Abweichung der Dichte
 dann 1e-4).
 
+## Hardware (11.11.2026)
+
+Element-WENO ist durch die Speicherbandbreite begrenzt; ab N ≈ 11 dominieren die Phasen, die mit der Zahl der
+Momente wachsen. Messungen:
+
+**Arbeitsplatz** (i5-12500, 6 Kerne mit Hyperthreading), P11, 193² Knoten: 4 Threads 4.31 s, **6 Threads
+3.45 s**, 8 Threads 4.34 s, 12 Threads 4.73 s.
+
+**nx-01…06** (2 × AMD EPYC 9354, Zen 4, je Sockel ein NUMA-Knoten mit 32 Kernen, 512 MB L3, 1.5 TB RAM),
+`OMP_PLACES=cores`:
+
+| Threads (close) | 1 | 4 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| P11, 257² Knoten, 28 Schritte | 17.9 s | 5.1 | 2.86 | 1.89 | **1.48** | 1.85 |
+| P15, 513² Knoten, 11 Schritte | – | – | 6.89 | 3.96 | **2.74** | 2.77 |
+
+Der zweite Sockel bringt einem einzelnen Lauf nichts, auch nicht bei Feldern weit über L3 (P15/513²: 288 MB pro
+Feld), weil der Hauptthread die Felder zuerst berührt und der Speicher deshalb auf Sockel 0 liegt. `spread` über
+beide Sockel ist langsamer (32 Threads: 3.26 statt 2.74 s). Mehrere gepinnte Läufe pro Knoten mit lokalem Speicher
+(`numactl --physcpubind … --localalloc`) beeinflussen sich dagegen kaum:
+
+| Packung auf einem nx-Knoten | P11/257²: Zeit je Lauf | Durchsatz | P15/513²: Zeit je Lauf | Durchsatz |
+|---|---:|---:|---:|---:|
+| 1 × 32 Threads | 1.48 s | 1.48 s/Lauf | 2.74 s | 2.74 s/Lauf |
+| 2 × 32 (je Sockel) | 1.49 s | 0.75 s/Lauf | 2.75 s | 1.37 s/Lauf |
+| 4 × 16 (je Viertel) | 1.95 s | **0.49 s/Lauf** | 4.3 s | **1.08 s/Lauf** |
+
+Umgesetzt:
+
+- **Threadzahl** (`src/hardware.hpp`): Ohne `--threads` und ohne `OMP_NUM_THREADS` nehmen `m1pn_fast` (nur
+  Element-WENO) und `m1pn_element_weno` die physischen Kerne der erlaubten CPUs im NUMA-Knoten der ersten
+  erlaubten CPU: 6 auf dem Arbeitsplatz, 32 auf einem ganzen nx-Knoten, 16 bei `--cpus-per-task=16`. Bei
+  gesetztem `OMP_PLACES` bindet libgomp den Hauptthread schon vor `main` an einen Kern; die erlaubten CPUs kommen
+  dann aus der OpenMP-Platzliste. `config.json` enthält `thread_policy`. Pfad B behält das OpenMP-Maximum.
+- **Packung** (`scripts/element_weno/pack_node.py`): Aufgabenliste `NAME<TAB>KOMMANDO`, Slots aus physischen
+  Kernen innerhalb eines NUMA-Knotens (Standard 16 Kerne), `numactl --physcpubind --localalloc`,
+  `OMP_PLACES=cores`, `OMP_PROC_BIND=close`, gemeinsame Warteschlange.
+  `nx/batches/element_weno_pack.sbatch` belegt einen nx-Knoten exklusiv mit vier Slots
+  (`sbatch --export=ALL,TASKFILE=… nx/batches/element_weno_pack.sbatch` aus dem Repository-Wurzelverzeichnis).
+- Die Binary (x86-64-v3, `-mtune=znver3`) läuft auf beiden Maschinen. Ein eigener Zen-4-Build (AVX-512) ist
+  nicht gemacht; bei bandbreitenbegrenzten Phasen ist wenig davon zu erwarten.
+
+Offen: NUMA-gerechtes paralleles Anlegen der Felder, damit ein Einzellauf beide Sockel nutzen kann. Für
+Kampagnen ist die Packung einfacher und schon effizienter.
+
 ## Bauen und ausführen
 
     cmake --build tmp/build --target m1pn_element_weno m1pn_element_weno_tests

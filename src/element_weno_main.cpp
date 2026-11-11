@@ -1,5 +1,6 @@
 // Stand-alone driver for the element-based WENO variant.
 #include "element_weno.hpp"
+#include "hardware.hpp"
 #include <filesystem>
 #include <malloc.h>
 #include <fstream>
@@ -56,6 +57,10 @@ int main(int argc, char **argv) {
     // Large fields are reallocated every stage; keep them in the heap (as m1pn_fast does).
     mallopt(M_MMAP_MAX, 0);
     mallopt(M_TRIM_THRESHOLD, 1 << 30);
+#ifdef _OPENMP
+    // Physical cores of one NUMA node unless OMP_NUM_THREADS is set (src/hardware.hpp).
+    omp_set_num_threads(m1pn::default_threads().threads);
+#endif
     try {
         const Args args = parse(argc, argv);
         Angular pn(args.pn);
@@ -151,6 +156,8 @@ int main(int argc, char **argv) {
         summary << std::setprecision(12) << "{\"problem\":\"" << args.problem << "\",\"pn_order\":" << args.pn
                 << ",\"degree\":" << args.degree << ",\"elements\":" << args.elements
                 << ",\"dimension\":" << args.dimension << ",\"steps\":" << steps << ",\"dt\":" << dt
+                << ",\"threads\":" << m1pn::default_threads().threads << ",\"thread_policy\":\""
+                << m1pn::default_threads().reason << "\""
                 << ",\"dt_bound\":" << scheme.dt_bound << ",\"high_order_step\":" << scheme.high_order_step() << ",\"wall_seconds\":" << wall
                 << ",\"l2_density_error\":" << error << ",\"final_mass\":" << total
                 << ",\"min_coefficient_density\":" << min_coefficient_density

@@ -4,6 +4,7 @@
 #include "pn_uncoupled.hpp"
 #include "filter.hpp"
 #include "element_weno.hpp"
+#include "hardware.hpp"
 #include <memory>
 #include <filesystem>
 #include <malloc.h>
@@ -26,6 +27,8 @@ struct Options {
     MeshSpec mesh;
     Numerics num;
     int order = 3, rk = 3, max_steps = 100000, norm_max = 512, threads = 1, checkpoint_stride = 0;
+    bool threads_explicit = false;
+    std::string thread_policy = "OpenMP maximum";
     double final_time = .01, dt = 0, cfl = .8, sigma_a = 0, sigma_s = 0, anisotropy = 0, source = 0;
     double pulse_width = .07, background = .001;
     // line-source: generated square [0.5-L/2, 0.5+L/2]^2, source at its centre.
@@ -90,7 +93,8 @@ Options parse(int argc, char **argv) {
                    "     symmetric about x_d = 1/2 in every direction: compute on [1/2,1]^d with mirror sides)\n"
 #ifdef M1PN_FAST_DEFAULTS
                    "defaults: --stabilization m1pn_mass_correction --time-integrator ssprk2 --cfl 1 --dt 0\n"
-                   "  --mass-mode lumped --kv-gamma 0 --threads <OpenMP maximum>\n"
+                   "  --mass-mode lumped --kv-gamma 0 --threads <OpenMP maximum;\n"
+                   "  element-weno: physical cores of one NUMA node unless OMP_NUM_THREADS is set>\n"
 #endif
                    ;
             std::exit(0);
@@ -225,8 +229,11 @@ Options parse(int argc, char **argv) {
             o.background = real();
         else if (key == "--domain-length")
             o.domain_length = real();
-        else if (key == "--threads")
+        else if (key == "--threads") {
             o.threads = integer();
+            o.threads_explicit = true;
+            o.thread_policy = "--threads";
+        }
         else if (key == "--ledger-stride") {
             o.num.ledger_stride = integer();
             require(o.num.ledger_stride >= 1, "--ledger-stride must be at least 1");
@@ -666,6 +673,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"time_integrator\":" << (eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\"")
                << ",\"case\":" << std::quoted(o.problem) << ",\"inflow\":" << std::quoted(o.inflow)
                << ",\"final_time\":" << o.final_time << ",\"dt_requested\":" << o.dt << ",\"dt_selected\":" << selected
+               << ",\"thread_policy\":" << std::quoted(o.thread_policy)
                << ",\"cfl_safety\":" << o.cfl << ",\"element_dt_bound\":" << scheme.dt_bound
                << ",\"realizability_step\":" << scheme.realizability_step()
                << ",\"high_order_step\":" << scheme.high_order_step()
@@ -743,6 +751,13 @@ int main(int argc, char **argv) {
         if (o.cuda_explicit)
             cuda_set_requested(o.cuda_on);
         world.deterministic = o.deterministic;
+        // Element WENO is bandwidth bound: default to the physical cores of one NUMA node (src/hardware.hpp).
+        // Path B keeps the OpenMP maximum so that its results do not depend on a changed thread count.
+        if (o.num.stabilization == "element-weno" && !o.threads_explicit) {
+            const ThreadDefault automatic = default_threads();
+            o.threads = automatic.threads;
+            o.thread_policy = automatic.reason;
+        }
 #ifdef _OPENMP
         omp_set_num_threads(o.threads);
 #else
