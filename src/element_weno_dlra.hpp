@@ -43,6 +43,10 @@ struct DlraState {
     Mat S;     // r x r (rectangular only inside a step)
     Mat W;     // q_H x r, W^T W = I; row k is active moment 4 + k
     int rank() const { return int(S.rows()); }
+    // Angular projections of W carried from the previous step (W_{n+1} = W^ Q_1): per boundary side W^T B_H (r x q,
+    // B = (A_n - llf_homogeneous)^T) and H_H W (outgoing points x r). Valid only while `cached` (W unchanged since).
+    std::array<Mat, 6> wtb, hw;
+    bool cached = false;
 };
 struct DlraStats {
     long steps = 0;
@@ -85,13 +89,18 @@ private:
     struct Context;    // angular matrices for a basis V
     struct Evaluation; // spatial operators applied to Z = [low | Y]
     struct Fixed;      // S step: operators on the fixed bases X^, W^
-    Fixed prepare(const Field &Xh, const Field &MXh, const Mat &Wh, const Vec &gamma, DlraStats *) const;
+    // `old` (optional): state whose W are the first columns of Wh and whose caches are valid.
+    Fixed prepare(const Field &Xh, const Field &MXh, const Mat &Wh, const Vec &gamma, const DlraState *old,
+                  DlraStats *) const;
+    // PN traces at the outgoing hemisphere points of all C6 ghost pairs (pairs x points), one GEMM per side:
+    // row k = H[side_k] Z.row(node_k)^T.
+    Field ghost_traces(const Field &Z, const std::array<Mat, 6> &H) const;
     // One fast Galerkin stage: limited low rate (coefficients) and dS/dt.
     void fast_stage(double time, const Fixed &, const Field &low, const Mat &S, Field &low_rate, Mat &Sdot,
                     ElementWenoStats *, DlraStats *) const;
     // PN face loads sum_faces (face mass) Z_face per side (boundary slots x Z.cols()).
     std::array<Field, 6> face_loads(const Field &Z) const;
-    Context context(const Mat &V) const;
+    Context context(const Mat &V, const DlraState *cache = nullptr) const;
     Evaluation evaluate(double time, const Field &Z, const Context &, bool boundary_low, DlraStats *,
                         ElementWenoStats *) const;
     // F(a) T for T = E_L (U == nullptr, 4 columns) or T = E_H U; pre (optional) receives the boundary rows of the
@@ -111,5 +120,6 @@ private:
     std::array<Sparse, 3> phi_;       // A_d restricted to the active moments (row vector convention: rate -= g A_d)
     std::array<Mat, 3> phi_dense_;
     std::vector<int> degree_;         // l of every active moment
+    std::array<Field, 6> bt_h_, harm_h_, datum_h_; // per side: B_H^T (q x q_H), H_H (points x q_H), datum_t_H; row-major
 };
 } // namespace m1pn

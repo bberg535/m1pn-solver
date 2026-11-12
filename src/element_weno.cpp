@@ -660,7 +660,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             for (int side = 0; side < 2; ++side) {
                 V3 normal = V3::Zero();
                 normal[d] = side ? 1 : -1;
-                boundaries_[2 * d + side] = std::make_unique<Boundary>(pn, *canonical_, normal, false);
+                boundaries_[2 * d + side] = std::make_unique<Boundary>(pn, *canonical_, normal, false, false);
                 // Face integrand .5 (A_n - I)(u - exterior(u, datum)) = (A_n - llf_homogeneous) u - llf_datum datum.
                 boundary_flux_t_[2 * d + side] =
                     restrict_square(pn.normal(normal) - boundaries_[2 * d + side]->llf_homogeneous, "boundary flux").transpose();
@@ -1963,7 +1963,10 @@ double ElementWeno::dropped_inflow(double time) const {
             V3 x = origin;
             for (int d = 0; d < dimension; ++d)
                 x[d] += h * rule.points(point, d);
-            const Vec full = b.llf_datum * b.data(inflow, x, time).d;
+            const Vec d = b.data(inflow, x, time).d;
+            if (d.isZero(0)) // vacuum: nothing dropped or kept (skips a dense q x r product per point)
+                continue;
+            const Vec full = b.llf_datum * d;
             for (int k = 0; k < pn.q; ++k) {
                 double &slot_max = is_active[k] ? kept : dropped;
                 slot_max = std::max(slot_max, std::abs(full[k]));

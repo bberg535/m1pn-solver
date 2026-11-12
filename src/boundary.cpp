@@ -1,3 +1,4 @@
+#include <limits>
 #include "boundary.hpp"
 #include "cone.hpp"
 #include <Eigen/SVD>
@@ -74,7 +75,7 @@ Vec CanonicalC1::incoming(const Vec &wp, const Vec &d) const {
             "C1 SPD true residual failed");
     return (z.array() / root.array()).matrix();
 }
-Boundary::Boundary(const Angular &a, const CanonicalC1 &c, const V3 &normal, bool zero)
+Boundary::Boundary(const Angular &a, const CanonicalC1 &c, const V3 &normal, bool zero, bool norms)
     : pn(a), canonical(c), n(normal), c0(zero) {
     require(std::abs(n.norm() - 1) < 2e-12, "Boundary normal must be unit");
     V3 ref = std::abs(n[0]) < .8 ? V3::UnitX() : V3::UnitY();
@@ -89,15 +90,20 @@ Boundary::Boundary(const Angular &a, const CanonicalC1 &c, const V3 &normal, boo
     homogeneous = Rplus * c.sigma.asDiagonal() * Rplus.transpose();
     if (!c0)
         homogeneous.noalias() -= Rminus * c.sigma.asDiagonal() * c.reflection * Rplus.transpose();
-    Eigen::JacobiSVD<Mat> normsolve(homogeneous);
-    norm = normsolve.singularValues()[0];
+    norm = llf_norm = std::numeric_limits<double>::quiet_NaN(); // set below unless norms == false
+    if (norms) {
+        Eigen::JacobiSVD<Mat> normsolve(homogeneous);
+        norm = normsolve.singularValues()[0];
+    }
     const Mat exterior_map = Mat::Identity(pn.q,pn.q) +
         Rminus * (c.reflection * Rplus.transpose() - Rminus.transpose());
     const Mat normal_matrix = pn.normal(n);
     llf_homogeneous = .5 * (normal_matrix + Mat::Identity(pn.q,pn.q)) +
         .5 * (normal_matrix - Mat::Identity(pn.q,pn.q)) * exterior_map;
-    Eigen::JacobiSVD<Mat> llf_svd(llf_homogeneous);
-    llf_norm = llf_svd.singularValues()[0];
+    if (norms) {
+        Eigen::JacobiSVD<Mat> llf_svd(llf_homogeneous);
+        llf_norm = llf_svd.singularValues()[0];
+    }
     // Exterior datum map: incoming(0,d) of CanonicalC1 as a matrix, with the
     // same true-residual guard that incoming() applies on every call.
     {

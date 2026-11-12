@@ -5,8 +5,12 @@
 #include <Eigen/QR>
 #include <Eigen/SVD>
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <random>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 namespace m1pn {
 namespace {
 // Row blocks for the deterministic parallel reductions (independent of the thread count).
@@ -18,9 +22,17 @@ Field mul(const Field &A, const Mat &B) {
         return out.setZero(), out;
     if (A.cols() == 0)
         return out.setZero(), out;
-    const int blocks = (int(A.rows()) + kBlock - 1) / kBlock;
+    // Rows are independent (no reduction), so the block size may follow the thread count: small row counts with
+    // wide B (ghost traces) are still split over all threads.
+#ifdef _OPENMP
+    const int threads = omp_get_max_threads();
+#else
+    const int threads = 1;
+#endif
+    const int block = std::max(8, std::min<int>(kBlock, int((A.rows() + 4 * threads - 1) / (4 * threads))));
+    const int blocks = (int(A.rows()) + block - 1) / block;
     parallel_for(blocks, [&](int b) {
-        const int begin = b * kBlock, n = std::min<int>(kBlock, A.rows() - begin);
+        const int begin = b * block, n = std::min<int>(block, A.rows() - begin);
         out.middleRows(begin, n).noalias() = A.middleRows(begin, n) * B;
     });
     return out;
@@ -101,9 +113,22 @@ ElementWenoDlra::ElementWenoDlra(const ElementWeno &s, DlraOptions o) : scheme(s
     degree_.resize(s.moments);
     for (int k = 0; k < s.moments; ++k)
         degree_[k] = int(std::sqrt(double(s.active[k]) + .5));
+    // Row-major copies of the l >= 2 blocks of the angular boundary matrices, so that W^T B_H = (B_H^T W)^T and
+    // H_H W are row-parallel products (mul) instead of serial GEMMs: bt_h_ = B_H^T (q x q_H), harm_h_ = H_H.
+    for (int side = 0; side < 6; ++side) {
+        if (!s.boundaries_[side])
+            continue;
+        bt_h_[side] = Mat(s.boundary_flux_t_[side].bottomRows(qh)).transpose();
+        harm_h_[side] = s.out_rules_[side].harmonics.rightCols(qh);
+        datum_h_[side] = s.datum_t_[side].rightCols(qh);
+    }
+}
+// Sum over nonzero datum loads only (vacuum inflow has d = 0 on every face).
+static bool zero_field(const Field &f) {
+    return f.size() == 0 || f.cwiseAbs().maxCoeff() == 0;
 }
 
-ElementWenoDlra::Context ElementWenoDlra::context(const Mat &V) const {
+ElementWenoDlra::Context ElementWenoDlra::context(const Mat &V, const DlraState *cache) const {
     Context ctx;
     ctx.V = V;
     const int k = V.cols(), q = scheme.moments;
@@ -121,13 +146,49 @@ ElementWenoDlra::Context ElementWenoDlra::context(const Mat &V) const {
         const Mat &bf = scheme.boundary_flux_t_[side];
         ctx.B[side].resize(ctx.c, q);
         ctx.B[side].topRows(4) = bf.topRows(4);
-        ctx.B[side].bottomRows(k).noalias() = Vt * bf.bottomRows(qh);
+        const bool use = cache && cache->cached && cache->wtb[side].rows() == k;
+        if (use)
+            ctx.B[side].bottomRows(k) = cache->wtb[side];
+        else
+            ctx.B[side].bottomRows(k) = mul(bt_h_[side], V).transpose();
         const Mat &harm = scheme.out_rules_[side].harmonics;
         ctx.H[side].resize(harm.rows(), ctx.c);
         ctx.H[side].leftCols(4) = harm.leftCols(4);
-        ctx.H[side].rightCols(k).noalias() = harm.rightCols(qh) * V;
+        if (use)
+            ctx.H[side].rightCols(k) = cache->hw[side];
+        else
+            ctx.H[side].rightCols(k) = mul(harm_h_[side], V);
     }
     return ctx;
+}
+
+Field ElementWenoDlra::ghost_traces(const Field &Z, const std::array<Mat, 6> &H) const {
+    const ElementWeno &s = scheme;
+    const int ng = s.ghost_node_.size();
+    int points = 0;
+    for (int side = 0; side < 6; ++side)
+        if (s.boundaries_[side])
+            points = std::max<int>(points, H[side].rows());
+    Field out(ng, points);
+    for (int side = 0; side < 6; ++side) {
+        if (!s.boundaries_[side])
+            continue;
+        std::vector<int> rows;
+        for (int k = 0; k < ng; ++k)
+            if (s.ghost_side_[k] == side)
+                rows.push_back(k);
+        if (rows.empty())
+            continue;
+        require(H[side].rows() == points, "DLRA: outgoing rules of different size");
+        // (points x c) H times (c x pairs) Z_g^T: the points are the parallel rows of the product.
+        Mat ZgT(Z.cols(), rows.size());
+        for (std::size_t j = 0; j < rows.size(); ++j)
+            ZgT.col(j) = Z.row(s.ghost_node_[rows[j]]).transpose();
+        const Field P = mul(Field(H[side]), ZgT);
+        for (std::size_t j = 0; j < rows.size(); ++j)
+            out.row(rows[j]) = P.col(j).transpose();
+    }
+    return out;
 }
 
 ElementWenoDlra::Evaluation ElementWenoDlra::evaluate(double time, const Field &Z, const Context &ctx,
@@ -177,10 +238,9 @@ ElementWenoDlra::Evaluation ElementWenoDlra::evaluate(double time, const Field &
     ev.boundary_inflow = Vec::Zero(nodes);
     if (!s.faces_.empty()) {
         ev.bnd = face_loads(Z);
+        const Field traces = ghost_traces(Z, ctx.H);
         ElementWeno::BoundaryExtras extras;
-        extras.ghost_psi = [&](int, int side, int node, Vec &psi) {
-            psi.noalias() = ctx.H[side] * Z.row(node).transpose();
-        };
+        extras.ghost_psi = [&](int k, int, int, Vec &psi) { psi = traces.row(k).transpose(); };
         extras.datum = &ev.datum;
         Field none(0, s.moments);
         s.add_boundary(time, Z, ev.low, ev.low_flux, none, ev.boundary_low, ev.flux_area, ev.boundary_area,
@@ -234,10 +294,12 @@ struct ElementWenoDlra::Fixed {
     std::array<Mat, 6> BLL, BLH, BHL, BHH;      // blocks of (A_n - llf_homogeneous)^T
     std::array<Mat, 6> DL, DH;                  // datum_t blocks
     std::array<Mat, 6> HL, HH;                  // outgoing harmonics: low columns, high columns times W^
+    std::array<Mat, 6> WhtB;                    // W^T B_H (rw x q), for the cache of the next step
+    std::array<Field, 6> HLHf;                  // [HL | HH] (points x (4 + rw)), row-major
 };
 
 ElementWenoDlra::Fixed ElementWenoDlra::prepare(const Field &Xh, const Field &MXh, const Mat &Wh, const Vec &gamma,
-                                                DlraStats *ds) const {
+                                                const DlraState *old, DlraStats *ds) const {
     const ElementWeno &s = scheme;
     const double start = seconds();
     Fixed f;
@@ -267,16 +329,33 @@ ElementWenoDlra::Fixed ElementWenoDlra::prepare(const Field &Xh, const Field &MX
                 continue;
             f.Pbnd[side] = f.Xhb.transpose() * f.bndX[side];
             const Mat &B = s.boundary_flux_t_[side];
+            const Mat &harm = s.out_rules_[side].harmonics;
+            const int rw = Wh.cols();
+            // Only the columns of W^ beyond the old W need new projections when the old ones are cached.
+            const int r0 = old && old->cached && old->wtb[side].rows() > 0 ? int(old->W.cols()) : 0;
+            f.WhtB[side].resize(rw, B.cols());
+            Mat HHs(harm.rows(), rw);
+            if (r0 > 0) {
+                f.WhtB[side].topRows(r0) = old->wtb[side];
+                HHs.leftCols(r0) = old->hw[side];
+            }
+            if (rw > r0) {
+                const Mat Wn = Wh.rightCols(rw - r0);
+                f.WhtB[side].bottomRows(rw - r0) = mul(bt_h_[side], Wn).transpose();
+                HHs.rightCols(rw - r0) = mul(harm_h_[side], Wn);
+            }
             f.BLL[side] = B.topLeftCorner(4, 4);
             f.BLH[side] = B.topRightCorner(4, qh) * Wh;
-            f.BHL[side] = Wh.transpose() * B.bottomLeftCorner(qh, 4);
-            f.BHH[side] = Wh.transpose() * B.bottomRightCorner(qh, qh) * Wh;
+            f.BHL[side] = f.WhtB[side].leftCols(4);
+            f.BHH[side] = f.WhtB[side].rightCols(qh) * Wh;
             const Mat &D = s.datum_t_[side];
             f.DL[side] = D.leftCols(4);
-            f.DH[side] = D.rightCols(qh) * Wh;
-            const Mat &harm = s.out_rules_[side].harmonics;
+            f.DH[side] = mul(datum_h_[side], Wh);
             f.HL[side] = harm.leftCols(4);
-            f.HH[side] = harm.rightCols(qh) * Wh;
+            f.HH[side] = std::move(HHs);
+            f.HLHf[side].resize(harm.rows(), 4 + rw);
+            f.HLHf[side].leftCols(4) = f.HL[side];
+            f.HLHf[side].rightCols(rw) = f.HH[side];
         }
     }
     if (ds)
@@ -346,17 +425,40 @@ void ElementWenoDlra::fast_stage(double time, const Fixed &f, const Field &low, 
     ev.boundary_inflow = Vec::Zero(nodes);
     Field pre = Field::Zero(0, 4);
     std::array<Field, 6> bndL;
-    std::array<Mat, 6> HS;
     if (!s.faces_.empty()) {
         bndL = face_loads(low);
-        for (int side = 0; side < 6; ++side)
-            if (s.boundaries_[side])
-                HS[side] = f.HH[side] * S.transpose();
+        // Ghost rows of [low | X^ S] (ghost pairs x (4 + rw)) times [HL | HH]^T per side.
+        std::array<Field, 6> tracesT;
+        std::vector<int> slot(s.ghost_node_.size(), 0);
+        {
+            const int ng = s.ghost_node_.size(), rw = S.cols();
+            Field xg(ng, Xh.cols());
+            for (int k = 0; k < ng; ++k)
+                xg.row(k) = Xh.row(s.ghost_node_[k]);
+            const Field yg = mul(xg, S);
+            Field rows(ng, 4 + rw);
+            for (int k = 0; k < ng; ++k) {
+                rows.row(k).head(4) = low.row(s.ghost_node_[k]);
+                rows.row(k).tail(rw) = yg.row(k);
+            }
+            // Per side: (points x c) [HL | HH] times (c x pairs) rows^T; points are the parallel rows of the product.
+            for (int side = 0; side < 6; ++side) {
+                if (!s.boundaries_[side])
+                    continue;
+                std::vector<int> idx;
+                for (int k = 0; k < ng; ++k)
+                    if (s.ghost_side_[k] == side)
+                        idx.push_back(k);
+                Mat subT(rows.cols(), idx.size());
+                for (std::size_t j = 0; j < idx.size(); ++j) {
+                    subT.col(j) = rows.row(idx[j]).transpose();
+                    slot[idx[j]] = int(j);
+                }
+                tracesT[side] = mul(f.HLHf[side], subT);
+            }
+        }
         ElementWeno::BoundaryExtras extras;
-        extras.ghost_psi = [&](int, int side, int node, Vec &psi) {
-            psi.noalias() = f.HL[side] * low.row(node).transpose();
-            psi.noalias() += HS[side] * Xh.row(node).transpose();
-        };
+        extras.ghost_psi = [&](int k, int side, int, Vec &psi) { psi = tracesT[side].col(slot[k]); };
         extras.datum = &ev.datum;
         Field none(0, s.moments);
         s.add_boundary(time, low, ev.low, ev.low_flux, none, ev.boundary_low, ev.flux_area, ev.boundary_area,
@@ -367,7 +469,8 @@ void ElementWenoDlra::fast_stage(double time, const Fixed &f, const Field &low, 
                 continue;
             pre.noalias() += bndL[side] * f.BLL[side];
             pre.noalias() += f.bndX[side] * Mat(S * f.BHL[side]);
-            pre.noalias() -= ev.datum[side] * f.DL[side];
+            if (!zero_field(ev.datum[side]))
+                pre.noalias() -= ev.datum[side] * f.DL[side];
         }
         for (std::size_t j = 0; j < s.boundary_nodes_.size(); ++j)
             R.row(s.boundary_nodes_[j]) += pre.row(j);
@@ -390,19 +493,35 @@ void ElementWenoDlra::fast_stage(double time, const Fixed &f, const Field &low, 
     });
     lap(&DlraStats::t_limiter);
     // Galerkin rate of the l >= 2 block: X^T R(a) W^ with a = [low | X^ S W^T].
-    Sdot = f.Pneg * S;
+    // The r^3 products are independent: evaluate them in parallel (one task per term), sum in a fixed order.
+    std::array<Mat, 3> lowproj;
+    for (int d = 0; d < dim; ++d)
+        lowproj[d] = cross(*f.MXh, gL[d]);
+    std::vector<std::function<Mat()>> terms;
+    terms.push_back([&] { return Mat(f.Pneg * S); });
     if (!s.faces_.empty())
         for (int side = 0; side < 6; ++side) {
             if (!s.boundaries_[side])
                 continue;
-            Sdot.noalias() += (f.Xhb.transpose() * bndL[side]) * f.BLH[side];
-            Sdot.noalias() += f.Pbnd[side] * S * f.BHH[side];
-            Sdot.noalias() -= (f.Xhb.transpose() * ev.datum[side]) * f.DH[side];
+            terms.push_back([&, side] {
+                Mat m = (f.Xhb.transpose() * bndL[side]) * f.BLH[side];
+                m.noalias() += f.Pbnd[side] * S * f.BHH[side];
+                if (!zero_field(ev.datum[side]))
+                    m.noalias() -= (f.Xhb.transpose() * ev.datum[side]) * f.DH[side];
+                return m;
+            });
         }
-    for (int d = 0; d < dim; ++d) {
-        Sdot.noalias() -= cross(*f.MXh, gL[d]) * f.ALH[d];
-        Sdot.noalias() -= f.Pgrad[d] * S * f.AHH[d];
-    }
+    for (int d = 0; d < dim; ++d)
+        terms.push_back([&, d] {
+            Mat m = lowproj[d] * f.ALH[d];
+            m.noalias() += f.Pgrad[d] * S * f.AHH[d];
+            return Mat(-m);
+        });
+    std::vector<Mat> parts(terms.size());
+    parallel_for(int(terms.size()), [&](int k) { parts[k] = terms[k](); });
+    Sdot = parts[0];
+    for (std::size_t k = 1; k < parts.size(); ++k)
+        Sdot += parts[k];
     lap(&DlraStats::t_products);
 }
 
@@ -424,9 +543,11 @@ Field ElementWenoDlra::full_rate(const Evaluation &ev, const Context &ctx, const
                 continue;
             const Mat Cb = U ? Mat(ctx.B[side].rightCols(qh) * *U) : Mat(ctx.B[side].leftCols(4));
             const Mat &dt = s.datum_t_[side];
-            const Mat Cd = U ? Mat(dt.rightCols(qh) * *U) : Mat(dt.leftCols(4));
             rows.noalias() += ev.bnd[side] * Cb;
-            rows.noalias() -= ev.datum[side] * Cd;
+            if (!zero_field(ev.datum[side])) {
+                const Mat Cd = U ? Mat(dt.rightCols(qh) * *U) : Mat(dt.leftCols(4));
+                rows.noalias() -= ev.datum[side] * Cd;
+            }
         }
         for (std::size_t j = 0; j < s.boundary_nodes_.size(); ++j)
             R.row(s.boundary_nodes_[j]) += rows.row(j);
@@ -460,7 +581,8 @@ Mat ElementWenoDlra::projected_rate(const Evaluation &ev, const Context &ctx, co
             if (!s.boundaries_[side])
                 continue;
             out.noalias() += (Xb.transpose() * ev.bnd[side]) * right(ctx.B[side]);
-            out.noalias() -= (Xb.transpose() * ev.datum[side]) * right(s.datum_t_[side]);
+            if (!zero_field(ev.datum[side]))
+                out.noalias() -= (Xb.transpose() * ev.datum[side]) * right(s.datum_t_[side]);
         }
     }
     for (int d = 0; d < s.dimension; ++d)
@@ -712,6 +834,7 @@ DlraState ElementWenoDlra::react(const DlraState &in, double tau, double source_
         Eigen::HouseholderQR<Mat> qr(W);
         const int r = W.cols();
         st.W = qr.householderQ() * Mat::Identity(qh, r);
+        st.cached = false; // W changed: cached projections are stale
         const Mat R = qr.matrixQR().topRows(r).triangularView<Eigen::Upper>();
         st.S = st.S * R.transpose();
     }
@@ -738,7 +861,7 @@ DlraState ElementWenoDlra::advance(double time, double dt, const DlraState &inpu
     Vec gamma_n;
     {
         const Field Y0 = mul(st.X, st.S);
-        const Context ctx = context(st.W);
+        const Context ctx = context(st.W, &st);
         const Evaluation ev = evaluate(time, hcat(st.low, Y0), ctx, false, ds, nullptr);
         gamma_n = ev.gamma;
         K1 = full_rate(ev, ctx, &st.W, nullptr, ds);
@@ -773,7 +896,7 @@ DlraState ElementWenoDlra::advance(double time, double dt, const DlraState &inpu
     // ---- Galerkin S step coupled to the limited M1 update (the scheme's SSP stages) ------------------------------
     const bool fast = options.frozen_gamma;
     const Context ch = fast ? Context() : context(Wh);
-    const Fixed fixed = fast ? prepare(Xh, MXh, Wh, gamma_n, ds) : Fixed();
+    const Fixed fixed = fast ? prepare(Xh, MXh, Wh, gamma_n, &st, ds) : Fixed();
     lap(&DlraStats::t_basis);
     struct Stage {
         Field low;
@@ -815,7 +938,7 @@ DlraState ElementWenoDlra::advance(double time, double dt, const DlraState &inpu
     DlraState out;
     out.low = std::move(last.low);
     {
-        Eigen::JacobiSVD<Mat> svd(last.S, Eigen::ComputeThinU | Eigen::ComputeThinV);
+        Eigen::BDCSVD<Mat> svd(last.S, Eigen::ComputeThinU | Eigen::ComputeThinV);
         const Vec sigma = svd.singularValues();
         const int cap = sigma.size();
         double norm = sigma.norm();
@@ -841,6 +964,15 @@ DlraState ElementWenoDlra::advance(double time, double dt, const DlraState &inpu
         out.X = mul(Xh, Mat(svd.matrixU().leftCols(r1)));
         out.W = Wh * svd.matrixV().leftCols(r1);
         out.S = sigma.head(r1).asDiagonal();
+        if (fast && !s.faces_.empty()) {
+            const Mat Q1 = svd.matrixV().leftCols(r1);
+            for (int side = 0; side < 6; ++side)
+                if (s.boundaries_[side]) {
+                    out.wtb[side] = Q1.transpose() * fixed.WhtB[side];
+                    out.hw[side] = fixed.HH[side] * Q1;
+                }
+            out.cached = true;
+        }
         if (ds) {
             ds->steps += 1;
             ds->last_rank = r1;

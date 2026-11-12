@@ -4,7 +4,7 @@
 N=$1; OUT=$2; shift 3
 "$@" > /dev/null 2>&1 &
 PID=$!
-sleep 3
+sleep ${PROFILE_DELAY:-3}
 : > "$OUT"
 for i in $(seq "$N"); do
   kill -0 $PID 2>/dev/null || break

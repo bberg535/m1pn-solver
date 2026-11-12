@@ -55,7 +55,8 @@ struct Boundary {
     Field odd_basis;
     double norm;
     bool c0;
-    Boundary(const Angular &, const CanonicalC1 &, const V3 &, bool c0 = false);
+    // norms = false skips the two full SVDs for `norm` and `llf_norm` (only path B uses them; O(q^3) per side).
+    Boundary(const Angular &, const CanonicalC1 &, const V3 &, bool c0 = false, bool norms = true);
     Incoming data(const Inflow &, const V3 &x, double time) const;
     // Full PN exterior for the LLF flux: Onsager incoming modes, interior
     // outgoing modes, and interior zero modes (equation (6.9)).
