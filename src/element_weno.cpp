@@ -386,6 +386,8 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
         m1d[d].resize(n1, n1);
         m1d[d].setFromTriplets(triplets.begin(), triplets.end());
+        mass_1d_[d] = m1d[d];
+        mass_1d_[d].makeCompressed();
         // On the tensor mesh M^-1 C_d = I x (M_1d^-1 C_1d).
         convection_1d_[d].resize(n1, n1);
         convection_1d_[d].setFromTriplets(entries.begin(), entries.end());
@@ -844,6 +846,34 @@ void ElementWeno::solve_lines(Field &b, int d, bool gradient) const {
         }
     });
 }
+Field ElementWeno::apply_mass(const Field &x) const {
+    require(x.rows() == nodes, "Mass product size mismatch");
+    require(std::none_of(mirror_index_.begin(), mirror_index_.end(), [](int m) { return m >= 0; }),
+            "apply_mass: mirror sides are not supported");
+    Field in = x, out(nodes, x.cols());
+    const int q = x.cols();
+    for (int d = 0; d < dimension; ++d) {
+        const int s = stride(d), per_direction = nodes_per_axis[d], lines = nodes / per_direction;
+        const int *outer = mass_1d_[d].outerIndexPtr(), *inner = mass_1d_[d].innerIndexPtr();
+        const double *value = mass_1d_[d].valuePtr();
+        const double *data = in.data();
+        parallel_for(lines, [&](int line) {
+            const int start = (line / s) * (s * per_direction) + line % s;
+            for (int k = 0; k < per_direction; ++k) {
+                double *__restrict y = &out.coeffRef(start + k * s, 0);
+                std::fill_n(y, q, 0.);
+                for (int e = outer[k]; e < outer[k + 1]; ++e) {
+                    const double c = value[e];
+                    const double *z = data + std::size_t(start + inner[e] * s) * q;
+#pragma omp simd
+                    for (int j = 0; j < q; ++j) y[j] += c * z[j];
+                }
+            }
+        });
+        std::swap(in, out);
+    }
+    return in;
+}
 Field ElementWeno::solve_mass(Field b) const {
     require(b.rows() == nodes, "Mass solve size mismatch");
     for (int d = 0; d < dimension; ++d)
@@ -1122,10 +1152,14 @@ Incoming ElementWeno::face_data(int side_id, const V3 &x, double time) const {
 }
 void ElementWeno::add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                                Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                               Field &bar, Vec *inflow_rate) const {
+                               Field &bar, Vec *inflow_rate, const BoundaryExtras *extras) const {
+    // DLRA (extras): `high` may have zero rows (the PN face load is then formed outside from the factored state), the
+    // C6 ghost trace comes from extras->ghost_psi, and the face datum loads are returned per side.
+    const bool skip_high = high.rows() == 0;
+    const bool want_datum = extras && extras->datum;
     struct Local {
         std::vector<int> global;
-        Mat high, load, bar, flux_area;
+        Mat high, load, bar, flux_area, datum;
         Vec area, inflow;
     };
     std::vector<Local> parts(faces_.size());
@@ -1140,7 +1174,10 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         const OutRule &out = out_rules_[side_id];
         const Boundary &b = *boundaries_[side_id];
         thread_local Vec psi;
-        psi.noalias() = out.harmonics * a.row(node).transpose();
+        if (extras && extras->ghost_psi)
+            extras->ghost_psi(k, side_id, node, psi);
+        else
+            psi.noalias() = out.harmonics * a.row(node).transpose();
         Four m = Four::Zero();
         for (int j = 0; j < psi.size(); ++j) {
             const double v = std::max(0., psi[j]) * out.weight[j];
@@ -1167,7 +1204,8 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         const int nf = rule.local.size();
         Local &part = parts[index];
         part.global.resize(nf);
-        part.high = Mat::Zero(nf, moments);
+        if (!skip_high)
+            part.high = Mat::Zero(nf, moments);
         part.load = Mat::Zero(nf, 4);
         part.bar = Mat::Zero(nf, 4);
         part.flux_area = Mat::Zero(nf, 3);
@@ -1229,6 +1267,10 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 part.load.row(n) += weight * (state - ui).transpose();
             }
         }
+        if (want_datum)
+            part.datum = datum;
+        if (skip_high)
+            return;
         // sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum], with the exact face mass matrix.
         Mat traces(nf, moments);
         for (int n = 0; n < nf; ++n)
@@ -1238,10 +1280,19 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     });
     // `high` has one row per node or, in rate(), one row per boundary node (boundary_slot_).
     const bool compact = high.rows() != nodes;
-    for (const auto &part : parts)
+    if (want_datum)
+        for (int s = 0; s < 6; ++s)
+            if (boundaries_[s])
+                (*extras->datum)[s] = Field::Zero(boundary_nodes_.size(), canonical_->r);
+    for (std::size_t index = 0; index < parts.size(); ++index) {
+        const auto &part = parts[index];
+        const int side_id = 2 * faces_[index].direction + faces_[index].side;
         for (std::size_t n = 0; n < part.global.size(); ++n) {
             const int i = part.global[n];
-            high.row(compact ? boundary_slot_[i] : i) += part.high.row(n);
+            if (!skip_high)
+                high.row(compact ? boundary_slot_[i] : i) += part.high.row(n);
+            if (want_datum)
+                (*extras->datum)[side_id].row(boundary_slot_[i]) += part.datum.row(n);
             low_load.row(i) += part.load.row(n);
             bar.row(i) += part.bar.row(n);
             node_flux_area.row(i) += part.flux_area.row(n);
@@ -1249,6 +1300,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             if (inflow_rate)
                 (*inflow_rate)[i] += part.inflow[n];
         }
+    }
 }
 Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                         ElementWenoDebug *debug) const {
@@ -1344,10 +1396,56 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             moment_rate -= projected_gradient(Field(low_flux.middleCols(4 * d, 4)), d);
     lap(timing.t_mass);
 
+    Field load;
+    Field raw_load;
+    {
+        const LowOrderInputs inputs{&low, &low_flux, &closure, &moment_rate, &stabilization_low, &boundary_high,
+                                    &boundary_low, &flux_area, &boundary_bar, &boundary_area, &boundary_inflow, &gamma};
+        load = limited_low_load(inputs, stats, debug ? &raw_load : nullptr);
+    }
+    clock = seconds();
+    parallel_for(nodes, [&](int i) {
+        set_low(Eigen::Map<Vec>(&high_rate.coeffRef(i, 0), q), Four(load.row(i).transpose()) / lumped[i]);
+    });
+    // Mirror planes: moments odd under the reflection vanish (the full scheme's two mirrored halves cancel).
+    // Dropping J_d from a cone state keeps it in the cone, so the realizability argument is unchanged.
+    for (int d = 0; d < dimension; ++d)
+        if (mirror_index_[d] >= 0)
+            parallel_for(int(mirror_nodes_[d].size()), [&](int k) {
+                double *row = &high_rate.coeffRef(mirror_nodes_[d][k], 0);
+                for (int c = 0; c < q; ++c)
+                    if (reflect_odd_[d][c])
+                        row[c] = 0;
+            });
+    lap(timing.t_finish);
+    if (debug) {
+        debug->ho_moment_rate = moment_rate;
+        debug->unlimited_rate = raw_load;
+        for (int i = 0; i < nodes; ++i)
+            debug->unlimited_rate.row(i) /= lumped[i];
+    }
+    return high_rate;
+}
+// Limited low-order load of the four M1 moments (element bar states, antidiffusive element contributions, boundary
+// corrections). Shared by rate() and the DLRA Galerkin step (src/element_weno_dlra.cpp). Returns the gathered nodal
+// load in (rho, J) units, not yet divided by the lumped mass; *raw_out receives the unlimited load when requested.
+Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *stats, Field *raw_out) const {
+    const Field &low = *in.low, &low_flux = *in.low_flux, &closure = *in.closure, &moment_rate = *in.moment_rate;
+    const Field &stabilization_low = *in.stabilization_low, &boundary_high = *in.boundary_high;
+    const Field &boundary_low = *in.boundary_low, &flux_area = *in.flux_area, &boundary_bar = *in.boundary_bar;
+    const Vec &boundary_area = *in.boundary_area, &boundary_inflow = *in.boundary_inflow;
+    double clock = seconds();
+    ElementWenoStats scratch;
+    ElementWenoStats &timing = stats ? *stats : scratch;
+    auto lap = [&](double &slot) {
+        const double now = seconds();
+        slot += now - clock;
+        clock = now;
+    };
     // Element bar states and antidiffusive contributions.
     const int width = local_nodes * 4;
     Field element_limited(cells, width), element_raw;
-    if (debug)
+    if (raw_out)
         element_raw.resize(cells, width);
     std::vector<double> element_factor(cells, 1.), raw_sum(cells, 0.), limited_sum(cells, 0.);
     std::vector<long> nudged(cells, 0), outward(cells, 0);
@@ -1456,7 +1554,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             const Four out = lo + limited[i];
             for (int c = 0; c < 4; ++c)
                 element_limited(e, i * 4 + c) = out[c];
-            if (debug) {
+            if (raw_out) {
                 const Four raw = lo + contribution[i];
                 for (int c = 0; c < 4; ++c)
                     element_raw(e, i * 4 + c) = raw[c];
@@ -1467,7 +1565,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     Field load = gather_load(element_limited);
     lap(timing.t_limiter);
     Field raw_load;
-    if (debug)
+    if (raw_out)
         raw_load = gather_load(element_raw);
     // Boundary corrections h_i = P b^H - b^L - (int phi_i n) . G_i, limited node by node.
     double min_boundary = 1, min_sign = 1, boundary_mass_rate = 0;
@@ -1523,7 +1621,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             for (int d = 0; d < dimension; ++d)
                 m -= flux_area(i, d) * low_flux(i, 4 * d);
             node_mass[k] = m;
-            if (debug)
+            if (raw_out)
                 raw_load.row(i) += (base + correction).transpose();
         });
         for (int k = 0; k < nb; ++k) {
@@ -1540,28 +1638,11 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             }
         }
     }
-    parallel_for(nodes, [&](int i) {
-        set_low(Eigen::Map<Vec>(&high_rate.coeffRef(i, 0), q), Four(load.row(i).transpose()) / lumped[i]);
-    });
-    // Mirror planes: moments odd under the reflection vanish (the full scheme's two mirrored halves cancel).
-    // Dropping J_d from a cone state keeps it in the cone, so the realizability argument is unchanged.
-    for (int d = 0; d < dimension; ++d)
-        if (mirror_index_[d] >= 0)
-            parallel_for(int(mirror_nodes_[d].size()), [&](int k) {
-                double *row = &high_rate.coeffRef(mirror_nodes_[d][k], 0);
-                for (int c = 0; c < q; ++c)
-                    if (reflect_odd_[d][c])
-                        row[c] = 0;
-            });
     lap(timing.t_finish);
-    if (debug) {
-        debug->ho_moment_rate = moment_rate;
-        debug->unlimited_rate = raw_load;
-        for (int i = 0; i < nodes; ++i)
-            debug->unlimited_rate.row(i) /= lumped[i];
-    }
+    if (raw_out)
+        *raw_out = std::move(raw_load);
     if (stats) {
-        stats->min_gamma = std::min(stats->min_gamma, gamma.minCoeff());
+        stats->min_gamma = std::min(stats->min_gamma, in.gamma->minCoeff());
         for (int e = 0; e < cells; ++e) {
             stats->min_limiter = std::min(stats->min_limiter, element_factor[e]);
             stats->limited_elements += element_factor[e] < 1;
@@ -1576,7 +1657,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
         stats->min_sign_factor = std::min(stats->min_sign_factor, min_sign);
         stats->limited_boundary_nodes += limited_boundary;
     }
-    return high_rate;
+    return load;
 }
 Field ElementWeno::linear_operator(const Field &x, double gamma_value) const {
     const int q = x.cols();

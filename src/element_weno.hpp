@@ -109,7 +109,9 @@ struct ElementWenoStats {
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
 };
+class ElementWenoDlra;
 class ElementWeno {
+    friend class ElementWenoDlra; // factored (low-rank) evaluation of the same operators, src/element_weno_dlra.cpp
 public:
     ElementWeno(const Angular &, const ElementWenoOptions &, Inflow = {});
     const Angular &pn;
@@ -177,6 +179,8 @@ public:
     Field linear_operator(const Field &x, double gamma) const;
     Field stabilization_load(const Field &a, const Vec &gamma, ElementWenoStats * = nullptr) const; // s_h^e(phi_i, a) per element
     Field solve_mass(Field rhs) const;
+    // Consistent mass times x (tensor product of the 1D Bernstein masses), any number of columns, no mirror sides.
+    Field apply_mass(const Field &x) const;
     Field interpolate(const std::function<Vec(const V3 &)> &) const;
     Field project_l2(const std::function<Vec(const V3 &)> &) const;
     Vec evaluate(const Field &a, const V3 &x) const;
@@ -235,9 +239,25 @@ private:
     void element_origin(int element, V3 &origin) const;
     // inflow_rate (optional, nodes): kinetic mass inflow rate int phi_i (-kinetic[0]) >= 0 per boundary node.
     // `high` is indexed by node (nodes rows) or compactly by boundary_slot_ (boundary_nodes_.size() rows).
+    // DLRA hooks of add_boundary: ghost_psi(k, side, node, psi) fills the PN trace at the outgoing hemisphere points
+    // of ghost pair k (instead of out.harmonics * a.row(node)); datum (if set) receives per side the face datum loads
+    // sum_points w phi_n d (boundary_slot_ rows x canonical r).
+    struct BoundaryExtras {
+        std::function<void(int, int, int, Vec &)> ghost_psi;
+        std::array<Field, 6> *datum = nullptr;
+    };
     void add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                      Field &bar, Vec *inflow_rate = nullptr) const;
+                      Field &bar, Vec *inflow_rate = nullptr, const BoundaryExtras *extras = nullptr) const;
+    // Inputs of the limited low-order part of rate() (all node-indexed except boundary_high, which has one row per
+    // boundary slot and at least the four low coefficient columns).
+    struct LowOrderInputs {
+        const Field *low, *low_flux, *closure, *moment_rate, *stabilization_low, *boundary_high;
+        const Field *boundary_low, *flux_area, *boundary_bar;
+        const Vec *boundary_area, *boundary_inflow, *gamma;
+    };
+    Field limited_low_load(const LowOrderInputs &, ElementWenoStats *, Field *raw_out) const;
+    std::array<Sparse, 3> mass_1d_; // assembled 1D consistent masses (h m1) per axis
     // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state.
     struct OutRule {
         Field omega;   // points x 3
