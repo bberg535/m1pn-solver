@@ -3,6 +3,7 @@
 #include "cuda_path.hpp"
 #include "pn_uncoupled.hpp"
 #include "filter.hpp"
+#include "uncollided.hpp"
 #include "element_weno.hpp"
 #include "hardware.hpp"
 #include "benchmark_cases.hpp"
@@ -46,6 +47,7 @@ struct Options {
     int degree = 2;
     double weno_linear = 1e-3, weno_q = 1;
     bool m1_target = false; // element-weno: M1 instead of PN target (P1, --mirror-reduction off)
+    std::string fcs = "off"; // element-weno: first-collision source with analytic uncollided pulse (docs/FCS.md)
     bool weno = true, element_limit = true;
     std::string problem = "smooth", inflow = "vacuum", output = std::string(PN_AFC_ROOT) + "/tmp/run", pair_limiter = "scalar", coupling = "m1pn";
 };
@@ -99,6 +101,8 @@ Options parse(int argc, char **argv) {
                    "   cases lattice-paul (2D, (0,7)^2), lattice-3d (3D, (0,7)^3), shadow-weih (3D, --inflow shadow-beam)\n"
                    "   --shadow-sigma S (sphere absorption, default 1e7) --beam-density B --material-subcells K\n"
                    "   --history-stride S (ledger rows) --skip-fields (no initial/final sample fields)\n"
+                   "   --fcs off|analytic (element-weno plane-source/line-source: analytic uncollided pulse, collided\n"
+                   "     part on the grid; output density = collided + uncollided; docs/FCS.md)\n"
                    "   --m1-target on|off (M1 instead of PN high-order target; needs --pn-order 1 --mirror-reduction off)\n"
                    "   --mirror-reduction auto|off (open mesh, vacuum inflow, even elements, initial data mirror-\n"
                    "     symmetric about x_d = 1/2 in every direction: compute on [1/2,1]^d with mirror sides)\n"
@@ -280,6 +284,9 @@ Options parse(int argc, char **argv) {
             o.angular_reduction = v;
         } else if (key == "--weno-q") {
             o.weno_q = real();
+        } else if (key == "--fcs") {
+            require(v == "off" || v == "analytic", "--fcs must be off or analytic");
+            o.fcs = v;
         } else if (key == "--m1-target") {
             require(v == "on" || v == "off", "--m1-target must be on or off");
             o.m1_target = v == "on";
@@ -626,6 +633,31 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     eo.limit = o.element_limit;
     eo.weno_linear = o.weno_linear;
     eo.m1_target = o.m1_target;
+    // ---- First-collision source (docs/FCS.md) ----------------------------------------------------------------------
+    // The grid carries the collided part psi_c (initially the isotropic floor), the Gaussian pulse is uncollided and
+    // known analytically in the homogeneous infinite medium; it feeds sigma_s rho_u into psi_c.
+    const bool fcs = o.fcs == "analytic";
+    uncollided::GaussianPulse pulse;
+    if (fcs) {
+        require(o.problem == "line-source" || o.problem == "plane-source", "--fcs analytic needs line-source or plane-source");
+        require(!material && o.inflow == "vacuum", "--fcs analytic needs a homogeneous medium and vacuum inflow");
+        pulse.sigma_t = o.sigma_a + o.sigma_s;
+        if (o.problem == "line-source") {
+            require(dim == 2, "--fcs analytic line-source is 2D");
+            pulse.dimension = 2, pulse.width = o.pulse_width, pulse.mass = 1, pulse.centre = V3(.5, .5, 0);
+        } else {
+            require(dim == 1, "--fcs analytic plane-source is 1D");
+            // initial_point(): rho_0 = exp(-200 (x - 1/2)^2), i.e. width 1/20 and peak one.
+            pulse.dimension = 1, pulse.width = .05, pulse.mass = std::sqrt(2 * pi) * .05, pulse.centre = V3(.5, 0, 0);
+        }
+        // The analytic pulse assumes an infinite medium: its support (t + 6 width, Gaussian tail < 1e-8) must stay
+        // inside the box.
+        require(o.final_time + 6 * pulse.width <= .5 * length_x,
+                "--fcs analytic: the uncollided front reaches the boundary before the final time");
+        eo.uncollided_density = [pulse](double t, const std::vector<V3> &x, std::vector<double> &out) {
+            pulse.density(t, x, out);
+        };
+    }
     eo.weno_q = o.weno_q;
     eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
     eo.sigma_s = o.sigma_s;
@@ -772,6 +804,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     std::vector<Vec> initial(scheme_ptr->nodes);
     for (int i = 0; i < scheme_ptr->nodes; ++i) {
         initial[i] = initial_point(o, scheme_ptr->node_position(i), i, dim, pn);
+        if (fcs) { // collided part: the floor only (the pulse is uncollided)
+            initial[i].setZero();
+            initial[i][0] = o.background / std::sqrt(4 * pi);
+        }
         cone_require(exact::cone(project(initial[i])), "Initial Bernstein coefficient outside the M1 cone");
     }
     double odd_initial = 0, odd_inflow = 0;
@@ -829,12 +865,17 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         where[s] = x;
         sample_mass[s] = m;
     }
-    auto write_samples = [&](const std::string &file, const Field &state) {
+    // With FCS the written u0 is the total density (collided + uncollided) and rho_uncollided is appended; the
+    // uncollided current is not added (u1..u3 are the collided moments).
+    auto write_samples = [&](const std::string &file, const Field &state, double time) {
         std::ofstream f(file);
         require(bool(f), "Cannot write field");
         f << std::setprecision(17) << "node,x,y,z";
         for (int k = 0; k < pn.q; ++k) f << ",u" << k;
+        if (fcs) f << ",rho_uncollided";
         f << "\n";
+        std::vector<double> unc;
+        if (fcs) pulse.density(time, where, unc);
         Field values(samples, pn.q);
         parallel_for(int(samples), [&](int s) {
             // Mirror reduction: evaluate at the reflected point and reflect the moments back.
@@ -851,11 +892,13 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         });
         for (long s = 0; s < samples; ++s) {
             f << s << "," << where[s][0] << "," << where[s][1] << "," << where[s][2];
+            if (fcs) values(s, 0) += unc[s] / std::sqrt(4 * pi);
             for (int k = 0; k < pn.q; ++k) f << "," << values(s, k);
+            if (fcs) f << "," << unc[s];
             f << "\n";
         }
     };
-    if (!o.skip_fields) write_samples(o.output + "/initial.csv", a);
+    if (!o.skip_fields) write_samples(o.output + "/initial.csv", a, 0.);
     auto mass_of = [&](const Field &state) {
         double m = 0;
         for (int i = 0; i < scheme.nodes; ++i) m += scheme.lumped[i] * project(state.row(i).transpose())[0];
@@ -879,6 +922,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"stabilization\":\"element-weno\",\"pn_target\":\"consistent_mass_cg_weno\""
                << ",\"basis\":\"tensor_bernstein\",\"degree\":" << o.degree
                << ",\"m1_target\":" << (o.m1_target ? "true" : "false")
+               << ",\"fcs\":" << std::quoted(o.fcs)
                << ",\"weno\":" << (o.weno ? "true" : "false") << ",\"weno_linear\":" << o.weno_linear
                << ",\"weno_q\":" << o.weno_q << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
                << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength
@@ -965,7 +1009,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         min_density = std::min(min_density, u[0]);
         min_margin = std::min(min_margin, margin(u));
     }
-    if (!o.skip_fields) write_samples(o.output + "/final.csv", a);
+    if (!o.skip_fields) write_samples(o.output + "/final.csv", a, t);
     if (dim == 3) {
         // Mid-plane slices through the box centre (density and |J|), written even with --skip-fields: the full 3D
         // sample field is too large for P11 on fine meshes. plane = normal axis, (i, j) = in-plane sample indices.
@@ -999,6 +1043,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     const double injected = stats.injected * domain_factor, absorbed = stats.absorbed * domain_factor,
                  outflow = stats.boundary_outflow * domain_factor, nudge = stats.nudge_mass * domain_factor;
     const double balance = final_mass - initial_mass + outflow + absorbed - injected - nudge;
+    double uncollided_final = 0; // int rho_u(T) over the computed domain by the FCS quadrature
+    if (fcs) scheme.collided_source(t, &uncollided_final);
     const double balance_scale = std::max({std::abs(initial_mass), injected, absorbed, std::abs(outflow), 1e-300});
     struct rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
@@ -1013,6 +1059,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
            << ",\"nudge_mass\":" << nudge << ",\"balance_residual\":" << balance
            << ",\"balance_relative\":" << balance / balance_scale << "}"
            << ",\"absorption_rate_final\":" << absorption_rate(a)
+           << ",\"fcs\":" << std::quoted(o.fcs) << ",\"uncollided_mass_final\":" << uncollided_final * domain_factor
+           << ",\"uncollided_mass_exact\":" << (fcs ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
            << ",\"min_weno_gamma\":" << stats.min_gamma
            << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states
@@ -1021,7 +1069,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
            << ",\"stabilization\":" << stats.t_stabilization << ",\"gradient_solve\":" << stats.t_gradient_solve
            << ",\"stab_local\":" << stats.t_stab_local << ",\"residual\":" << stats.t_residual
            << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass << ",\"limiter\":" << stats.t_limiter
-           << ",\"finish\":" << stats.t_finish << ",\"reaction\":" << stats.t_reaction << "}}\n";
+           << ",\"finish\":" << stats.t_finish << ",\"reaction\":" << stats.t_reaction
+           << ",\"fcs_density\":" << stats.t_fcs_density << ",\"fcs_quadrature\":" << stats.t_fcs_quadrature << "}}\n";
     std::cout << "Completed " << steps << " steps, P" << pn.order << ", element-weno p=" << o.degree << ", "
               << scheme.nodes << " coefficients\n";
     return 0;

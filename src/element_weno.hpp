@@ -10,6 +10,7 @@
 #include "m1.hpp"
 #include <Eigen/SparseCholesky>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 namespace m1pn {
@@ -75,6 +76,13 @@ struct ElementWenoOptions {
     // G = F^H - F^L is zero and the boundary keeps the low-order M1 flux (correction factor 0). Requires P1 and no
     // mirror sides (the flux components have other reflection parities than the moments).
     bool m1_target = false;
+    // First-collision source (FCS, docs/FCS.md): when set, the state is the *collided* part psi_c and the
+    // reaction step adds the isotropic source sigma_s(x) rho_u(x, t) of the analytic uncollided density rho_u.
+    // The function fills rho_u(t) at a batch of physical points. The nodal source is the positive average
+    // int sigma_s rho_u phi_i / int phi_i by Gauss quadrature (uncollided_points per element and direction,
+    // 0: degree + 3), evaluated at the midpoint of each Strang half step (second order in time).
+    std::function<void(double, const std::vector<V3> &, std::vector<double> &)> uncollided_density;
+    int uncollided_points = 0;
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -96,6 +104,7 @@ struct ElementWenoStats {
     double boundary_outflow = 0, absorbed = 0, injected = 0, nudge_mass = 0;
     double last_boundary_mass_rate = 0; // of the last rate() call (sum over boundary nodes)
     double t_reaction = 0;
+    double t_fcs_density = 0, t_fcs_quadrature = 0; // FCS: rho_u evaluation and nodal source quadrature
 };
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
@@ -139,11 +148,17 @@ public:
     Field angular_filter(const Field &a, double tau) const;
     // True when the reaction step changes anything (filter, scattering, absorption or source).
     bool reacts() const {
-        return options.filter_strength != 0 || options.sigma_s != 0 || options.sigma_a != 0 || bool(options.material);
+        return options.filter_strength != 0 || options.sigma_s != 0 || options.sigma_a != 0 || bool(options.material) ||
+               bool(options.uncollided_density);
     }
     // Exact local reaction over tau (filter, absorption, scattering, source), node by node; see react() in the .cpp.
     // Adds the absorbed and injected mass to the ledger of `stats`.
-    Field react(const Field &a, double tau, ElementWenoStats * = nullptr) const;
+    // source_time: time at which the FCS source sigma_s rho_u is evaluated (required with uncollided_density).
+    Field react(const Field &a, double tau, ElementWenoStats * = nullptr,
+                double source_time = std::numeric_limits<double>::quiet_NaN()) const;
+    // FCS: nodal collided source int sigma_s rho_u(t) phi_i / int phi_i (density rate) and int rho_u(t) dx over
+    // the computed domain (zero without uncollided_density).
+    Vec collided_source(double t, double *uncollided_mass = nullptr, ElementWenoStats *stats = nullptr) const;
     // Rounding-only nudge of the low moments into the M1 cone (counted, mass recorded in the ledger).
     Field admissible_rows_public(Field x, ElementWenoStats * = nullptr) const;
     // Nodal reaction data (zero without material): averages int c phi_i / int phi_i, and the quadrature
@@ -201,6 +216,13 @@ private:
     };
     std::array<LineFactor, 3> natural_;
     std::array<LineFactor, 3> dirichlet_;
+    // FCS quadrature: physical points (element-major, fcs_per_element_ per element), sigma_s and weight at each
+    // point, shape values phi_l at the per-element points, and int phi_i dx of the same rule.
+    std::vector<V3> fcs_points_;
+    std::vector<double> fcs_sigma_s_, fcs_weight_;
+    Mat fcs_shape_;
+    Vec fcs_node_mass_;
+    int fcs_per_element_ = 0;
     std::array<int, 3> mirror_index_{-1, -1, -1};   // grid-line position of the mirror node per direction
     std::array<std::vector<char>, 3> reflect_odd_;  // per active moment: odd under x_d -> -x_d
     std::array<std::vector<int>, 3> mirror_nodes_;  // nodes on the mirror plane of direction d
