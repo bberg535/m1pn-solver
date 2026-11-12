@@ -3,6 +3,9 @@
 #include "parallel.hpp"
 #include <algorithm>
 #include <atomic>
+#include <string>
+#include <iomanip>
+#include <sstream>
 #include <random>
 #include <Eigen/Eigenvalues>
 namespace m1pn {
@@ -45,12 +48,38 @@ Mat tensor(const std::vector<Mat> &factors, int p) {
     return out;
 }
 // A rounding fix for stored states: raises only the density, by a few ulps.
-bool nudge_into_cone(Four &v) {
+std::string describe(const Four &v) {
+    std::ostringstream out;
+    out << std::setprecision(17) << "(rho=" << v[0] << ", J=" << v[1] << ", " << v[2] << ", " << v[3]
+        << ", rho-|J|=" << v[0] - v.tail<3>().norm() << ")";
+    return out.str();
+}
+// |J| rounded upwards, accurate also for subnormal components: below 1e-290 binary64 loses significant bits
+// (subnormals), so |J| is evaluated after the exact power-of-two scaling by 2^600 and scaled back upwards.
+double norm_up(const Four &v) {
+    const double scale = std::ldexp(1., 600);
+    const bool tiny = std::max({std::abs(v[1]), std::abs(v[2]), std::abs(v[3])}) < 1e-290;
+    const double s = tiny ? scale : 1.;
+    const double n = std::sqrt((v[1] * s) * (v[1] * s) + (v[2] * s) * (v[2] * s) + (v[3] * s) * (v[3] * s));
+    double up = n * (1 + 8 * std::numeric_limits<double>::epsilon());
+    up = tiny ? up / scale : up;
+    return std::nextafter(up, std::numeric_limits<double>::infinity());
+}
+bool nudge_into_cone(Four &v, const char *where = "bar state") {
     if (exact::cone(v))
         return false;
+    const Four original = v;
     for (int k = 0; k < 256 && !exact::cone(v); ++k)
         v[0] = std::nextafter(v[0], std::numeric_limits<double>::infinity());
-    cone_require(exact::cone(v), "State left the M1 cone beyond rounding");
+    if (!exact::cone(v) && v[0] < 1e-290) {
+        // Subnormal range (e.g. densities ~1e-316 behind a sigma = 1e7 absorber): the rounding error of a few
+        // operations exceeds 256 ulp there. Raise rho to |J| rounded upwards (rounding fix, counted by the caller).
+        v[0] = std::max(v[0], norm_up(v));
+        for (int k = 0; k < 256 && !exact::cone(v); ++k)
+            v[0] = std::nextafter(v[0], std::numeric_limits<double>::infinity());
+    }
+    cone_require(exact::cone(v), std::string("State left the M1 cone beyond rounding (") + where + ", 256 ulp): " +
+                                     describe(original));
     return true;
 }
 inline Four block(const Field &f, int row, int direction) {
@@ -1610,7 +1639,16 @@ Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lu
         const double before = row[0];
         for (int k = 0; k < 4096 && !exact::cone(project(view)); ++k)
             row[0] = std::nextafter(row[0], std::numeric_limits<double>::infinity());
-        cone_require(exact::cone(project(view)), "State left the M1 cone beyond rounding");
+        if (!exact::cone(project(view)) && std::abs(row[0]) < 1e-290) {
+            // Subnormal densities: start from |J| rounded upwards (see norm_up), then ulp steps as above.
+            row[0] = std::max(row[0], norm_up(project(view)) / std::sqrt(4 * pi));
+            for (int k = 0; k < 4096 && !exact::cone(project(view)); ++k)
+                row[0] = std::nextafter(row[0], std::numeric_limits<double>::infinity());
+        }
+        cone_require(exact::cone(project(view)),
+                     "State left the M1 cone beyond rounding (stored row " + std::to_string(i) + ", 4096 ulp): " +
+                         describe(project(Eigen::Map<const Vec>(row, q))) + ", before nudge rho coefficient " +
+                         std::to_string(before));
         added[i] = lumped[i] * std::sqrt(4 * pi) * (row[0] - before);
         ++nudged;
     });

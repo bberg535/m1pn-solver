@@ -302,6 +302,32 @@ void lattice3d() {
         check(cone && st.absorbed > 0, tag + "cone kept, absorption active", st.absorbed);
     }
 }
+// Rounding fix in the subnormal range: the bar state of the sigma = 1e7 shadow run (n = 32) lay 636 ulp outside the
+// cone at rho ~ 8.6e-316; the stored-row nudge must also succeed there.
+void subnormal_rounding() {
+    Angular pn(3);
+    ElementWenoOptions o;
+    o.degree = 1, o.dimension = 1, o.elements = 4, o.periodic = true;
+    ElementWeno s(pn, o);
+    std::mt19937 rng(17);
+    std::uniform_real_distribution<double> u(-1, 1);
+    Field a = Field::Zero(s.nodes, s.moments);
+    for (int i = 0; i < s.nodes; ++i) {
+        Vec row = Vec::Zero(pn.q);
+        const Four bad = i == 0 ? Four(8.5986781350577896e-316, 8.5811272434943127e-316, 3.8862665170318486e-317,
+                                       3.8862665170318486e-317)
+                                : Four(1e-315 * (1 + .1 * u(rng)), 1e-315, 3e-318 * u(rng), 3e-318 * u(rng));
+        set_low(row, bad);
+        a.row(i) = row.transpose();
+    }
+    ElementWenoStats st;
+    const Field b = s.admissible_rows_public(a, &st);
+    bool cone = true;
+    for (int i = 0; i < s.nodes; ++i)
+        cone = cone && exact::cone(project(b.row(i).transpose()));
+    check(cone && st.nudged_states > 0, "subnormal states are rounded into the cone", double(st.nudged_states));
+    check(std::abs(st.nudge_mass) < 1e-300, "subnormal rounding adds only subnormal mass", st.nudge_mass);
+}
 } // namespace
 int main() {
     try {
@@ -313,6 +339,7 @@ int main() {
         global_balance(false);
         global_balance(true);
         lattice3d();
+        subnormal_rounding();
     } catch (const std::exception &e) {
         std::cerr << "exception: " << e.what() << "\n";
         return 1;

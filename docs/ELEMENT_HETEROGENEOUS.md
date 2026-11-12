@@ -328,6 +328,72 @@ python3 nx/tmp/ew_hetero_paper/study.py submit --campaign "$PWD/nx/tmp/ew_hetero
 python3 nx/tmp/ew_hetero_paper/study.py submit --campaign "$PWD/nx/tmp/ew_hetero_paper" --execute
 ```
 
+## 11a. Ergebnisse der nx-Kampagne `ew_hetero_paper` (12.11.2026)
+
+Profil `hetero-paper`, Git 47b8752, Binary eingefroren, 16 Packs à 4 × 16 Kerne (NUMA-gepinnt), `--cfl 0.2`.
+60 von 63 Aufgaben validiert. Bilder und Tabellen: `results/element_heterogeneous_20261111/nx_hetero_paper/`
+(`lattice_*`, `shadow_*`, `lattice3d_*`, PNG und PDF; Tabellen `lattice.md`, `shadow.md`, `lattice3d.md`).
+
+**Lattice** (`lattice.md`, `lattice_convergence`, `lattice_density_maps`, `lattice_lineout`, `lattice_error_vs_time`):
+
+| P | Q1/112 → Q1/224: Masse | Absorption gesamt | Rate bei T |
+|---|---|---|---|
+| P7 | −1.91 % → −0.87 % | +3.58 % → +1.65 % | +2.20 % → +1.28 % |
+| P11 | −1.80 % → −0.63 % | +3.37 % → +1.20 % | +2.06 % → +0.96 % |
+
+Abweichungen gegen Schotthöfer/Hauck Tab. 1 / 2π.
+
+- **Konvergenz:** Die Abweichungen halbieren sich bis drittelns sich bei Verdopplung der Auflösung, der Fehler ist also
+  räumlich dominiert. Mit dem historischen B-Zeitschritt (6.5-mal kleiner) ändern sich die Größen um < 1e-4; der
+  Zeitfehler ist vernachlässigbar.
+- **Pfad B mit aktuellem Binary,** gleiches Gitter Q1/112 und P, auf nx mit 16 Kernen:
+
+  | | Element-WENO | Pfad B |
+  |---|---|---|
+  | Masse P3 | −3.14 % | −2.98 % |
+  | Masse P7 | −1.91 % | −1.83 % |
+  | Rate P7 | +2.20 % | +2.05 % |
+  | Lösezeit P3 | 7.5 s | 88 s |
+  | Lösezeit P7 | 9.5 s | 122 s |
+
+  Gleiche Genauigkeit bei etwa 12–13-mal kürzerer Rechenzeit. Pfad B nutzt das kleinere historische dt; mit gleichem dt
+  braucht Element-WENO 57 s (P7). Pfad B P11 ist am internen Speicherbudget gescheitert (Skriptfehler, behoben,
+  Nachlauf).
+- **Grad bei gleicher Punktzahl:** wie lokal Q1 > Q2 > Q3 > Q4.
+
+**Shadow** (`shadow.md`, `shadow_convergence`, `shadow_density_maps`, `shadow_profiles`):
+
+- **σ = 10:** Die Schattentiefe hinter der Kugel konvergiert gegen Beer-Lambert. P7: 0.100 → 0.126 → 0.131
+  (n = 8, 16, 32; Referenz 0.135); P11: 0.098 → 0.141 → 0.148.
+- **σ ≥ 100:** Der Schatten füllt sich mit wachsender Auflösung (P7/P11 bei n = 32: 0.08–0.10 statt ≈ 0). Die
+  Dichtekarten zeigen brennpunktartige Strukturen auf der Achse hinter der Kugel. Das ist der Winkelmodellfehler
+  eines endlichen PN: Die PN-Darstellung des δ-Strahls enthält breite Winkelanteile, die schräg hinter den Absorber
+  laufen. Feineres Gitter dämpft sie weniger. Eine Konvergenz gegen den kinetischen Schatten ist mit P ≤ 11 nicht
+  zu erwarten und wird nicht behauptet.
+- **Überhöhung vor dem Absorber (neuer Befund):** Der freie Strahl bei x = −0.25 erreicht bei P7 auf n = 32 bis
+  1.29, auf n = 50 bis 1.25 (Referenz 1). Der Effekt wächst mit σ; bei P11 bleibt der Wert ≤ 0.92, bei P3 ≤ 0.72.
+  Kinetisch gibt es bei reiner Absorption keine Rückstreuung. Die Überhöhung ist ein Artefakt des PN/M1-Modells
+  bzw. der Kopplung vor einem stark absorbierenden Hindernis. Ihre Ursache ist **nicht untersucht.**
+- **Querausbreitung:** Der Strahl füllt quer fast die ganze Box. Die M1/PN-Strahlaufweitung in zwei Querrichtungen
+  ist in 3D erheblich.
+- **Robustheit:** Bilanz ≤ 6e-12 und Kegel in allen erfolgreichen Läufen.
+  - σ = 10⁷, P3, n = 32 brach bei t = 0.90 ab: Ein Bar State mit subnormalen Werten (ρ ≈ 8.6e-316) lag 636 ulp
+    außerhalb des Kegels, weil binary64 dort nur noch etwa 24 signifikante Bits hat. Behoben: Unterhalb von 1e-290
+    wird |J| nach exakter Skalierung mit 2⁶⁰⁰ berechnet und ρ darauf aufgerundet. Das bleibt eine reine
+    Rundungskorrektur, die Zusatzmasse liegt bei ~1e-317 und wird gezählt. Test `subnormal_rounding`.
+  - P11, n = 50 (Weih-Auflösung) überschritt das Zeitlimit von 7 h bei t = 1.24 von 1.6.
+
+**3D-Lattice** (`lattice3d.md`, `lattice3d_slices`, `lattice3d_convergence`):
+
+- Bilanz ≤ 6e-12, Kegelmarge > 0.
+- Die drei Mittelebenen zeigen die asymmetrische 3D-Struktur (z. B. den Absorber (3,3,1) unter der Quelle).
+- Masse bei T über die Auflösungen (Q2/14, Q1/28, Q2/28): 0.33, 0.41, 0.49 (P3) bzw. 0.50 (P7). Das ist **nicht
+  konvergiert**; für Konvergenzaussagen braucht es feinere Gitter (Zellbreite ≤ 1/8 der Materialwürfel).
+
+**Kostenmodell:** Die Kampagne lief mit `--cfl 0.2`, das Modell war auf CFL 1 kalibriert und 3D lief auf nx 1.8-mal
+langsamer. Das Modell ist korrigiert (CFL der Aufgabe, 3D-Faktor 1.8). `hetero-paper` entspricht damit etwa 550
+Kernstunden. Nachlauf der drei Fehlschläge: Kampagne `ew_hetero_paper_recovery` (2 × 32 Kerne, Partition `long`).
+
 ## 12. Abnahme
 
 | Prüfpunkt | Ergebnis |
@@ -345,11 +411,14 @@ python3 nx/tmp/ew_hetero_paper/study.py submit --campaign "$PWD/nx/tmp/ew_hetero
 | Element-Korrektursummen, Randkorrekturen, WENO-Beiträge unverändert | bestanden (bitgleiche Altfälle, Bestandstests 140 + 43) |
 | Spiegelreduktion nur bei symmetrischem Material, Quelle, Einstrom | bestanden (Lattice x, Shadow yz, 3D-Lattice keine) |
 | Geometrie mit Elementzahl pro Achse | bestanden (Box = Würfel knotenweise) |
-| Lattice gegen kinetische Referenz | gemessen (P11: −1.8 / +3.4 / +2.0 %) |
+| Lattice gegen kinetische Referenz | konvergierend (P11 Q1/224: −0.63 / +1.20 / +0.96 %) |
+| Lattice gegen Pfad B (aktuelles Binary) | gleiche Genauigkeit, Element-WENO 12–13× schneller (P3, P7) |
 | Lattice gegen historische B-Läufe | ρ_max und Schnitt übereinstimmend; Felder nicht mehr vorhanden |
-| Shadow Stufe A gegen Beer-Lambert | lokal bis n = 16: σ = 10 Schattentiefe P11 0.138 vs 0.135; Konvergenz **nicht untersucht** (nx) |
+| Shadow Stufe A gegen Beer-Lambert | σ = 10: konvergiert (P7 0.131, P11 0.148 vs 0.135 bei n = 32); σ ≥ 100: Schatten füllt sich (Winkelmodell) |
+| Shadow: kein Aufstau vor dem Absorber | **nicht bestanden** (P7 bis 1.29 statt 1; Ursache offen) |
+| Robustheit subnormaler Zustände (σ = 10⁷) | nach Korrektur bestanden (Test; Nachlauf n = 32) |
 | Shadow Stufe B (σ = 10⁷) stabil | bestanden; quantitative Reproduktion nicht behauptet |
-| 3D-Lattice Konvergenz | **nicht untersucht** (nx, Selbstvergleich) |
+| 3D-Lattice Konvergenz | **nicht erreicht** auf Q2/28 (Masse 0.33 → 0.41 → 0.50); feinere Gitter nötig |
 | Manufactured Solution mit variablen Koeffizienten im vollen Solver | **nicht untersucht** (Studie §3 nur Reaktion, §4 Zeit) |
 | Extrudierter 2D-Lattice in 3D | **nicht untersucht** |
 | Kobayashi-Probleme (OECD/NEA) | **nicht untersucht** (Quelle nicht erreichbar) |

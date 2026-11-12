@@ -254,10 +254,12 @@ def cost_model(t: dict) -> dict:
         nodes *= (n + 1) // 2 if mirror[d] else n
     moments = active_moments(t) if t.get("stabilization", "element-weno") == "element-weno" else (t["pn_order"] + 1) ** 2
     c = {1: .25, 2: .15, 3: .08, 4: .05}.get(p, .05) * (.67 if dim == 3 else 1)
-    dt = t.get("fixed_dt") or c * h
+    # dt / h above was measured at cfl = 1; tasks use t["cfl"] (0.2 in this study).
+    dt = t.get("fixed_dt") or c * h * t.get("cfl", 1.)
     stages = 4 * math.ceil(t["time"] / dt)
     a = 5.0e-6 if dim == 3 else 1.65e-6
-    core_seconds = (a + 4.5e-8 * moments) * nodes * stages
+    # Recalibrated on ew_hetero_paper (NX, 16 cores): 3D runs are 1.8 times slower than the workstation model.
+    core_seconds = (a + 4.5e-8 * moments) * nodes * stages * (1.8 if dim == 3 else 1.)
     memory_gb = 30 * nodes * moments * 8 / 1e9 + .2
     slot = 32 if memory_gb > 48 or core_seconds > 16 * 6 * 3600 else 16
     return dict(estimate_nodes=nodes, estimate_moments=moments, estimate_steps=stages // 4,
@@ -345,6 +347,10 @@ def prepare(ns) -> int:
         if unknown:
             raise ValueError("unknown task labels: " + ", ".join(sorted(unknown)))
         tasks = [t for t in tasks if t["label"] in set(ns.only)]
+    if getattr(ns, "slot_cores", None):
+        for t in tasks:
+            t["slot_cores"] = ns.slot_cores
+            t["estimate_wall_hours"] = t.get("estimate_core_hours", 0) / ns.slot_cores
     print(f"{ns.profile}: {len(tasks)} tasks; groups: "
           + ", ".join(sorted(set(t["family"] for t in tasks))))
     if ns.dry_run:
@@ -1078,6 +1084,7 @@ def main() -> int:
     p.add_argument("--standalone-bin", type=Path, default=ROOT / "tmp/build/m1pn_element_weno")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--only", nargs="+", help="freeze only these task labels (supplementary/recovery campaign)")
+    p.add_argument("--slot-cores", type=int, choices=[16, 32], help="override the slot size of all frozen tasks")
     p.set_defaults(action=prepare)
     p = sub.add_parser("plan", help="resource plan of a profile (dry, no files)")
     p.add_argument("--profile", choices=["smoke", "paper", *HETERO_PROFILES], default="hetero-paper")
