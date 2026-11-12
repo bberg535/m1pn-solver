@@ -45,6 +45,7 @@ struct Options {
     // --stabilization element-weno (Bernstein Q_p, element-based limiting)
     int degree = 2;
     double weno_linear = 1e-3, weno_q = 1;
+    bool m1_target = false; // element-weno: M1 instead of PN target (P1, --mirror-reduction off)
     bool weno = true, element_limit = true;
     std::string problem = "smooth", inflow = "vacuum", output = std::string(PN_AFC_ROOT) + "/tmp/run", pair_limiter = "scalar", coupling = "m1pn";
 };
@@ -98,6 +99,7 @@ Options parse(int argc, char **argv) {
                    "   cases lattice-paul (2D, (0,7)^2), lattice-3d (3D, (0,7)^3), shadow-weih (3D, --inflow shadow-beam)\n"
                    "   --shadow-sigma S (sphere absorption, default 1e7) --beam-density B --material-subcells K\n"
                    "   --history-stride S (ledger rows) --skip-fields (no initial/final sample fields)\n"
+                   "   --m1-target on|off (M1 instead of PN high-order target; needs --pn-order 1 --mirror-reduction off)\n"
                    "   --mirror-reduction auto|off (open mesh, vacuum inflow, even elements, initial data mirror-\n"
                    "     symmetric about x_d = 1/2 in every direction: compute on [1/2,1]^d with mirror sides)\n"
 #ifdef M1PN_FAST_DEFAULTS
@@ -278,6 +280,9 @@ Options parse(int argc, char **argv) {
             o.angular_reduction = v;
         } else if (key == "--weno-q") {
             o.weno_q = real();
+        } else if (key == "--m1-target") {
+            require(v == "on" || v == "off", "--m1-target must be on or off");
+            o.m1_target = v == "on";
         } else if (key == "--weno" || key == "--element-limit") {
             require(v == "on" || v == "off", key + " must be on or off");
             (key == "--weno" ? o.weno : o.element_limit) = v == "on";
@@ -620,6 +625,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     eo.weno = o.weno;
     eo.limit = o.element_limit;
     eo.weno_linear = o.weno_linear;
+    eo.m1_target = o.m1_target;
     eo.weno_q = o.weno_q;
     eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
     eo.sigma_s = o.sigma_s;
@@ -872,6 +878,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         config << std::setprecision(17) << "{\n\"method\":\"element-weno\",\"model\":\"r2\",\"coupling\":\"m1pn\""
                << ",\"stabilization\":\"element-weno\",\"pn_target\":\"consistent_mass_cg_weno\""
                << ",\"basis\":\"tensor_bernstein\",\"degree\":" << o.degree
+               << ",\"m1_target\":" << (o.m1_target ? "true" : "false")
                << ",\"weno\":" << (o.weno ? "true" : "false") << ",\"weno_linear\":" << o.weno_linear
                << ",\"weno_q\":" << o.weno_q << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
                << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength

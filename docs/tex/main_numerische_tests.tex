@@ -1,0 +1,19 @@
+% Eigenständiger Rahmen zum Übersetzen des Kapitels numerische_tests.tex.
+%   cd docs/tex && pdflatex main_numerische_tests && bibtex main_numerische_tests \
+%     && pdflatex main_numerische_tests && pdflatex main_numerische_tests
+% Für die Masterarbeit/das Paper genügt \input{numerische_tests.tex} und die Einträge aus numerische_tests.bib.
+\documentclass[12pt]{report}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[a4paper,left=25mm,right=25mm,top=25mm,bottom=25mm]{geometry}
+\usepackage[ngerman]{babel}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{csquotes}
+\usepackage[hidelinks]{hyperref}
+\begin{document}
+\input{numerische_tests.tex}
+\bibliographystyle{plain}
+\bibliography{numerische_tests}
+\end{document}

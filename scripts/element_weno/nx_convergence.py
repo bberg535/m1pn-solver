@@ -122,16 +122,15 @@ def make_hetero_tasks(profile: str) -> list[dict]:
             row["coupling"] = "m1pn"
             out.append(row)
     # 3D shadow, stage A (moderate, Beer-Lambert reference) and stage B (sigma = 1e7, Weih et al.).
+    # Archived on 12.11.2026 (docs/ELEMENT_HETEROGENEOUS.md, section 11b): the collimated delta beam is outside what
+    # P_N with N <= 11 can represent, so Beer-Lambert measures the angular model, not the scheme. Only the smoke
+    # profile keeps one shadow task as a functional test of the 3D/mirror/material machinery.
     sh = dict(background=1e-6, skip_fields=True, expect_mirror=[False, True, True])
-    for sigma in ([10.] if smoke else [1., 10., 100.]):
-        for pn in ([3] if smoke else [3, 7, 11]):
-            for n in ([4] if smoke else [8, 16, 32]):
-                out.append(task("shadowA", "fast", "shadow-weih", "shadow-beam", 3, n, 2, pn, 1.6,
-                                kind="shadow", tag=f"s{sigma:g}", shadow_sigma=sigma, **sh))
-    for pn in ([3] if smoke else [3, 7, 11]):
-        for n in ([4] if smoke else [16, 32, 50]):
-            out.append(task("shadowB", "fast", "shadow-weih", "shadow-beam", 3, n, 2, pn, 1.6,
-                            kind="shadow", tag="s1e7", shadow_sigma=1e7, **sh))
+    if smoke:
+        out.append(task("shadowA", "fast", "shadow-weih", "shadow-beam", 3, 4, 2, 3, 1.6,
+                        kind="shadow", tag="s10", shadow_sigma=10., **sh))
+        out.append(task("shadowB", "fast", "shadow-weih", "shadow-beam", 3, 4, 2, 3, 1.6,
+                        kind="shadow", tag="s1e7", shadow_sigma=1e7, **sh))
     # Own 3D lattice extension (asymmetric: no mirror).
     for pn in ([3] if smoke else [3, 7]):
         for p, n in ([(1, 14)] if smoke else [(1, 28), (2, 14), (2, 28)]):

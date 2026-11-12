@@ -203,6 +203,9 @@ Test: x-abhängige Daten auf periodischen Boxen 12×4 und 6×2×3 ergeben knoten
 
 ## 7. 3D-Shadow
 
+> **Archiviert am 12.11.2026** (Begründung in §11b). Der Fall bleibt im Code und im Profil `hetero-smoke`
+> als Funktionstest; `hetero-paper` enthält ihn nicht mehr.
+
 `--case shadow-weih --dimension 3 --inflow shadow-beam --shadow-sigma σ --background 1e-6`, Gebiet nach Weih
 (n = Zellen pro 0.5, also 3n·n·n). **Strahl (eigene Festlegung):** kollimiert in +x, Dichte 1 für
 r = |(y,z)| ≤ 0.15, cos²-Übergang bis 0.2, danach 0.
@@ -309,7 +312,7 @@ Der 2D-Lattice ist unverändert (0.6 s; kaum Rand).
 - **Smoke-Fehler behoben:** Aufgaben ohne Schlüssel `stabilization` verloren `--weno`, `--element-limit` und
   `--weno-linear`. Die zwei Smoke-Ablationen liefen deshalb mit WENO und Limiter; `weno_weight_02` im Paper-Profil
   wäre unbemerkt mit 1e-3 gelaufen. Der vorhandene Offline-Test schlug auf a62b016 schon fehl.
-- **Neue Profile** `hetero-smoke` (5 Aufgaben) und `hetero-paper` (63 Aufgaben); die v1-Profile mit 81/21 Aufgaben
+- **Neue Profile** `hetero-smoke` (5 Aufgaben) und `hetero-paper` (63 Aufgaben; seit §11b ohne Shadow 27); die v1-Profile mit 81/21 Aufgaben
   bleiben unverändert.
 - **Ressourcenplan** `plan --profile hetero-paper`: 62.7 Kernstunden. Das teuerste ist P11 auf 150×50×50
   (etwa 16 Kernstunden, 27 GB); alles passt in `med` mit 16-Kern-Slots. Der Plan ist auf dem Arbeitsplatz
@@ -393,6 +396,45 @@ Abweichungen gegen Schotthöfer/Hauck Tab. 1 / 2π.
 **Kostenmodell:** Die Kampagne lief mit `--cfl 0.2`, das Modell war auf CFL 1 kalibriert und 3D lief auf nx 1.8-mal
 langsamer. Das Modell ist korrigiert (CFL der Aufgabe, 3D-Faktor 1.8). `hetero-paper` entspricht damit etwa 550
 Kernstunden. Nachlauf der drei Fehlschläge: Kampagne `ew_hetero_paper_recovery` (2 × 32 Kerne, Partition `long`).
+
+## 11b. Shadow-Test archiviert (12.11.2026)
+
+**Entscheidung:** Der Shadow-Test wird nicht weiter als Validierung verwendet. `hetero-paper` hat damit 27 statt 63
+Aufgaben; `hetero-smoke` behält eine Shadow-Aufgabe je Stufe als Funktionstest (3D, Spiegel, Material, σ = 10⁷).
+Die Ergebnisse aus §11a bleiben unverändert in `results/element_heterogeneous_20261111/nx_hetero_paper/shadow*`.
+Nachlauf: `shadowB_P3_p2_E32_s1e7` abgeschlossen; `shadowB_P11_p2_E50_s1e7` (Job 159521) abgebrochen.
+
+**Begründung:**
+
+- **Der freie Strahl ist schon falsch, nicht erst der Schatten.** Bei σ = 1 enthält das Gebiet 0.124 (P7) bzw.
+  0.133 (P11) Masse; der Einstrom ist korrekt (Anfangsrate 0.095 = Strahlquerschnitt). ρ auf der Achse bei x = 0.5
+  liegt aber bei 0.24 bzw. 0.48 statt 0.82: Der Strahl verteilt sich über den Boxquerschnitt (0.098 / 0.25 ≈ 0.39).
+  Ursache ist die PN-Darstellung des δ-Strahls in der Richtung; die Box (Halbbreite 0.25, Strahlradius 0.2) lässt
+  keinen Raum. Bei σ ≥ 100 füllt sich der Schatten seitlich auf.
+- **Nicht stationär bei T = 1.6:** P11 gewinnt in den letzten 0.14 noch etwa 5 % Masse; Beer-Lambert ist stationär.
+- **Literatur:** Weih et al. (arXiv:2007.05718) ist ein Lattice-Boltzmann-Paper. Der Stencil enthält eine diskrete
+  Richtung genau entlang x („All other directions do not matter“); der Test ist dort trivial. Das Ergebnis ist ein
+  einziges Farbbild, ohne Referenz und ohne Zahl. M1 oder PN wurden für den Shadow-Test nicht gerechnet.
+- **FCS:** Mit First-Collision-Aufspaltung ist die Lösung rein unkollidiert (σ_s = 0) und gleich Beer-Lambert; der
+  Test prüft dann nur den unkollidierten Löser.
+
+**M1-Ziel (Diagnose, `--m1-target on`):** Option `ElementWenoOptions::m1_target`. Hochordnungsrate der vier
+Momente ist die Gruppen-FE-Galerkin-Rate −Σ_d M⁻¹C_d F^L_d des nodalen Levermore-Flusses plus s_h, G = F^H − F^L = 0,
+Rand nur mit dem M1-Fluss niedriger Ordnung (Korrekturfaktor 0). Nur P1, offenes Netz, ohne Spiegel. Bei n = 8,
+σ = 10 (Q2, ein Kern):
+
+| | Achse x = 0.5 (Ref. 0.135) | Strahlrand y = 0.175, x = 0.5 (Ref. 0.5) | freier Strahl x = −0.25 (Ref. 1) | Masse |
+|---|---:|---:|---:|---:|
+| P1, PN-Ziel | 0.094 | 0.067 | 0.40 | 0.066 |
+| P7, PN-Ziel | 0.100 | 0.152 | 0.55 | 0.098 |
+| M1-Ziel | 0.037 | 0.446 | 0.36 | 0.091 |
+
+M1 hält den Strahl zusammen und wirft einen Schatten mit zwei Strahlmaxima bei y ≈ ±0.15. Hinter der Kugel ist der
+Schatten zu tief und schließt sich ab x ≈ 0.55 durch Verschmelzen der Teilstrahlen (bekannte M1-Eigenschaft bei
+sich kreuzenden Strahlen). Bilanz 4e-14. Die Option ist nur ein Diagnosewerkzeug und nicht Teil der Kampagnen.
+
+**Was stattdessen nötig wäre:** ein Strahltest mit Streuung und kinetischer Referenz (S_N), eine breitere Box und
+T ≈ 3, oder der Vergleich mit FCS.
 
 ## 12. Abnahme
 

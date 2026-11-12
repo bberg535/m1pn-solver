@@ -70,6 +70,11 @@ struct ElementWenoOptions {
     // consistent mass for those components), and the WENO neighbour across the mirror is the mirrored element.
     // At most one mirror side per direction; not with periodic meshes or the symmetric residual form.
     std::array<bool, 6> mirror{};
+    // M1 target instead of PN (diagnostic, docs/ELEMENT_HETEROGENEOUS.md): the high-order rate of (rho, J) is the
+    // group-FE Galerkin rate -sum_d M^-1 C_d F^L_d of the nodal Levermore flux plus s_h, the closure difference
+    // G = F^H - F^L is zero and the boundary keeps the low-order M1 flux (correction factor 0). Requires P1 and no
+    // mirror sides (the flux components have other reflection parities than the moments).
+    bool m1_target = false;
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;

@@ -127,6 +127,9 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     : pn(angular), options(o), inflow(std::move(in)), degree(o.degree), dimension(o.dimension),
       elements(o.elements) {
     require(degree >= 1 && degree <= 12, "Element WENO supports Bernstein degrees 1 to 12");
+    require(!o.m1_target || (angular.order == 1 && !o.periodic &&
+                             std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; })),
+            "The M1 target needs P1, an open mesh and no mirror sides");
     require(dimension >= 1 && dimension <= 3, "Element WENO supports dimensions 1 to 3");
     for (int d = 0; d < 3; ++d) {
         count[d] = d < o.dimension ? (o.elements_per_axis[d] > 0 ? o.elements_per_axis[d] : o.elements) : 1;
@@ -1248,6 +1251,8 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             }
         }
     });
+    if (options.m1_target)
+        closure.setZero(); // target flux = F^L
     lap(timing.t_closure);
 
     // High-order PN residual and its stabilization.
@@ -1272,18 +1277,23 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     if (!faces_.empty()) {
         add_boundary(time, a, low, low_flux, boundary_high, boundary_low, flux_area, boundary_area,
                      boundary_bar, &boundary_inflow);
-        for (std::size_t k = 0; k < boundary_nodes_.size(); ++k)
-            residual.row(boundary_nodes_[k]) += boundary_high.row(k);
+        if (!options.m1_target)
+            for (std::size_t k = 0; k < boundary_nodes_.size(); ++k)
+                residual.row(boundary_nodes_[k]) += boundary_high.row(k);
     }
     lap(timing.t_boundary);
     Field high_rate = options.stabilize || !faces_.empty() ? solve_mass(std::move(residual)) : std::move(residual);
     Field moment_rate(nodes, 4);
     parallel_for(nodes, [&](int i) {
         double *row = &high_rate.coeffRef(i, 0);
-        for (int d = 0; d < dimension; ++d)
-            add_flux(flux_t_[d], gradient[d].data() + std::size_t(i) * q, -1., row, q);
+        if (!options.m1_target)
+            for (int d = 0; d < dimension; ++d)
+                add_flux(flux_t_[d], gradient[d].data() + std::size_t(i) * q, -1., row, q);
         moment_rate.row(i) = project(high_rate.row(i).transpose()).transpose();
     });
+    if (options.m1_target)
+        for (int d = 0; d < dimension; ++d)
+            moment_rate -= projected_gradient(Field(low_flux.middleCols(4 * d, 4)), d);
     lap(timing.t_mass);
 
     // Element bar states and antidiffusive contributions.
@@ -1430,8 +1440,8 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
             Four bar(boundary_bar(i, 0), boundary_bar(i, 1), boundary_bar(i, 2), boundary_bar(i, 3));
             bar /= boundary_area[i];
             nudge_into_cone(bar);
-            double theta = 1;
-            if (options.limit) {
+            double theta = options.m1_target ? 0. : 1.;
+            if (options.limit && !options.m1_target) {
                 const Four g = correction / boundary_area[i];
                 if (!exact::cone(bar + g))
                     theta = options.element_theta * segment(bar, g);

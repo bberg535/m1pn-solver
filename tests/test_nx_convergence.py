@@ -109,7 +109,10 @@ class HeterogeneousProfiles(unittest.TestCase):
             tasks = study.make_tasks(profile)
             labels = [t["label"] for t in tasks]
             self.assertEqual(len(labels), len(set(labels)))
-            self.assertTrue({"lattice", "shadow", "lattice3d"} <= {t["kind"] for t in tasks})
+            kinds = {t["kind"] for t in tasks}
+            self.assertTrue({"lattice", "lattice3d"} <= kinds)
+            # shadow archived (12.11.2026): only the smoke profile keeps it as a functional test
+            self.assertEqual("shadow" in kinds, profile == "hetero-smoke")
         # the frozen v1 matrices are unchanged by the new profiles
         self.assertEqual(len(study.make_tasks("paper")), 81)
         self.assertEqual(len(study.make_tasks("smoke")), 21)
