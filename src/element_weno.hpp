@@ -265,6 +265,7 @@ private:
         Mat harmonics; // points x q
     };
     std::array<OutRule, 6> out_rules_;
+    std::array<Field, 6> out_harmonics_; // row-major copies of out_rules_[side].harmonics (batched trace products)
     // Kinetic inflow data at a face quadrature point (one code path for the steady cache and the per-stage call).
     Incoming face_data(int side_id, const V3 &x, double time) const;
     std::vector<Incoming> steady_data_; // per (face, point) when inflow.steady

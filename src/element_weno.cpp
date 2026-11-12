@@ -7,6 +7,9 @@
 #include <iomanip>
 #include <sstream>
 #include <random>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <Eigen/Eigenvalues>
 namespace m1pn {
 namespace {
@@ -120,6 +123,25 @@ inline void add_flux(const Sparse &at, const double *x, double scale, double *ou
             sum += value[k] * x[inner[k]];
         out[j] += scale * sum;
     }
+}
+// A B with the rows of A split over the threads (rows are independent, so the result does not depend on the
+// thread count). Used for the batched boundary products (hemisphere traces, PN face fluxes).
+Field row_product(const Field &A, const Mat &B) {
+    Field out(A.rows(), B.cols());
+    if (A.rows() == 0 || B.cols() == 0)
+        return out.setZero(), out;
+#ifdef _OPENMP
+    const int threads = omp_get_max_threads();
+#else
+    const int threads = 1;
+#endif
+    const int block = std::max(8, int((A.rows() + 4 * threads - 1) / (4 * threads)));
+    const int blocks = (int(A.rows()) + block - 1) / block;
+    parallel_for(blocks, [&](int b) {
+        const int begin = b * block, n = std::min<int>(block, A.rows() - begin);
+        out.middleRows(begin, n).noalias() = A.middleRows(begin, n) * B;
+    });
+    return out;
 }
 } // namespace
 
@@ -684,6 +706,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                     for (int c = 0; c < moments; ++c)
                         out.harmonics(k, c) = y[active[c]];
                 }
+                out_harmonics_[2 * d + side] = out.harmonics;
             }
     }
     // Forward Euler bound of report (19), including the boundary bar states.
@@ -1159,7 +1182,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     const bool want_datum = extras && extras->datum;
     struct Local {
         std::vector<int> global;
-        Mat high, load, bar, flux_area, datum;
+        Mat high, load, bar, flux_area, datum, mass_traces;
         Vec area, inflow;
     };
     std::vector<Local> parts(faces_.size());
@@ -1169,6 +1192,28 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     // evaluated once per boundary node and face side.
     const bool ghost = options.fullsphere_ghost && !inflow.exterior_state && !inflow.exterior_m1;
     std::vector<Four> outgoing_moments(ghost ? ghost_node_.size() : 0);
+    // PN traces at the outgoing points, one product per side (points as parallel rows) instead of one
+    // matrix-vector product per ghost pair: traces[side](:, slot[k]) = harmonics * a.row(node_k)^T.
+    std::array<Field, 6> traces;
+    std::vector<int> slot(outgoing_moments.size(), 0);
+    if (ghost && !(extras && extras->ghost_psi)) {
+        for (int side = 0; side < 6; ++side) {
+            if (!boundaries_[side])
+                continue;
+            std::vector<int> idx;
+            for (std::size_t k = 0; k < ghost_node_.size(); ++k)
+                if (ghost_side_[k] == side)
+                    idx.push_back(k);
+            if (idx.empty())
+                continue;
+            Mat at(moments, idx.size());
+            for (std::size_t j = 0; j < idx.size(); ++j) {
+                at.col(j) = a.row(ghost_node_[idx[j]]).transpose();
+                slot[idx[j]] = j;
+            }
+            traces[side] = row_product(out_harmonics_[side], at);
+        }
+    }
     parallel_for(int(outgoing_moments.size()), [&](int k) {
         const int side_id = ghost_side_[k], node = ghost_node_[k];
         const OutRule &out = out_rules_[side_id];
@@ -1177,7 +1222,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         if (extras && extras->ghost_psi)
             extras->ghost_psi(k, side_id, node, psi);
         else
-            psi.noalias() = out.harmonics * a.row(node).transpose();
+            psi = traces[side_id].col(slot[k]);
         Four m = Four::Zero();
         for (int j = 0; j < psi.size(); ++j) {
             const double v = std::max(0., psi[j]) * out.weight[j];
@@ -1267,17 +1312,48 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 part.load.row(n) += weight * (state - ui).transpose();
             }
         }
-        if (want_datum)
+        if (want_datum || !skip_high)
             part.datum = datum;
         if (skip_high)
             return;
-        // sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum], with the exact face mass matrix.
+        // sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum], with the exact face mass matrix;
+        // the products with the dense q x q (and r x q) matrices are done per side below.
         Mat traces(nf, moments);
         for (int n = 0; n < nf; ++n)
             traces.row(n) = a.row(part.global[n]);
-        part.high.noalias() = (rule.mass * traces) * boundary_flux_t_[side_id];
-        part.high.noalias() -= datum * datum_t_[side_id];
+        part.mass_traces.noalias() = rule.mass * traces;
     });
+    if (!skip_high)
+        for (int side = 0; side < 6; ++side) {
+            if (!boundaries_[side])
+                continue;
+            std::vector<int> list;
+            int rows = 0;
+            for (std::size_t index = 0; index < faces_.size(); ++index)
+                if (2 * faces_[index].direction + faces_[index].side == side)
+                    list.push_back(index), rows += parts[index].mass_traces.rows();
+            if (list.empty())
+                continue;
+            Field G(rows, moments), D(rows, canonical_->r);
+            int at = 0;
+            bool datum_zero = true;
+            for (int index : list) {
+                const int nf = parts[index].mass_traces.rows();
+                G.middleRows(at, nf) = parts[index].mass_traces;
+                D.middleRows(at, nf) = parts[index].datum;
+                datum_zero = datum_zero && parts[index].datum.isZero(0);
+                at += nf;
+            }
+            Field H = row_product(G, boundary_flux_t_[side]);
+            if (!datum_zero)
+                H -= row_product(D, datum_t_[side]);
+            at = 0;
+            for (int index : list) {
+                const int nf = parts[index].mass_traces.rows();
+                parts[index].high = H.middleRows(at, nf);
+                at += nf;
+            }
+        }
     // `high` has one row per node or, in rate(), one row per boundary node (boundary_slot_).
     const bool compact = high.rows() != nodes;
     if (want_datum)
