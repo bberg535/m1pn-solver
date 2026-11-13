@@ -1,5 +1,6 @@
 #include "separable_trace.hpp"
 #include "angular.hpp"
+#include <cstdio>
 #include <random>
 
 namespace m1pn {
@@ -92,8 +93,15 @@ SeparableTrace::SeparableTrace(int order, const std::vector<int> &active, const 
         }
     }
     verified_error = err / std::max(size, 1e-300);
-    require(verified_error < 1e-12, "SeparableTrace: factorization does not reproduce the dense traces (" +
-                                        std::to_string(verified_error) + ")");
+    // Both evaluations round; their difference grows like eps times the number of terms (measured: 6e-15 at N = 15,
+    // 5e-13 at N = 31 with the 2N+1 rule, 1.4e-12 at N = 31 with a 4N+7 rule).
+    const double limit = 64 * std::numeric_limits<double>::epsilon() * qf;
+    if (!(verified_error < limit)) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "SeparableTrace: factorization does not reproduce the dense traces (%.3e > %.3e)",
+                      verified_error, limit);
+        throw std::runtime_error(buf);
+    }
 }
 
 void SeparableTrace::evaluate(const Mat &at, Mat &out) const {
