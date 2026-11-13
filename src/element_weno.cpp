@@ -138,6 +138,38 @@ inline void add_flux(const Sparse &at, const double *x, double scale, double *ou
         out[j] += scale * sum;
     }
 }
+// out.row(i) += scale * (A^T applied to x.row(i)) for all rows i, A^T in CSR form (`at`, as add_flux). Rows are
+// processed in blocks of 8: the block is transposed into a column buffer, so every stored entry becomes one
+// contiguous 8-wide multiply-add instead of eight indirect scalar loads. Per output entry the products are summed in
+// the same order as add_flux and then scaled and added once, i.e. the same arithmetic.
+void add_flux_rows(const Sparse &at, const Field &x, double scale, Field &out) {
+    constexpr int B = 8;
+    const int rows = int(x.rows()), q = int(x.cols()), count = int(out.cols());
+    const int *outer = at.outerIndexPtr(), *inner = at.innerIndexPtr();
+    const double *value = at.valuePtr();
+    parallel_for((rows + B - 1) / B, [&](int block) {
+        const int i0 = block * B, nb = std::min(B, rows - i0);
+        thread_local std::vector<double> xin, sum;
+        xin.assign(std::size_t(q) * B, 0.);
+        sum.resize(B);
+        for (int b = 0; b < nb; ++b) {
+            const double *src = x.data() + std::size_t(i0 + b) * q;
+            for (int k = 0; k < q; ++k)
+                xin[std::size_t(k) * B + b] = src[k];
+        }
+        for (int j = 0; j < count; ++j) {
+            double s[B] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int e = outer[j]; e < outer[j + 1]; ++e) {
+                const double v = value[e], *col = &xin[std::size_t(inner[e]) * B];
+#pragma omp simd
+                for (int b = 0; b < B; ++b)
+                    s[b] += v * col[b];
+            }
+            for (int b = 0; b < nb; ++b)
+                out(i0 + b, j) += scale * s[b];
+        }
+    });
+}
 // A B with the rows of A split over the threads (rows are independent, so the result does not depend on the
 // thread count). Used for the batched boundary products (hemisphere traces, PN face fluxes).
 Field row_product(const Field &A, const Mat &B) {
@@ -1568,9 +1600,11 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
         slot += now - clock;
         clock = now;
     };
+    const double closure_setup_before = timing.t_closure_setup;
     Field low(nodes, 4), low_flux(nodes, 12), closure(nodes, 12);
     low_flux.setZero();
     closure.setZero();
+    lap(timing.t_closure_setup);
     // Only the four low moments of the PN flux a A_d enter the closure difference G = F^H - F^L.
     parallel_for(nodes, [&](int i) {
         const double *row = a.data() + std::size_t(i) * q;
@@ -1593,6 +1627,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     if (options.m1_target)
         closure.setZero(); // target flux = F^L
     lap(timing.t_closure);
+    timing.t_closure += timing.t_closure_setup - closure_setup_before; // keep t_closure = setup + loop
 
     // High-order PN residual and its stabilization.
     const Vec gamma = options.stabilize ? weno_gamma(a) : Vec(Vec::Ones(cells));
@@ -1623,13 +1658,10 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     lap(timing.t_boundary);
     Field high_rate = options.stabilize || !faces_.empty() ? solve_mass(std::move(residual)) : std::move(residual);
     Field moment_rate(nodes, 4);
-    parallel_for(nodes, [&](int i) {
-        double *row = &high_rate.coeffRef(i, 0);
-        if (!options.m1_target)
-            for (int d = 0; d < dimension; ++d)
-                add_flux(flux_t_[d], gradient[d].data() + std::size_t(i) * q, -1., row, q);
-        moment_rate.row(i) = project(high_rate.row(i).transpose()).transpose();
-    });
+    if (!options.m1_target)
+        for (int d = 0; d < dimension; ++d)
+            add_flux_rows(flux_t_[d], gradient[d], -1., high_rate);
+    parallel_for(nodes, [&](int i) { moment_rate.row(i) = project(high_rate.row(i).transpose()).transpose(); });
     if (options.m1_target)
         for (int d = 0; d < dimension; ++d)
             moment_rate -= projected_gradient(Field(low_flux.middleCols(4 * d, 4)), d);

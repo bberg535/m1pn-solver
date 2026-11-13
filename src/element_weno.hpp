@@ -110,6 +110,7 @@ struct ElementWenoStats {
     // t_gradient_gather and t_residual stay zero (kept for the summary format).
     double t_closure = 0, t_weno = 0, t_stabilization = 0, t_residual = 0, t_boundary = 0;
     double t_mass = 0, t_limiter = 0, t_finish = 0;
+    double t_closure_setup = 0; // allocation and zeroing part of t_closure
     double t_gradient_local = 0, t_gradient_gather = 0, t_gradient_solve = 0, t_stab_local = 0;
     // Mass ledger in rho units (sum_i m_i rho_i, m_i = lumped mass), accumulated by advance():
     //   M(T) - M(0) + boundary_outflow + absorbed - injected - nudge_mass = 0 up to rounding.

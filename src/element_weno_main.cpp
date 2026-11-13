@@ -279,7 +279,7 @@ int main(int argc, char **argv) {
                 << ",\"nudged_states\":" << stats.nudged_states
                 << ",\"max_raw_zero_sum\":" << stats.max_raw_zero_sum
                 << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
-                << ",\"seconds\":{\"closure\":" << stats.t_closure << ",\"weno\":" << stats.t_weno
+                << ",\"seconds\":{\"closure\":" << stats.t_closure << ",\"closure_setup\":" << stats.t_closure_setup << ",\"weno\":" << stats.t_weno
                 << ",\"stabilization\":" << stats.t_stabilization << ",\"residual\":" << stats.t_residual
                 << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass
                 << ",\"limiter\":" << stats.t_limiter << ",\"gradient_local\":" << stats.t_gradient_local
