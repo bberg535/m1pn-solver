@@ -1,10 +1,7 @@
 {
  "campaign": "/home/warehouse15/bberg/phd/03_projects/M1PN_Solver/.claude/worktrees/positivity-projection/nx/tmp/positivity_20261113",
  "commit": "ac06bb7ff0f6421faf7819ece7a1b5574b9505d9",
- "missing": [
-  "grid_c6_p1_E1024_N7",
-  "grid_proj_p1_E1024_N7"
- ],
+ "missing": [],
  "runtime": [
   {
    "p": 1,
@@ -2075,6 +2072,26 @@
    "overhead": 0.020778326546935677,
    "kinetic_c6": 0.0175644381011,
    "kinetic_proj": 0.0171908793191
+  },
+  {
+   "N": 7,
+   "E": 1024,
+   "wall_c6": 5769.35821431,
+   "wall_proj": 5744.34765725,
+   "ghost_c6": 13.1715875891,
+   "ghost_proj": 51.2217055629,
+   "calls": 88719900,
+   "us_ghost_c6_per_node": 0.1484626063498719,
+   "us_ghost_proj_per_node": 0.5773417864864591,
+   "iterations_per_call": 0.7680857056872247,
+   "max_iterations": 21,
+   "augmented_share": 0.021115578353898056,
+   "identity_share": 0.3356123936118052,
+   "failures": 3,
+   "max_residual": 9.99971050479e-13,
+   "overhead": -0.004335067460010555,
+   "kinetic_c6": 0.0216687071196,
+   "kinetic_proj": 0.0212999457397
   }
  ],
  "bench": [

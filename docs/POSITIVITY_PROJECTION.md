@@ -72,6 +72,38 @@ Gleiche Operationen in gleicher Reihenfolge außer der Trace-Summation; gemessen
 1e−12 … 3e−11 (alle Felder, normiert auf max ρ), unabhängig von der Threadzahl. Bestehende Tests (element_weno,
 material, fixes, FCS, DLRA) bestehen unverändert.
 
+### Zweite Runde: ganzer Zeitschritt und Thread-Skalierung (System unverändert)
+
+Profil eines ganzen Schritts (callgrind mit Zeileninformation) und Thread-Skalierungsproben auf nx (E=256, Q1, N=7):
+
+| Änderung | Wirkung (nx, 31 Threads, E=256, Q1, N=7, T=0.05) |
+|---|---|
+| `require/cone_require(bool, const char*)`: kein `std::string` je Aufruf (Limiter, Levermore) | Limiter 2.6× schneller (malloc-Konkurrenz bei 32 Threads) |
+| PN-Advektion −Σ g_d A_d als Block-SpMM (8 Knoten, transponierter Puffer) statt skalarer CSR-Schleife | Massenphase −24 % bei P15 (ein Thread) |
+| Knotengroße Puffer je `rate()` parallel genullt (First Touch) statt seriell | Closure 1.39 s → 0.17 s (seriell wuchs mit der Threadzahl) |
+| Keine Kopie des Zustands am Schrittende (`cond ? react(..) : last` kopierte) | −0.75 s unerfasste serielle Zeit |
+| Randstufe: Flächenzeilen statt tausender Kleinmatrizen, parallele Knotenreduktion (gleiche Summationsreihenfolge), Seitenprodukte in einem Parallelbereich | Rand 0.66 s → 0.25 s |
+| Gesamt | 5.60 s (`bdd5d3f`) → 2.22 s, Skalierung 1→31 Threads 6× → 13.8× |
+
+Neue Zeitmessungen in `summary.json`: `closure_setup`, `finite`, `ssp_stage`, `rate`, `advance`, `boundary_faces`,
+`boundary_products`, `boundary_reduce`.
+
+### Grenze des 1e−6-Kriteriums
+
+Für einzelne Operatorauswertungen und kurze Läufe (T = 0.1) liegt jede Änderung bei ≤ 3e−11. Über tausende Schritte
+verstärkt das nichtlineare Verfahren (Limiter-, Kegel- und WENO-Schalter) Rundungsunterschiede jedoch. Die
+**unveränderte Referenz** `bdd5d3f` ist deshalb nicht einmal mit sich selbst auf 1e−6 reproduzierbar, wenn nur die
+Threadzahl wechselt (32 vs. 16, T = 0.8, max. relative Feldabweichung):
+
+| Fall | Referenz 32 vs. 16 Threads | Referenz vs. optimiert |
+|---|---|---|
+| E=256, Q2, N=7 | 5.7e−6 | 1.5e−6 |
+| E=128, Q1, N=7 | 2.1e−10 | 1.2e−10 |
+| E=128, Q1, N=15 | 6.5e−5 | 3.5e−4 |
+
+Die Abweichungen der Optimierung liegen damit in derselben Größenordnung wie die Eigenvariabilität der Referenz;
+bei N=15 sitzt das Maximum am Ausflussrand (RMS 2e−5).
+
 ## 4. Benutzung
 
 ```bash
