@@ -17,6 +17,10 @@ struct PositivityProjectionOptions {
     double tolerance = 1e-12; // |F|_inf <= tolerance * (sum_k w_k |y_k| + rho_U)
     int max_iterations = 60;
     int max_backtracks = 40;
+    // false: an unsolvable problem returns unconverged instead of augmenting the rule by an atom at J/|J|.
+    bool augment = true;
+    // Optional per-point weights of the objective 1/2 sum w c (z - y)^2 (both arrays or none; cinv = 1 / c).
+    const double *c = nullptr, *cinv = nullptr;
 };
 
 struct PositivityProjectionResult {
@@ -89,6 +93,10 @@ struct PositivityProjectionStats {
     double seconds = 0;           // wall time of the ghost stage (trace products + projections)
     // Remaining add_boundary stages (diagnostics): face loop, per-side PN flux products, serial node reduction.
     double face_seconds = 0, product_seconds = 0, reduce_seconds = 0;
+    // Diagnostics (projection_diagnostics): distance of the projected ghost to the C6 ghost, relative to rho.
+    long c6_scaled = 0, hybrid_kept = 0;
+    double c6_diff_sum = 0, c6_diff_max = 0, c6_scaled_diff = 0;
+    std::array<double, 6> c6_diff_side{};
     void merge(const PositivityProjectionStats &o) {
         calls += o.calls, identities += o.identities, failures += o.failures, vacuum += o.vacuum, scaled += o.scaled;
         augmented += o.augmented, certificates += o.certificates, diracs += o.diracs, farkas += o.farkas;
@@ -98,6 +106,10 @@ struct PositivityProjectionStats {
         min_active_fraction = std::min(min_active_fraction, o.min_active_fraction);
         seconds += o.seconds;
         face_seconds += o.face_seconds, product_seconds += o.product_seconds, reduce_seconds += o.reduce_seconds;
+        c6_scaled += o.c6_scaled, hybrid_kept += o.hybrid_kept, c6_diff_sum += o.c6_diff_sum, c6_scaled_diff += o.c6_scaled_diff;
+        c6_diff_max = std::max(c6_diff_max, o.c6_diff_max);
+        for (int s = 0; s < 6; ++s)
+            c6_diff_side[s] += o.c6_diff_side[s];
     }
 };
 

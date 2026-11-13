@@ -57,6 +57,26 @@ Positivität nur an den Quadraturpunkten, nicht für Interpolationen dazwischen;
 erhalten; keine globale Stabilitätsaussage für den FEM/MCL-Löser. Die Projektion ändert nur den M1-Ghost (Bar-States
 des Low-Order-Randflusses); der PN-Randfluss (LLF mit Onsager-Datum) ist unverändert.
 
+## 2b. Varianten für U_aus (untersucht 13.11.2026)
+
+Verglichen an den **exakten kinetischen Halbraummomenten** der Randknoten (Option `--ghost-study K`, Funktion
+`ElementWeno::ghost_estimates`; [Tabelle](../results/positivity/ghost_study_20261113/README.md)):
+
+| Variante (Option) | Idee | Ergebnis |
+|---|---|---|
+| C6 (`fullsphere_ghost`) | max(0, ψ_N) auslaufend, λ-Skalierung | Referenz |
+| **volle Projektion** (Notiz, Standard) | W-Projektion auf der ganzen Kugel, volle Momente U | **4–12× genauer als C6** in a = ρ − n·J (glatt N=7: 2.2 % vs 8.4 %; Crossing N=7: 0.035 vs 0.44) |
+| gewichtet (`--projection-incoming-weight c`) | Gewicht c auf der einlaufenden Hälfte; c → 0 lässt sie die Korrektur aufnehmen | praktisch wie volle Projektion: der Rest U − U_aus ist auf der einlaufenden Hälfte meist nicht nichtnegativ darstellbar |
+| Halbraum (`--projection-mode half`) | nur auslaufend, erhält die Halbraummomente des PN-Traces | glatt wie volle Projektion, Crossing kaum besser als C6 (Halbraummomente der Strahlen oft nicht darstellbar) |
+| Hybrid (`--projection-mode hybrid`) | C6, Projektion nur statt der λ-Skalierung | nahe C6 |
+| Filter (`--ghost-filter α`) | exp(−α(l/(N+1))⁴) auf l ≥ 2 vor dem Trace | mit C6: Crossing besser, glatt schlechter; mit Projektion wirkungslos |
+
+Der globale Lösungsfehler reagiert kaum auf die Güte des Ghosts (er wird vom PN-Fehler im Inneren dominiert); die
+leichte Verschlechterung im glatten Ausflusstest (+0.5…1.2 %) geht daher nicht auf einen schlechteren Randzustand
+zurück. **Regel:** N+1 je Halbkugel liefert dieselben Ghost-Momente und Lösungen wie 2N+1 und 4N+3 (3–4 Stellen) bei
+2.5–3× geringeren Kosten und ist seitdem Standard (`--projection-rule` überschreibt); Aufpreis im Gesamtsolver damit
++0.5…+5.5 % (nx, E=64–256).
+
 ## 3. Optimierung des Randpfads (vorab, Methode unverändert)
 
 Ziel: wesentlich schneller bei relativer Feldabweichung ≤ 1e−6 gegenüber `bdd5d3f`. Profil vorher (callgrind,
@@ -119,6 +139,6 @@ tmp/build/m1pn_positivity_projection_bench --orders 3,7,15 --states 2000   # Ker
 PN-Modellfehler), `kinetic_l2_error_outflow_strip` (nur max(x,y) > 1 − 4·Breite), `exact_mass`, `seconds.ghost`
 und bei Projektion `projection{calls, identities, augmented, certificates, diracs, farkas, failures, iterations,
 backtracks, max_iterations, max_residual, min_active_fraction}`. `--projection-rule R` setzt die Hemisphärenregel
-(Standard 2N+1, Minimum N+1 für Momentenkonsistenz).
+(Standard N+1 für die Projektion, C6 behält 2N+1; Minimum N+1 für Momentenkonsistenz).
 
 NX-Kampagne: `scripts/positivity/campaign.py prepare|submit|collect`, Auswertung `scripts/positivity/analyze.py`.

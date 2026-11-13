@@ -787,6 +787,13 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         }
         if (options.positivity_projection)
             projection_warm_.assign(ghost_node_.size(), PositivityProjectionWarm{});
+        if (options.ghost_filter > 0) {
+            ghost_sigma_.resize(moments);
+            for (int c = 0; c < moments; ++c) {
+                const int l = int(std::sqrt(double(active[c]) + .5));
+                ghost_sigma_[c] = l <= 1 ? 1. : std::exp(-options.ghost_filter * std::pow(l / (angular.order + 1.), 4));
+            }
+        }
         canonical_ = std::make_unique<CanonicalC1>(pn);
         for (int d = 0; d < dimension; ++d)
             for (int side = 0; side < 2; ++side) {
@@ -805,12 +812,14 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 // Outgoing hemisphere rule (local z in (0,1)), rotated to the global frame: C6 ghost state.
                 OutRule &out = out_rules_[2 * d + side];
                 // Positivity projection: full sphere = outgoing rows first, then the incoming hemisphere.
-                const int rule_n = options.positivity_projection && options.projection_rule > 0
-                                       ? options.projection_rule
-                                       : 2 * pn.order + 1;
+                // C6: 2N+1. Projection: N+1 by default (measured: ghost moments and solution unchanged to 3-4 digits
+                // against 2N+1 and 4N+3, docs/POSITIVITY_PROJECTION.md), 2.5-3x cheaper.
+                const int rule_n = !options.positivity_projection ? 2 * pn.order + 1
+                                   : options.projection_rule > 0  ? options.projection_rule
+                                                                  : pn.order + 1;
                 auto points = sphere_rule(rule_n, +1);
                 out.outgoing = int(points.size());
-                if (options.positivity_projection) {
+                if (options.positivity_projection && !options.projection_half_range) {
                     const auto incoming = sphere_rule(rule_n, -1);
                     points.insert(points.end(), incoming.begin(), incoming.end());
                 }
@@ -829,7 +838,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 out.oy = out.omega.col(1);
                 out.oz = out.omega.col(2);
                 std::vector<int> hemispheres{+1};
-                if (options.positivity_projection)
+                if (options.positivity_projection && !options.projection_half_range)
                     hemispheres.push_back(-1);
                 separable_[2 * d + side] = std::make_shared<SeparableTrace>(
                     pn.order, active, boundaries_[2 * d + side]->frame, rule_n, hemispheres);
@@ -841,6 +850,13 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                             rings.push_back(local[k].omega[2]);
                     }
                     out.facets = lat_long_facets(rings, 2 * rule_n + 4, boundaries_[2 * d + side]->frame);
+                    if (options.projection_incoming_weight != 1 && !options.projection_half_range) {
+                        require(options.projection_incoming_weight > 0, "projection_incoming_weight must be positive");
+                        const int all = int(out.weight.size());
+                        out.c = Vec::Ones(all);
+                        out.c.tail(all - out.outgoing).setConstant(options.projection_incoming_weight);
+                        out.cinv = out.c.cwiseInverse();
+                    }
                     require(out.facets.count() > 0, "Positivity projection: hull facets of the rule failed verification");
                 }
                 out_harmonics_[2 * d + side] = out.harmonics;
@@ -1379,14 +1395,35 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         };
         Four m;
         bool projected = false;
-        if (project) {
+        // Hybrid: keep the C6 ghost where it is admissible (a_ext <= b, no cone scaling needed); project otherwise.
+        bool need = project;
+        if (project && options.projection_hybrid) {
+            m = positive_part();
+            const double bn = low(node, 0) + b.n.dot(Four(low.row(node).transpose()).tail<3>());
+            need = m[0] - b.n.dot(m.tail<3>()) > bn;
+            if (!need)
+                ++pstats[thread_id()].hybrid_kept;
+        }
+        if (need) {
             PositivityProjectionStats &ps = pstats[thread_id()];
-            const Four U(low(node, 0), low(node, 1), low(node, 2), low(node, 3));
-            const int q = int(psi.size());
+            const bool half = options.projection_half_range;
+            Four U(low(node, 0), low(node, 1), low(node, 2), low(node, 3));
+            if (half) { // target: outgoing half moments of the PN trace
+                U.setZero();
+                for (int j = 0; j < out.outgoing; ++j) {
+                    const double v = psi[j] * out.weight[j];
+                    U[0] += v, U[1] += v * out.omega(j, 0), U[2] += v * out.omega(j, 1), U[3] += v * out.omega(j, 2);
+                }
+            }
+            const int q = half ? out.outgoing : int(psi.size());
             z.resize(q);
             PositivityProjectionWarm &warm = projection_warm_[k];
+            PositivityProjectionOptions nopt = popt;
+            nopt.augment = !half;
+            if (out.c.size())
+                nopt.c = out.c.data(), nopt.cinv = out.cinv.data();
             const auto o = project_positive_moments(q, out.ox.data(), out.oy.data(), out.oz.data(),
-                                                    out.weight.data(), psi.data(), U, z.data(), popt,
+                                                    out.weight.data(), psi.data(), U, z.data(), nopt,
                                                     options.projection_warm_start ? &warm : nullptr, &out.facets);
             const auto &r = o.result;
             ++ps.calls;
@@ -1426,8 +1463,27 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                                        " (relative moment residual " + std::to_string(r.residual) + ")");
             }
         }
-        if (!projected)
+        if (!projected && !(project && options.projection_hybrid))
             m = positive_part();
+        else if (!projected && options.projection_hybrid && need)
+            m = positive_part(); // projection failed: C6 (scaled below)
+        else if (projected && options.projection_diagnostics) {
+            // Diagnostic: the C6 ghost of the same node (with its cone scaling) and its distance to the projection.
+            Four c6 = positive_part();
+            const double bn = low(node, 0) + b.n.dot(Four(low.row(node).transpose()).tail<3>());
+            const double ae = c6[0] - b.n.dot(c6.tail<3>());
+            PositivityProjectionStats &ps = pstats[thread_id()];
+            if (ae > bn) {
+                ++ps.c6_scaled;
+                c6 *= bn > 0 ? bn / ae : 0.;
+            }
+            const double scale = std::max(low(node, 0), 1e-300);
+            const double d = (m - c6).cwiseAbs().maxCoeff() / scale;
+            ps.c6_diff_sum += d;
+            ps.c6_diff_max = std::max(ps.c6_diff_max, d);
+            ps.c6_diff_side[side_id] += d;
+            ps.c6_scaled_diff += ae > bn ? d : 0.;
+        }
         // Low-order vacuum outflow property: B^L = -(b - a_ext)/2 <= 0 needs a_ext <= b, where
         // b = rho + n.J of the node (>= 0 in the cone) and a_ext = rho_o - n.J_o >= 0 of the ghost part.
         // For a nonnegative PN trace a <= b holds automatically (mu > 0 on the outgoing hemisphere);
@@ -1465,6 +1521,8 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             at.resize(moments, end - begin);
             for (int j = begin; j < end; ++j)
                 at.col(j - begin) = a.row(ghost_node_[list[j]]).transpose();
+            if (ghost_sigma_.size())
+                at = ghost_sigma_.asDiagonal() * at;
             if (separable_[side])
                 separable_[side]->evaluate(at, traces);
             else
@@ -2263,6 +2321,69 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
 }
 Field ElementWeno::admissible_rows_public(Field x, ElementWenoStats *stats) const {
     return admissible_rows(std::move(x), nodes, stats, lumped);
+}
+ElementWeno::GhostEstimates ElementWeno::ghost_estimates(const Field &a, double alpha) const {
+    require(options.positivity_projection && !options.projection_half_range,
+            "ghost_estimates needs the full-sphere projection rule");
+    GhostEstimates g;
+    const int K = int(ghost_node_.size());
+    g.node.resize(K), g.side.resize(K), g.m.resize(K);
+    Vec sigma(moments);
+    for (int c = 0; c < moments; ++c) {
+        const int l = int(std::sqrt(double(active[c]) + .5));
+        sigma[c] = l <= 1 ? 1. : std::exp(-alpha * std::pow(l / (pn.order + 1.), 4));
+    }
+    parallel_for(K, [&](int k) {
+        const int side = ghost_side_[k], node = ghost_node_[k];
+        const OutRule &out = out_rules_[side];
+        const V3 n = boundaries_[side]->n;
+        g.node[k] = node, g.side[k] = side;
+        const Vec coeff = a.row(node).transpose();
+        const Vec psi = out.harmonics * coeff, psif = out.harmonics * Vec(sigma.cwiseProduct(coeff));
+        const Four U = project(coeff);
+        const double bn = U[0] + n.dot(U.tail<3>());
+        auto mom = [&](const double *z, int count) {
+            Four m = Four::Zero();
+            for (int j = 0; j < count; ++j) {
+                const double v = z[j] * out.weight[j];
+                m += v * Four(1, out.omega(j, 0), out.omega(j, 1), out.omega(j, 2));
+            }
+            return m;
+        };
+        auto c6 = [&](const Vec &y) {
+            Vec p = y.head(out.outgoing).cwiseMax(0.);
+            Four m = mom(p.data(), out.outgoing);
+            const double ae = m[0] - n.dot(m.tail<3>());
+            if (ae > bn)
+                m *= bn > 0 ? bn / ae : 0.;
+            return m;
+        };
+        const Four m_c6 = c6(psi);
+        Vec z(psi.size());
+        PositivityProjectionOptions opt;
+        opt.tolerance = options.projection_tolerance;
+        auto o = project_positive_moments(int(psi.size()), out.ox.data(), out.oy.data(), out.oz.data(),
+                                          out.weight.data(), psi.data(), U, z.data(), opt, nullptr, &out.facets);
+        Four m_full = m_c6;
+        if (o.result.converged) {
+            m_full = mom(z.data(), out.outgoing);
+            if (o.augmented && o.atom_direction.dot(n) > 0)
+                m_full += o.atom;
+        }
+        // Half range: target = outgoing half moments of the trace, outgoing points only, no atom.
+        const Four Uh = mom(psi.data(), out.outgoing);
+        PositivityProjectionOptions hopt = opt;
+        hopt.augment = false;
+        Vec zh(out.outgoing);
+        auto oh = project_positive_moments(out.outgoing, out.ox.data(), out.oy.data(), out.oz.data(),
+                                           out.weight.data(), psi.data(), Uh, zh.data(), hopt);
+        const Four m_half = oh.result.converged ? mom(zh.data(), out.outgoing) : m_c6;
+        Vec p = psi.head(out.outgoing).cwiseMax(0.);
+        const Four raw = mom(p.data(), out.outgoing);
+        const Four m_hybrid = raw[0] - n.dot(raw.tail<3>()) > bn ? m_full : m_c6;
+        g.m[k] = {m_c6, m_full, m_half, m_hybrid, c6(psif)};
+    });
+    return g;
 }
 Field ElementWeno::interpolate(const std::function<Vec(const V3 &)> &f) const {
     Field a(nodes, moments);

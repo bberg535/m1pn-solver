@@ -69,6 +69,26 @@ Vec dykstra(const Rule &r, const Vec &y, const Four &U, int iterations) {
     }
     return x;
 }
+// Dykstra in the (W C) inner product: affine step z - C^-1 M^T (M W C^-1 M^T)^-1 (M W z - U), then clipping.
+Vec dykstra_weighted(const Rule &r, const Vec &y, const Four &U, const Vec &c, int iterations) {
+    const int q = y.size();
+    Mat M(4, q);
+    for (int k = 0; k < q; ++k)
+        M.col(k) = Four(1, r.ox[k], r.oy[k], r.oz[k]);
+    const Vec ci = c.cwiseInverse();
+    Mat G = M * (r.w.array() * ci.array()).matrix().asDiagonal() * M.transpose();
+    Eigen::LDLT<Mat> ldlt(G);
+    Vec x = y, p = Vec::Zero(q), qv = Vec::Zero(q);
+    for (int it = 0; it < iterations; ++it) {
+        Vec a = x + p;
+        Vec ya = a - (ci.array() * (M.transpose() * ldlt.solve(M * (r.w.asDiagonal() * a) - U)).array()).matrix();
+        p = a - ya;
+        Vec b = ya + qv;
+        x = b.cwiseMax(0.);
+        qv = b - x;
+    }
+    return x;
+}
 double objective(const Rule &r, const Vec &z, const Vec &y) {
     return .5 * (r.w.array() * (z - y).array().square()).sum();
 }
@@ -146,6 +166,36 @@ int main() {
                 // The certificate is sufficient for infeasibility: it may never fire on a solvable problem.
                 check(!(o.certificate && res.converged), t + "certificate only on infeasible problems");
             }
+        }
+    }
+    // Weighted objective (incoming hemisphere weight c_in): agrees with weighted Dykstra; c_in -> 0 keeps the outgoing
+    // positive part when the remaining moments fit on the incoming half.
+    for (int order : {3, 7}) {
+        const Rule r = full_rule(order, 2 * order + 1);
+        const int q = r.w.size(), half = q / 2; // sphere_rule(n, +1) points first (z > 0 = "outgoing")
+        const V3 e = V3(1, 2, -1).normalized();
+        Vec cf = coefficients(r, [&](const V3 &w) { return std::exp(8 * (w.dot(e) - 1)); });
+        const Vec y = r.harm * cf;
+        const Four U(std::sqrt(4 * pi) * cf[0], std::sqrt(4 * pi / 3) * cf[3], std::sqrt(4 * pi / 3) * cf[1],
+                     std::sqrt(4 * pi / 3) * cf[2]);
+        for (double cin : {.3, .01}) {
+            Vec c = Vec::Ones(q);
+            c.tail(q - half).setConstant(cin);
+            const Vec ci = c.cwiseInverse();
+            PositivityProjectionOptions opt;
+            opt.c = c.data(), opt.cinv = ci.data();
+            Vec z(q);
+            const auto res = project_positive(q, r.ox.data(), r.oy.data(), r.oz.data(), r.w.data(), y.data(), U,
+                                              z.data(), opt);
+            const Vec ref = dykstra_weighted(r, y, U, c, 40000);
+            const double dist = std::sqrt((r.w.array() * (z - ref).array().square()).sum() / r.w.sum());
+            const std::string t = "P" + std::to_string(order) + " c_in " + std::to_string(cin) + ": ";
+            std::cout << t << "converged " << res.converged << " it " << res.iterations << " W-distance to weighted Dykstra "
+                      << dist << "\n";
+            check(res.converged && z.minCoeff() >= 0, t + "weighted converged, z >= 0");
+            check((moments(r, z) - U).cwiseAbs().maxCoeff() <= 1e-11 * U[0], t + "weighted moments preserved");
+            check(dist <= 1e-6 * std::sqrt((r.w.array() * y.array().square()).sum() / r.w.sum()),
+                  t + "weighted agrees with Dykstra");
         }
     }
     // Hull facets: the exact solvability test agrees with Newton on random strongly anisotropic states.

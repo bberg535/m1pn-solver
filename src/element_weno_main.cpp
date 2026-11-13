@@ -22,7 +22,12 @@ struct Args {
     // reference angular rule and sample points per axis of the error.
     double kappa = 5, angle = 30, outflow_width = .1;
     int reference_rule = 48, error_samples = 256;
-    double projection_tolerance = 1e-12;
+    double projection_tolerance = 1e-12, projection_incoming_weight = 1;
+    bool projection_half_range = false;
+    double ghost_filter = 0;
+    bool projection_diagnostics = false, projection_hybrid = false;
+    int ghost_study = 0; // checkpoints of the ghost-estimator study (0: off)
+    double ghost_study_filter = 16;
 };
 Args parse(int argc, char **argv) {
     Args a;
@@ -57,6 +62,17 @@ Args parse(int argc, char **argv) {
         else if (key == "--positivity-projection") a.positivity_projection = true; // docs/POSITIVITY_PROJECTION.md
         else if (key == "--projection-strict") a.projection_strict = true;
         else if (key == "--projection-cold-start") a.projection_warm_start = false;
+        else if (key == "--projection-incoming-weight") a.projection_incoming_weight = std::stod(next());
+        else if (key == "--ghost-filter") a.ghost_filter = std::stod(next());
+        else if (key == "--projection-diagnostics") a.projection_diagnostics = true;
+        else if (key == "--ghost-study") a.ghost_study = std::stoi(next());
+        else if (key == "--ghost-study-filter") a.ghost_study_filter = std::stod(next());
+        else if (key == "--projection-mode") {
+            const std::string m = next();
+            require(m == "full" || m == "half" || m == "hybrid", "--projection-mode must be full, half or hybrid");
+            a.projection_half_range = m == "half";
+            a.projection_hybrid = m == "hybrid";
+        }
         else if (key == "--kappa") a.kappa = std::stod(next());
         else if (key == "--angle") a.angle = std::stod(next());
         else if (key == "--outflow-width") a.outflow_width = std::stod(next());
@@ -100,6 +116,11 @@ int main(int argc, char **argv) {
         options.positivity_projection = args.positivity_projection;
         options.projection_strict = args.projection_strict;
         options.projection_warm_start = args.projection_warm_start;
+        options.projection_incoming_weight = args.projection_incoming_weight;
+        options.projection_half_range = args.projection_half_range;
+        options.ghost_filter = args.ghost_filter;
+        options.projection_diagnostics = args.projection_diagnostics;
+        options.projection_hybrid = args.projection_hybrid;
         options.projection_rule = args.projection_rule;
         options.projection_tolerance = args.projection_tolerance;
         const bool smooth = args.problem == "smooth";
@@ -159,16 +180,70 @@ int main(int argc, char **argv) {
         const double requested = args.dt > 0 ? std::min(args.dt, step_limit) : step_limit;
         const int steps = std::max(1, int(std::ceil(args.time / requested - 1e-12)));
         const double dt = args.time / steps;
+        // Ghost-estimator study: outgoing half moments of the estimators vs the exact kinetic ones at the boundary nodes.
+        std::vector<AngularPoint> study_rule;
+        if (args.ghost_study > 0) {
+            require(!smooth && args.positivity_projection, "--ghost-study needs an open problem and --positivity-projection");
+            for (const auto &p : sphere_rule(args.reference_rule))
+                if (outflow ? fdist(p.omega) > 1e-16 : true)
+                    study_rule.push_back(p);
+        }
+        auto exact_half = [&](const V3 &x, const V3 &n, double tt) {
+            Four m = Four::Zero();
+            if (outflow) {
+                for (const auto &p : study_rule)
+                    if (p.omega.dot(n) > 0) {
+                        const double v = p.weight * (bgo / (4 * pi) + gauss2(x - tt * p.omega - ocenter) * fdist(p.omega));
+                        m += v * Four(1, p.omega[0], p.omega[1], p.omega[2]);
+                    }
+                // Background on the part of the hemisphere outside the pruned rule is negligible (f > 1e-16 kept all).
+            } else {
+                const double bg = args.background, w = args.width;
+                m += Four(bg / 2, bg / 4 * n[0], bg / 4 * n[1], bg / 4 * n[2]);
+                auto p = [w](const V3 &d) { return std::exp(-(d[0] * d[0] + d[1] * d[1]) / (2 * w * w)); };
+                const V3 ex = V3::UnitX(), ey = V3::UnitY();
+                if (ex.dot(n) > 0)
+                    m += p(x - tt * ex - V3(.3, .5, 0)) * Four(1, 1, 0, 0);
+                if (ey.dot(n) > 0)
+                    m += p(x - tt * ey - V3(.5, .3, 0)) * Four(1, 0, 1, 0);
+            }
+            return m;
+        };
+        constexpr int E = ElementWeno::ghost_estimators;
+        std::array<std::array<double, 4>, E> study_err{}; // |d rho|, |d n.J|, |dJ|, |d (rho - n.J)|
+        double study_scale = 0, study_points = 0;
+        auto run_study = [&](const Field &state, double tt) {
+            const auto g = scheme.ghost_estimates(state, args.ghost_study_filter);
+            for (std::size_t k = 0; k < g.node.size(); ++k) {
+                const V3 x = scheme.node_position(g.node[k]), n = scheme.side_normal(g.side[k]);
+                const Four ex = exact_half(x, n, tt);
+                study_scale += ex[0];
+                study_points += 1;
+                for (int e = 0; e < E; ++e) {
+                    const Four d = g.m[k][e] - ex;
+                    study_err[e][0] += std::abs(d[0]);
+                    study_err[e][1] += std::abs(n.dot(d.tail<3>()));
+                    study_err[e][2] += d.tail<3>().norm();
+                    study_err[e][3] += std::abs(d[0] - n.dot(d.tail<3>()));
+                }
+            }
+        };
         ElementWenoStats stats;
         const double start = seconds();
         double t = 0;
+        double study_seconds = 0;
         for (int n = 0; n < steps; ++n) {
             const double step_start = seconds();
             a = scheme.advance(t, dt, a, &stats);
             stats.t_advance += seconds() - step_start;
             t += dt;
+            if (args.ghost_study > 0 && (n + 1) % std::max(1, steps / args.ghost_study) == 0) {
+                const double s0 = seconds();
+                run_study(a, t);
+                study_seconds += seconds() - s0;
+            }
         }
-        const double wall = seconds() - start;
+        const double wall = seconds() - start - study_seconds;
         double error = -1;
         if (smooth) {
             const double final_time = t;
@@ -269,7 +344,7 @@ int main(int argc, char **argv) {
                 << ",\"threads\":" << m1pn::default_threads().threads << ",\"thread_policy\":\""
                 << m1pn::default_threads().reason << "\""
                 << ",\"dt_bound\":" << scheme.dt_bound << ",\"high_order_step\":" << scheme.high_order_step() << ",\"wall_seconds\":" << wall
-                << ",\"l2_density_error\":" << error << ",\"final_mass\":" << total
+                << ",\"ghost_filter\":" << args.ghost_filter << ",\"l2_density_error\":" << error << ",\"final_mass\":" << total
                 << ",\"kinetic_l2_error\":" << kinetic_error << ",\"kinetic_l2_error_outflow_strip\":" << kinetic_error_outflow
                 << ",\"exact_mass\":" << exact_mass << ",\"boundary_outflow\":" << stats.boundary_outflow
                 << ",\"min_coefficient_density\":" << min_coefficient_density
@@ -298,9 +373,31 @@ int main(int argc, char **argv) {
                     << ",\"augmented\":" << p.augmented << ",\"certificates\":" << p.certificates
                     << ",\"diracs\":" << p.diracs << ",\"farkas\":" << p.farkas
                     << ",\"warm_start\":" << (args.projection_warm_start ? "true" : "false")
+                    << ",\"incoming_weight\":" << args.projection_incoming_weight
+                    << ",\"mode\":\"" << (args.projection_half_range ? "half" : args.projection_hybrid ? "hybrid" : "full")
+                    << "\",\"hybrid_kept\":" << p.hybrid_kept
                     << ",\"iterations\":" << p.iterations << ",\"backtracks\":" << p.backtracks
                     << ",\"max_iterations\":" << p.max_iterations << ",\"max_residual\":" << p.max_residual
-                    << ",\"min_active_fraction\":" << p.min_active_fraction << "}";
+                    << ",\"min_active_fraction\":" << p.min_active_fraction;
+            if (args.projection_diagnostics) {
+                summary << ",\"c6_scaled\":" << p.c6_scaled << ",\"c6_diff_mean\":" << p.c6_diff_sum / std::max(1L, p.calls)
+                        << ",\"c6_diff_max\":" << p.c6_diff_max << ",\"c6_scaled_diff_share\":"
+                        << p.c6_scaled_diff / std::max(1e-300, p.c6_diff_sum) << ",\"c6_diff_side\":[";
+                for (int s = 0; s < 6; ++s)
+                    summary << (s ? "," : "") << p.c6_diff_side[s] / std::max(1e-300, p.c6_diff_sum);
+                summary << "]";
+            }
+            summary << "}";
+        }
+        if (args.ghost_study > 0) {
+            static const char *names[E] = {"c6", "full", "half", "hybrid", "c6_filtered"};
+            summary << ",\"ghost_study\":{\"checkpoints\":" << args.ghost_study << ",\"pairs\":" << study_points
+                    << ",\"filter\":" << args.ghost_study_filter << ",\"exact_outgoing_mass\":" << study_scale;
+            for (int e = 0; e < E; ++e)
+                summary << ",\"" << names[e] << "\":{\"rho\":" << study_err[e][0] / study_scale << ",\"nJ\":"
+                        << study_err[e][1] / study_scale << ",\"J\":" << study_err[e][2] / study_scale
+                        << ",\"rho_minus_nJ\":" << study_err[e][3] / study_scale << "}";
+            summary << "}";
         }
         summary << "}";
         std::ofstream(args.output + "/summary.json") << summary.str() << "\n";

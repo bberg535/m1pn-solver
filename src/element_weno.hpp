@@ -92,10 +92,24 @@ struct ElementWenoOptions {
     // to the C6 ghost of that node, or throws with projection_strict.
     bool positivity_projection = false;
     bool projection_strict = false;
-    // Exactness parameter n of sphere_rule(n, +-1) per hemisphere (0: 2N + 1, the C6 rule). Moment consistency
-    // (identity for nonnegative PN traces) needs n >= N + 1.
+    // Exactness parameter n of sphere_rule(n, +-1) per hemisphere (0: N + 1; the C6 ghost uses 2N + 1). Moment
+    // consistency (identity for nonnegative PN traces) needs n >= N + 1.
     int projection_rule = 0;
     double projection_tolerance = 1e-12;
+    // Weight c_in of the incoming hemisphere in the projection objective 1/2 sum w c (z - y)^2 (outgoing: c = 1).
+    // 1 is the note's projection; c_in -> 0 lets the incoming half absorb the moment correction, so the outgoing trace
+    // stays max(0, psi) whenever the remaining moments are realizable on the incoming half (C6 without scaling).
+    double projection_incoming_weight = 1;
+    // Half-range variant: project the outgoing trace alone onto {z >= 0, sum_out w m z = sum_out w m psi_N} (the
+    // outgoing half moments of the PN trace). Identity (= C6) where psi_N >= 0 on the outgoing hemisphere; unsolvable
+    // half moments fall back to the C6 ghost of that node (counted as failures). Uses the outgoing rule only.
+    bool projection_half_range = false;
+    // Angular filter of the ghost trace (C6 and projection): coefficients of degree l >= 2 are multiplied by
+    // exp(-ghost_filter (l / (N + 1))^4) before the trace is evaluated; l <= 1 (rho, J) is unchanged. 0: off.
+    double ghost_filter = 0;
+    bool projection_diagnostics = false;
+    // Hybrid: C6 ghost where admissible (a_ext <= b); the projection replaces only the C6 cone scaling cases.
+    bool projection_hybrid = false; // also evaluate the C6 ghost and record its distance (slower)
     bool projection_warm_start = true; // start Newton from the node's last multiplier (iteration count only)
 };
 struct ElementWenoStats {
@@ -204,6 +218,18 @@ public:
     Field project_l2(const std::function<Vec(const V3 &)> &) const;
     Vec evaluate(const Field &a, const V3 &x) const;
     V3 node_position(int node) const;
+    // Diagnostics of the ghost estimators (requires positivity_projection in full mode, i.e. the full-sphere rule):
+    // for every ghost pair (boundary node, side) the outgoing half moments of
+    //   0: C6 (positive part, cone scaling if a_ext > b), 1: full projection, 2: half-range projection (C6 if
+    //   unsolvable), 3: hybrid (C6 if admissible, else full), 4: C6 of the filtered trace (filter strength `alpha`).
+    // Cold projections, serial; independent of the scheme options except the rule.
+    static constexpr int ghost_estimators = 5;
+    struct GhostEstimates {
+        std::vector<int> node, side;
+        std::vector<std::array<Four, ghost_estimators>> m;
+    };
+    GhostEstimates ghost_estimates(const Field &a, double alpha) const;
+    V3 side_normal(int side) const { return boundaries_[side]->n; }
     double l2_density_error(const Field &a, const std::function<double(const V3 &)> &exact) const;
 
 private:
@@ -289,6 +315,7 @@ private:
         int outgoing = 0;
         Vec ox, oy, oz;
         PositivityFacets facets; // hull of the full-sphere directions (positivity projection only)
+        Vec c, cinv;             // objective weights per point (empty: unweighted)
     };
     std::array<OutRule, 6> out_rules_;
     // Separable trace evaluation per side (src/separable_trace.hpp; null: dense out_rules_[side].harmonics) and the
@@ -301,6 +328,7 @@ private:
     // Positivity projection warm start per ghost pair (multiplier and rule of the last accepted projection). Only a
     // starting guess: the projection is unique, so the result does not depend on it beyond the solver tolerance.
     mutable std::vector<PositivityProjectionWarm> projection_warm_;
+    Vec ghost_sigma_; // per active moment: ghost trace filter factor (empty: no filter)
     std::array<Field, 6> out_harmonics_; // row-major copies of out_rules_[side].harmonics (batched trace products)
     // Kinetic inflow data at a face quadrature point (one code path for the steady cache and the per-stage call).
     Incoming face_data(int side_id, const V3 &x, double time) const;

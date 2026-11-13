@@ -11,8 +11,11 @@ struct Eval {
     double phi, min_xm;
     int active;
 };
-Eval evaluate(int q, const double *ox, const double *oy, const double *oz, const double *w, const double *y,
-              const Four &U, const Four &xi) {
+// Weighted form (c, cinv given): objective 1/2 sum w c (z - y)^2, z = max(0, y - xi.m / c), H = sum_{z>0} (w / c) m m^T,
+// phi = -1/2 sum w c z^2 - xi.U.
+template <bool Weighted>
+Eval evaluate_t(int q, const double *ox, const double *oy, const double *oz, const double *w, const double *y,
+                const double *c, const double *cinv, const Four &U, const Four &xi) {
     double f0 = 0, f1 = 0, f2 = 0, f3 = 0, zz = 0, mn = std::numeric_limits<double>::infinity();
     double h00 = 0, h01 = 0, h02 = 0, h03 = 0, h11 = 0, h12 = 0, h13 = 0, h22 = 0, h23 = 0, h33 = 0;
     int active = 0;
@@ -21,10 +24,10 @@ Eval evaluate(int q, const double *ox, const double *oy, const double *oz, const
     reduction(min : mn)
     for (int k = 0; k < q; ++k) {
         const double xm = x0 + x1 * ox[k] + x2 * oy[k] + x3 * oz[k];
-        const double r = y[k] - xm;
+        const double r = Weighted ? y[k] - xm * cinv[k] : y[k] - xm;
         const double pos = r > 0 ? 1. : 0.;
-        const double z = pos * r, wz = w[k] * z, wa = w[k] * pos;
-        f0 += wz, f1 += wz * ox[k], f2 += wz * oy[k], f3 += wz * oz[k], zz += wz * z;
+        const double z = pos * r, wz = w[k] * z, wa = Weighted ? w[k] * pos * cinv[k] : w[k] * pos;
+        f0 += wz, f1 += wz * ox[k], f2 += wz * oy[k], f3 += wz * oz[k], zz += Weighted ? wz * z * c[k] : wz * z;
         h00 += wa, h01 += wa * ox[k], h02 += wa * oy[k], h03 += wa * oz[k];
         h11 += wa * ox[k] * ox[k], h12 += wa * ox[k] * oy[k], h13 += wa * ox[k] * oz[k];
         h22 += wa * oy[k] * oy[k], h23 += wa * oy[k] * oz[k], h33 += wa * oz[k] * oz[k];
@@ -38,6 +41,11 @@ Eval evaluate(int q, const double *ox, const double *oy, const double *oz, const
     e.active = active;
     e.H << h00, h01, h02, h03, h01, h11, h12, h13, h02, h12, h22, h23, h03, h13, h23, h33;
     return e;
+}
+Eval evaluate(int q, const double *ox, const double *oy, const double *oz, const double *w, const double *y,
+              const Four &U, const Four &xi, const PositivityProjectionOptions &o) {
+    return o.c ? evaluate_t<true>(q, ox, oy, oz, w, y, o.c, o.cinv, U, xi)
+               : evaluate_t<false>(q, ox, oy, oz, w, y, nullptr, nullptr, U, xi);
 }
 } // namespace
 
@@ -57,7 +65,8 @@ PositivityProjectionResult project_positive(int q, const double *ox, const doubl
     const double tol = options.tolerance * out.scale;
     auto finish = [&](const Four &xi, const Eval &e) {
         for (int k = 0; k < q; ++k) {
-            const double r = y[k] - xi[0] - xi[1] * ox[k] - xi[2] * oy[k] - xi[3] * oz[k];
+            const double xm = xi[0] + xi[1] * ox[k] + xi[2] * oy[k] + xi[3] * oz[k];
+            const double r = options.c ? y[k] - xm * options.cinv[k] : y[k] - xm;
             z[k] = r > 0 ? r : 0.;
         }
         out.xi = xi;
@@ -83,7 +92,7 @@ PositivityProjectionResult project_positive(int q, const double *ox, const doubl
         return out;
     }
     Four xi = xi0.allFinite() ? xi0 : Four::Zero();
-    Eval e = evaluate(q, ox, oy, oz, w, y, U, xi);
+    Eval e = evaluate(q, ox, oy, oz, w, y, U, xi, options);
     for (int it = 0; it < options.max_iterations; ++it) {
         if (e.F.cwiseAbs().maxCoeff() <= tol) {
             out.converged = true;
@@ -118,7 +127,7 @@ PositivityProjectionResult project_positive(int q, const double *ox, const doubl
         bool accepted = false;
         for (int b = 0; b <= options.max_backtracks; ++b) {
             const Four candidate = xi + t * d;
-            trial = evaluate(q, ox, oy, oz, w, y, U, candidate);
+            trial = evaluate(q, ox, oy, oz, w, y, U, candidate, options);
             if (trial.phi >= e.phi + 1e-4 * t * slope || trial.F.cwiseAbs().maxCoeff() <= tol) {
                 xi = candidate;
                 accepted = true;
@@ -175,6 +184,8 @@ PositivityProjectionOutcome project_positive_moments(int q, const double *ox, co
         if (out.result.converged)
             return out;
     }
+    if (!options.augment)
+        return out; // unconverged: the caller decides (no atom)
     // Augmented rule: one atom at J^ with the mean weight.
     out.augmented = true;
     out.atom_direction = jhat;
@@ -198,8 +209,23 @@ PositivityProjectionOutcome project_positive_moments(int q, const double *ox, co
     ax.push_back(jhat[0]), ay.push_back(jhat[1]), az.push_back(jhat[2]), aw.push_back(wstar), ayv.push_back(0.);
     azv.resize(q + 1);
     const Four xi0 = warm ? warm->xi_augmented : Four::Zero();
+    PositivityProjectionOptions aopt = options;
+    thread_local std::vector<double> ac, acinv;
+    if (options.c) {
+        // The atom gets the weight of its hemisphere (that of the nearest rule point).
+        int nearest = 0;
+        double best = -2;
+        for (int k = 0; k < q; ++k) {
+            const double d = ox[k] * jhat[0] + oy[k] * jhat[1] + oz[k] * jhat[2];
+            if (d > best)
+                best = d, nearest = k;
+        }
+        ac.assign(options.c, options.c + q), acinv.assign(options.cinv, options.cinv + q);
+        ac.push_back(options.c[nearest]), acinv.push_back(options.cinv[nearest]);
+        aopt.c = ac.data(), aopt.cinv = acinv.data();
+    }
     out.result = project_positive(q + 1, ax.data(), ay.data(), az.data(), aw.data(), ayv.data(), U, azv.data(),
-                                  options, xi0);
+                                  aopt, xi0);
     out.newton_iterations += out.result.iterations;
     std::copy(azv.begin(), azv.begin() + q, z);
     out.atom = wstar * azv[q] * Four(1, jhat[0], jhat[1], jhat[2]);
