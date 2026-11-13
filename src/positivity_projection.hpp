@@ -56,6 +56,7 @@ struct PositivityProjectionWarm {
 // solvability test is exact: U = rho (1, u) lies in the interior of cone{m_k} iff max_f (n_f . u - h_f) < 0.
 struct PositivityFacets {
     Vec nx, ny, nz, h;
+    double inradius = 0; // min_f h_f: |u| < inradius is always inside (no facet scan needed)
     int count() const { return int(h.size()); }
     double margin(const V3 &u) const; // max_f (n_f . u - h_f)
 };

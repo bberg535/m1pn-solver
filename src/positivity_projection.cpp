@@ -158,8 +158,10 @@ PositivityProjectionOutcome project_positive_moments(int q, const double *ox, co
     // Solvability of the plain rule (only relevant for strongly anisotropic states): exact with the hull facets,
     // else the necessary certificate. A relative interior margin keeps the dual well posed for Newton.
     if (facets && facets->count() > 0) {
-        out.hull_margin = facets->margin(V3(U.tail<3>() / rho));
-        out.certificate = out.hull_margin > -1e-9;
+        if (jn >= .999 * facets->inradius * rho) {
+            out.hull_margin = facets->margin(V3(U.tail<3>() / rho));
+            out.certificate = out.hull_margin > -1e-9;
+        }
     } else if (jn > .5 * rho) {
         double best = -1;
         for (int k = 0; k < q; ++k)
@@ -254,6 +256,7 @@ PositivityFacets lat_long_facets(const std::vector<double> &ring_z, int azimuth,
         const V3 n = frame * normals[k];
         f.nx[k] = n[0], f.ny[k] = n[1], f.nz[k] = n[2], f.h[k] = offsets[k];
     }
+    f.inradius = f.h.minCoeff();
     return f;
 }
 
