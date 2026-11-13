@@ -8,6 +8,8 @@
 // See docs/ELEMENT_WENO.md for the formulas and the choices made here.
 #include "boundary.hpp"
 #include "m1.hpp"
+#include "positivity_projection.hpp"
+#include "separable_trace.hpp"
 #include <Eigen/SparseCholesky>
 #include <functional>
 #include <limits>
@@ -83,6 +85,18 @@ struct ElementWenoOptions {
     // 0: degree + 3), evaluated at the midpoint of each Strang half step (second order in time).
     std::function<void(double, const std::vector<V3> &, std::vector<double> &)> uncollided_density;
     int uncollided_points = 0;
+    // Moment-preserving positivity projection of the C6 ghost (docs/POSITIVITY_PROJECTION.md). Requires
+    // fullsphere_ghost. Instead of max(0, psi_N) on the outgoing hemisphere and a cone scaling, the nodal PN
+    // trace on the full sphere is projected onto {z >= 0, sum w m z = (rho_i, J_i)} (four multipliers, semismooth
+    // Newton); the ghost uses the outgoing half-range moments of z. A failed projection is counted and falls back
+    // to the C6 ghost of that node, or throws with projection_strict.
+    bool positivity_projection = false;
+    bool projection_strict = false;
+    // Exactness parameter n of sphere_rule(n, +-1) per hemisphere (0: 2N + 1, the C6 rule). Moment consistency
+    // (identity for nonnegative PN traces) needs n >= N + 1.
+    int projection_rule = 0;
+    double projection_tolerance = 1e-12;
+    bool projection_warm_start = true; // start Newton from the node's last multiplier (iteration count only)
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -105,6 +119,7 @@ struct ElementWenoStats {
     double last_boundary_mass_rate = 0; // of the last rate() call (sum over boundary nodes)
     double t_reaction = 0;
     double t_fcs_density = 0, t_fcs_quadrature = 0; // FCS: rho_u evaluation and nodal source quadrature
+    PositivityProjectionStats projection;         // positivity projection of the ghost (rate() calls only)
 };
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
@@ -239,8 +254,9 @@ private:
     void element_origin(int element, V3 &origin) const;
     // inflow_rate (optional, nodes): kinetic mass inflow rate int phi_i (-kinetic[0]) >= 0 per boundary node.
     // `high` is indexed by node (nodes rows) or compactly by boundary_slot_ (boundary_nodes_.size() rows).
-    // DLRA hooks of add_boundary: ghost_psi(k, side, node, psi) fills the PN trace at the outgoing hemisphere points
-    // of ghost pair k (instead of out.harmonics * a.row(node)); datum (if set) receives per side the face datum loads
+    // DLRA hooks of add_boundary: ghost_psi(k, side, node, psi) fills the PN trace at the points of out_rules_[side]
+    // (outgoing hemisphere, plus the incoming one with the positivity projection) of ghost pair k (instead of
+    // out.harmonics * a.row(node)); datum (if set) receives per side the face datum loads
     // sum_points w phi_n d (boundary_slot_ rows x canonical r).
     struct BoundaryExtras {
         std::function<void(int, int, int, Vec &)> ghost_psi;
@@ -248,7 +264,8 @@ private:
     };
     void add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                      Field &bar, Vec *inflow_rate = nullptr, const BoundaryExtras *extras = nullptr) const;
+                      Field &bar, Vec *inflow_rate = nullptr, const BoundaryExtras *extras = nullptr,
+                      PositivityProjectionStats *projection = nullptr) const;
     // Inputs of the limited low-order part of rate() (all node-indexed except boundary_high, which has one row per
     // boundary slot and at least the four low coefficient columns).
     struct LowOrderInputs {
@@ -258,16 +275,29 @@ private:
     };
     Field limited_low_load(const LowOrderInputs &, ElementWenoStats *, Field *raw_out) const;
     std::array<Sparse, 3> mass_1d_; // assembled 1D consistent masses (h m1) per axis
-    // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state.
+    // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state. With the positivity
+    // projection the incoming hemisphere follows as rows [outgoing, points) (full sphere); the C6 sums only use the
+    // first `outgoing` rows. ox/oy/oz are contiguous copies of the omega columns for the projection kernel.
     struct OutRule {
         Field omega;   // points x 3
         Vec weight;
         Mat harmonics; // points x q
+        int outgoing = 0;
+        Vec ox, oy, oz;
+        PositivityFacets facets; // hull of the full-sphere directions (positivity projection only)
     };
     std::array<OutRule, 6> out_rules_;
+    // Separable trace evaluation per side (src/separable_trace.hpp; null: dense out_rules_[side].harmonics) and the
+    // ghost pairs of each side.
+    std::array<std::shared_ptr<const SeparableTrace>, 6> separable_;
+    std::array<std::vector<int>, 6> ghost_by_side_;
+    // Positivity projection warm start per ghost pair (multiplier and rule of the last accepted projection). Only a
+    // starting guess: the projection is unique, so the result does not depend on it beyond the solver tolerance.
+    mutable std::vector<PositivityProjectionWarm> projection_warm_;
     std::array<Field, 6> out_harmonics_; // row-major copies of out_rules_[side].harmonics (batched trace products)
     // Kinetic inflow data at a face quadrature point (one code path for the steady cache and the per-stage call).
     Incoming face_data(int side_id, const V3 &x, double time) const;
+    void face_data_into(int side_id, const V3 &x, double time, Incoming &data) const;
     std::vector<Incoming> steady_data_; // per (face, point) when inflow.steady
     std::vector<int> boundary_nodes_sorted_;
     struct PairEntry {

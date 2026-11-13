@@ -13,6 +13,20 @@
 #include <Eigen/Eigenvalues>
 namespace m1pn {
 namespace {
+int max_threads() {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+int thread_id() {
+#ifdef _OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
+}
 double binomial(int n, int k) {
     double out = 1;
     for (int i = 1; i <= k; ++i)
@@ -153,6 +167,10 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                              std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; })),
             "The M1 target needs P1, an open mesh and no mirror sides");
     require(dimension >= 1 && dimension <= 3, "Element WENO supports dimensions 1 to 3");
+    require(!o.positivity_projection || o.fullsphere_ghost,
+            "The positivity projection replaces the C6 ghost and needs fullsphere_ghost");
+    require(!o.positivity_projection || o.projection_rule == 0 || o.projection_rule >= angular.order + 1,
+            "projection_rule must be at least N + 1 (moment consistency of the PN trace)");
     for (int d = 0; d < 3; ++d) {
         count[d] = d < o.dimension ? (o.elements_per_axis[d] > 0 ? o.elements_per_axis[d] : o.elements) : 1;
         require(d >= o.dimension || count[d] >= 2, "Element WENO needs at least two elements per direction");
@@ -677,6 +695,10 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 ghost_of_face_.push_back(ghost_slot[side_id][node]);
             }
         }
+        for (std::size_t k = 0; k < ghost_node_.size(); ++k)
+            ghost_by_side_[ghost_side_[k]].push_back(int(k));
+        if (options.positivity_projection)
+            projection_warm_.assign(ghost_node_.size(), PositivityProjectionWarm{});
         canonical_ = std::make_unique<CanonicalC1>(pn);
         for (int d = 0; d < dimension; ++d)
             for (int side = 0; side < 2; ++side) {
@@ -694,7 +716,16 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
                 // Outgoing hemisphere rule (local z in (0,1)), rotated to the global frame: C6 ghost state.
                 OutRule &out = out_rules_[2 * d + side];
-                const auto points = sphere_rule(2 * pn.order + 1, +1);
+                // Positivity projection: full sphere = outgoing rows first, then the incoming hemisphere.
+                const int rule_n = options.positivity_projection && options.projection_rule > 0
+                                       ? options.projection_rule
+                                       : 2 * pn.order + 1;
+                auto points = sphere_rule(rule_n, +1);
+                out.outgoing = int(points.size());
+                if (options.positivity_projection) {
+                    const auto incoming = sphere_rule(rule_n, -1);
+                    points.insert(points.end(), incoming.begin(), incoming.end());
+                }
                 out.omega.resize(points.size(), 3);
                 out.weight.resize(points.size());
                 out.harmonics.resize(points.size(), moments);
@@ -705,6 +736,24 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                     const Vec y = harmonics(pn.order, w);
                     for (int c = 0; c < moments; ++c)
                         out.harmonics(k, c) = y[active[c]];
+                }
+                out.ox = out.omega.col(0);
+                out.oy = out.omega.col(1);
+                out.oz = out.omega.col(2);
+                std::vector<int> hemispheres{+1};
+                if (options.positivity_projection)
+                    hemispheres.push_back(-1);
+                separable_[2 * d + side] = std::make_shared<SeparableTrace>(
+                    pn.order, active, boundaries_[2 * d + side]->frame, rule_n, hemispheres);
+                if (options.positivity_projection) {
+                    std::vector<double> rings;
+                    for (int h : hemispheres) {
+                        const auto local = sphere_rule(rule_n, h);
+                        for (std::size_t k = 0; k < local.size(); k += 2 * rule_n + 4)
+                            rings.push_back(local[k].omega[2]);
+                    }
+                    out.facets = lat_long_facets(rings, 2 * rule_n + 4, boundaries_[2 * d + side]->frame);
+                    require(out.facets.count() > 0, "Positivity projection: hull facets of the rule failed verification");
                 }
                 out_harmonics_[2 * d + side] = out.harmonics;
             }
@@ -1153,6 +1202,35 @@ Field ElementWeno::stabilization_residual(const Field &a, const Vec &gamma, cons
         stats->t_stab_local += seconds() - start;
     return residual;
 }
+void ElementWeno::face_data_into(int side_id, const V3 &x, double time, Incoming &data) const {
+    // Same operations as face_data(), reusing the buffers of `data` (no allocation for the cached density).
+    if (!cached_density_) {
+        data = face_data(side_id, x, time);
+        return;
+    }
+    const Boundary &b = *boundaries_[side_id];
+    const Incoming &base = density_inflow_[side_id];
+    data.d = base.d;
+    data.kinetic = base.kinetic;
+    data.moments = base.moments;
+    if (inflow.atoms) {
+        thread_local Incoming atoms;
+        atoms.d.setZero(canonical_->r);
+        atoms.kinetic.setZero();
+        atoms.moments.setZero();
+        b.add_atoms(inflow.atoms(x, time), atoms);
+        b.finish_data(atoms);
+        data.d += atoms.d;
+        data.moments += atoms.moments;
+        data.kinetic += atoms.kinetic;
+        bool in_cone = exact::cone(data.moments);
+        for (int k = 0; k < 64 && !in_cone; ++k) {
+            data.moments[0] = std::nextafter(data.moments[0], std::numeric_limits<double>::infinity());
+            in_cone = exact::cone(data.moments);
+        }
+        cone_require(in_cone, "Unable to represent incoming moments in M1 cone");
+    }
+}
 Incoming ElementWeno::face_data(int side_id, const V3 &x, double time) const {
     const Boundary &b = *boundaries_[side_id];
     Incoming data;
@@ -1175,7 +1253,9 @@ Incoming ElementWeno::face_data(int side_id, const V3 &x, double time) const {
 }
 void ElementWeno::add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                                Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                               Field &bar, Vec *inflow_rate, const BoundaryExtras *extras) const {
+                               Field &bar, Vec *inflow_rate, const BoundaryExtras *extras,
+                               PositivityProjectionStats *projection) const {
+    const double ghost_start = seconds();
     // DLRA (extras): `high` may have zero rows (the PN face load is then formed outside from the factored state), the
     // C6 ghost trace comes from extras->ghost_psi, and the face datum loads are returned per side.
     const bool skip_high = high.rows() == 0;
@@ -1192,55 +1272,132 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     // evaluated once per boundary node and face side.
     const bool ghost = options.fullsphere_ghost && !inflow.exterior_state && !inflow.exterior_m1;
     std::vector<Four> outgoing_moments(ghost ? ghost_node_.size() : 0);
-    // PN traces at the outgoing points, one product per side (points as parallel rows) instead of one
-    // matrix-vector product per ghost pair: traces[side](:, slot[k]) = harmonics * a.row(node_k)^T.
-    std::array<Field, 6> traces;
-    std::vector<int> slot(outgoing_moments.size(), 0);
-    if (ghost && !(extras && extras->ghost_psi)) {
-        for (int side = 0; side < 6; ++side) {
-            if (!boundaries_[side])
-                continue;
-            std::vector<int> idx;
-            for (std::size_t k = 0; k < ghost_node_.size(); ++k)
-                if (ghost_side_[k] == side)
-                    idx.push_back(k);
-            if (idx.empty())
-                continue;
-            Mat at(moments, idx.size());
-            for (std::size_t j = 0; j < idx.size(); ++j) {
-                at.col(j) = a.row(ghost_node_[idx[j]]).transpose();
-                slot[idx[j]] = j;
-            }
-            traces[side] = row_product(out_harmonics_[side], at);
-        }
-    }
-    parallel_for(int(outgoing_moments.size()), [&](int k) {
+    const bool project = ghost && options.positivity_projection;
+    PositivityProjectionOptions popt;
+    popt.tolerance = options.projection_tolerance;
+    // Per-thread statistics, merged after the loop (parallel_for gives no reduction).
+    std::vector<PositivityProjectionStats> pstats(project ? std::max(1, max_threads()) : 0);
+    // Ghost moments of pair k from the PN trace psi at the points of out_rules_[side].
+    auto ghost_pair = [&](int k, const Vec &psi) {
         const int side_id = ghost_side_[k], node = ghost_node_[k];
         const OutRule &out = out_rules_[side_id];
         const Boundary &b = *boundaries_[side_id];
-        thread_local Vec psi;
-        if (extras && extras->ghost_psi)
-            extras->ghost_psi(k, side_id, node, psi);
-        else
-            psi = traces[side_id].col(slot[k]);
-        Four m = Four::Zero();
-        for (int j = 0; j < psi.size(); ++j) {
-            const double v = std::max(0., psi[j]) * out.weight[j];
-            m[0] += v;
-            m[1] += v * out.omega(j, 0);
-            m[2] += v * out.omega(j, 1);
-            m[3] += v * out.omega(j, 2);
+        thread_local Vec z;
+        // C6: positive part on the outgoing hemisphere (first `outgoing` points).
+        auto positive_part = [&]() {
+            Four m = Four::Zero();
+            for (int j = 0; j < out.outgoing; ++j) {
+                const double v = std::max(0., psi[j]) * out.weight[j];
+                m[0] += v;
+                m[1] += v * out.omega(j, 0);
+                m[2] += v * out.omega(j, 1);
+                m[3] += v * out.omega(j, 2);
+            }
+            return m;
+        };
+        Four m;
+        bool projected = false;
+        if (project) {
+            PositivityProjectionStats &ps = pstats[thread_id()];
+            const Four U(low(node, 0), low(node, 1), low(node, 2), low(node, 3));
+            const int q = int(psi.size());
+            z.resize(q);
+            PositivityProjectionWarm &warm = projection_warm_[k];
+            const auto o = project_positive_moments(q, out.ox.data(), out.oy.data(), out.oz.data(),
+                                                    out.weight.data(), psi.data(), U, z.data(), popt,
+                                                    options.projection_warm_start ? &warm : nullptr, &out.facets);
+            const auto &r = o.result;
+            ++ps.calls;
+            ps.certificates += o.certificate;
+            ps.farkas += o.farkas;
+            if (r.converged) {
+                if (!o.augmented)
+                    warm.xi = r.xi;
+                else if (!o.dirac)
+                    warm.xi_augmented = r.xi;
+                projected = true;
+                ps.identities += r.identity;
+                ps.vacuum += !(U[0] > 0);
+                ps.augmented += o.augmented;
+                ps.diracs += o.dirac;
+                ps.iterations += o.newton_iterations;
+                ps.backtracks += r.backtracks;
+                ps.max_iterations = std::max(ps.max_iterations, o.newton_iterations);
+                ps.max_residual = std::max(ps.max_residual, r.residual);
+                if (U[0] > 0 && !o.augmented)
+                    ps.min_active_fraction = std::min(ps.min_active_fraction, double(r.active) / q);
+                m.setZero();
+                for (int j = 0; j < out.outgoing; ++j) {
+                    const double v = z[j] * out.weight[j];
+                    m[0] += v;
+                    m[1] += v * out.omega(j, 0);
+                    m[2] += v * out.omega(j, 1);
+                    m[3] += v * out.omega(j, 2);
+                }
+                // The atom of an augmented rule belongs to the outgoing half if Omega*.n > 0.
+                if (o.augmented && o.atom_direction.dot(b.n) > 0)
+                    m += o.atom;
+            } else {
+                ++ps.failures;
+                if (options.projection_strict)
+                    throw StepRejected("Positivity projection failed at boundary node " + std::to_string(node) +
+                                       " (relative moment residual " + std::to_string(r.residual) + ")");
+            }
         }
+        if (!projected)
+            m = positive_part();
         // Low-order vacuum outflow property: B^L = -(b - a_ext)/2 <= 0 needs a_ext <= b, where
         // b = rho + n.J of the node (>= 0 in the cone) and a_ext = rho_o - n.J_o >= 0 of the ghost part.
         // For a nonnegative PN trace a <= b holds automatically (mu > 0 on the outgoing hemisphere);
         // a PN trace with negative lobes can violate it, then the outgoing part is scaled by b/a (a cone scaling).
+        // A converged projection has full moments (rho, J) of the node and z >= 0, so a_ext <= b up to rounding.
         const double b_node = low(node, 0) + b.n[0] * low(node, 1) + b.n[1] * low(node, 2) + b.n[2] * low(node, 3);
         const double a_ext = m[0] - b.n.dot(m.tail<3>());
-        if (a_ext > b_node)
+        if (a_ext > b_node) {
+            if (projected)
+                ++pstats[thread_id()].scaled;
             m *= b_node > 0 ? b_node / a_ext : 0.;
+        }
         outgoing_moments[k] = m;
-    });
+    };
+    if (ghost && extras && extras->ghost_psi) {
+        parallel_for(int(outgoing_moments.size()), [&](int k) {
+            thread_local Vec psi;
+            extras->ghost_psi(k, ghost_side_[k], ghost_node_[k], psi);
+            ghost_pair(k, psi);
+        });
+    } else if (ghost) {
+        // PN traces in blocks of ghost_block pairs of one side (bounded memory, GEMM-sized blocks): separable
+        // evaluation (SeparableTrace) or, if unavailable, the dense harmonics product.
+        // At least ~4 blocks per thread, at most 32 pairs per block (GEMM width) and at least 4.
+        const int ghost_block = std::clamp(int(ghost_node_.size()) / std::max(1, 4 * max_threads()), 4, 32);
+        std::vector<std::array<int, 3>> tasks; // side, begin, end in ghost_by_side_[side]
+        for (int side = 0; side < 6; ++side)
+            for (int begin = 0; begin < int(ghost_by_side_[side].size()); begin += ghost_block)
+                tasks.push_back({side, begin, std::min<int>(begin + ghost_block, ghost_by_side_[side].size())});
+        parallel_for(int(tasks.size()), [&](int t) {
+            const auto [side, begin, end] = tasks[t];
+            const std::vector<int> &list = ghost_by_side_[side];
+            thread_local Mat at, traces;
+            thread_local Vec psi;
+            at.resize(moments, end - begin);
+            for (int j = begin; j < end; ++j)
+                at.col(j - begin) = a.row(ghost_node_[list[j]]).transpose();
+            if (separable_[side])
+                separable_[side]->evaluate(at, traces);
+            else
+                traces.noalias() = out_rules_[side].harmonics * at;
+            for (int j = begin; j < end; ++j) {
+                psi = traces.col(j - begin);
+                ghost_pair(list[j], psi);
+            }
+        });
+    }
+    if (project && projection)
+        for (const auto &ps : pstats)
+            projection->merge(ps);
+    if (projection)
+        projection->seconds += seconds() - ghost_start;
     parallel_for(int(faces_.size()), [&](int index) {
         const auto &f = faces_[index];
         const int side_id = 2 * f.direction + f.side;
@@ -1257,7 +1414,8 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         part.area = Vec::Zero(nf);
         part.inflow = Vec::Zero(nf);
         // int phi_n datum over the face; the PN face flux is affine in (trace, datum).
-        Mat datum = Mat::Zero(nf, canonical_->r);
+        Mat &datum = part.datum;
+        datum.setZero(nf, canonical_->r);
         V3 origin;
         element_origin(f.element, origin);
         for (int n = 0; n < nf; ++n)
@@ -1267,14 +1425,19 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         // through data.moments. For spatially uniform inflow (vacuum, plane waves, isotropic) they are evaluated
         // once per node instead of once per (point, node); identical inputs give identical values.
         const bool memo = !inflow.exterior_state && !inflow.exterior_m1;
-        std::vector<char> memo_valid(nf, 0);
-        std::vector<Four> memo_moments(nf), memo_state(nf);
+        thread_local std::vector<char> memo_valid;
+        thread_local std::vector<Four> memo_moments, memo_state;
+        memo_valid.assign(nf, 0);
+        memo_moments.resize(nf), memo_state.resize(nf);
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
             for (int d = 0; d < dimension; ++d)
                 x[d] += h * rule.points(point, d);
+            thread_local Incoming fresh;
+            if (!inflow.steady)
+                face_data_into(side_id, x, time, fresh);
             const Incoming &data = inflow.steady ? steady_data_[std::size_t(index) * rule.weights.size() + point]
-                                                 : face_data(side_id, x, time);
+                                                 : fresh;
             for (int n = 0; n < nf; ++n) {
                 const double weight = rule.weights[point] * rule.shape(n, point);
                 if (weight == 0)
@@ -1290,13 +1453,15 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                     Four ext = inflow.exterior_state ? inflow.exterior_state(x, time, b.n, ui)
                                : inflow.exterior_m1  ? inflow.exterior_m1(x, time)
                                                      : data.moments;
-                    if (ghost) {
-                        // Sum of two cone elements is in the cone; outward ulp rounding only for binary64 sums.
+                    // Sum of two cone elements is in the cone; outward ulp rounding only for binary64 sums.
+                    if (ghost)
                         ext += outgoing_moments[ghost_id[n]];
-                        for (int k = 0; k < 64 && !exact::cone(ext); ++k)
-                            ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
+                    bool in_cone = exact::cone(ext);
+                    for (int k = 0; ghost && k < 64 && !in_cone; ++k) {
+                        ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
+                        in_cone = exact::cone(ext);
                     }
-                    cone_require(exact::cone(ext), "M1 exterior state outside cone");
+                    cone_require(in_cone, "M1 exterior state outside cone");
                     Four own = Four::Zero();
                     for (int d = 0; d < dimension; ++d)
                         own += b.n[d] * block(low_flux, i, d);
@@ -1312,8 +1477,6 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 part.load.row(n) += weight * (state - ui).transpose();
             }
         }
-        if (want_datum || !skip_high)
-            part.datum = datum;
         if (skip_high)
             return;
         // sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum], with the exact face mass matrix;
@@ -1452,7 +1615,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     Vec boundary_area = Vec::Zero(nodes), boundary_inflow = Vec::Zero(nodes);
     if (!faces_.empty()) {
         add_boundary(time, a, low, low_flux, boundary_high, boundary_low, flux_area, boundary_area,
-                     boundary_bar, &boundary_inflow);
+                     boundary_bar, &boundary_inflow, nullptr, &timing.projection);
         if (!options.m1_target)
             for (std::size_t k = 0; k < boundary_nodes_.size(); ++k)
                 residual.row(boundary_nodes_[k]) += boundary_high.row(k);

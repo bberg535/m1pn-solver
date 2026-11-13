@@ -16,6 +16,9 @@ struct Args {
     std::string problem = "smooth", output = "tmp/element_weno";
     bool weno = true, limit = true, stabilize = true, legacy_boundary = false, symmetric_residual = false, ssprk43 = false,
          reduce_angular = true;
+    bool positivity_projection = false, projection_strict = false, projection_warm_start = true;
+    int projection_rule = 0;
+    double projection_tolerance = 1e-12;
 };
 Args parse(int argc, char **argv) {
     Args a;
@@ -47,6 +50,11 @@ Args parse(int argc, char **argv) {
         else if (key == "--no-stabilization") a.stabilize = false;
         else if (key == "--legacy-boundary") a.legacy_boundary = true; // commit 8efe517 behaviour (docs/BOUNDARY_FIXES.md)
         else if (key == "--symmetric-residual") a.symmetric_residual = true;
+        else if (key == "--positivity-projection") a.positivity_projection = true; // docs/POSITIVITY_PROJECTION.md
+        else if (key == "--projection-strict") a.projection_strict = true;
+        else if (key == "--projection-cold-start") a.projection_warm_start = false;
+        else if (key == "--projection-rule") a.projection_rule = std::stoi(next());
+        else if (key == "--projection-tolerance") a.projection_tolerance = std::stod(next());
         else throw std::runtime_error("Unknown option " + key);
     }
     require(a.problem == "smooth" || a.problem == "crossing-study", "Problem must be smooth or crossing-study");
@@ -79,6 +87,11 @@ int main(int argc, char **argv) {
         options.filter_strength = args.filter_strength;
         options.ssprk43 = args.ssprk43;
         options.reduce_angular = args.reduce_angular && args.dimension < 3;
+        options.positivity_projection = args.positivity_projection;
+        options.projection_strict = args.projection_strict;
+        options.projection_warm_start = args.projection_warm_start;
+        options.projection_rule = args.projection_rule;
+        options.projection_tolerance = args.projection_tolerance;
         const bool smooth = args.problem == "smooth";
         options.periodic = smooth;
         Inflow inflow;
@@ -128,6 +141,28 @@ int main(int argc, char **argv) {
                 return project(element_weno_smooth_exact(pn, x, final_time))[0];
             });
         }
+        // crossing-study: free transport, the kinetic density is bg + sum of the two shifted Gaussians (no
+        // scattering). Its L2 distance contains the PN model error; the mass in the box measures the outflow.
+        double kinetic_error = -1, kinetic_error_outflow = -1, exact_mass = -1;
+        if (!smooth) {
+            const double w = args.width, bg = args.background, T = t;
+            const V3 c1(.3 + T, .5, 0), c2(.5, .3 + T, 0);
+            auto rho = [&](const V3 &x) {
+                auto p = [w](const V3 &d) { return std::exp(-(d[0] * d[0] + d[1] * d[1]) / (2 * w * w)); };
+                return bg + p(x - c1) + p(x - c2);
+            };
+            kinetic_error = scheme.l2_density_error(a, rho);
+            auto line = [w](double c) {
+                return w * std::sqrt(pi / 2) * (std::erf((1 - c) / (std::sqrt(2.) * w)) - std::erf(-c / (std::sqrt(2.) * w)));
+            };
+            exact_mass = bg + line(c1[0]) * line(c1[1]) + line(c2[0]) * line(c2[1]);
+            // Error restricted to the outflow strip max(x, y) > 1 - 4 width (where the ghost acts).
+            const double edge = 1 - 4 * w;
+            const double inner = std::pow(scheme.l2_density_error(a, [&](const V3 &x) {
+                return std::max(x[0], x[1]) > edge ? rho(x) : project(scheme.evaluate(a, x))[0];
+            }), 2);
+            kinetic_error_outflow = std::sqrt(std::max(0., inner));
+        }
         std::filesystem::create_directories(args.output);
         {
             std::ofstream csv(args.output + "/final.csv");
@@ -160,6 +195,8 @@ int main(int argc, char **argv) {
                 << m1pn::default_threads().reason << "\""
                 << ",\"dt_bound\":" << scheme.dt_bound << ",\"high_order_step\":" << scheme.high_order_step() << ",\"wall_seconds\":" << wall
                 << ",\"l2_density_error\":" << error << ",\"final_mass\":" << total
+                << ",\"kinetic_l2_error\":" << kinetic_error << ",\"kinetic_l2_error_outflow_strip\":" << kinetic_error_outflow
+                << ",\"exact_mass\":" << exact_mass << ",\"boundary_outflow\":" << stats.boundary_outflow
                 << ",\"min_coefficient_density\":" << min_coefficient_density
                 << ",\"min_coefficient_margin\":" << min_coefficient_margin
                 << ",\"min_gamma\":" << stats.min_gamma << ",\"min_limiter\":" << stats.min_limiter
@@ -174,7 +211,21 @@ int main(int argc, char **argv) {
                 << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass
                 << ",\"limiter\":" << stats.t_limiter << ",\"gradient_local\":" << stats.t_gradient_local
                 << ",\"gradient_gather\":" << stats.t_gradient_gather << ",\"gradient_solve\":" << stats.t_gradient_solve
-                << ",\"stab_local\":" << stats.t_stab_local << ",\"finish\":" << stats.t_finish << "}}";
+                << ",\"stab_local\":" << stats.t_stab_local << ",\"finish\":" << stats.t_finish
+                << ",\"ghost\":" << stats.projection.seconds << "}";
+        if (args.positivity_projection) {
+            const auto &p = stats.projection;
+            summary << ",\"projection\":{\"rule\":" << args.projection_rule << ",\"calls\":" << p.calls
+                    << ",\"identities\":" << p.identities << ",\"failures\":" << p.failures
+                    << ",\"vacuum\":" << p.vacuum << ",\"scaled\":" << p.scaled
+                    << ",\"augmented\":" << p.augmented << ",\"certificates\":" << p.certificates
+                    << ",\"diracs\":" << p.diracs << ",\"farkas\":" << p.farkas
+                    << ",\"warm_start\":" << (args.projection_warm_start ? "true" : "false")
+                    << ",\"iterations\":" << p.iterations << ",\"backtracks\":" << p.backtracks
+                    << ",\"max_iterations\":" << p.max_iterations << ",\"max_residual\":" << p.max_residual
+                    << ",\"min_active_fraction\":" << p.min_active_fraction << "}";
+        }
+        summary << "}";
         std::ofstream(args.output + "/summary.json") << summary.str() << "\n";
         std::cout << summary.str() << std::endl;
     } catch (const std::exception &e) {

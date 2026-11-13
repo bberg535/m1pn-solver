@@ -31,6 +31,15 @@ inline void require(bool ok, const std::string &what) {
     if (!ok)
         throw std::runtime_error(what);
 }
+// Literal overloads: no std::string is constructed on the (hot) success path.
+inline void cone_require(bool ok, const char *what) {
+    if (!ok)
+        throw StepRejected(what);
+}
+inline void require(bool ok, const char *what) {
+    if (!ok)
+        throw std::runtime_error(what);
+}
 inline double seconds() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
         .count();

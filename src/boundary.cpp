@@ -123,6 +123,65 @@ Boundary::Boundary(const Angular &a, const CanonicalC1 &c, const V3 &normal, boo
         rule[p].omega = frame * rule[p].omega;
     }
 }
+void Boundary::finish_data(Incoming &out) const {
+    if (c0)
+        require(out.d.norm() == 0 && out.kinetic.norm() == 0,
+                "C0 h=0 requires vacuum physical inflow; it is not C1");
+    // Convert the nonnegative kinetic quadrature to an admissible stored M1
+    // exterior. Products of a collimated atom's mass and rounded direction can
+    // put its stored current outside its stored density by an ulp. Round the
+    // exterior density outward, without a density floor or an admission tolerance.
+    // This conversion affects only the independent M1 exterior, never the PN datum.
+    require(out.moments.allFinite() && out.moments[0] >= 0, "Invalid incoming moment quadrature");
+    bool in_cone = exact::cone(out.moments); // evaluated once per candidate (the exact predicate is costly)
+    for(int k=0;k<64 && !in_cone;++k) {
+        out.moments[0]=std::nextafter(out.moments[0],std::numeric_limits<double>::infinity());
+        in_cone = exact::cone(out.moments);
+    }
+    require(in_cone,"Unable to represent incoming moments in M1 cone");
+}
+void Boundary::add_atoms(const std::vector<Atom> &atoms, Incoming &out) const {
+    // Odd harmonics of the local atom direction, cached per (boundary, direction): the inflow directions of a
+    // problem are few and fixed, and harmonics() dominated the boundary stage. Identical values as before.
+    struct Entry {
+        const Boundary *owner = nullptr;
+        V3 direction;
+        Vec odd;
+    };
+    thread_local std::array<Entry, 8> cache;
+    thread_local int next = 0;
+    for (const auto &a : atoms) {
+        require(a.mass >= 0 && std::isfinite(a.mass) &&
+                    std::abs(a.direction.norm() - 1) < 2e-12,
+                "Invalid incoming atom");
+        const double mu = n.dot(a.direction);
+        if (mu >= 0)
+            continue;
+        out.moments[0] += a.mass;
+        out.moments.tail<3>() += a.mass*a.direction;
+        const Vec *odd = nullptr;
+        for (const auto &e : cache)
+            if (e.owner == this && (e.direction.array() == a.direction.array()).all()) {
+                odd = &e.odd;
+                break;
+            }
+        if (!odd) {
+            Entry &e = cache[next];
+            next = (next + 1) % int(cache.size());
+            const Vec y = harmonics(pn.order, frame.transpose() * a.direction);
+            e.owner = this;
+            e.direction = a.direction;
+            e.odd.resize(canonical.r);
+            for (int j = 0; j < canonical.r; ++j)
+                e.odd[j] = y[canonical.odd[j]];
+            odd = &e.odd;
+        }
+        for (int j = 0; j < canonical.r; ++j)
+            out.d[j] += 2 * a.mass * (*odd)[j];
+        out.kinetic[0] += mu * a.mass;
+        out.kinetic.tail<3>() += mu * a.mass * a.direction;
+    }
+}
 Incoming Boundary::data(const Inflow &in, const V3 &x, double time) const {
     Incoming out;
     out.d = Vec::Zero(canonical.r);
@@ -139,33 +198,8 @@ Incoming Boundary::data(const Inflow &in, const V3 &x, double time) const {
             out.kinetic.tail<3>() += mass * p.omega;
         }
     if (in.atoms)
-        for (const auto &a : in.atoms(x, time)) {
-            require(a.mass >= 0 && std::isfinite(a.mass) &&
-                        std::abs(a.direction.norm() - 1) < 2e-12,
-                    "Invalid incoming atom");
-            const double mu = n.dot(a.direction);
-            if (mu >= 0)
-                continue;
-            out.moments[0] += a.mass;
-            out.moments.tail<3>() += a.mass*a.direction;
-            Vec y = harmonics(pn.order, frame.transpose() * a.direction);
-            for (int j = 0; j < canonical.r; ++j)
-                out.d[j] += 2 * a.mass * y[canonical.odd[j]];
-            out.kinetic[0] += mu * a.mass;
-            out.kinetic.tail<3>() += mu * a.mass * a.direction;
-        }
-    if (c0)
-        require(out.d.norm() == 0 && out.kinetic.norm() == 0,
-                "C0 h=0 requires vacuum physical inflow; it is not C1");
-    // Convert the nonnegative kinetic quadrature to an admissible stored M1
-    // exterior. Products of a collimated atom's mass and rounded direction can
-    // put its stored current outside its stored density by an ulp. Round the
-    // exterior density outward, without a density floor or an admission tolerance.
-    // This conversion affects only the independent M1 exterior, never the PN datum.
-    require(out.moments.allFinite() && out.moments[0] >= 0, "Invalid incoming moment quadrature");
-    for(int k=0;k<64 && !exact::cone(out.moments);++k)
-        out.moments[0]=std::nextafter(out.moments[0],std::numeric_limits<double>::infinity());
-    require(exact::cone(out.moments),"Unable to represent incoming moments in M1 cone");
+        add_atoms(in.atoms(x, time), out);
+    finish_data(out);
     return out;
 }
 Vec Boundary::flux(const Vec &u, const Vec &d) const {

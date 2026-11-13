@@ -58,6 +58,10 @@ struct Boundary {
     // norms = false skips the two full SVDs for `norm` and `llf_norm` (only path B uses them; O(q^3) per side).
     Boundary(const Angular &, const CanonicalC1 &, const V3 &, bool c0 = false, bool norms = true);
     Incoming data(const Inflow &, const V3 &x, double time) const;
+    // Atom part of data(): adds the incoming atoms (same operations and order as data()) to `out`.
+    void add_atoms(const std::vector<Atom> &atoms, Incoming &out) const;
+    // Checks and outward density rounding at the end of data().
+    void finish_data(Incoming &out) const;
     // Full PN exterior for the LLF flux: Onsager incoming modes, interior
     // outgoing modes, and interior zero modes (equation (6.9)).
     Vec exterior(const Vec &interior, const Vec &d) const;
