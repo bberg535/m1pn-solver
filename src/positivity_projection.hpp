@@ -87,6 +87,8 @@ struct PositivityProjectionStats {
     double max_residual = 0;      // max relative moment residual of accepted projections
     double min_active_fraction = 1;
     double seconds = 0;           // wall time of the ghost stage (trace products + projections)
+    // Remaining add_boundary stages (diagnostics): face loop, per-side PN flux products, serial node reduction.
+    double face_seconds = 0, product_seconds = 0, reduce_seconds = 0;
     void merge(const PositivityProjectionStats &o) {
         calls += o.calls, identities += o.identities, failures += o.failures, vacuum += o.vacuum, scaled += o.scaled;
         augmented += o.augmented, certificates += o.certificates, diracs += o.diracs, farkas += o.farkas;
@@ -95,6 +97,7 @@ struct PositivityProjectionStats {
         max_residual = std::max(max_residual, o.max_residual);
         min_active_fraction = std::min(min_active_fraction, o.min_active_fraction);
         seconds += o.seconds;
+        face_seconds += o.face_seconds, product_seconds += o.product_seconds, reduce_seconds += o.reduce_seconds;
     }
 };
 

@@ -287,7 +287,9 @@ int main(int argc, char **argv) {
                 << ",\"limiter\":" << stats.t_limiter << ",\"gradient_local\":" << stats.t_gradient_local
                 << ",\"gradient_gather\":" << stats.t_gradient_gather << ",\"gradient_solve\":" << stats.t_gradient_solve
                 << ",\"stab_local\":" << stats.t_stab_local << ",\"finish\":" << stats.t_finish
-                << ",\"ghost\":" << stats.projection.seconds << "}";
+                << ",\"ghost\":" << stats.projection.seconds << ",\"boundary_faces\":" << stats.projection.face_seconds
+                << ",\"boundary_products\":" << stats.projection.product_seconds
+                << ",\"boundary_reduce\":" << stats.projection.reduce_seconds << "}";
         if (args.positivity_projection) {
             const auto &p = stats.projection;
             summary << ",\"projection\":{\"rule\":" << args.projection_rule << ",\"calls\":" << p.calls

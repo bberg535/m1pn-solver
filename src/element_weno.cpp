@@ -750,6 +750,41 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         }
         for (std::size_t k = 0; k < ghost_node_.size(); ++k)
             ghost_by_side_[ghost_side_[k]].push_back(int(k));
+        // Face rows (add_boundary): the rows of face f are face_row_[f] + n, n < nf; the faces of one side are
+        // contiguous (rows side_row_start_[s] ..), in ascending face index. boundary_rows_ lists, per boundary slot,
+        // the rows of its node in ascending face index (the order of the former serial reduction).
+        face_row_.assign(faces_.size(), 0);
+        side_row_start_.fill(0);
+        {
+            int row = 0;
+            for (int side = 0; side < 6; ++side) {
+                side_row_start_[side] = row;
+                for (std::size_t index = 0; index < faces_.size(); ++index)
+                    if (2 * faces_[index].direction + faces_[index].side == side) {
+                        face_row_[index] = row;
+                        row += int(rules_[side].local.size());
+                    }
+            }
+            side_row_start_[6] = row;
+            face_row_side_.assign(row, 0);
+            std::vector<std::vector<int>> per_slot(boundary_nodes_.size());
+            for (std::size_t index = 0; index < faces_.size(); ++index) {
+                const auto &f = faces_[index];
+                const int side_id = 2 * f.direction + f.side;
+                const auto &local = rules_[side_id].local;
+                for (std::size_t n = 0; n < local.size(); ++n) {
+                    const int node = connectivity_[f.element * local_nodes + local[n]];
+                    per_slot[boundary_slot_[node]].push_back(face_row_[index] + int(n));
+                    face_row_side_[face_row_[index] + n] = side_id;
+                }
+            }
+            boundary_row_offsets_.assign(boundary_nodes_.size() + 1, 0);
+            for (std::size_t k = 0; k < per_slot.size(); ++k)
+                boundary_row_offsets_[k + 1] = boundary_row_offsets_[k] + int(per_slot[k].size());
+            boundary_rows_.reserve(boundary_row_offsets_.back());
+            for (const auto &list : per_slot)
+                boundary_rows_.insert(boundary_rows_.end(), list.begin(), list.end());
+        }
         if (options.positivity_projection)
             projection_warm_.assign(ghost_node_.size(), PositivityProjectionWarm{});
         canonical_ = std::make_unique<CanonicalC1>(pn);
@@ -1313,12 +1348,6 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     // C6 ghost trace comes from extras->ghost_psi, and the face datum loads are returned per side.
     const bool skip_high = high.rows() == 0;
     const bool want_datum = extras && extras->datum;
-    struct Local {
-        std::vector<int> global;
-        Mat high, load, bar, flux_area, datum, mass_traces;
-        Vec area, inflow;
-    };
-    std::vector<Local> parts(faces_.size());
     Inflow atoms_only;
     atoms_only.atoms = inflow.atoms;
     // C6: outgoing half-range moments of the positive part of the nodal PN trace (point independent),
@@ -1449,30 +1478,33 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     if (project && projection)
         for (const auto &ps : pstats)
             projection->merge(ps);
+    const double ghost_end = seconds();
     if (projection)
-        projection->seconds += seconds() - ghost_start;
+        projection->seconds += ghost_end - ghost_start;
+    // Face rows (constructor): one row per (face, face node). The face loop writes its rows directly; no per-face
+    // matrices (thousands of small allocations per call did not scale with the thread count).
+    const int face_rows = side_row_start_[6];
+    Field G, D(face_rows, canonical_->r), L(face_rows, 4), BR(face_rows, 4), FA(face_rows, 3);
+    Vec AR(face_rows), IN(face_rows);
+    if (!skip_high)
+        G.resize(face_rows, moments);
+    std::vector<char> face_datum(faces_.size(), 0);
     parallel_for(int(faces_.size()), [&](int index) {
         const auto &f = faces_[index];
         const int side_id = 2 * f.direction + f.side;
         const FaceRule &rule = rules_[side_id];
         const Boundary &b = *boundaries_[side_id];
-        const int nf = rule.local.size();
-        Local &part = parts[index];
-        part.global.resize(nf);
-        if (!skip_high)
-            part.high = Mat::Zero(nf, moments);
-        part.load = Mat::Zero(nf, 4);
-        part.bar = Mat::Zero(nf, 4);
-        part.flux_area = Mat::Zero(nf, 3);
-        part.area = Vec::Zero(nf);
-        part.inflow = Vec::Zero(nf);
-        // int phi_n datum over the face; the PN face flux is affine in (trace, datum).
-        Mat &datum = part.datum;
-        datum.setZero(nf, canonical_->r);
+        const int nf = rule.local.size(), r0 = face_row_[index];
+        thread_local std::vector<int> global;
+        global.resize(nf);
+        auto load_row = L.middleRows(r0, nf), bar_row = BR.middleRows(r0, nf), fa_row = FA.middleRows(r0, nf);
+        auto datum = D.middleRows(r0, nf);
+        load_row.setZero(), bar_row.setZero(), fa_row.setZero(), datum.setZero();
+        AR.segment(r0, nf).setZero(), IN.segment(r0, nf).setZero();
         V3 origin;
         element_origin(f.element, origin);
         for (int n = 0; n < nf; ++n)
-            part.global[n] = connectivity_[f.element * local_nodes + rule.local[n]];
+            global[n] = connectivity_[f.element * local_nodes + rule.local[n]];
         const int *ghost_id = &ghost_of_face_[std::size_t(index) * nf];
         // Memo per face node: the exterior state, its Levermore flux and the bar state depend on the point only
         // through data.moments. For spatially uniform inflow (vacuum, plane waves, isotropic) they are evaluated
@@ -1495,10 +1527,10 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 const double weight = rule.weights[point] * rule.shape(n, point);
                 if (weight == 0)
                     continue;
-                const int i = part.global[n];
+                const int i = global[n];
                 datum.row(n).noalias() += weight * data.d.transpose();
                 const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
-                part.inflow[n] += weight * std::max(0., -data.kinetic[0]);
+                IN[r0 + n] += weight * std::max(0., -data.kinetic[0]);
                 Four state;
                 if (memo && memo_valid[n] && (memo_moments[n].array() == data.moments.array()).all())
                     state = memo_state[n];
@@ -1523,76 +1555,79 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                     if (memo)
                         memo_valid[n] = 1, memo_moments[n] = data.moments, memo_state[n] = state;
                 }
-                part.area[n] += weight;
-                part.bar.row(n) += weight * state.transpose();
+                AR[r0 + n] += weight;
+                bar_row.row(n) += weight * state.transpose();
                 for (int d = 0; d < dimension; ++d)
-                    part.flux_area(n, d) += weight * b.n[d];
-                part.load.row(n) += weight * (state - ui).transpose();
+                    fa_row(n, d) += weight * b.n[d];
+                load_row.row(n) += weight * (state - ui).transpose();
             }
         }
+        face_datum[index] = !datum.isZero(0);
         if (skip_high)
             return;
         // sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum], with the exact face mass matrix;
         // the products with the dense q x q (and r x q) matrices are done per side below.
-        Mat traces(nf, moments);
+        thread_local Mat traces;
+        traces.resize(nf, moments);
         for (int n = 0; n < nf; ++n)
-            traces.row(n) = a.row(part.global[n]);
-        part.mass_traces.noalias() = rule.mass * traces;
+            traces.row(n) = a.row(global[n]);
+        G.middleRows(r0, nf).noalias() = rule.mass * traces;
     });
-    if (!skip_high)
-        for (int side = 0; side < 6; ++side) {
-            if (!boundaries_[side])
-                continue;
-            std::vector<int> list;
-            int rows = 0;
-            for (std::size_t index = 0; index < faces_.size(); ++index)
-                if (2 * faces_[index].direction + faces_[index].side == side)
-                    list.push_back(index), rows += parts[index].mass_traces.rows();
-            if (list.empty())
-                continue;
-            Field G(rows, moments), D(rows, canonical_->r);
-            int at = 0;
-            bool datum_zero = true;
-            for (int index : list) {
-                const int nf = parts[index].mass_traces.rows();
-                G.middleRows(at, nf) = parts[index].mass_traces;
-                D.middleRows(at, nf) = parts[index].datum;
-                datum_zero = datum_zero && parts[index].datum.isZero(0);
-                at += nf;
-            }
-            Field H = row_product(G, boundary_flux_t_[side]);
-            if (!datum_zero)
-                H -= row_product(D, datum_t_[side]);
-            at = 0;
-            for (int index : list) {
-                const int nf = parts[index].mass_traces.rows();
-                parts[index].high = H.middleRows(at, nf);
-                at += nf;
-            }
-        }
-    // `high` has one row per node or, in rate(), one row per boundary node (boundary_slot_).
+    const double faces_done = seconds();
+    if (projection)
+        projection->face_seconds += faces_done - ghost_end;
+    // Per side: H = G B - D B_datum on the contiguous rows of the side. The matrices are small (rows x q x q), so all
+    // sides run in one parallel loop over blocks of rows with allocation-free coefficient products (a GEMM call per
+    // small block allocated workspace and did not scale with the thread count).
+    Field H;
+    if (!skip_high) {
+        H.resize(face_rows, moments);
+        std::array<bool, 6> datum_zero;
+        datum_zero.fill(true);
+        for (std::size_t index = 0; index < faces_.size(); ++index)
+            if (face_datum[index])
+                datum_zero[2 * faces_[index].direction + faces_[index].side] = false;
+        constexpr int rows_per_task = 16;
+        std::vector<std::array<int, 3>> tasks; // side, first row, row count
+        for (int side = 0; side < 6; ++side)
+            if (boundaries_[side])
+                for (int r = side_row_start_[side]; r < side_row_start_[side + 1]; r += rows_per_task)
+                    tasks.push_back({side, r, std::min(rows_per_task, side_row_start_[side + 1] - r)});
+        parallel_for(int(tasks.size()), [&](int t) {
+            const auto [side, r, n] = tasks[t];
+            H.middleRows(r, n).noalias() = G.middleRows(r, n).lazyProduct(boundary_flux_t_[side]);
+            if (!datum_zero[side])
+                H.middleRows(r, n).noalias() -= D.middleRows(r, n).lazyProduct(datum_t_[side]);
+        });
+    }
+    const double products_done = seconds();
+    if (projection)
+        projection->product_seconds += products_done - faces_done;
+    // `high` has one row per node or, in rate(), one row per boundary node (boundary_slot_). Node by node in
+    // parallel; each node sums its face rows in ascending face index (the order of the former serial loop).
     const bool compact = high.rows() != nodes;
     if (want_datum)
         for (int s = 0; s < 6; ++s)
             if (boundaries_[s])
                 (*extras->datum)[s] = Field::Zero(boundary_nodes_.size(), canonical_->r);
-    for (std::size_t index = 0; index < parts.size(); ++index) {
-        const auto &part = parts[index];
-        const int side_id = 2 * faces_[index].direction + faces_[index].side;
-        for (std::size_t n = 0; n < part.global.size(); ++n) {
-            const int i = part.global[n];
+    parallel_for(int(boundary_nodes_.size()), [&](int k) {
+        const int i = boundary_nodes_[k];
+        for (int e = boundary_row_offsets_[k]; e < boundary_row_offsets_[k + 1]; ++e) {
+            const int r = boundary_rows_[e];
             if (!skip_high)
-                high.row(compact ? boundary_slot_[i] : i) += part.high.row(n);
+                high.row(compact ? k : i) += H.row(r);
             if (want_datum)
-                (*extras->datum)[side_id].row(boundary_slot_[i]) += part.datum.row(n);
-            low_load.row(i) += part.load.row(n);
-            bar.row(i) += part.bar.row(n);
-            node_flux_area.row(i) += part.flux_area.row(n);
-            area[i] += part.area[n];
+                (*extras->datum)[face_row_side_[r]].row(k) += D.row(r);
+            low_load.row(i) += L.row(r);
+            bar.row(i) += BR.row(r);
+            node_flux_area.row(i) += FA.row(r);
+            area[i] += AR[r];
             if (inflow_rate)
-                (*inflow_rate)[i] += part.inflow[n];
+                (*inflow_rate)[i] += IN[r];
         }
-    }
+    });
+    if (projection)
+        projection->reduce_seconds += seconds() - products_done;
 }
 Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                         ElementWenoDebug *debug) const {

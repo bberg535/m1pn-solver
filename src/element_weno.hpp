@@ -295,6 +295,9 @@ private:
     // ghost pairs of each side.
     std::array<std::shared_ptr<const SeparableTrace>, 6> separable_;
     std::array<std::vector<int>, 6> ghost_by_side_;
+    // Face-row layout of add_boundary (see the constructor).
+    std::vector<int> face_row_, face_row_side_, boundary_row_offsets_, boundary_rows_;
+    std::array<int, 7> side_row_start_{};
     // Positivity projection warm start per ghost pair (multiplier and rule of the last accepted projection). Only a
     // starting guess: the projection is unique, so the result does not depend on it beyond the solver tolerance.
     mutable std::vector<PositivityProjectionWarm> projection_warm_;
