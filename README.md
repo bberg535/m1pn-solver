@@ -27,6 +27,11 @@ gekoppeltem M1PN auf 128²](results/pn_comparisons/20261105_123328/README.md)
 zeigt die Wirkung der abgeschalteten M1-Kopplung bei gleichen Anfangsdaten
 und gleicher Schrittweite.
 
+Die [momententreue Positivitätsprojektion am Rand](docs/POSITIVITY_PROJECTION.md)
+(`m1pn_element_weno --positivity-projection`) ersetzt den C6-Ghost durch die Projektion des PN-Traces auf
+nichtnegative, momententreue Winkelmaße; der Randpfad wurde vorab optimiert (Ergebnisse unter
+[results/positivity](results/positivity/README.md)).
+
 ## Standardprogramm `m1pn_fast`
 
 `m1pn_fast` ist das Standardprogramm (Quelle `nn_filter/src/main.cpp`, gebaut mit
