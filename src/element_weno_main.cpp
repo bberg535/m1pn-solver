@@ -163,7 +163,9 @@ int main(int argc, char **argv) {
         const double start = seconds();
         double t = 0;
         for (int n = 0; n < steps; ++n) {
+            const double step_start = seconds();
             a = scheme.advance(t, dt, a, &stats);
+            stats.t_advance += seconds() - step_start;
             t += dt;
         }
         const double wall = seconds() - start;
@@ -279,7 +281,7 @@ int main(int argc, char **argv) {
                 << ",\"nudged_states\":" << stats.nudged_states
                 << ",\"max_raw_zero_sum\":" << stats.max_raw_zero_sum
                 << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
-                << ",\"seconds\":{\"closure\":" << stats.t_closure << ",\"closure_setup\":" << stats.t_closure_setup << ",\"weno\":" << stats.t_weno
+                << ",\"seconds\":{\"closure\":" << stats.t_closure << ",\"closure_setup\":" << stats.t_closure_setup << ",\"advance\":" << stats.t_advance << ",\"rate\":" << stats.t_rate << ",\"finite\":" << stats.t_finite << ",\"ssp_stage\":" << stats.t_ssp_stage << ",\"weno\":" << stats.t_weno
                 << ",\"stabilization\":" << stats.t_stabilization << ",\"residual\":" << stats.t_residual
                 << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass
                 << ",\"limiter\":" << stats.t_limiter << ",\"gradient_local\":" << stats.t_gradient_local

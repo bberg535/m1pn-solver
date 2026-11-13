@@ -138,6 +138,27 @@ inline void add_flux(const Sparse &at, const double *x, double scale, double *ou
         out[j] += scale * sum;
     }
 }
+// Zero-filled buffers whose pages are first touched by the worker threads. Serial zeroing of node-sized buffers in
+// every rate() call did not scale: measured on nx (E = 256, Q1, P7) it grew from 0.11 s (1 thread) to 1.15 s
+// (32 threads) and was most of the closure phase.
+template <class M> void parallel_fill_zero(M &m) {
+    double *p = m.data();
+    const std::size_t total = std::size_t(m.size()), chunk = 1 << 15;
+    parallel_for(int((total + chunk - 1) / chunk), [&](int k) {
+        const std::size_t begin = std::size_t(k) * chunk;
+        std::fill(p + begin, p + std::min(total, begin + chunk), 0.);
+    });
+}
+Field parallel_zero(Eigen::Index rows, Eigen::Index cols) {
+    Field f(rows, cols);
+    parallel_fill_zero(f);
+    return f;
+}
+Vec parallel_zero(Eigen::Index n) {
+    Vec v(n);
+    parallel_fill_zero(v);
+    return v;
+}
 // out.row(i) += scale * (A^T applied to x.row(i)) for all rows i, A^T in CSR form (`at`, as add_flux). Rows are
 // processed in blocks of 8: the block is transposed into a column buffer, so every stored entry becomes one
 // contiguous 8-wide multiply-add instead of eight indirect scalar loads. Per output entry the products are summed in
@@ -1576,6 +1597,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
 Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                         ElementWenoDebug *debug) const {
     require(a.rows() == nodes && a.cols() == moments, "Invalid element WENO state");
+    const double finite_start = seconds();
     {
         // Parallel finiteness check; the serial a.allFinite() cost a quarter of the run time on 8 threads.
         std::atomic<bool> finite{true};
@@ -1595,15 +1617,14 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     double clock = seconds();
     ElementWenoStats scratch;
     ElementWenoStats &timing = stats ? *stats : scratch;
+    timing.t_finite += clock - finite_start;
     auto lap = [&](double &slot) {
         const double now = seconds();
         slot += now - clock;
         clock = now;
     };
     const double closure_setup_before = timing.t_closure_setup;
-    Field low(nodes, 4), low_flux(nodes, 12), closure(nodes, 12);
-    low_flux.setZero();
-    closure.setZero();
+    Field low(nodes, 4), low_flux = parallel_zero(nodes, 12), closure = parallel_zero(nodes, 12);
     lap(timing.t_closure_setup);
     // Only the four low moments of the PN flux a A_d enter the closure difference G = F^H - F^L.
     parallel_for(nodes, [&](int i) {
@@ -1645,9 +1666,9 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     clock = seconds();
     timing.t_stabilization += clock - stabilization_start;
     // boundary_high holds one row per boundary node (boundary_slot_).
-    Field boundary_high = Field::Zero(boundary_nodes_.size(), q), boundary_low = Field::Zero(nodes, 4);
-    Field flux_area = Field::Zero(nodes, 3), boundary_bar = Field::Zero(nodes, 4);
-    Vec boundary_area = Vec::Zero(nodes), boundary_inflow = Vec::Zero(nodes);
+    Field boundary_high = parallel_zero(boundary_nodes_.size(), q), boundary_low = parallel_zero(nodes, 4);
+    Field flux_area = parallel_zero(nodes, 3), boundary_bar = parallel_zero(nodes, 4);
+    Vec boundary_area = parallel_zero(nodes), boundary_inflow = parallel_zero(nodes);
     if (!faces_.empty()) {
         add_boundary(time, a, low, low_flux, boundary_high, boundary_low, flux_area, boundary_area,
                      boundary_bar, &boundary_inflow, nullptr, &timing.projection);
@@ -1689,6 +1710,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                         row[c] = 0;
             });
     lap(timing.t_finish);
+    timing.t_rate += seconds() - finite_start;
     if (debug) {
         debug->ho_moment_rate = moment_rate;
         debug->unlimited_rate = raw_load;
@@ -2110,7 +2132,7 @@ Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lu
     // Rounding fix only: raise the stored density coefficient by ulps until the stored row itself projects into
     // the M1 cone (coefficient level, so no set_low() round trip can move it out again).
     std::atomic<long> nudged{0};
-    std::vector<double> added(nodes, 0.);
+    Vec added = parallel_zero(nodes);
     const int q = x.cols();
     parallel_for(nodes, [&](int i) {
         double *row = &x.coeffRef(i, 0);
@@ -2135,8 +2157,8 @@ Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lu
     });
     if (stats && nudged.load()) {
         stats->nudged_states += nudged.load();
-        for (double v : added)
-            stats->nudge_mass += v;
+        for (int i = 0; i < nodes; ++i)
+            stats->nudge_mass += added[i];
     }
     return x;
 }
@@ -2164,13 +2186,19 @@ Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, El
         Field r = rate(t, x, stats);
         if (stats)
             stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
+        const double combine_start = seconds();
         combine(r, x, a, old, fresh, dt, nodes);
-        return admissible_rows(std::move(r), nodes, stats, lumped);
+        Field out = admissible_rows(std::move(r), nodes, stats, lumped);
+        if (stats)
+            stats->t_ssp_stage += seconds() - combine_start;
+        return out;
     };
     const Field first = stage(time, a, 0, 1, 1. / 6);
     const Field second = stage(time + dt, first, .75, .25, 1. / 6);
     Field last = stage(time + .5 * dt, second, 1. / 3, 2. / 3, 2. / 3);
-    return reacts() ? react(last, .5 * dt, stats, time + .75 * dt) : last;
+    if (reacts())
+        return react(last, .5 * dt, stats, time + .75 * dt);
+    return last; // no copy (a conditional operator would copy the lvalue)
 }
 // SSPRK(4,3) (Kraaijevanger; Spiteri and Ruuth): four forward Euler stages of dt/2 at times t, t+dt/2, t+dt,
 // t+dt/2; u3 = 2/3 u + 1/3 (u2 + dt/2 L(u2)). Realizable for dt <= 2 dt_bound.
@@ -2183,14 +2211,20 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
         Field r = rate(t, x, stats);
         if (stats)
             stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
+        const double combine_start = seconds();
         combine(r, x, a, old, fresh, half, nodes);
-        return admissible_rows(std::move(r), nodes, stats, lumped);
+        Field out = admissible_rows(std::move(r), nodes, stats, lumped);
+        if (stats)
+            stats->t_ssp_stage += seconds() - combine_start;
+        return out;
     };
     const Field first = stage(time, a, 0, 1, 1. / 6);
     const Field second = stage(time + half, first, 0, 1, 1. / 6);
     const Field third = stage(time + dt, second, 2. / 3, 1. / 3, 1. / 6);
     Field last = stage(time + half, third, 0, 1, .5);
-    return reacts() ? react(last, .5 * dt, stats, time + .75 * dt) : last;
+    if (reacts())
+        return react(last, .5 * dt, stats, time + .75 * dt);
+    return last; // no copy (a conditional operator would copy the lvalue)
 }
 Field ElementWeno::admissible_rows_public(Field x, ElementWenoStats *stats) const {
     return admissible_rows(std::move(x), nodes, stats, lumped);

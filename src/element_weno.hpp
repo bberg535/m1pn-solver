@@ -111,6 +111,9 @@ struct ElementWenoStats {
     double t_closure = 0, t_weno = 0, t_stabilization = 0, t_residual = 0, t_boundary = 0;
     double t_mass = 0, t_limiter = 0, t_finish = 0;
     double t_closure_setup = 0; // allocation and zeroing part of t_closure
+    double t_rate = 0;    // wall time inside rate() (all phases plus anything untimed)
+    double t_advance = 0; // wall time of the advance() calls (set by the driver)
+    double t_finite = 0, t_ssp_stage = 0; // finiteness check of rate(); SSP stage combination + cone rounding fix
     double t_gradient_local = 0, t_gradient_gather = 0, t_gradient_solve = 0, t_stab_local = 0;
     // Mass ledger in rho units (sum_i m_i rho_i, m_i = lumped mass), accumulated by advance():
     //   M(T) - M(0) + boundary_outflow + absorbed - injected - nudge_mass = 0 up to rounding.
