@@ -18,6 +18,10 @@ struct Args {
          reduce_angular = true;
     bool positivity_projection = false, projection_strict = false, projection_warm_start = true;
     int projection_rule = 0;
+    // smooth-outflow (docs/POSITIVITY_PROJECTION.md): angular concentration, direction (degrees), pulse width,
+    // reference angular rule and sample points per axis of the error.
+    double kappa = 5, angle = 30, outflow_width = .1;
+    int reference_rule = 48, error_samples = 256;
     double projection_tolerance = 1e-12;
 };
 Args parse(int argc, char **argv) {
@@ -53,11 +57,17 @@ Args parse(int argc, char **argv) {
         else if (key == "--positivity-projection") a.positivity_projection = true; // docs/POSITIVITY_PROJECTION.md
         else if (key == "--projection-strict") a.projection_strict = true;
         else if (key == "--projection-cold-start") a.projection_warm_start = false;
+        else if (key == "--kappa") a.kappa = std::stod(next());
+        else if (key == "--angle") a.angle = std::stod(next());
+        else if (key == "--outflow-width") a.outflow_width = std::stod(next());
+        else if (key == "--reference-rule") a.reference_rule = std::stoi(next());
+        else if (key == "--error-samples") a.error_samples = std::stoi(next());
         else if (key == "--projection-rule") a.projection_rule = std::stoi(next());
         else if (key == "--projection-tolerance") a.projection_tolerance = std::stod(next());
         else throw std::runtime_error("Unknown option " + key);
     }
-    require(a.problem == "smooth" || a.problem == "crossing-study", "Problem must be smooth or crossing-study");
+    require(a.problem == "smooth" || a.problem == "crossing-study" || a.problem == "smooth-outflow",
+            "Problem must be smooth, crossing-study or smooth-outflow");
     return a;
 }
 } // namespace
@@ -95,7 +105,21 @@ int main(int argc, char **argv) {
         const bool smooth = args.problem == "smooth";
         options.periodic = smooth;
         Inflow inflow;
-        if (!smooth) {
+        // smooth-outflow: psi_0 = bg / 4 pi + G(x - c) f(Omega), f = kappa / (2 pi (1 - e^-2kappa)) exp(kappa (Omega.e - 1))
+        // (unit mass, smooth in angle), free transport: psi(x, Omega, t) = psi_0(x - t Omega, Omega), also the inflow.
+        const bool outflow = args.problem == "smooth-outflow";
+        const double kappa = args.kappa, ow = args.outflow_width, bgo = args.background;
+        const V3 odir(std::cos(args.angle * pi / 180), std::sin(args.angle * pi / 180), 0), ocenter(.4, .4, 0);
+        auto fdist = [kappa, odir](const V3 &o) {
+            return kappa / (2 * pi * (1 - std::exp(-2 * kappa))) * std::exp(kappa * (o.dot(odir) - 1));
+        };
+        auto gauss2 = [ow](const V3 &d) { return std::exp(-(d[0] * d[0] + d[1] * d[1]) / (2 * ow * ow)); };
+        if (outflow) {
+            require(args.dimension == 2, "smooth-outflow is 2D");
+            inflow.density = [=](const V3 &x, double t, const V3 &o) {
+                return bgo / (4 * pi) + gauss2(x - t * o - ocenter) * fdist(o);
+            };
+        } else if (!smooth) {
             require(args.dimension == 2, "crossing-study is 2D");
             const double bg = args.background, w = args.width;
             inflow.density = [bg](const V3 &, double, const V3 &) { return bg / (4 * pi); };
@@ -112,6 +136,15 @@ int main(int argc, char **argv) {
         Field a;
         if (smooth) {
             a = scheme.project_l2([&](const V3 &x) { return element_weno_smooth_exact(pn, x, 0); });
+        } else if (outflow) {
+            Vec F = Vec::Zero(pn.q); // PN coefficients of f (fine rule; f is smooth)
+            for (const auto &p : sphere_rule(2 * args.pn + 40))
+                F += p.weight * fdist(p.omega) * harmonics(pn.order, p.omega);
+            a = scheme.interpolate([&](const V3 &x) {
+                Vec s = gauss2(x - ocenter) * F;
+                s[0] += bgo / std::sqrt(4 * pi);
+                return s;
+            });
         } else {
             a = scheme.interpolate([&](const V3 &x) {
                 auto p = [&](const V3 &d) { return std::exp(-d.squaredNorm() / (2 * args.width * args.width)); };
@@ -144,7 +177,47 @@ int main(int argc, char **argv) {
         // crossing-study: free transport, the kinetic density is bg + sum of the two shifted Gaussians (no
         // scattering). Its L2 distance contains the PN model error; the mass in the box measures the outflow.
         double kinetic_error = -1, kinetic_error_outflow = -1, exact_mass = -1;
-        if (!smooth) {
+        if (outflow) {
+            // Exact density by angular quadrature (points with negligible f dropped), sampled L2 error on the cell
+            // centres of an M x M grid (whole box and the outflow strip max(x, y) > 0.8), exact mass via erf.
+            const double T = t;
+            std::vector<AngularPoint> rule;
+            double fmax = 0;
+            for (const auto &p : sphere_rule(args.reference_rule))
+                fmax = std::max(fmax, fdist(p.omega));
+            for (const auto &p : sphere_rule(args.reference_rule))
+                if (fdist(p.omega) > 1e-16 * fmax)
+                    rule.push_back({p.omega, p.weight * fdist(p.omega)});
+            auto rho = [&](const V3 &x) {
+                double r = bgo;
+                for (const auto &p : rule)
+                    r += p.weight * gauss2(x - T * p.omega - ocenter);
+                return r;
+            };
+            const int M = args.error_samples;
+            std::vector<double> all(M, 0.), strip(M, 0.);
+#pragma omp parallel for schedule(dynamic)
+            for (int j = 0; j < M; ++j)
+                for (int i = 0; i < M; ++i) {
+                    const V3 x((i + .5) / M, (j + .5) / M, 0);
+                    const double d = project(scheme.evaluate(a, x))[0] - rho(x);
+                    all[j] += d * d / (double(M) * M);
+                    if (std::max(x[0], x[1]) > .8)
+                        strip[j] += d * d / (double(M) * M);
+                }
+            double sa = 0, ss = 0;
+            for (int j = 0; j < M; ++j)
+                sa += all[j], ss += strip[j];
+            kinetic_error = std::sqrt(sa);
+            kinetic_error_outflow = std::sqrt(ss);
+            auto line = [ow](double c) {
+                return ow * std::sqrt(pi / 2) *
+                       (std::erf((1 - c) / (std::sqrt(2.) * ow)) - std::erf(-c / (std::sqrt(2.) * ow)));
+            };
+            exact_mass = bgo;
+            for (const auto &p : rule)
+                exact_mass += p.weight * line(ocenter[0] + T * p.omega[0]) * line(ocenter[1] + T * p.omega[1]);
+        } else if (!smooth) {
             const double w = args.width, bg = args.background, T = t;
             const V3 c1(.3 + T, .5, 0), c2(.5, .3 + T, 0);
             auto rho = [&](const V3 &x) {

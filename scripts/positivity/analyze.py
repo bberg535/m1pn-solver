@@ -50,6 +50,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--campaign", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--prefix", default="rt", help="run-name prefix of the runtime/accuracy matrix (rt, of)")
     ns = p.parse_args()
     camp, out = ns.campaign.resolve(), ns.output
     out.mkdir(parents=True, exist_ok=True)
@@ -78,7 +79,7 @@ def main():
         for E in (32, 64, 128, 256):
             for N in (3, 7, 15):
                 key = f"p{p_}_E{E}_N{N}"
-                r, c, j = runs.get(f"rt_ref_{key}"), runs.get(f"rt_c6_{key}"), runs.get(f"rt_proj_{key}")
+                r, c, j = runs.get(f"{ns.prefix}_ref_{key}"), runs.get(f"{ns.prefix}_c6_{key}"), runs.get(f"{ns.prefix}_proj_{key}")
                 if not (r and c):
                     continue
                 diff = field_diff(camp / "runs" / f"rt_ref_{key}", camp / "runs" / f"rt_c6_{key}")
@@ -104,7 +105,7 @@ def main():
         for E in (32, 64, 128, 256):
             for N in (3, 7, 15):
                 for v in ("c6", "proj", "projN1"):
-                    d = runs.get(f"rt_{v}_p{p_}_E{E}_N{N}")
+                    d = runs.get(f"{ns.prefix}_{v}_p{p_}_E{E}_N{N}")
                     if not d:
                         continue
                     pr = d.get("projection", {})

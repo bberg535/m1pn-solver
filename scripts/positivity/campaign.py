@@ -42,14 +42,27 @@ def sha256(path):
     return h.hexdigest()
 
 
-def run_task(campaign, name, binary, N, p, E, extra):
+OUTFLOW = ["--problem", "smooth-outflow", "--dimension", "2", "--time", ".6", "--cfl", ".9", "--sample-grid", "256"]
+
+
+def run_task(campaign, name, binary, N, p, E, extra, common=COMMON):
     extra = [str(N + 1) if x == "N+1" else x for x in extra]
-    args = [str(campaign / "bin" / binary), *COMMON, "--pn-order", str(N), "--degree", str(p), "--elements", str(E),
+    args = [str(campaign / "bin" / binary), *common, "--pn-order", str(N), "--degree", str(p), "--elements", str(E),
             *extra, "--output", str(campaign / "runs" / name)]
     return name, shlex.join(args)
 
 
-def tasks(campaign):
+def tasks(campaign, suite="crossing"):
+    if suite == "outflow":
+        # smooth-outflow: smooth angular data (PN error small), exact kinetic reference; accuracy campaign.
+        items = []
+        for p in (2, 1):
+            for E in (256, 128, 64, 32):
+                for N in (15, 7, 3):
+                    for v in ("c6", "proj", "projN1"):
+                        binary, extra = VARIANTS[v]
+                        items.append(run_task(campaign, f"of_{v}_p{p}_E{E}_N{N}", binary, N, p, E, extra, OUTFLOW))
+        return {"outflow": items}
     packs = {"runtime_p1": [], "runtime_p2": [], "scaling": []}
     for p in (1, 2):
         # Largest first: the long runs start immediately (better packing).
@@ -92,8 +105,9 @@ def prepare(ns):
                 "reference_commit": "bdd5d3f", "binaries": {}, "packs": {}}
     for b in ("ref", "new", "bench"):
         manifest["binaries"][b] = {"sha256": sha256(campaign / "bin" / b)}
-    slot = {"runtime_p1": 32, "runtime_p2": 32, "scaling": 16}
-    for pack, items in tasks(campaign).items():
+    slot = {"runtime_p1": 32, "runtime_p2": 32, "scaling": 16, "outflow": 16}
+    manifest["suite"] = ns.suite
+    for pack, items in tasks(campaign, ns.suite).items():
         path = campaign / "packs" / f"{pack}.tsv"
         path.write_text("".join(f"{name}\t{command}\n" for name, command in items))
         manifest["packs"][pack] = {"taskfile": str(path), "slot_cores": slot[pack], "tasks": len(items),
@@ -161,6 +175,7 @@ def main():
     a.add_argument("--reference-bin", type=Path, required=True)
     a.add_argument("--bin", type=Path, required=True)
     a.add_argument("--bench", type=Path, required=True)
+    a.add_argument("--suite", choices=("crossing", "outflow"), default="crossing")
     a = sub.add_parser("submit")
     a.add_argument("--campaign", type=Path, required=True)
     a.add_argument("--execute", action="store_true")
