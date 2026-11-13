@@ -36,7 +36,7 @@ einlaufenden Hälfte verschieben über ξ auch die auslaufenden Momente, die C6 
 | Aufpreis vs. Gitter (N=7) | E=32 +11.6 %, 64 +7.1 %, 128 +4.0 %, 256 +0.7 %, 512 +2.1 %, 1024 −0.4 % |
 | Aufpreis vs. N (E=64) | N=3 +0.4 %, 7 +10.6 %, 15 +20.4 %, 31 +30.9 % |
 | Ergänzte Regel (unlösbare Zustände) | 0.3–4 % der Aufrufe, Anteil sinkt mit N |
-| Rückfall auf C6 (nicht konvergiert) | 7 Fälle in allen Skalierungsläufen (≈ 10⁶ Aufrufe), gezählt |
+| Rückfall auf C6 (nicht konvergiert) | 7 von 1.2·10⁸ Aufrufen in allen Skalierungsläufen, gezählt |
 
 Kernel (ein Thread): Projektion warm 0.9 µs (N=3) … 38 µs (N=31, gepeakt) bzw. 202 µs (N=31, Strahl, Regel 2N+1);
 mit Regel N+1 etwa 4× billiger. Die separable Trace-Auswertung ist bei N=31 5.2× schneller als die dichte.
