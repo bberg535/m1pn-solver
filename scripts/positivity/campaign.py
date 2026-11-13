@@ -82,6 +82,8 @@ def tasks(campaign, suite="crossing"):
     bench = (f"OMP_NUM_THREADS=1 {shlex.quote(str(campaign / 'bin' / 'bench'))} --orders 3,5,7,11,15,21,31 "
              f"--states 2000 --repeat 3 > {shlex.quote(str(campaign / 'runs' / 'bench.jsonl'))}")
     packs["scaling"].insert(2, ("bench", bench))
+    if suite == "runtime":
+        return {k: v for k, v in packs.items() if k.startswith("runtime")}
     return packs
 
 
@@ -175,7 +177,7 @@ def main():
     a.add_argument("--reference-bin", type=Path, required=True)
     a.add_argument("--bin", type=Path, required=True)
     a.add_argument("--bench", type=Path, required=True)
-    a.add_argument("--suite", choices=("crossing", "outflow"), default="crossing")
+    a.add_argument("--suite", choices=("crossing", "outflow", "runtime"), default="crossing")
     a = sub.add_parser("submit")
     a.add_argument("--campaign", type=Path, required=True)
     a.add_argument("--execute", action="store_true")
