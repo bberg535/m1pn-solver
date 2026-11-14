@@ -144,7 +144,8 @@ ElementWenoMpi::ElementWenoMpi(ElementWeno &scheme, MPI_Comm comm, const SlabPar
     {
         int provided = 0;
         MPI_Query_thread(&provided);
-        thread_multiple_ = provided >= MPI_THREAD_MULTIPLE && !std::getenv("M1PN_MPI_FUNNELED");
+        // Opt-in only: with UCX, 32 threads blocking in MPI_Recv contend badly (NX: 4 ranks 1665 s instead of 47 s).
+        thread_multiple_ = provided >= MPI_THREAD_MULTIPLE && std::getenv("M1PN_MPI_THREADED_PIPELINE");
     }
     std::vector<char> owned(s_.nodes, 0);
     for (int i = 0; i < s_.nodes; ++i) {
