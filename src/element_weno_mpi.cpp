@@ -80,27 +80,21 @@ ElementWenoMpi::ElementWenoMpi(ElementWeno &scheme, MPI_Comm comm, const SlabPar
         for (int k = 0; k < n1; ++k)
             perm_[k] = f.permutationP().indices()[k], inv_[perm_[k]] = k;
     }
-    // The owners along the factor positions must form one contiguous run per rank (sequential chain).
-    {
-        std::vector<int> seen(P, 0);
-        int last = -1;
-        j0_ = j1_ = -1;
-        for (int j = 0; j < n1; ++j) {
-            const int o = owner_[inv_[j]];
-            if (o != last) {
-                require(!seen[o], "MPI: the line factor order visits a rank twice (use more elements per rank)");
-                seen[o] = 1, last = o;
-            }
-            if (o == r) {
-                if (j0_ < 0)
-                    j0_ = j;
-                j1_ = j + 1;
-            }
-        }
+    // Runs of positions with one owner.
+    for (int j = 0; j < n1; ++j) {
+        const int o = owner_[inv_[j]];
+        if (runs_.empty() || runs_.back().owner != o)
+            runs_.push_back({o, j, j + 1});
+        else
+            runs_.back().end = j + 1;
     }
-    // Communication links of the substitution: forward, column j (owner of j) updates rows i; backward, column j
-    // reads the final rows i.
-    std::map<int, std::vector<int>> fs, fr, bs, br;
+    std::vector<int> run_of(n1);
+    for (std::size_t g = 0; g < runs_.size(); ++g)
+        for (int j = runs_[g].first; j < runs_[g].end; ++j)
+            run_of[j] = int(g);
+    // Messages. Forward: column j (owner oj) updates row i (owner oi != oj): oj sends y_j after the run of j.
+    // Backward: column j reads the final y_i (i > j): oi sends y_i after the (backward) run of i.
+    std::map<std::pair<int, int>, std::vector<int>> fs, fr, bs, br; // (run, peer) -> positions
     for (int j = 0; j < n1; ++j)
         for (int k = outer_[j]; k < outer_[j + 1]; ++k) {
             const int i = inner_[k];
@@ -110,20 +104,23 @@ ElementWenoMpi::ElementWenoMpi(ElementWeno &scheme, MPI_Comm comm, const SlabPar
             if (oj == oi)
                 continue;
             if (oj == r)
-                fs[oi].push_back(j), br[oi].push_back(i);
+                fs[{run_of[j], oi}].push_back(j), br[{run_of[i], oi}].push_back(i);
             if (oi == r)
-                fr[oj].push_back(j), bs[oj].push_back(i);
+                fr[{run_of[j], oj}].push_back(j), bs[{run_of[i], oj}].push_back(i);
         }
-    auto links = [](std::map<int, std::vector<int>> &m) {
-        std::vector<Link> out;
-        for (auto &[rank, v] : m) {
+    auto messages = [](std::map<std::pair<int, int>, std::vector<int>> &m, bool descending) {
+        std::vector<Message> out;
+        for (auto &[key, v] : m) {
             std::sort(v.begin(), v.end());
             v.erase(std::unique(v.begin(), v.end()), v.end());
-            out.push_back({rank, v});
+            out.push_back({key.first, key.second, v});
         }
+        if (descending)
+            std::stable_sort(out.begin(), out.end(), [](const Message &x, const Message &y) { return x.run > y.run; });
         return out;
     };
-    fwd_send_ = links(fs), fwd_recv_ = links(fr), bwd_send_ = links(bs), bwd_recv_ = links(br);
+    fwd_send_ = messages(fs, false), fwd_recv_ = messages(fr, false);
+    bwd_send_ = messages(bs, true), bwd_recv_ = messages(br, true);
     // Halo layers: mine from their owners; the halo layers of the other ranks that I own.
     auto runs = [&](int first_layer, int count, int self, bool mine, std::vector<Range> &out, int base) {
         int k = first_layer;
@@ -197,132 +194,149 @@ void ElementWenoMpi::solve_axis(Field &b) const {
     std::vector<std::size_t> cs(C + 1);
     for (int c = 0; c <= C; ++c)
         cs[c] = len * c / C;
-    // Link buffers in chunk-major layout: chunk c of position m at npos * cs[c] + m * (cs[c+1] - cs[c]).
-    auto alloc = [&](const std::vector<Link> &links) {
-        std::vector<std::vector<double>> out(links.size());
-        for (std::size_t l = 0; l < links.size(); ++l)
-            out[l].resize(links[l].positions.size() * len);
+    // Message buffers in chunk-major layout: chunk c of position m at npos * cs[c] + m * (cs[c+1] - cs[c]).
+    auto alloc = [&](const std::vector<Message> &msgs) {
+        std::vector<std::vector<double>> out(msgs.size());
+        for (std::size_t l = 0; l < msgs.size(); ++l)
+            out[l].resize(msgs[l].positions.size() * len);
         return out;
     };
-    auto slot = [&](std::vector<double> &buf, std::size_t npos, int c, std::size_t m) {
-        return buf.data() + npos * cs[c] + m * (cs[c + 1] - cs[c]);
+    auto slot = [&](const std::vector<double> &buf, std::size_t npos, int c, std::size_t m) {
+        return const_cast<double *>(buf.data()) + npos * cs[c] + m * (cs[c + 1] - cs[c]);
     };
-    const int threads = std::max(1, max_threads());
-    // Element-parallel execution of `body(from, to)` on the chunk range (all operations are element-wise).
-    auto split = [&](std::size_t n, const auto &body) {
+    const int threads = std::max(1, omp_get_max_threads());
+    auto split = [&](std::size_t n, const auto &body) { // element-parallel (all operations are element-wise)
         const int T = int(std::min<std::size_t>(threads, std::max<std::size_t>(1, n / 256)));
         parallel_for(T, [&](int t) { body(n * t / T, n * (t + 1) / T); });
     };
-    // Foreign positions of a link set, merged in ascending position order: (position, link, index).
-    auto merged = [](const std::vector<Link> &links) {
-        std::vector<std::array<int, 3>> out;
-        for (std::size_t l = 0; l < links.size(); ++l)
-            for (std::size_t m = 0; m < links[l].positions.size(); ++m)
-                out.push_back({links[l].positions[m], int(l), int(m)});
-        std::sort(out.begin(), out.end());
-        return out;
-    };
+    auto tag = [&](int run, int c, bool backward) { return int((backward ? 1 : 0) + 2 * (c + C * run)) % 30000 + 100; };
     double wait = 0;
-    // ---- forward: for positions j ascending, y_i -= L_ij y_j ----
+    // ---- forward: positions j ascending, y_i -= L_ij y_j ----
     {
         auto rbuf = alloc(fwd_recv_), sbuf = alloc(fwd_send_);
-        const auto foreign = merged(fwd_recv_);
         std::vector<MPI_Request> req;
         for (int c = 0; c < C; ++c) {
             const std::size_t cl = cs[c + 1] - cs[c];
-            const double w0 = MPI_Wtime();
-            for (std::size_t l = 0; l < fwd_recv_.size(); ++l) {
-                const std::size_t np = fwd_recv_[l].positions.size();
-                MPI_Recv(slot(rbuf[l], np, c, 0), int(np * cl), MPI_DOUBLE, fwd_recv_[l].rank, 100 + c, comm_,
-                         MPI_STATUS_IGNORE);
-            }
-            wait += MPI_Wtime() - w0;
-            split(cl, [&](std::size_t from, std::size_t to) {
-                for (const auto &[j, l, m] : foreign) {
-                    const double *yj = slot(rbuf[l], fwd_recv_[l].positions.size(), c, m);
-                    for (int k = outer_[j]; k < outer_[j + 1]; ++k) {
-                        const int i = inner_[k];
-                        if (i == j || owner_[inv_[i]] != me)
-                            continue;
-                        const double v = values_[k];
-                        double *yi = layer(b, inv_[i]) + cs[c];
-                        for (std::size_t t = from; t < to; ++t) yi[t] -= v * yj[t];
-                    }
+            std::size_t next_recv = 0, next_send = 0;
+            for (std::size_t g = 0; g < runs_.size(); ++g) {
+                if (runs_[g].owner != me)
+                    continue;
+                // Foreign columns of earlier runs: receive and apply in run (= position) order.
+                while (next_recv < fwd_recv_.size() && fwd_recv_[next_recv].run < int(g)) {
+                    const Message &msg = fwd_recv_[next_recv];
+                    const std::size_t np = msg.positions.size();
+                    const double w0 = MPI_Wtime();
+                    MPI_Recv(slot(rbuf[next_recv], np, c, 0), int(np * cl), MPI_DOUBLE, msg.peer, tag(msg.run, c, false),
+                             comm_, MPI_STATUS_IGNORE);
+                    wait += MPI_Wtime() - w0;
+                    const double *base = slot(rbuf[next_recv], np, c, 0);
+                    split(cl, [&](std::size_t from, std::size_t to) {
+                        for (std::size_t m = 0; m < np; ++m) {
+                            const int j = msg.positions[m];
+                            const double *yj = base + m * cl;
+                            for (int k = outer_[j]; k < outer_[j + 1]; ++k) {
+                                const int i = inner_[k];
+                                if (i == j || owner_[inv_[i]] != me)
+                                    continue;
+                                const double v = values_[k];
+                                double *yi = layer(b, inv_[i]) + cs[c];
+                                for (std::size_t t = from; t < to; ++t) yi[t] -= v * yj[t];
+                            }
+                        }
+                    });
+                    ++next_recv;
                 }
-                for (int j = j0_; j < j1_; ++j) {
-                    const double *yj = layer(b, inv_[j]) + cs[c];
-                    for (int k = outer_[j]; k < outer_[j + 1]; ++k) {
-                        const int i = inner_[k];
-                        if (i == j || owner_[inv_[i]] != me)
-                            continue;
-                        const double v = values_[k];
-                        double *yi = layer(b, inv_[i]) + cs[c];
-                        for (std::size_t t = from; t < to; ++t) yi[t] -= v * yj[t];
+                split(cl, [&](std::size_t from, std::size_t to) {
+                    for (int j = runs_[g].first; j < runs_[g].end; ++j) {
+                        const double *yj = layer(b, inv_[j]) + cs[c];
+                        for (int k = outer_[j]; k < outer_[j + 1]; ++k) {
+                            const int i = inner_[k];
+                            if (i == j || owner_[inv_[i]] != me)
+                                continue;
+                            const double v = values_[k];
+                            double *yi = layer(b, inv_[i]) + cs[c];
+                            for (std::size_t t = from; t < to; ++t) yi[t] -= v * yj[t];
+                        }
                     }
+                });
+                while (next_send < fwd_send_.size() && fwd_send_[next_send].run == int(g)) {
+                    const Message &msg = fwd_send_[next_send];
+                    const std::size_t np = msg.positions.size();
+                    for (std::size_t m = 0; m < np; ++m)
+                        std::copy_n(layer(b, inv_[msg.positions[m]]) + cs[c], cl, slot(sbuf[next_send], np, c, m));
+                    req.emplace_back();
+                    MPI_Isend(slot(sbuf[next_send], np, c, 0), int(np * cl), MPI_DOUBLE, msg.peer, tag(msg.run, c, false),
+                              comm_, &req.back());
+                    ++next_send;
                 }
-            });
-            for (std::size_t l = 0; l < fwd_send_.size(); ++l) {
-                const auto &pos = fwd_send_[l].positions;
-                for (std::size_t m = 0; m < pos.size(); ++m)
-                    std::copy_n(layer(b, inv_[pos[m]]) + cs[c], cl, slot(sbuf[l], pos.size(), c, m));
-                req.emplace_back();
-                MPI_Isend(slot(sbuf[l], pos.size(), c, 0), int(pos.size() * cl), MPI_DOUBLE, fwd_send_[l].rank, 100 + c,
-                          comm_, &req.back());
             }
+            // Columns of later foreign runs never update my rows (L is lower triangular in position order); every
+            // forward message to me has been received above.
         }
         MPI_Waitall(int(req.size()), req.data(), MPI_STATUSES_IGNORE);
     }
     // ---- diagonal ----
-    for (int j = j0_; j < j1_; ++j) {
-        const double inv = 1. / diag_[j];
-        double *yj = layer(b, inv_[j]);
-        split(len, [&](std::size_t from, std::size_t to) {
-            for (std::size_t t = from; t < to; ++t) yj[t] *= inv;
-        });
-    }
-    // ---- backward: for positions j descending, y_j -= L_ij y_i ----
+    for (const Run &run : runs_)
+        if (run.owner == me)
+            for (int j = run.first; j < run.end; ++j) {
+                const double inv = 1. / diag_[j];
+                double *yj = layer(b, inv_[j]);
+                split(len, [&](std::size_t from, std::size_t to) {
+                    for (std::size_t t = from; t < to; ++t) yj[t] *= inv;
+                });
+            }
+    // ---- backward: positions j descending, y_j -= L_ij y_i ----
     {
         auto rbuf = alloc(bwd_recv_), sbuf = alloc(bwd_send_);
-        std::map<int, std::pair<int, int>> where; // foreign row position -> (link, index)
+        std::map<int, std::pair<int, int>> where; // foreign row position -> (message, index)
         for (std::size_t l = 0; l < bwd_recv_.size(); ++l)
             for (std::size_t m = 0; m < bwd_recv_[l].positions.size(); ++m)
                 where[bwd_recv_[l].positions[m]] = {int(l), int(m)};
         std::vector<MPI_Request> req;
         for (int c = 0; c < C; ++c) {
             const std::size_t cl = cs[c + 1] - cs[c];
-            const double w0 = MPI_Wtime();
-            for (std::size_t l = 0; l < bwd_recv_.size(); ++l) {
-                const std::size_t np = bwd_recv_[l].positions.size();
-                MPI_Recv(slot(rbuf[l], np, c, 0), int(np * cl), MPI_DOUBLE, bwd_recv_[l].rank, 100000 + c, comm_,
-                         MPI_STATUS_IGNORE);
-            }
-            wait += MPI_Wtime() - w0;
-            split(cl, [&](std::size_t from, std::size_t to) {
-                for (int j = j1_ - 1; j >= j0_; --j) {
-                    double *yj = layer(b, inv_[j]) + cs[c];
-                    for (int k = outer_[j]; k < outer_[j + 1]; ++k) {
-                        const int i = inner_[k];
-                        if (i == j)
-                            continue;
-                        const double v = values_[k];
-                        const double *yi;
-                        if (owner_[inv_[i]] == me)
-                            yi = layer(b, inv_[i]) + cs[c];
-                        else {
-                            const auto [l, m] = where.at(i);
-                            yi = slot(rbuf[l], bwd_recv_[l].positions.size(), c, m);
-                        }
-                        for (std::size_t t = from; t < to; ++t) yj[t] -= v * yi[t];
-                    }
+            std::size_t next_recv = 0, next_send = 0;
+            for (int g = int(runs_.size()) - 1; g >= 0; --g) {
+                if (runs_[g].owner != me)
+                    continue;
+                while (next_recv < bwd_recv_.size() && bwd_recv_[next_recv].run > g) {
+                    const Message &msg = bwd_recv_[next_recv];
+                    const std::size_t np = msg.positions.size();
+                    const double w0 = MPI_Wtime();
+                    MPI_Recv(slot(rbuf[next_recv], np, c, 0), int(np * cl), MPI_DOUBLE, msg.peer, tag(msg.run, c, true),
+                             comm_, MPI_STATUS_IGNORE);
+                    wait += MPI_Wtime() - w0;
+                    ++next_recv;
                 }
-            });
-            for (std::size_t l = 0; l < bwd_send_.size(); ++l) {
-                const auto &pos = bwd_send_[l].positions;
-                for (std::size_t m = 0; m < pos.size(); ++m)
-                    std::copy_n(layer(b, inv_[pos[m]]) + cs[c], cl, slot(sbuf[l], pos.size(), c, m));
-                req.emplace_back();
-                MPI_Isend(slot(sbuf[l], pos.size(), c, 0), int(pos.size() * cl), MPI_DOUBLE, bwd_send_[l].rank,
-                          100000 + c, comm_, &req.back());
+                split(cl, [&](std::size_t from, std::size_t to) {
+                    for (int j = runs_[g].end - 1; j >= runs_[g].first; --j) {
+                        double *yj = layer(b, inv_[j]) + cs[c];
+                        for (int k = outer_[j]; k < outer_[j + 1]; ++k) {
+                            const int i = inner_[k];
+                            if (i == j)
+                                continue;
+                            const double v = values_[k];
+                            const double *yi;
+                            if (owner_[inv_[i]] == me)
+                                yi = layer(b, inv_[i]) + cs[c];
+                            else {
+                                const auto [l, m] = where.at(i);
+                                yi = slot(rbuf[l], bwd_recv_[l].positions.size(), c, m);
+                            }
+                            for (std::size_t t = from; t < to; ++t) yj[t] -= v * yi[t];
+                        }
+                    }
+                });
+                while (next_send < bwd_send_.size() && bwd_send_[next_send].run == g) {
+                    const Message &msg = bwd_send_[next_send];
+                    const std::size_t np = msg.positions.size();
+                    for (std::size_t m = 0; m < np; ++m)
+                        std::copy_n(layer(b, inv_[msg.positions[m]]) + cs[c], cl, slot(sbuf[next_send], np, c, m));
+                    req.emplace_back();
+                    MPI_Isend(slot(sbuf[next_send], np, c, 0), int(np * cl), MPI_DOUBLE, msg.peer, tag(msg.run, c, true),
+                              comm_, &req.back());
+                    ++next_send;
+                }
             }
         }
         MPI_Waitall(int(req.size()), req.data(), MPI_STATUSES_IGNORE);

@@ -243,6 +243,7 @@ public:
     Field linear_operator(const Field &x, double gamma) const;
     Field stabilization_load(const Field &a, const Vec &gamma, ElementWenoStats * = nullptr) const; // s_h^e(phi_i, a) per element
     Field solve_mass(Field rhs) const;
+    Field gradient(const Field &a, int direction) const { return projected_gradient(a, direction); } // M^-1 C_d a
     // Consistent mass times x (tensor product of the 1D Bernstein masses), any number of columns, no mirror sides.
     Field apply_mass(const Field &x) const;
     Field interpolate(const std::function<Vec(const V3 &)> &) const;

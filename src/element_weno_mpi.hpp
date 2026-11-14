@@ -19,7 +19,7 @@
 namespace m1pn {
 
 struct SlabPartition {
-    int ranks = 1, rank = 0, axis = 1, elements = 0, halo = 2; // global elements along the axis
+    int ranks = 1, rank = 0, axis = 1, elements = 0, halo = 6; // global elements along the axis
     std::vector<int> first;                                   // first[r]: first owned element of rank r (size ranks+1)
     int owned_first(int r) const { return first[r]; }
     int owned_end(int r) const { return first[r + 1]; }
@@ -56,12 +56,17 @@ class ElementWenoMpi : public DistributedHooks {
     // Global 1D mass factor (as in the ElementWeno constructor): CSC of L, D, perm (layer -> position), inverse.
     std::vector<int> outer_, inner_, perm_, inv_;
     std::vector<double> values_, diag_;
-    int j0_ = 0, j1_ = 0;                        // owned factor positions [j0, j1)
-    struct Link {
-        int rank;
+    // Runs of consecutive factor positions with one owner (global, in position order). The substitution processes
+    // them in this order (backward: reversed); after a run its owner sends the values other ranks need.
+    struct Run {
+        int owner, first, end;
+    };
+    std::vector<Run> runs_;
+    struct Message {
+        int run, peer;                           // global run index; peer = destination (send) or source (recv)
         std::vector<int> positions;              // ascending
     };
-    std::vector<Link> fwd_recv_, fwd_send_, bwd_recv_, bwd_send_;
+    std::vector<Message> fwd_send_, fwd_recv_, bwd_send_, bwd_recv_; // ordered by run (backward: descending)
     struct Range {
         int rank, layer0, layer1; // local layers [layer0, layer1)
     };

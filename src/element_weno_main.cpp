@@ -29,7 +29,7 @@ struct Args {
     bool projection_diagnostics = false, projection_hybrid = false, projection_high_order = false;
     int ghost_study = 0; // checkpoints of the ghost-estimator study (0: off)
     double ghost_study_filter = 16;
-    int mpi_halo = 2, mpi_chunks = 0; // MPI slab decomposition (src/element_weno_mpi.hpp)
+    int mpi_halo = 6, mpi_chunks = 0; // MPI slab decomposition (src/element_weno_mpi.hpp)
     std::string dump_state;           // binary dump of the final coefficients (rows, cols, row-major doubles)
 };
 Args parse(int argc, char **argv) {
