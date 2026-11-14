@@ -59,6 +59,8 @@ class ElementWenoMpi : public DistributedHooks {
     // default: one MPI thread, OpenMP tasks per block of whole lines; optional low-priority filler tasks
     void solve_axis_tasks(Field &b, int fillers = 0, const std::function<void(int)> *filler = nullptr) const;
     bool tasks_ = true;
+    bool static_ = true; // static block ownership with block buffers (default)
+    void solve_axis_static(Field &b, int fillers = 0, const std::function<void(int)> *filler = nullptr) const;
     // Partitioned (Schur) line solve, opt-in (M1PN_MPI_SCHUR=1): every rank solves its interior layers independently; the separator
     // layers (bandwidth b at the start of every rank r >= 1) form a small SPD system, assembled by one Allreduce and
     // solved on every rank; spikes W = M_II^-1 M_IS correct the interior. Same linear system, rounding differs
