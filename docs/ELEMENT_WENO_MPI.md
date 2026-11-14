@@ -55,22 +55,41 @@ Knoten ist gesperrt; `mpirun` startet trotzdem auf allen Knoten der Allokation.
 
 ## Messung (NX, Crossing-Studie 2D, Q1, T = 0.1, feste Schrittweite)
 
-Job 160224 (`nx/tmp/mpi_ucx5_20261114`, Commit in `commit.txt`, SHA256 der Binaries in `sha256.txt`). Ein Rang pro
-Sockel (32 Kerne), 2 Ränge pro Server. Alle Endzustände sind bitgleich zum Ein-Rang-Lauf.
+Job 160226 (`nx/tmp/mpi_ucx6_20261114`; Commit in `commit.txt`, SHA256 der Binaries in `sha256.txt`). Ein Prozess
+pro Sockel (32 Kerne), 2 Prozesse pro Server. **Alle Endzustände sind bitgleich zum Ein-Prozess-Lauf.**
 
-| Fall | 1 Rang | 2 Ränge (1 Server) | 4 Ränge (2 Server) | 6 Ränge (3 Server) |
+| Fall | 1 Sockel | 1 Server (2 Proz.) | 2 Server (4) | 3 Server (6) |
 |---|---|---|---|---|
-| E=512, N=15 | 59.2 s | 43.3 s (1.37×) | 27.3 s (2.17×) | 24.6 s (2.41×) |
-| E=512, N=31 | 218.5 s | 198.2 s (1.10×) | 246.8 s (0.89×) | 70.4 s (3.10×) |
-| E=1024, N=15 | 510.8 s | 425.0 s (1.20×) | 195.6 s (2.61×) | 143.7 s (3.56×) |
+| E=512, N=15 | 59.2 s | 45.9 s (1.29×) | 27.2 s (2.18×) | 23.1 s (2.56×) |
+| E=512, N=31 | 218.5 s | 143.3 s (1.52×) | 92.7 s (2.36×) | 67.8 s (3.22×) |
+| E=1024, N=15 | 510.8 s | 327.1 s (1.56×) | 200.5 s (2.55×) | 152.9 s (3.34×) |
 
-Zum Vergleich: ein Prozess mit 64 Threads auf einem ganzen Server braucht bei E=512, N=15 47.4 s.
+Ein Prozess mit 64 Threads auf einem ganzen Server: 47.4 s (E=512, N=15).
+
+**UCX-Rendezvous:** Die Pipeline sendet viele Nachrichten von einigen 10 KB aus einem Thread, der selten in MPI ist.
+Oberhalb der UCX-Standardschwelle (wenige KB) läuft das Rendezvous-Protokoll und kommt nur voran, wenn beide
+Seiten MPI aufrufen.
+
+| N=31, verkürzt (T = 0.02) | Zeit |
+|---|---|
+| 1 Sockel | 43.6 s |
+| 4 Prozesse, Standardschwelle | 49.4 s |
+| 4 Prozesse, `UCX_RNDV_THRESH=4mb` | 18.5 s |
+| 2 Prozesse, Standardschwelle | 39.8 s |
+| 2 Prozesse, `UCX_RNDV_THRESH=4mb` | 28.4 s |
+
+Weitere Diagnosen (`nx/tmp/mpi_diag_n31_20261114`):
+- mehr Blöcke: schlechter;
+- Transport `rc_x`: ohne Wirkung.
+
+Das Programm setzt daher `UCX_RNDV_THRESH` vor `MPI_Init`, sofern nicht gesetzt (jetzt 512 KB: die
+Pipeline-Nachrichten gehen eager, die MB-großen Halo-Pakete weiter per Rendezvous; mit 4 MB stieg der
+Halo-Austausch bei E=1024 von 6 auf 18 s).
 
 Bewertung:
-- Die lokalen Kerne skalieren nahezu ideal: Stabilisierung, Limiter und Rand teilen sich durch die Rangzahl.
-- Der Halo-Austausch kostet über InfiniBand 1.6–2 s; über TCP waren es 17–23 s.
-- Begrenzend ist die verteilte y-Linienlösung (Spalte `t_axis_solve_max` in `summary.json`).
-- Offen: Bei N=31 sind 2 und 4 Ränge auffällig langsam (Linienlösung 93 bzw. 183 s, 6 Ränge 33 s). Vermutet wird
-  ein Protokolleffekt großer Nachrichten (UCX-Rendezvous) in der Task-Pipeline; noch nicht untersucht.
-- Größere Gitter skalieren besser (E=1024: 3.56× auf 3 Servern), weil die Rechenarbeit pro Pipeline-Block mit
-  der Gittergröße wächst.
+- Die lokalen Kerne skalieren nahezu ideal.
+- Begrenzend bleibt die verteilte y-Linienlösung (`t_axis_solve_max`: E=512/N=15 etwa 10 s bei 4–6 Prozessen). Sie
+  ist sequenziell über die Rangkette und wird pipelined.
+- Nächster Hebel: die y-Lösung mit der lokalen Rechnung überlappen (x-Gradient, Stabilisierung).
+- Ältere Varianten (blockweise Thread-Aufteilung, je Thread eigene Kommunikation) sind per Umgebungsvariable
+  erreichbar (`M1PN_MPI_CHUNK_SPLIT`, `M1PN_MPI_THREADED_PIPELINE`), aber langsamer.
