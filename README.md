@@ -1,5 +1,17 @@
 # PN-Massenkorrektur im nativen M1PN-MCL-Solver
 
+> **Aktueller Stand und Standard (14.11.2026):** Branch `feature/boundary-positivity-projection`, Tag
+> `standard-20261114`. Element-WENO-Solver (`m1pn_element_weno`, bzw. `m1pn_fast --stabilization element-weno`) mit
+> - der **momententreuen Positivitätsprojektion am Rand** als Standard-Ghost (C6 nur noch mit `--c6-ghost`),
+>   Projektionsregel N+1, Warmstart mit Kaltstart-Retry ([docs/POSITIVITY_PROJECTION.md](docs/POSITIVITY_PROJECTION.md));
+> - dem **optimierten Randpfad und Zeitschritt** (separable Trace-Auswertung, Face-Zeilen, Thread-Skalierung, blockweises
+>   SpMM; 1.6–3.0× schneller als `bdd5d3f`, [results/positivity](results/positivity/README.md));
+> - den **Optimierungen aus dem DLRA-Zweig** (`846e6c9` schnelleres Setup/Initialisierung, `bdd5d3f` gebündelte
+>   Randprodukte), **ohne DLRA**: DLRA bleibt optional und ist standardmäßig aus (`--dlra off`).
+>
+> Verworfen und nicht Teil des Standards: adaptive PN-Ordnung (Branch gelöscht; auf NX bei 54–63 % aktiven Momenten
+> 1.2–1.4× langsamer als feste Ordnung), Projektion im Hochordnungs-Randfluss (`--projection-high-order`, schlechter).
+
 Isoliertes Experiment im eigenen Git-Repository, Branch
 `experiment/m1pn-pn-mass-correction`. Der eingefrorene Ausgangsstand steht
 unverändert in `baseline/src` (Manifest und Baseline-Commit `ce1e785`).
