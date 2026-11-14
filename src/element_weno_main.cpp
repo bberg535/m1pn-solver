@@ -1,5 +1,6 @@
 // Stand-alone driver for the element-based WENO variant.
 #include "element_weno.hpp"
+#include "element_weno_mpi.hpp"
 #include "hardware.hpp"
 #include <filesystem>
 #include <malloc.h>
@@ -28,6 +29,8 @@ struct Args {
     bool projection_diagnostics = false, projection_hybrid = false, projection_high_order = false;
     int ghost_study = 0; // checkpoints of the ghost-estimator study (0: off)
     double ghost_study_filter = 16;
+    int mpi_halo = 2, mpi_chunks = 0; // MPI slab decomposition (src/element_weno_mpi.hpp)
+    std::string dump_state;           // binary dump of the final coefficients (rows, cols, row-major doubles)
 };
 Args parse(int argc, char **argv) {
     Args a;
@@ -44,6 +47,9 @@ Args parse(int argc, char **argv) {
         else if (key == "--time") a.time = std::stod(next());
         else if (key == "--cfl") a.cfl = std::stod(next());
         else if (key == "--dt") a.dt = std::stod(next());
+        else if (key == "--mpi-halo") a.mpi_halo = std::stoi(next());
+        else if (key == "--mpi-chunks") a.mpi_chunks = std::stoi(next());
+        else if (key == "--dump-state") a.dump_state = next();
         else if (key == "--width") a.width = std::stod(next());
         else if (key == "--background") a.background = std::stod(next());
         else if (key == "--weno-linear") a.weno_linear = std::stod(next());
@@ -91,6 +97,18 @@ Args parse(int argc, char **argv) {
 }
 } // namespace
 int main(int argc, char **argv) {
+    int mpi_rank = 0, mpi_size = 1;
+#ifdef M1PN_MPI
+    {
+        int provided = 0;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+    }
+    struct Finalize {
+        ~Finalize() { MPI_Finalize(); }
+    } finalize;
+#endif
     // Large fields are reallocated every stage; keep them in the heap (as m1pn_fast does).
     mallopt(M_MMAP_MAX, 0);
     mallopt(M_TRIM_THRESHOLD, 1 << 30);
@@ -155,23 +173,39 @@ int main(int argc, char **argv) {
                                          {V3::UnitY(), p(x - t * V3::UnitY() - V3(.5, .3, 0))}};
             };
         }
-        ElementWeno scheme(pn, options, inflow);
+        // MPI: every rank integrates its slab (plus halo) of the global mesh; rank 0 evaluates the gathered final
+        // state with the unchanged serial code below (global scheme `post`).
+        std::unique_ptr<ElementWeno> holder;
+#ifdef M1PN_MPI
+        std::unique_ptr<ElementWenoMpi> mpi;
+        SlabPartition part;
+        if (mpi_size > 1) {
+            require(args.dimension >= 2 && !smooth && args.ghost_study == 0,
+                    "MPI runs: 2D/3D open problems (crossing-study, smooth-outflow), no ghost study");
+            const int D = args.dimension - 1;
+            part = slab_partition(args.elements, mpi_size, mpi_rank, D, args.mpi_halo);
+            holder = std::make_unique<ElementWeno>(pn, slab_options(options, part), inflow);
+            mpi = std::make_unique<ElementWenoMpi>(*holder, MPI_COMM_WORLD, part, args.mpi_chunks);
+        } else
+#endif
+            holder = std::make_unique<ElementWeno>(pn, options, inflow);
+        ElementWeno *sp = holder.get();
         for (int k = 0; k <= 8; ++k) // both problems have data even in the unresolved directions; verify the inflow
-            require(scheme.dropped_inflow(args.time * k / 8.) <= 1e-12, "Inflow is not even; use --no-angular-reduction");
+            require(sp->dropped_inflow(args.time * k / 8.) <= 1e-12, "Inflow is not even; use --no-angular-reduction");
         Field a;
         if (smooth) {
-            a = scheme.project_l2([&](const V3 &x) { return element_weno_smooth_exact(pn, x, 0); });
+            a = sp->project_l2([&](const V3 &x) { return element_weno_smooth_exact(pn, x, 0); });
         } else if (outflow) {
             Vec F = Vec::Zero(pn.q); // PN coefficients of f (fine rule; f is smooth)
             for (const auto &p : sphere_rule(2 * args.pn + 40))
                 F += p.weight * fdist(p.omega) * harmonics(pn.order, p.omega);
-            a = scheme.interpolate([&](const V3 &x) {
+            a = sp->interpolate([&](const V3 &x) {
                 Vec s = gauss2(x - ocenter) * F;
                 s[0] += bgo / std::sqrt(4 * pi);
                 return s;
             });
         } else {
-            a = scheme.interpolate([&](const V3 &x) {
+            a = sp->interpolate([&](const V3 &x) {
                 auto p = [&](const V3 &d) { return std::exp(-d.squaredNorm() / (2 * args.width * args.width)); };
                 Vec s = Vec::Zero(pn.q);
                 s[0] = args.background / std::sqrt(4 * pi);
@@ -180,7 +214,7 @@ int main(int argc, char **argv) {
                 return s;
             });
         }
-        const double step_limit = args.cfl * scheme.step_bound();
+        const double step_limit = args.cfl * sp->step_bound();
         const double requested = args.dt > 0 ? std::min(args.dt, step_limit) : step_limit;
         const int steps = std::max(1, int(std::ceil(args.time / requested - 1e-12)));
         const double dt = args.time / steps;
@@ -217,9 +251,9 @@ int main(int argc, char **argv) {
         std::array<std::array<double, 4>, E> study_err{}; // |d rho|, |d n.J|, |dJ|, |d (rho - n.J)|
         double study_scale = 0, study_points = 0;
         auto run_study = [&](const Field &state, double tt) {
-            const auto g = scheme.ghost_estimates(state, args.ghost_study_filter);
+            const auto g = sp->ghost_estimates(state, args.ghost_study_filter);
             for (std::size_t k = 0; k < g.node.size(); ++k) {
-                const V3 x = scheme.node_position(g.node[k]), n = scheme.side_normal(g.side[k]);
+                const V3 x = sp->node_position(g.node[k]), n = sp->side_normal(g.side[k]);
                 const Four ex = exact_half(x, n, tt);
                 study_scale += ex[0];
                 study_points += 1;
@@ -238,7 +272,7 @@ int main(int argc, char **argv) {
         double study_seconds = 0;
         for (int n = 0; n < steps; ++n) {
             const double step_start = seconds();
-            a = scheme.advance(t, dt, a, &stats);
+            a = sp->advance(t, dt, a, &stats);
             stats.t_advance += seconds() - step_start;
             t += dt;
             if (args.ghost_study > 0 && (n + 1) % std::max(1, steps / args.ghost_study) == 0) {
@@ -247,11 +281,37 @@ int main(int argc, char **argv) {
                 study_seconds += seconds() - s0;
             }
         }
-        const double wall = seconds() - start - study_seconds;
+        double wall = seconds() - start - study_seconds;
+        std::string mpi_json;
+#ifdef M1PN_MPI
+        if (mpi) {
+            wall = mpi->max(wall);
+            const double ts = mpi->max(mpi->t_solve), tx = mpi->max(mpi->t_exchange), tw = mpi->max(mpi->t_wait);
+            std::ostringstream m;
+            m << ",\"mpi\":{\"ranks\":" << mpi_size << ",\"halo\":" << args.mpi_halo << ",\"local_nodes_rank0\":"
+              << sp->nodes << ",\"t_axis_solve_max\":" << ts << ",\"t_exchange_max\":" << tx
+              << ",\"t_pipeline_wait_max\":" << tw << "}";
+            mpi_json = m.str();
+            Field global = mpi->gather(a);
+            mpi.reset(); // detaches from the local scheme
+            if (mpi_rank != 0)
+                return 0;
+            holder = std::make_unique<ElementWeno>(pn, options, inflow); // serial global scheme for the evaluation
+            sp = holder.get();
+            a = std::move(global);
+        }
+#endif
+        if (!args.dump_state.empty()) {
+            std::ofstream f(args.dump_state, std::ios::binary);
+            const long rows = a.rows(), cols = a.cols();
+            f.write(reinterpret_cast<const char *>(&rows), sizeof rows);
+            f.write(reinterpret_cast<const char *>(&cols), sizeof cols);
+            f.write(reinterpret_cast<const char *>(a.data()), std::streamsize(sizeof(double) * rows * cols));
+        }
         double error = -1;
         if (smooth) {
             const double final_time = t;
-            error = scheme.l2_density_error(a, [&](const V3 &x) {
+            error = sp->l2_density_error(a, [&](const V3 &x) {
                 return project(element_weno_smooth_exact(pn, x, final_time))[0];
             });
         }
@@ -281,7 +341,7 @@ int main(int argc, char **argv) {
             for (int j = 0; j < M; ++j)
                 for (int i = 0; i < M; ++i) {
                     const V3 x((i + .5) / M, (j + .5) / M, 0);
-                    const double d = project(scheme.evaluate(a, x))[0] - rho(x);
+                    const double d = project(sp->evaluate(a, x))[0] - rho(x);
                     all[j] += d * d / (double(M) * M);
                     if (std::max(x[0], x[1]) > .8)
                         strip[j] += d * d / (double(M) * M);
@@ -305,15 +365,15 @@ int main(int argc, char **argv) {
                 auto p = [w](const V3 &d) { return std::exp(-(d[0] * d[0] + d[1] * d[1]) / (2 * w * w)); };
                 return bg + p(x - c1) + p(x - c2);
             };
-            kinetic_error = scheme.l2_density_error(a, rho);
+            kinetic_error = sp->l2_density_error(a, rho);
             auto line = [w](double c) {
                 return w * std::sqrt(pi / 2) * (std::erf((1 - c) / (std::sqrt(2.) * w)) - std::erf(-c / (std::sqrt(2.) * w)));
             };
             exact_mass = bg + line(c1[0]) * line(c1[1]) + line(c2[0]) * line(c2[1]);
             // Error restricted to the outflow strip max(x, y) > 1 - 4 width (where the ghost acts).
             const double edge = 1 - 4 * w;
-            const double inner = std::pow(scheme.l2_density_error(a, [&](const V3 &x) {
-                return std::max(x[0], x[1]) > edge ? rho(x) : project(scheme.evaluate(a, x))[0];
+            const double inner = std::pow(sp->l2_density_error(a, [&](const V3 &x) {
+                return std::max(x[0], x[1]) > edge ? rho(x) : project(sp->evaluate(a, x))[0];
             }), 2);
             kinetic_error_outflow = std::sqrt(std::max(0., inner));
         }
@@ -327,27 +387,27 @@ int main(int argc, char **argv) {
                     for (int i = 0; i < n; ++i) {
                         V3 x(double(i) / (n - 1), args.dimension > 1 ? double(j) / (n - 1) : 0,
                              args.dimension > 2 ? double(k) / (n - 1) : 0);
-                        const Four u = project(scheme.evaluate(a, x));
+                        const Four u = project(sp->evaluate(a, x));
                         csv << x[0] << ',' << x[1] << ',' << x[2] << ',' << u[0] << ',' << u[1] << ',' << u[2] << ',' << u[3] << '\n';
                     }
         }
         double min_coefficient_density = std::numeric_limits<double>::infinity();
         double min_coefficient_margin = min_coefficient_density;
-        for (int i = 0; i < scheme.nodes; ++i) {
+        for (int i = 0; i < sp->nodes; ++i) {
             const Four u = project(a.row(i).transpose());
             min_coefficient_density = std::min(min_coefficient_density, u[0]);
             min_coefficient_margin = std::min(min_coefficient_margin, margin(u));
         }
         double total = 0;
-        for (int i = 0; i < scheme.nodes; ++i)
-            total += scheme.lumped[i] * project(a.row(i).transpose())[0];
+        for (int i = 0; i < sp->nodes; ++i)
+            total += sp->lumped[i] * project(a.row(i).transpose())[0];
         std::ostringstream summary;
         summary << std::setprecision(12) << "{\"problem\":\"" << args.problem << "\",\"pn_order\":" << args.pn
                 << ",\"degree\":" << args.degree << ",\"elements\":" << args.elements
                 << ",\"dimension\":" << args.dimension << ",\"steps\":" << steps << ",\"dt\":" << dt
                 << ",\"threads\":" << m1pn::default_threads().threads << ",\"thread_policy\":\""
                 << m1pn::default_threads().reason << "\""
-                << ",\"dt_bound\":" << scheme.dt_bound << ",\"high_order_step\":" << scheme.high_order_step() << ",\"wall_seconds\":" << wall
+                << ",\"dt_bound\":" << sp->dt_bound << ",\"high_order_step\":" << sp->high_order_step() << ",\"wall_seconds\":" << wall
                 << ",\"ghost_filter\":" << args.ghost_filter << ",\"l2_density_error\":" << error << ",\"final_mass\":" << total
                 << ",\"kinetic_l2_error\":" << kinetic_error << ",\"kinetic_l2_error_outflow_strip\":" << kinetic_error_outflow
                 << ",\"exact_mass\":" << exact_mass << ",\"boundary_outflow\":" << stats.boundary_outflow
@@ -403,11 +463,15 @@ int main(int argc, char **argv) {
                         << ",\"rho_minus_nJ\":" << study_err[e][3] / study_scale << "}";
             summary << "}";
         }
-        summary << "}";
+        summary << mpi_json << "}";
         std::ofstream(args.output + "/summary.json") << summary.str() << "\n";
         std::cout << summary.str() << std::endl;
     } catch (const std::exception &e) {
-        std::cerr << "error: " << e.what() << "\n";
+        std::cerr << "error (rank " << mpi_rank << "): " << e.what() << "\n";
+#ifdef M1PN_MPI
+        if (mpi_size > 1)
+            MPI_Abort(MPI_COMM_WORLD, 1);
+#endif
         return 1;
     }
     return 0;

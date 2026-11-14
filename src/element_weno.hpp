@@ -8,6 +8,7 @@
 // See docs/ELEMENT_WENO.md for the formulas and the choices made here.
 #include "boundary.hpp"
 #include "m1.hpp"
+#include <random>
 #include "positivity_projection.hpp"
 #include "separable_trace.hpp"
 #include <Eigen/SparseCholesky>
@@ -73,6 +74,9 @@ struct ElementWenoOptions {
     // consistent mass for those components), and the WENO neighbour across the mirror is the mirrored element.
     // At most one mirror side per direction; not with periodic meshes or the symmetric residual form.
     std::array<bool, 6> mirror{};
+    // MPI subdomains (src/element_weno_mpi.hpp): sides 2d + side that are internal cuts of the global mesh. No
+    // boundary faces there; the halo elements beyond belong to neighbouring ranks.
+    std::array<bool, 6> cut{};
     // M1 target instead of PN (diagnostic, docs/ELEMENT_HETEROGENEOUS.md): the high-order rate of (rho, J) is the
     // group-FE Galerkin rate -sum_d M^-1 C_d F^L_d of the nodal Levermore flux plus s_h, the closure difference
     // G = F^H - F^L is zero and the boundary keeps the low-order M1 flux (correction factor 0). Requires P1 and no
@@ -149,9 +153,30 @@ struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
 };
 class ElementWenoDlra;
+class ElementWenoMpi;
+// Hooks of a distributed (MPI) run, implemented by ElementWenoMpi. The scheme then lives on a slab of the global mesh
+// plus halo layers along `axis` (the last axis); `owned` marks the nodes this rank owns.
+struct DistributedHooks {
+    int axis = -1;
+    long node_offset = 0; // global id of local node 0 (local ids are global ids shifted along the last axis)
+    long global_nodes = 0;
+    virtual ~DistributedHooks() = default;
+    // Global line solve with the 1D mass along `axis`, in place on the owned rows of b (same arithmetic as serial).
+    virtual void solve_axis(Field &b) const = 0;
+    // Halo rows of f (rows = local nodes, any column count) from their owners.
+    virtual void exchange(Field &f) const = 0;
+    virtual double sum(double local) const = 0;
+    virtual double min(double local) const = 0;
+};
 class ElementWeno {
     friend class ElementWenoDlra; // factored (low-rank) evaluation of the same operators, src/element_weno_dlra.cpp
+    friend class ElementWenoMpi;
 public:
+    // Distributed run (null: serial). owned: one flag per local node.
+    void set_distributed(const DistributedHooks *hooks, std::vector<char> owned);
+    const std::vector<char> &owned() const { return owned_; }
+    bool is_owned(int i) const { return owned_.empty() || owned_[i]; }
+    Vec node_dt_bound; // lumped / rates per node (dt_bound is their minimum)
     ElementWeno(const Angular &, const ElementWenoOptions &, Inflow = {});
     const Angular &pn;
     ElementWenoOptions options;
@@ -367,6 +392,10 @@ private:
     // C6 ghost state; ghost_of_face_ maps (face, face node) to such a pair.
     std::vector<int> boundary_slot_, boundary_nodes_, ghost_node_, ghost_side_, ghost_of_face_;
     mutable double spectral_radius_ = -1;
+    const DistributedHooks *dist_ = nullptr;
+    std::vector<char> owned_;
+    void distributed_random(Field &x, std::mt19937 &rng, std::uniform_real_distribution<double> &u) const;
+    Mat m1_reference_; // 1D reference element mass (the global line factor of the MPI layer is assembled from it)
 };
 // PN moments of the reflected distribution psi(R_d omega): moments odd under x_d -> -x_d change sign.
 Vec reflect_pn(const Angular &, const Vec &full, int direction);

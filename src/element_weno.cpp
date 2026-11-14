@@ -421,7 +421,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                         e + ((next + count[d]) % count[d] - id[d]) * powers[d];
                 else if (o.mirror[2 * d + side])
                     neighbors_[e * 2 * dimension + 2 * d + side] = -2; // the mirrored element itself
-                else
+                else if (!o.cut[2 * d + side])
                     faces_.push_back({e, d, side});
             }
     }
@@ -475,6 +475,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                     if (o.periodic)
                         a %= n1, b %= n1;
                     triplets.emplace_back(a, b, h * m1(i, j));
+                    m1_reference_ = m1;
                     entries.emplace_back(a, b, c1(i, j));
                 }
         m1d[d].resize(n1, n1);
@@ -880,7 +881,8 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             rates[connectivity_[f.element * local_nodes + rule.local[n]]] +=
                 (rule.shape.row(n).transpose().array() * rule.weights.array()).sum();
     }
-    dt_bound = (lumped.array() / rates.array()).minCoeff();
+    node_dt_bound = lumped.array() / rates.array();
+    dt_bound = node_dt_bound.minCoeff();
     total_viscosity_ = viscosity_ij_.rowwise().sum();
     node_offsets_.assign(nodes + 1, 0);
     for (int entry = 0; entry < cells * local_nodes; ++entry)
@@ -978,7 +980,38 @@ void ElementWeno::solve_line(const LineFactor &f, double *work, int q) const {
         }
     }
 }
+void ElementWeno::set_distributed(const DistributedHooks *hooks, std::vector<char> owned) {
+    require(!hooks || (int(owned.size()) == nodes && !options.periodic && !options.symmetric_residual &&
+                       std::none_of(mirror_index_.begin(), mirror_index_.end(), [](int m) { return m >= 0; })),
+            "Distributed element WENO: open mesh without mirror sides and with the standard residual");
+    dist_ = hooks;
+    owned_ = std::move(owned);
+    spectral_radius_ = -1;
+    if (dist_) {
+        double m = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < nodes; ++i)
+            if (owned_[i])
+                m = std::min(m, node_dt_bound[i]);
+        dt_bound = dist_->min(m);
+    }
+}
+void ElementWeno::distributed_random(Field &x, std::mt19937 &rng, std::uniform_real_distribution<double> &u) const {
+    // The serial start vector draws node by node in global order; skip the draws of the nodes before this slab.
+    const long skip = dist_->node_offset * long(moments);
+    for (long k = 0; k < skip; ++k)
+        u(rng);
+    for (int i = 0; i < nodes; ++i)
+        for (int c = 0; c < moments; ++c)
+            x(i, c) = u(rng);
+    const long rest = (dist_->global_nodes - dist_->node_offset - nodes) * long(moments);
+    for (long k = 0; k < rest; ++k)
+        u(rng);
+}
 void ElementWeno::solve_lines(Field &b, int d, bool gradient) const {
+    if (dist_ && d == dist_->axis) {
+        dist_->solve_axis(b);
+        return;
+    }
     const int q = b.cols(), s = stride(d), per_direction = nodes_per_axis[d], lines = nodes / per_direction;
     const LineFactor &natural = natural_[d];
     if (mirror_index_[d] < 0 || q != moments) {
@@ -1072,6 +1105,26 @@ Field ElementWeno::projected_gradient(const Field &a, int d) const {
     const int *outer = convection_1d_[d].outerIndexPtr(), *inner = convection_1d_[d].innerIndexPtr();
     const double *value = convection_1d_[d].valuePtr();
     const double *data = a.data();
+    if (dist_ && d == dist_->axis) {
+        // Distributed axis: the banded product C_1d along the line (same summation order as below), the global line
+        // solve on the owned rows, then the halo rows from their owners.
+        parallel_for(lines, [&](int line) {
+            const int start = (line / s) * (s * per_direction) + line % s;
+            for (int k = 0; k < per_direction; ++k) {
+                double *__restrict y = &out.coeffRef(start + k * s, 0);
+                std::fill_n(y, q, 0.);
+                for (int e = outer[k]; e < outer[k + 1]; ++e) {
+                    const double c = value[e];
+                    const double *x = data + std::size_t(start + inner[e] * s) * q;
+#pragma omp simd
+                    for (int j = 0; j < q; ++j) y[j] += c * x[j];
+                }
+            }
+        });
+        dist_->solve_axis(out);
+        dist_->exchange(out);
+        return out;
+    }
     if (mirror_index_[d] >= 0 && q == moments) {
         // Mirror in d: the banded product C_1d along d, then the split natural/Dirichlet solve.
         parallel_for(lines, [&](int line) {
@@ -1846,6 +1899,8 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
         for (int d = 0; d < dimension; ++d)
             add_flux_rows(flux_t_[d], gradient[d], -1., high_rate);
     parallel_for(nodes, [&](int i) { moment_rate.row(i) = project(high_rate.row(i).transpose()).transpose(); });
+    if (dist_ && !options.m1_target)
+        dist_->exchange(moment_rate); // the limiter of owned nodes reads the halo rows
     if (options.m1_target)
         for (int d = 0; d < dimension; ++d)
             moment_rate -= projected_gradient(Field(low_flux.middleCols(4 * d, 4)), d);
@@ -2083,7 +2138,8 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
         for (int k = 0; k < nb; ++k) {
             if (boundary_area[boundary_nodes_sorted_[k]] <= 0)
                 continue;
-            boundary_mass_rate += node_mass[k];
+            if (is_owned(boundary_nodes_sorted_[k]))
+                boundary_mass_rate += node_mass[k];
             if (options.limit) {
                 min_boundary = std::min(min_boundary, node_theta[k]);
                 limited_boundary += node_theta[k] < 1;
@@ -2108,7 +2164,7 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
             stats->outward_bars += outward[e];
         }
         stats->min_boundary_limiter = std::min(stats->min_boundary_limiter, min_boundary);
-        stats->last_boundary_mass_rate = boundary_mass_rate;
+        stats->last_boundary_mass_rate = dist_ ? dist_->sum(boundary_mass_rate) : boundary_mass_rate;
         stats->sign_limited_nodes += sign_limited;
         stats->min_sign_factor = std::min(stats->min_sign_factor, min_sign);
         stats->limited_boundary_nodes += limited_boundary;
@@ -2134,20 +2190,36 @@ double ElementWeno::high_order_step() const {
         std::mt19937 rng(12345);
         std::uniform_real_distribution<double> uniform(-1, 1);
         double radius = 0;
+        // Distributed: the norms over the owned rows (global sums), the start vector of the same random sequence over
+        // the global node order (rank-independent; equal to serial up to the summation order of the norms).
+        auto norm = [&](const Field &f) {
+            if (!dist_)
+                return f.norm();
+            double s2 = 0;
+            for (int i = 0; i < nodes; ++i)
+                if (owned_[i])
+                    s2 += f.row(i).squaredNorm();
+            return std::sqrt(dist_->sum(s2));
+        };
         for (double gamma_value : {0., 1.}) {
             Field x(nodes, moments);
-            for (int i = 0; i < nodes; ++i)
-                for (int c = 0; c < moments; ++c)
-                    x(i, c) = uniform(rng);
-            x /= x.norm();
+            if (!dist_) {
+                for (int i = 0; i < nodes; ++i)
+                    for (int c = 0; c < moments; ++c)
+                        x(i, c) = uniform(rng);
+            } else
+                distributed_random(x, rng, uniform);
+            x /= norm(x);
             const int iterations = 60;
             for (int k = 0; k < iterations; ++k) {
                 Field y = linear_operator(x, gamma_value);
-                const double growth = y.norm();
+                const double growth = norm(y);
                 require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed");
                 if (k >= iterations - 15)
                     radius = std::max(radius, growth);
                 x = y / growth;
+                if (dist_)
+                    dist_->exchange(x);
             }
         }
         spectral_radius_ = radius;
@@ -2347,6 +2419,8 @@ Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, El
     // Effective weights of the stage rates: u^{n+1} = u^n + dt (L1 + L2 + 4 L3) / 6 (boundary mass ledger).
     auto stage = [&](double t, const Field &x, double old, double fresh, double weight) {
         Field r = rate(t, x, stats);
+        if (dist_)
+            dist_->exchange(r); // halo rows of the stage = the owners' values (deterministic, no garbage)
         if (stats)
             stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
         const double combine_start = seconds();
@@ -2372,6 +2446,8 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
     // Effective weights: u^{n+1} = u^n + dt (L1 + L2 + L3 + 3 L4) / 6.
     auto stage = [&](double t, const Field &x, double old, double fresh, double weight) {
         Field r = rate(t, x, stats);
+        if (dist_)
+            dist_->exchange(r); // halo rows of the stage = the owners' values (deterministic, no garbage)
         if (stats)
             stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
         const double combine_start = seconds();
