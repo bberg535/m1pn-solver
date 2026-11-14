@@ -19,7 +19,7 @@
 namespace m1pn {
 
 struct SlabPartition {
-    int ranks = 1, rank = 0, axis = 1, elements = 0, halo = 6; // global elements along the axis
+    int ranks = 1, rank = 0, axis = 1, elements = 0, halo = 2; // global elements along the axis
     std::vector<int> first;                                   // first[r]: first owned element of rank r (size ranks+1)
     int owned_first(int r) const { return first[r]; }
     int owned_end(int r) const { return first[r + 1]; }
@@ -46,12 +46,15 @@ class ElementWenoMpi : public DistributedHooks {
     // Owned rows (global ids, row-major data) gathered to rank 0 in global order; empty on other ranks.
     Field gather(const Field &f, std::vector<long> *ids = nullptr) const;
     mutable double t_solve = 0, t_exchange = 0, t_wait = 0;
+    bool threaded() const { return thread_multiple_; }
 
   private:
     ElementWeno &s_;
     MPI_Comm comm_;
     SlabPartition part_;
     int p_ = 1, layer_size_ = 0, L0_ = 0, layers_ = 0, O0_ = 0, O1_ = 0, chunks_ = 1;
+    bool thread_multiple_ = false; // MPI_THREAD_MULTIPLE: every thread pipelines its own column blocks
+    void solve_axis_threaded(Field &b) const;
     std::vector<int> owner_;                     // global layer -> rank
     // Global 1D mass factor (as in the ElementWeno constructor): CSC of L, D, perm (layer -> position), inverse.
     std::vector<int> outer_, inner_, perm_, inv_;

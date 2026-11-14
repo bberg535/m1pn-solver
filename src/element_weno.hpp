@@ -61,6 +61,9 @@ struct ElementWenoOptions {
     bool reduce_angular = false;
     // Domain origin + [0, length]^d (default: the unit cube).
     V3 origin = V3::Zero();
+    // MPI subdomains: global element index of local element 0 per axis. Positions are computed from the global
+    // index (origin + global * h), so a slab reproduces the serial coordinates bit for bit.
+    std::array<int, 3> element_offset{};
     double length = 1;
     // Optional element counts per axis (0 = `elements`). Cells stay cubic with h = length / count[0], so the
     // box is origin + [0, h count[0]] x [0, h count[1]] x [0, h count[2]] (e.g. 150 x 50 x 50 for the shadow

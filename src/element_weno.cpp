@@ -938,7 +938,7 @@ void ElementWeno::element_origin(int element, V3 &origin) const {
     origin = V3::Zero();
     int x = element;
     for (int d = 0; d < dimension; ++d) {
-        origin[d] = options.origin[d] + (x % count[d]) * h;
+        origin[d] = options.origin[d] + (options.element_offset[d] + x % count[d]) * h;
         x /= count[d];
     }
 }
@@ -946,7 +946,7 @@ V3 ElementWeno::node_position(int node) const {
     V3 x = V3::Zero();
     int value = node;
     for (int d = 0; d < dimension; ++d) {
-        x[d] = options.origin[d] + (value % nodes_per_axis[d]) * h / degree;
+        x[d] = options.origin[d] + (options.element_offset[d] * degree + value % nodes_per_axis[d]) * h / degree;
         value /= nodes_per_axis[d];
     }
     return x;
@@ -2618,7 +2618,7 @@ Vec ElementWeno::evaluate(const Field &a, const V3 &x) const {
     int element = 0, scale = 1;
     Vec ref(dimension);
     for (int d = 0; d < dimension; ++d) {
-        double s = (x[d] - options.origin[d]) / h;
+        double s = (x[d] - options.origin[d]) / h - options.element_offset[d];
         int id = std::min(count[d] - 1, std::max(0, int(std::floor(s))));
         ref[d] = s - id;
         element += id * scale;
