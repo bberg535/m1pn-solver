@@ -25,7 +25,7 @@ struct Args {
     double projection_tolerance = 1e-12, projection_incoming_weight = 1;
     bool projection_half_range = false;
     double ghost_filter = 0;
-    bool projection_diagnostics = false, projection_hybrid = false;
+    bool projection_diagnostics = false, projection_hybrid = false, projection_high_order = false;
     int ghost_study = 0; // checkpoints of the ghost-estimator study (0: off)
     double ghost_study_filter = 16;
 };
@@ -66,6 +66,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--projection-incoming-weight") a.projection_incoming_weight = std::stod(next());
         else if (key == "--ghost-filter") a.ghost_filter = std::stod(next());
         else if (key == "--projection-diagnostics") a.projection_diagnostics = true;
+        else if (key == "--projection-high-order") a.projection_high_order = true; // z* also in the PN boundary flux
         else if (key == "--ghost-study") a.ghost_study = std::stoi(next());
         else if (key == "--ghost-study-filter") a.ghost_study_filter = std::stod(next());
         else if (key == "--projection-mode") {
@@ -123,6 +124,7 @@ int main(int argc, char **argv) {
         options.ghost_filter = args.ghost_filter;
         options.projection_diagnostics = args.projection_diagnostics;
         options.projection_hybrid = args.projection_hybrid;
+        options.projection_high_order = args.projection_high_order;
         options.projection_rule = args.projection_rule;
         options.projection_tolerance = args.projection_tolerance;
         const bool smooth = args.problem == "smooth";

@@ -85,7 +85,24 @@ verschiebt über ξ·m auch die auslaufenden Werte, sobald die einlaufende Hälf
 und es wird öfter limitiert (glatter Ausfluss, E=32, N=7, Q1: 711 statt 452 limitierte Randknoten), was am
 Ausflussrand diffundiert. Beim Crossing wird ohnehin limitiert, dort hilft der bessere Tiefordnungszustand; bei N=15
 ist der Trace positiv (Identität, kein Unterschied). Konsequenz: den Gewinn hebt erst ein Hochordnungsrandfluss, der
-für die auslaufende Hälfte ebenfalls z* statt ψ_N verwendet (offen).
+für die auslaufende Hälfte ebenfalls z* statt ψ_N verwendet.
+
+**Getestet (14.11.2026, Option `projection_high_order`, CLI `--projection-high-order`, Standard aus).** Der
+PN-Randfluss ist kein Halbraumintegral, sondern der charakteristische LLF/C1-Fluss ½(A_n − I)(u − ext(u, d)) mit
+ext = exterior_map·u + Datenanteil. Konsistente Übertragung: im Außenzustand ũ = u + δ statt u, mit
+δ = Σ_k w_k Y(Ω_k)(z*_k − y_k) (+ Atom), d. h. die L2-Projektion der Korrektur (δ = 0 bei Identität, M1-Momente von δ
+null; Σ w Y Yᵀ = I auf 1e−15 geprüft). Zusatzterm −(llf_homogeneous − ½(A_n + I)) δ, nur an projizierten Knoten.
+Ergebnis (E=32, Q1, kin. L2-Fehler; C6 / Projektion / Projektion+HO):
+
+| Problem | N=3 | N=7 |
+|---|---|---|
+| glatter Ausfluss T=0.6 | 1.5065e−2 / 1.4997e−2 / 1.5338e−2 | 2.2593e−3 / 2.2720e−3 / 2.3944e−3 |
+| Crossing T=0.8 | 6.5006e−2 / 6.4986e−2 / 6.5769e−2 | 2.3610e−2 / 2.2360e−2 / 2.5779e−2 |
+
+Die Variante ist durchweg schlechter, obwohl sie beim Crossing die Limitierung senkt (40529 statt 46033 limitierte
+Randknoten). Deutung: der charakteristische Fluss soll die auslaufenden Charakteristiken des **PN-Zustands** selbst
+transportieren; ersetzt man sie durch die der positiven Rekonstruktion, ist der PN-Ausfluss nicht mehr konsistent
+mit der PN-Lösung im Inneren (O(δ)-Störung). Verworfen; der Ghost bleibt ein reiner Tiefordnungsbaustein.
 
 **Regel:** N+1 je Halbkugel liefert dieselben Ghost-Momente und Lösungen wie 2N+1 und 4N+3 (3–4 Stellen) bei
 2.5–3× geringeren Kosten und ist seitdem Standard (`--projection-rule` überschreibt); Aufpreis im Gesamtsolver damit

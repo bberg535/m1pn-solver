@@ -112,6 +112,11 @@ struct ElementWenoOptions {
     // Hybrid: C6 ghost where admissible (a_ext <= b); the projection replaces only the C6 cone scaling cases.
     bool projection_hybrid = false; // also evaluate the C6 ghost and record its distance (slower)
     bool projection_warm_start = true; // start Newton from the node's last multiplier (iteration count only)
+    // Projected exterior state also in the PN high-order boundary flux: the LLF/C1 exterior state uses
+    // u~ = u + delta, delta = sum_k w_k Y(Omega_k) (z*_k - y_k) (+ atom), instead of the trace u. delta has zero
+    // M1 moments (moment consistency of the rule), vanishes for identity projections, and changes the face
+    // integrand by -(llf_homogeneous - (A_n + I)/2) delta. Full projection mode only.
+    bool projection_high_order = false;
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -357,6 +362,7 @@ private:
     std::array<Mat, 6> boundary_flux_t_; // (A_n - llf_homogeneous)^T per face side (active moments)
     std::vector<char> parity_odd_;       // odd under the reflections of the angular reduction (full index)
     std::array<Mat, 6> datum_t_;         // llf_datum^T restricted to the active moments (r x moments)
+    std::array<Mat, 6> exterior_t_;      // (llf_homogeneous - (A_n + I)/2)^T (projection_high_order)
     // Boundary nodes (compact row index of the PN boundary load) and the distinct (side, node) pairs of the
     // C6 ghost state; ghost_of_face_ maps (face, face node) to such a pair.
     std::vector<int> boundary_slot_, boundary_nodes_, ghost_node_, ghost_side_, ghost_of_face_;

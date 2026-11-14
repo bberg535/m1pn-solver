@@ -803,6 +803,12 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 // Face integrand .5 (A_n - I)(u - exterior(u, datum)) = (A_n - llf_homogeneous) u - llf_datum datum.
                 boundary_flux_t_[2 * d + side] =
                     restrict_square(pn.normal(normal) - boundaries_[2 * d + side]->llf_homogeneous, "boundary flux").transpose();
+                if (options.projection_high_order)
+                    exterior_t_[2 * d + side] =
+                        restrict_square(boundaries_[2 * d + side]->llf_homogeneous -
+                                            .5 * (pn.normal(normal) + Mat::Identity(pn.q, pn.q)),
+                                        "exterior flux")
+                            .transpose();
                 {
                     const Mat &datum = boundaries_[2 * d + side]->llf_datum;
                     datum_t_[2 * d + side].resize(datum.cols(), moments);
@@ -1375,6 +1381,15 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     popt.tolerance = options.projection_tolerance;
     // Per-thread statistics, merged after the loop (parallel_for gives no reduction).
     std::vector<PositivityProjectionStats> pstats(project ? std::max(1, max_threads()) : 0);
+    // projection_high_order: delta of the exterior PN state per ghost pair (zero rows: identity / C6).
+    const bool high_exterior = project && options.projection_high_order && !options.projection_half_range &&
+                               !options.projection_hybrid && !skip_high;
+    Field delta;
+    std::vector<char> has_delta;
+    if (high_exterior) {
+        delta.resize(ghost_node_.size(), moments);
+        has_delta.assign(ghost_node_.size(), 0);
+    }
     // Ghost moments of pair k from the PN trace psi at the points of out_rules_[side].
     auto ghost_pair = [&](int k, const Vec &psi) {
         const int side_id = ghost_side_[k], node = ghost_node_[k];
@@ -1463,6 +1478,19 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 if (m[0] > U[0] * (1 + 64 * std::numeric_limits<double>::epsilon())) {
                     ++ps.capped;
                     m *= U[0] > 0 ? U[0] / m[0] : 0.;
+                }
+                if (high_exterior && !r.identity) {
+                    thread_local Vec diff;
+                    diff.resize(q);
+                    for (int j = 0; j < q; ++j)
+                        diff[j] = out.weight[j] * (z[j] - psi[j]);
+                    delta.row(k).noalias() = (out.harmonics.transpose() * diff).transpose();
+                    if (o.augmented && o.atom[0] != 0) {
+                        const Vec y = harmonics(pn.order, V3(o.atom_direction));
+                        for (int c = 0; c < moments; ++c)
+                            delta(k, c) += o.atom[0] * y[active[c]];
+                    }
+                    has_delta[k] = 1;
                 }
             } else {
                 ++ps.failures;
@@ -1554,6 +1582,15 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     Vec AR(face_rows), IN(face_rows);
     if (!skip_high)
         G.resize(face_rows, moments);
+    Field K; // face rows of delta (projection_high_order)
+    std::vector<char> face_delta;
+    if (high_exterior) {
+        K.resize(face_rows, moments);
+        face_delta.assign(6, 0);
+        for (std::size_t k = 0; k < has_delta.size(); ++k)
+            if (has_delta[k])
+                face_delta[ghost_side_[k]] = 1;
+    }
     std::vector<char> face_datum(faces_.size(), 0);
     parallel_for(int(faces_.size()), [&](int index) {
         const auto &f = faces_[index];
@@ -1648,6 +1685,19 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         for (int n = 0; n < nf; ++n)
             traces.row(n) = a.row(global[n]);
         G.middleRows(r0, nf).noalias() = rule.mass * traces;
+        if (high_exterior) {
+            bool any = false;
+            for (int n = 0; n < nf; ++n)
+                if (has_delta[ghost_id[n]]) {
+                    traces.row(n) = delta.row(ghost_id[n]);
+                    any = true;
+                } else
+                    traces.row(n).setZero();
+            if (any)
+                K.middleRows(r0, nf).noalias() = rule.mass * traces;
+            else
+                K.middleRows(r0, nf).setZero();
+        }
     });
     const double faces_done = seconds();
     if (projection)
@@ -1674,6 +1724,8 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             H.middleRows(r, n).noalias() = G.middleRows(r, n).lazyProduct(boundary_flux_t_[side]);
             if (!datum_zero[side])
                 H.middleRows(r, n).noalias() -= D.middleRows(r, n).lazyProduct(datum_t_[side]);
+            if (high_exterior && face_delta[side])
+                H.middleRows(r, n).noalias() -= K.middleRows(r, n).lazyProduct(exterior_t_[side]);
         });
     }
     const double products_done = seconds();
