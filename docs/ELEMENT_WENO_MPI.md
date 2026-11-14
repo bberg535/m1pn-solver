@@ -90,6 +90,11 @@ Bewertung:
 - Die lokalen Kerne skalieren nahezu ideal.
 - Begrenzend bleibt die verteilte y-Linienlösung (`t_axis_solve_max`: E=512/N=15 etwa 10 s bei 4–6 Prozessen). Sie
   ist sequenziell über die Rangkette und wird pipelined.
-- Nächster Hebel: die y-Lösung mit der lokalen Rechnung überlappen (x-Gradient, Stabilisierung).
+- Überlappen der y-Pipeline mit den x-Gradienten (Füllaufgaben niedriger Priorität, Job 160228, `mpi_ucx7`): 0–3 %
+  (E=512/N=15, 6 Prozesse: 23.1 → 22.3 s; E=1024: 152.9 → 151.3 s), bitgleich. Mit Schwelle 512 KB sinkt der
+  Halo-Austausch bei E=1024 wieder (4 Prozesse: 16 → 8 s).
+- Grenze der bitgleichen Variante: Die y-Substitution ist eine sequenzielle Kette über alle Ränge (Reihenfolge der
+  seriellen Faktorisierung). Mehr Skalierung bräuchte einen parallelen Partitionslöser (z. B. SPIKE oder Schur auf
+  den Schnittstellen). Er ist mathematisch dieselbe Lösung, aber nur bis auf Rundung gleich (rangabhängig).
 - Ältere Varianten (blockweise Thread-Aufteilung, je Thread eigene Kommunikation) sind per Umgebungsvariable
   erreichbar (`M1PN_MPI_CHUNK_SPLIT`, `M1PN_MPI_THREADED_PIPELINE`), aber langsamer.
