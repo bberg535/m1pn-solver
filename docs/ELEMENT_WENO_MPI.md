@@ -117,3 +117,44 @@ Das Gleichungssystem ist dasselbe, die Rundung ist eine andere.
   Abschnitt 3).
 - Eine 1e-8-Vorgabe gegenüber dem seriellen Lauf hält über lange Läufe nur die bitgleiche Pipeline ein. Sie bleibt
   Standard.
+
+## 3D (Zerlegung entlang z, Job 160239, `nx/tmp/mpi_3d_20261114`)
+
+Crossing-Studie in 3D (Pulse bei z = 0.5, ohne kinetische Fehlermaße), Q1, ohne Winkelreduktion (N=7: 64,
+N=15: 256 Momente). Alle Endzustände sind bitgleich zum Ein-Prozess-Lauf.
+
+| Fall | 1 Prozess | 1 Server | 2 Server | 3 Server |
+|---|---|---|---|---|
+| E=64³, N=7, T=0.3 | 66.1 s | 47.6 (1.39×) | 34.0 (1.94×) | 30.1 (2.20×) |
+| E=96³, N=7, T=0.2 | 200.6 s | 129.4 (1.55×) | 80.5 (2.49×) | 63.9 (3.14×) |
+| E=64³, N=15, T=0.3 | 209.4 s | 148.7 (1.41×) | 103.6 (2.02×) | 82.9 (2.53×) |
+
+## Nadelöhr y-/z-Kette (Untersuchung 14.11.2026, Kurzläufe T = 0.02, E=512)
+
+| Variante | N=15, 4 Proz. | N=15, 6 Proz. | N=31, 4 Proz. | N=31, 6 Proz. | Ergebnis |
+|---|---|---|---|---|---|
+| Task-Pipeline, gleich große Blöcke | 5.87 | 4.75 | 18.2 | 13.7 | Basis |
+| Trapez-Blöcke (klein am Anfang und Ende) | 5.37 | 4.55 | 19.4 | 13.9 | neutral bis −9 % |
+| 48 / 192 Blöcke | 5.80 / 6.67 | 4.69 / 6.07 | 20.1 / 17.3 | 15.7 / 13.0 | uneinheitlich |
+| `OMP_WAIT_POLICY=active`, `GOMP_SPINCOUNT` | −13 % | 0 | −5 % | 0 | kaum |
+| feste Block-Zuordnung, Blockpuffer | 5.54 | 4.38 | 18.8 | 14.1 | wie Tasks |
+| + dauerhafte Puffer (Standard) | – | 3.95 | – | – | −10 % |
+
+Profil (Rang 0, N=15, 786 Lösungen):
+
+| | 2 Prozesse | 6 Prozesse |
+|---|---|---|
+| Hauptschleife | 3.5 s | 2.2 s |
+| Rechenzeit, Summe über 31 Arbeiter | 59.8 s | 12.7 s |
+| ideal (Summe / 31) | 1.9 s | 0.41 s |
+| Auslastung der Kette | 55 % | 19 % |
+
+Befund:
+1. Die verteilte Substitution kostet pro Wert mehr als die serielle. Seriell wird jede Linie in einem Zug im Cache
+   gelöst; verteilt liegt zwischen Vorwärts- und Rückwärtsschritt die Wartezeit auf die anderen Ränge, und die
+   Daten fallen aus L2/L3.
+2. Mit wachsender Rangzahl dominiert die Weitergabe durch 2·P Stationen pro Block. Sie skaliert nicht.
+
+Bitgleich ist mit dieser Kette nach heutigem Stand höchstens etwa 10–20 % mehr drin. Der parallele Schur-Löser
+skaliert besser im Rechenteil, verliert aber an der Allreduce ganzer Schichten und hält 1e-8 über lange Läufe nicht.
+Eine 2D-Zerlegung (x und y) würde beide Richtungen ketten und hilft nicht.
