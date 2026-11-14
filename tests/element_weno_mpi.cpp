@@ -3,6 +3,7 @@
 #include "element_weno_mpi.hpp"
 #include <cstdio>
 #include <random>
+#include <string>
 using namespace m1pn;
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
@@ -10,6 +11,35 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     int failures = 0;
+    if (argc > 1 && std::string(argv[1]) == "bench") { // bench E pn reps: serial vs distributed mass solve timing
+        const int E = std::stoi(argv[2]), N = std::stoi(argv[3]), reps = std::stoi(argv[4]);
+        Angular pn(N);
+        ElementWenoOptions o;
+        o.degree = 1, o.dimension = 2, o.elements = E, o.periodic = false;
+        const SlabPartition part = slab_partition(E, size, rank, 1, 6);
+        ElementWeno local(pn, slab_options(o, part));
+        ElementWenoMpi mpi(local, MPI_COMM_WORLD, part);
+        Field l = Field::Random(local.nodes, local.moments);
+        MPI_Barrier(MPI_COMM_WORLD);
+        double t0 = MPI_Wtime();
+        for (int k = 0; k < reps; ++k) { Field r = local.solve_mass(l); }
+        const double tl = mpi.max(MPI_Wtime() - t0);
+        Field x = l;
+        t0 = MPI_Wtime();
+        for (int k = 0; k < reps; ++k) mpi.solve_axis(x);
+        const double ta = mpi.max(MPI_Wtime() - t0);
+        if (rank == 0) {
+            ElementWeno global(pn, o);
+            Field g = Field::Random(global.nodes, global.moments);
+            t0 = MPI_Wtime();
+            for (int k = 0; k < reps; ++k) { Field r = global.solve_mass(g); }
+            const double tg = MPI_Wtime() - t0;
+            std::printf("E=%d q=%d ranks=%d: serial solve_mass %.4f s/call, distributed solve_mass %.4f s/call, axis solve only %.4f s/call (wait %.4f)\n",
+                        E, global.moments, size, tg / reps, tl / reps, ta / reps, mpi.t_wait / (2 * reps));
+        }
+        MPI_Finalize();
+        return 0;
+    }
     for (int degree : {1, 2}) {
         Angular pn(3);
         ElementWenoOptions o;

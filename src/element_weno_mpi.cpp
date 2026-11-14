@@ -275,16 +275,8 @@ void ElementWenoMpi::solve_axis(Field &b) const {
         }
         MPI_Waitall(int(req.size()), req.data(), MPI_STATUSES_IGNORE);
     }
-    // ---- diagonal ----
-    for (const Run &run : runs_)
-        if (run.owner == me)
-            for (int j = run.first; j < run.end; ++j) {
-                const double inv = 1. / diag_[j];
-                double *yj = layer(b, inv_[j]);
-                split(len, [&](std::size_t from, std::size_t to) {
-                    for (std::size_t t = from; t < to; ++t) yj[t] *= inv;
-                });
-            }
+    // ---- diagonal: fused into the backward sweep (y_j *= 1/D_j right before its backward row; y_j is not read
+    // between the forward and the backward sweep, so the arithmetic is the serial one) ----
     // ---- backward: positions j descending, y_j -= L_ij y_i ----
     {
         auto rbuf = alloc(bwd_recv_), sbuf = alloc(bwd_send_);
@@ -311,6 +303,8 @@ void ElementWenoMpi::solve_axis(Field &b) const {
                 split(cl, [&](std::size_t from, std::size_t to) {
                     for (int j = runs_[g].end - 1; j >= runs_[g].first; --j) {
                         double *yj = layer(b, inv_[j]) + cs[c];
+                        const double inv = 1. / diag_[j];
+                        for (std::size_t t = from; t < to; ++t) yj[t] *= inv;
                         for (int k = outer_[j]; k < outer_[j + 1]; ++k) {
                             const int i = inner_[k];
                             if (i == j)
