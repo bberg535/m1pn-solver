@@ -158,3 +158,58 @@ Befund:
 Bitgleich ist mit dieser Kette nach heutigem Stand höchstens etwa 10–20 % mehr drin. Der parallele Schur-Löser
 skaliert besser im Rechenteil, verliert aber an der Allreduce ganzer Schichten und hält 1e-8 über lange Läufe nicht.
 Eine 2D-Zerlegung (x und y) würde beide Richtungen ketten und hilft nicht.
+
+## Vier weitere Varianten (14.11.2026)
+
+### 1. Transponieren statt Kette (verworfen, gemessen)
+
+Idee: Für die Lösung entlang der verteilten Achse das Feld per `MPI_Alltoall` so umverteilen, dass jeder Rang ganze
+Linien besitzt (bitgleich, keine Kette). Mikrobenchmark Job 160249 (`nx/tmp/mpi_a2a_20261114`, UCX, 1 Rang pro Sockel):
+
+| Feld pro Rang | 2 Proz. | 4 Proz. | 6 Proz. |
+|---|---|---|---|
+| 12 MB | 0.35 ms | 1.10 ms | 1.41 ms |
+| 50 MB | 2.45 ms | 4.63 ms | 5.84 ms |
+
+E=512, N=15 hat 49 MB pro Rang (6 Prozesse). Zwei Alltoall pro Lösung kosten ≈ 11.7 ms, die Kette heute 3.35 ms pro
+Lösung (2.63 s / 786). Bei Q1 ist die Linienlösung (Bandbreite 1) so billig, dass das Verschieben des ganzen Felds
+teurer ist als das Warten in der Kette, die nur Randschichten verschickt.
+
+### 2. Pencils in 3D (Zerlegung in y und z; nicht umgesetzt, abgeschätzt)
+
+Die Kettenzeit in 3D ist nahezu unabhängig von der Rangzahl (E=64³, N=15: 32.7 / 42.2 / 39.7 s bei 2 / 4 / 6 Proz.).
+Für 2×3 Pencils: z-Kette über 3 Stationen mit halber Datenmenge ≈ 20 s, y-Kette über 2 Stationen ≈ 11 s, zusammen
+≈ 31 s statt 40 s, also rund 10 % der Gesamtzeit (83 s). Der Umbau (Schichten entlang y sind nicht zusammenhängend,
+Halo in zwei Richtungen mit Ecken, Hooks pro Achse) ist groß. Lohnt erst bei deutlich mehr Rängen.
+
+### 3. Aufbau und Auswertung (umgesetzt, bitgleich)
+
+Neue Phasenzeiten in `summary.json` (`phases.setup/post/post_rebuild`) zeigten: Bei Kurzläufen dominierte nicht die
+Zeitschleife, sondern der Rest.
+- `dropped_inflow` lief seriell, 9× über alle Randquadraturpunkte (N=31: > 100 s). Jetzt parallel (Maxima pro Thread,
+  exakt in jeder Reihenfolge).
+- `l2_density_error` seriell; jetzt parallel, summiert in der seriellen Reihenfolge.
+- MPI: Die Zusammenfassung rief `high_order_step()` auf dem für die Auswertung neu gebauten globalen Schema auf und
+  wiederholte damit die ganze Potenziteration seriell (N=31: ≈ 25 s). Jetzt wird der Wert des verteilten Schemas
+  berichtet.
+- Option `--step-cache DATEI`: gespeicherter Spektralradius, Schlüssel aus Konfiguration, Rangzahl und einer bitweisen
+  Probe des Operators (eine Anwendung). Ein Treffer spart die ≈ 120 Operatoranwendungen der Potenziteration.
+- Anfangszustand der Crossing-Studie: die Kugelflächenfunktionen der zwei Richtungen einmal statt pro Knoten.
+
+Jobs 160251–160255 (`nx/tmp/mpi_node_20261114`, `nx/tmp/mpi_setup_20261114`), E=512, T=0.02, Gesamtzeit inkl.
+`mpirun`, Endzustände bitgleich (md5):
+
+| Fall | vorher | jetzt | mit Cache-Treffer |
+|---|---|---|---|
+| N=15, 1 Proz. | 30.0 s | 20.6 s | 15.1 s |
+| N=15, 6 Proz. | 22.8 s | 12.0 s | 7.8 s |
+| N=31, 1 Proz. | 206 s | 86 s | 60 s |
+| N=31, 6 Proz. | ≈ 72 s | 35 s | 28 s |
+
+Rest bei 6 Prozessen: Neuaufbau des globalen Schemas auf Rang 0 für die Auswertung (N=31: 4 s) und das Einsammeln.
+
+### 4. Knotenebene
+
+Spaltenblockung (Zeilen-Kernel von `stab_local` und Linienlösungen in Spaltenblöcken von 32/64/128, bitgleich):
+durchweg langsamer (N=15: `stab_local` 2.49 → 2.65–3.28 s; N=31: Zeitschleife 43.4 → 47.5 s). Nicht übernommen.
+Der wirksame Teil von Variante 4 waren die seriellen Abschnitte in Aufbau und Auswertung (Variante 3).
