@@ -98,3 +98,22 @@ Bewertung:
   den Schnittstellen). Er ist mathematisch dieselbe Lösung, aber nur bis auf Rundung gleich (rangabhängig).
 - Ältere Varianten (blockweise Thread-Aufteilung, je Thread eigene Kommunikation) sind per Umgebungsvariable
   erreichbar (`M1PN_MPI_CHUNK_SPLIT`, `M1PN_MPI_THREADED_PIPELINE`), aber langsamer.
+
+## Paralleler Schnittstellenlöser (Schur, Option `M1PN_MPI_SCHUR=1`)
+
+Job 160229 (`nx/tmp/mpi_ucx8_20261114`). Jeder Rang löst seine inneren Schichten unabhängig. Die Separatorschichten
+bilden ein kleines SPD-System (eine Allreduce, Lösung auf jedem Rang), vorberechnete Spikes korrigieren das Innere.
+Das Gleichungssystem ist dasselbe, die Rundung ist eine andere.
+
+| Fall | 2 Prozesse | 4 Prozesse | 6 Prozesse | max. rel. Abweichung zum seriellen Lauf |
+|---|---|---|---|---|
+| E=512, N=15 | 86.2 s (bitgleich: 45.5) | 31.6 (27.6) | 28.6 (22.3) | 8e-9 … 1.3e-8 |
+| E=512, N=31 | 140.6 (141.6) | 107.0 (92.1) | 103.9 (70.1) | 2.5e-7 … 3.4e-7 |
+| E=1024, N=15 | 300.0 (322.9) | 181.8 (193.7) | 152.6 (151.3) | 9e-6 … 1.4e-5 |
+
+- Die Allreduce ganzer Separatorschichten kostet 18–54 s.
+- Wichtiger: Die Rundungsunterschiede wachsen im limitierten Verfahren chaotisch. Nach 455 Schritten liegen sie bei
+  1e-8 … 3e-7, nach 910 Schritten bei 1e-5 (wie beim Threadwechsel im Positivitätszweig, POSITIVITY_PROJECTION.md,
+  Abschnitt 3).
+- Eine 1e-8-Vorgabe gegenüber dem seriellen Lauf hält über lange Läufe nur die bitgleiche Pipeline ein. Sie bleibt
+  Standard.

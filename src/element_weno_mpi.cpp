@@ -153,7 +153,10 @@ ElementWenoMpi::ElementWenoMpi(ElementWeno &scheme, MPI_Comm comm, const SlabPar
         tasks_ = !std::getenv("M1PN_MPI_CHUNK_SPLIT"); // M1PN_MPI_CHUNK_SPLIT: the earlier block-split pipeline
     }
     // ---- partitioned (Schur) solver setup: identical on every rank (global 1D data) ----
-    schur_ = !std::getenv("M1PN_MPI_EXACT") && P > 1;
+    // Opt-in (M1PN_MPI_SCHUR=1). NX: the Allreduce of whole separator layers costs 18-54 s, and the rounding
+    // differences grow chaotically in the limited scheme to 1e-8..1e-5 after 455-910 steps; the bitwise pipeline is
+    // both faster and exact (docs/ELEMENT_WENO_MPI.md).
+    schur_ = std::getenv("M1PN_MPI_SCHUR") && P > 1;
     if (schur_) {
         // dense band of the global 1D mass (same assembly as above)
         const Mat &m1 = s_.m1_reference_;
