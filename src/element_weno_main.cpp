@@ -31,6 +31,7 @@ struct Args {
     int ghost_study = 0; // checkpoints of the ghost-estimator study (0: off)
     double ghost_study_filter = 16;
     int mpi_halo = 2, mpi_chunks = 0; // MPI slab decomposition (src/element_weno_mpi.hpp)
+    std::string step_cache;           // file of stored spectral radii (keyed by configuration and an operator probe)
     std::string dump_state;           // binary dump of the final coefficients (rows, cols, row-major doubles)
 };
 Args parse(int argc, char **argv) {
@@ -51,6 +52,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--mpi-halo") a.mpi_halo = std::stoi(next());
         else if (key == "--mpi-chunks") a.mpi_chunks = std::stoi(next());
         else if (key == "--dump-state") a.dump_state = next();
+        else if (key == "--step-cache") a.step_cache = next();
         else if (key == "--width") a.width = std::stod(next());
         else if (key == "--background") a.background = std::stod(next());
         else if (key == "--weno-linear") a.weno_linear = std::stod(next());
@@ -123,6 +125,7 @@ int main(int argc, char **argv) {
     omp_set_num_threads(m1pn::default_threads().threads);
 #endif
     try {
+        const double program_start = seconds();
         const Args args = parse(argc, argv);
         const double zc = args.dimension == 3 ? .5 : 0.; // crossing-study pulse centre height (3D: mid-plane)
         Angular pn(args.pn);
@@ -212,14 +215,44 @@ int main(int argc, char **argv) {
                 return s;
             });
         } else {
+            const Vec hx = harmonics(pn.order, V3::UnitX()), hy = harmonics(pn.order, V3::UnitY()); // once, not per node
             a = sp->interpolate([&](const V3 &x) {
                 auto p = [&](const V3 &d) { return std::exp(-d.squaredNorm() / (2 * args.width * args.width)); };
                 Vec s = Vec::Zero(pn.q);
                 s[0] = args.background / std::sqrt(4 * pi);
-                s += p(x - V3(.3, .5, zc)) * harmonics(pn.order, V3::UnitX());
-                s += p(x - V3(.5, .3, zc)) * harmonics(pn.order, V3::UnitY());
+                s += p(x - V3(.3, .5, zc)) * hx;
+                s += p(x - V3(.5, .3, zc)) * hy;
                 return s;
             });
+        }
+        if (!args.step_cache.empty()) {
+            // The power iteration of high_order_step() costs ~120 operator applications (N=31: 25 s). A stored radius
+            // is reused when the configuration and the probe (one application, bitwise) match; the step is then the
+            // one the iteration would give for this rank count.
+            std::ostringstream k;
+            k << "v1 pn=" << args.pn << " degree=" << args.degree << " dim=" << args.dimension << " E=" << args.elements
+              << " ranks=" << mpi_size << " ssprk43=" << args.ssprk43 << " probe=" << std::hexfloat << sp->operator_probe();
+            const std::string key = k.str();
+            double radius = -1;
+            if (mpi_rank == 0) {
+                std::ifstream in(args.step_cache);
+                for (std::string line; std::getline(in, line);)
+                    if (line.size() > key.size() && line.compare(0, key.size(), key) == 0 && line[key.size()] == ' ')
+                        radius = std::strtod(line.c_str() + key.size() + 1, nullptr);
+            }
+#ifdef M1PN_MPI
+            if (mpi_size > 1)
+                MPI_Bcast(&radius, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+#endif
+            if (radius > 0)
+                sp->set_spectral_radius(radius);
+            else {
+                radius = sp->spectral_radius();
+                if (mpi_rank == 0) {
+                    std::ofstream out(args.step_cache, std::ios::app);
+                    out << key << ' ' << std::hexfloat << radius << '\n';
+                }
+            }
         }
         const double step_limit = args.cfl * sp->step_bound();
         const double requested = args.dt > 0 ? std::min(args.dt, step_limit) : step_limit;
@@ -275,6 +308,7 @@ int main(int argc, char **argv) {
         };
         ElementWenoStats stats;
         const double start = seconds();
+        double setup_seconds = start - program_start, rebuild_seconds = 0;
         double t = 0;
         double study_seconds = 0;
         for (int n = 0; n < steps; ++n) {
@@ -289,7 +323,11 @@ int main(int argc, char **argv) {
             }
         }
         double wall = seconds() - start - study_seconds;
+        const double post_start = seconds();
         std::string mpi_json;
+        // The step bound used by this run (MPI: the distributed estimate, cached in the slab scheme; the global scheme
+        // rebuilt on rank 0 for the evaluation would repeat the whole power iteration serially).
+        const double high_order_step = sp->high_order_step();
 #ifdef M1PN_MPI
         if (mpi) {
             wall = mpi->max(wall);
@@ -301,11 +339,14 @@ int main(int argc, char **argv) {
               << ",\"setup\":" << mpi->t_setup << ",\"loop\":" << mpi->t_loop << ",\"worker_compute_sum\":" << mpi->t_exec
               << ",\"threads\":" << omp_get_max_threads() << "}}";
             mpi_json = m.str();
+            setup_seconds = mpi->max(setup_seconds);
             Field global = mpi->gather(a);
             mpi.reset(); // detaches from the local scheme
             if (mpi_rank != 0)
                 return 0;
+            const double r0 = seconds();
             holder = std::make_unique<ElementWeno>(pn, options, inflow); // serial global scheme for the evaluation
+            rebuild_seconds = seconds() - r0;
             sp = holder.get();
             a = std::move(global);
         }
@@ -416,7 +457,7 @@ int main(int argc, char **argv) {
                 << ",\"dimension\":" << args.dimension << ",\"steps\":" << steps << ",\"dt\":" << dt
                 << ",\"threads\":" << m1pn::default_threads().threads << ",\"thread_policy\":\""
                 << m1pn::default_threads().reason << "\""
-                << ",\"dt_bound\":" << sp->dt_bound << ",\"high_order_step\":" << sp->high_order_step() << ",\"wall_seconds\":" << wall
+                << ",\"dt_bound\":" << sp->dt_bound << ",\"high_order_step\":" << high_order_step << ",\"wall_seconds\":" << wall
                 << ",\"ghost_filter\":" << args.ghost_filter << ",\"l2_density_error\":" << error << ",\"final_mass\":" << total
                 << ",\"kinetic_l2_error\":" << kinetic_error << ",\"kinetic_l2_error_outflow_strip\":" << kinetic_error_outflow
                 << ",\"exact_mass\":" << exact_mass << ",\"boundary_outflow\":" << stats.boundary_outflow
@@ -472,6 +513,8 @@ int main(int argc, char **argv) {
                         << ",\"rho_minus_nJ\":" << study_err[e][3] / study_scale << "}";
             summary << "}";
         }
+        summary << ",\"phases\":{\"setup\":" << setup_seconds << ",\"post\":" << seconds() - post_start
+                << ",\"post_rebuild\":" << rebuild_seconds << "}";
         summary << mpi_json << "}";
         std::ofstream(args.output + "/summary.json") << summary.str() << "\n";
         std::cout << summary.str() << std::endl;

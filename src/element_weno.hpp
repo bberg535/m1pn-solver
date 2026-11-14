@@ -246,6 +246,12 @@ public:
     // 5.1495). The largest eigenvalues of the stabilized target are dissipative (close to the negative real
     // axis); the periodic amplification test in tests/element_weno.cpp checks this. Cached per integrator.
     double high_order_step() const;
+    // Step cache (driver option --step-cache): the norm of one application of linear_operator to a fixed vector
+    // identifies the operator (distributed: global norm, collective); set_spectral_radius installs a stored estimate
+    // of the same operator, so high_order_step() returns the same value without the power iteration.
+    double operator_probe() const;
+    void set_spectral_radius(double radius) const { spectral_radius_ = radius; }
+    double spectral_radius() const { high_order_step(); return spectral_radius_; }
     // Step limit used by the drivers: min(realizability bound, high_order_step).
     double step_bound() const { return std::min(realizability_step(), high_order_step()); }
     // M^-1(-C.A - S_gamma) a with constant gamma and without boundary terms (the operator of high_order_step).

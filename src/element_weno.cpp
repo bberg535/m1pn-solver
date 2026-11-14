@@ -2231,6 +2231,25 @@ Field ElementWeno::linear_operator(const Field &x, double gamma_value) const {
     });
     return out;
 }
+double ElementWeno::operator_probe() const {
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<double> uniform(-1, 1);
+    Field x(nodes, moments);
+    if (!dist_) {
+        for (int i = 0; i < nodes; ++i)
+            for (int c = 0; c < moments; ++c)
+                x(i, c) = uniform(rng);
+    } else
+        distributed_random(x, rng, uniform);
+    const Field y = linear_operator(x, .5);
+    if (!dist_)
+        return y.norm();
+    double s2 = 0;
+    for (int i = 0; i < nodes; ++i)
+        if (owned_[i])
+            s2 += y.row(i).squaredNorm();
+    return std::sqrt(dist_->sum(s2));
+}
 double ElementWeno::high_order_step() const {
     if (spectral_radius_ <= 0) {
         std::mt19937 rng(12345);
@@ -2605,11 +2624,14 @@ double ElementWeno::dropped_inflow(double time) const {
     std::vector<char> is_active(pn.q, 0);
     for (int k : active)
         is_active[k] = 1;
-    double kept = 0, dropped = 0;
-    for (const auto &f : faces_) {
+    // Per-thread maxima (a maximum is exact in any order, so the result does not depend on the thread count).
+    std::vector<std::array<double, 2>> partial(std::max(1, max_threads()), {0., 0.});
+    parallel_for(int(faces_.size()), [&](int index) {
+        const auto &f = faces_[index];
         const int side_id = 2 * f.direction + f.side;
         const FaceRule &rule = rules_[side_id];
         const Boundary &b = *boundaries_[side_id];
+        double &kept = partial[thread_id()][0], &dropped = partial[thread_id()][1];
         V3 origin;
         element_origin(f.element, origin);
         for (int point = 0; point < rule.weights.size(); ++point) {
@@ -2625,7 +2647,10 @@ double ElementWeno::dropped_inflow(double time) const {
                 slot_max = std::max(slot_max, std::abs(full[k]));
             }
         }
-    }
+    });
+    double kept = 0, dropped = 0;
+    for (const auto &p : partial)
+        kept = std::max(kept, p[0]), dropped = std::max(dropped, p[1]);
     return kept > 0 ? dropped / kept : dropped;
 }
 Field ElementWeno::project_l2(const std::function<Vec(const V3 &)> &f) const {
@@ -2690,8 +2715,10 @@ double ElementWeno::l2_density_error(const Field &a, const std::function<double(
     for (int d = 0; d < dimension; ++d)
         points *= xq.size();
     const double volume = std::pow(h, dimension);
-    double sum = 0;
-    for (int e = 0; e < cells; ++e) {
+    // The point terms in parallel, summed afterwards in the serial (element, point) order: same result for every
+    // thread count.
+    std::vector<double> terms(std::size_t(cells) * points);
+    parallel_for(cells, [&](int e) {
         V3 origin;
         element_origin(e, origin);
         for (int p = 0; p < points; ++p) {
@@ -2703,9 +2730,12 @@ double ElementWeno::l2_density_error(const Field &a, const std::function<double(
                 w *= wq[value % xq.size()];
             }
             const double difference = project(evaluate(a, x))[0] - exact_density(x);
-            sum += w * difference * difference;
+            terms[std::size_t(e) * points + p] = w * difference * difference;
         }
-    }
+    });
+    double sum = 0;
+    for (const double t : terms)
+        sum += t;
     return std::sqrt(sum);
 }
 Vec reflect_pn(const Angular &pn, const Vec &full, int direction) {
