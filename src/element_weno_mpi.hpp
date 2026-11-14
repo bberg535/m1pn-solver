@@ -47,6 +47,9 @@ class ElementWenoMpi : public DistributedHooks {
     // Owned rows (global ids, row-major data) gathered to rank 0 in global order; empty on other ranks.
     Field gather(const Field &f, std::vector<long> *ids = nullptr) const;
     mutable double t_solve = 0, t_exchange = 0, t_wait = 0;
+    // Profile of the static pipeline: buffer setup, master loop, summed worker compute, calls.
+    mutable double t_setup = 0, t_loop = 0, t_exec = 0;
+    mutable long n_solves = 0;
     bool threaded() const { return thread_multiple_; }
 
   private:
@@ -60,6 +63,8 @@ class ElementWenoMpi : public DistributedHooks {
     void solve_axis_tasks(Field &b, int fillers = 0, const std::function<void(int)> *filler = nullptr) const;
     bool tasks_ = true;
     bool static_ = true; // static block ownership with block buffers (default)
+    // Persistent buffers of the static pipeline (grown, never shrunk; no allocation or first touch per call).
+    mutable std::vector<std::vector<double>> pool_fr_, pool_fs_, pool_br_, pool_bs_, pool_work_;
     void solve_axis_static(Field &b, int fillers = 0, const std::function<void(int)> *filler = nullptr) const;
     // Partitioned (Schur) line solve, opt-in (M1PN_MPI_SCHUR=1): every rank solves its interior layers independently; the separator
     // layers (bandwidth b at the start of every rank r >= 1) form a small SPD system, assembled by one Allreduce and

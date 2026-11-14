@@ -1013,7 +1013,17 @@ void ElementWenoMpi::solve_axis_static(Field &b, int fillers, const std::functio
             out[l].resize(msgs[l].positions.size() * len);
         return out;
     };
-    auto fr = alloc(fwd_recv_), fs = alloc(fwd_send_), br = alloc(bwd_recv_), bs = alloc(bwd_send_);
+    const double setup_start = MPI_Wtime();
+    auto pooled = [&](const std::vector<Message> &msgs, std::vector<std::vector<double>> &pool) -> std::vector<std::vector<double>> & {
+        if (pool.size() < msgs.size())
+            pool.resize(msgs.size());
+        for (std::size_t l = 0; l < msgs.size(); ++l)
+            if (pool[l].size() < msgs[l].positions.size() * len)
+                pool[l].resize(msgs[l].positions.size() * len);
+        return pool;
+    };
+    auto &fr = pooled(fwd_recv_, pool_fr_), &fs = pooled(fwd_send_, pool_fs_), &br = pooled(bwd_recv_, pool_br_),
+         &bs = pooled(bwd_send_, pool_bs_);
     auto slot = [&](const std::vector<double> &buf, std::size_t npos, int c, std::size_t m) {
         return const_cast<double *>(buf.data()) + npos * cs[c] + m * (cs[c + 1] - cs[c]);
     };
@@ -1067,14 +1077,18 @@ void ElementWenoMpi::solve_axis_static(Field &b, int fillers, const std::functio
         }
     auto ready_phase = [&](int c, int k) { return missing[std::size_t(c) * phases + k] == 0; };
     // Block buffers: owned layers [O0, O1) x block width, copied in before the first and out after the last phase.
-    std::vector<std::vector<double>> work(C);
+    if (pool_work_.size() < std::size_t(C))
+        pool_work_.resize(C);
+    auto &work = pool_work_;
+    for (int c = 0; c < C; ++c)
+        if (work[c].size() < std::size_t(O1_ - O0_) * (cs[c + 1] - cs[c]))
+            work[c].resize(std::size_t(O1_ - O0_) * (cs[c + 1] - cs[c]));
     auto wl = [&](int c, int global_layer) { return work[c].data() + std::size_t(global_layer - O0_) * (cs[c + 1] - cs[c]); };
     // Execute phase k of block c (the owning worker).
     std::vector<std::vector<char>> applied(C, std::vector<char>(nf, 0));
     auto execute = [&](int c, int k) {
         const std::size_t cl = cs[c + 1] - cs[c];
         if (k == 0) {
-            work[c].resize(std::size_t(O1_ - O0_) * cl);
             for (int g = O0_; g < O1_; ++g)
                 std::copy_n(layer(b, g) + cs[c], cl, wl(c, g));
         }
@@ -1177,7 +1191,10 @@ void ElementWenoMpi::solve_axis_static(Field &b, int fillers, const std::functio
             ready[c].store(released[c], std::memory_order_release);
         }
     };
-#pragma omp parallel num_threads(T)
+    double exec_total = 0;
+    const double loop_start = MPI_Wtime();
+    t_setup += loop_start - setup_start;
+#pragma omp parallel num_threads(T) reduction(+ : exec_total)
     {
         const int tid = omp_get_thread_num();
         if (tid == 0) {
@@ -1241,13 +1258,18 @@ void ElementWenoMpi::solve_axis_static(Field &b, int fillers, const std::functio
                     while (ready[c].load(std::memory_order_acquire) < k + 1)
                         if (!run_filler()) {
                         }
+                    const double e0 = MPI_Wtime();
                     execute(c, k);
+                    exec_total += MPI_Wtime() - e0;
                     done[c].store(k + 1, std::memory_order_release);
                 }
             while (run_filler()) {
             }
         }
     }
+    t_loop += MPI_Wtime() - loop_start;
+    t_exec += exec_total;
+    ++n_solves;
     MPI_Waitall(int(rreq.size()), rreq.data(), MPI_STATUSES_IGNORE);
     MPI_Waitall(int(sreq.size()), sreq.data(), MPI_STATUSES_IGNORE);
     t_wait += wait;

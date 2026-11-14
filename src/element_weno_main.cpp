@@ -297,7 +297,9 @@ int main(int argc, char **argv) {
             std::ostringstream m;
             m << ",\"mpi\":{\"ranks\":" << mpi_size << ",\"halo\":" << args.mpi_halo << ",\"local_nodes_rank0\":"
               << sp->nodes << ",\"t_axis_solve_max\":" << ts << ",\"t_exchange_max\":" << tx
-              << ",\"t_pipeline_wait_max\":" << tw << "}";
+              << ",\"t_pipeline_wait_max\":" << tw << ",\"profile_rank0\":{\"solves\":" << mpi->n_solves
+              << ",\"setup\":" << mpi->t_setup << ",\"loop\":" << mpi->t_loop << ",\"worker_compute_sum\":" << mpi->t_exec
+              << ",\"threads\":" << omp_get_max_threads() << "}}";
             mpi_json = m.str();
             Field global = mpi->gather(a);
             mpi.reset(); // detaches from the local scheme
