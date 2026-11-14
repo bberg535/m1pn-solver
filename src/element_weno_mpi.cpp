@@ -606,10 +606,33 @@ void ElementWenoMpi::solve_axis_tasks(Field &b, int fillers, const std::function
     const int me = part_.rank, q = int(b.cols());
     const int T = std::max(1, omp_get_max_threads());
     const int lines = layer_size_;
-    const int C = chunks_ > 0 ? chunks_ : std::max(1, std::min(lines, 3 * T));
-    std::vector<std::size_t> cs(C + 1);
-    for (int c = 0; c <= C; ++c)
-        cs[c] = std::size_t(long(lines) * c / C) * q;
+    // Blocks of whole lines. Trapezoidal sizes (default): the first and the last blocks are small (1, 2, 4, ...
+    // lines) so that the chain over the ranks fills and drains quickly; the middle blocks have the base size.
+    const int base = std::max(1, chunks_ > 0 ? lines / chunks_ : lines / std::max(1, 3 * T));
+    std::vector<int> sizes;
+    if (std::getenv("M1PN_MPI_NO_RAMP") || chunks_ > 0) {
+        const int C0 = std::max(1, std::min(lines, lines / base));
+        for (int c = 0; c < C0; ++c)
+            sizes.push_back(int(long(lines) * (c + 1) / C0 - long(lines) * c / C0));
+    } else {
+        std::vector<int> ramp;
+        for (int r = 1; r < base; r *= 2)
+            ramp.push_back(r);
+        int rest = lines;
+        std::vector<int> head, tail;
+        for (int r : ramp)
+            if (rest >= 2 * r + base)
+                head.push_back(r), tail.push_back(r), rest -= 2 * r;
+        const int middle = std::max(1, rest / base);
+        sizes = head;
+        for (int c = 0; c < middle; ++c)
+            sizes.push_back(int(long(rest) * (c + 1) / middle - long(rest) * c / middle));
+        sizes.insert(sizes.end(), tail.rbegin(), tail.rend());
+    }
+    const int C = int(sizes.size());
+    std::vector<std::size_t> cs(C + 1, 0);
+    for (int c = 0; c < C; ++c)
+        cs[c + 1] = cs[c] + std::size_t(sizes[c]) * q;
     const std::size_t len = std::size_t(lines) * q;
     auto alloc = [&](const std::vector<Message> &msgs) {
         std::vector<std::vector<double>> out(msgs.size());
