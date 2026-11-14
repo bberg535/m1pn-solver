@@ -59,6 +59,21 @@ class ElementWenoMpi : public DistributedHooks {
     // default: one MPI thread, OpenMP tasks per block of whole lines; optional low-priority filler tasks
     void solve_axis_tasks(Field &b, int fillers = 0, const std::function<void(int)> *filler = nullptr) const;
     bool tasks_ = true;
+    // Partitioned (Schur) line solve, default: every rank solves its interior layers independently; the separator
+    // layers (bandwidth b at the start of every rank r >= 1) form a small SPD system, assembled by one Allreduce and
+    // solved on every rank; spikes W = M_II^-1 M_IS correct the interior. Same linear system, rounding differs
+    // from the serial factor order (M1PN_MPI_EXACT=1: the bitwise pipeline).
+    bool schur_ = true;
+    void solve_axis_schur(Field &b) const;
+    int bw_ = 1, ns_ = 0;                        // bandwidth, separator unknowns ((P-1) b)
+    int I0_ = 0, I1_ = 0;                        // my interior layers [I0, I1) (global)
+    std::vector<double> band_;                   // global 1D mass, row k, offsets -bw..bw
+    std::vector<double> iL_, iD_;                // banded LDL^T of my interior block
+    std::vector<int> adj_;                       // separator unknowns adjacent to my interior (global index u)
+    std::vector<double> spike_;                  // (I1 - I0) x adj_.size(): M_II^-1 M_I,adj
+    Mat schur_inverse_;                          // inverse of the Schur complement (ns x ns, small)
+    double band(int i, int j) const { return std::abs(i - j) > bw_ ? 0. : band_[std::size_t(i) * (2 * bw_ + 1) + (j - i + bw_)]; }
+    int sep_layer(int u) const { return part_.first[1 + u / bw_] * p_ + u % bw_; } // global layer of separator u
     std::vector<int> owner_;                     // global layer -> rank
     // Global 1D mass factor (as in the ElementWeno constructor): CSC of L, D, perm (layer -> position), inverse.
     std::vector<int> outer_, inner_, perm_, inv_;

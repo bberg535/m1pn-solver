@@ -152,6 +152,90 @@ ElementWenoMpi::ElementWenoMpi(ElementWeno &scheme, MPI_Comm comm, const SlabPar
         thread_multiple_ = provided >= MPI_THREAD_MULTIPLE && std::getenv("M1PN_MPI_THREADED_PIPELINE");
         tasks_ = !std::getenv("M1PN_MPI_CHUNK_SPLIT"); // M1PN_MPI_CHUNK_SPLIT: the earlier block-split pipeline
     }
+    // ---- partitioned (Schur) solver setup: identical on every rank (global 1D data) ----
+    schur_ = !std::getenv("M1PN_MPI_EXACT") && P > 1;
+    if (schur_) {
+        // dense band of the global 1D mass (same assembly as above)
+        const Mat &m1 = s_.m1_reference_;
+        bw_ = p_;
+        band_.assign(std::size_t(n1) * (2 * bw_ + 1), 0.);
+        for (int e = 0; e < E; ++e)
+            for (int i = 0; i <= p_; ++i)
+                for (int j = 0; j <= p_; ++j)
+                    band_[std::size_t(e * p_ + i) * (2 * bw_ + 1) + (j - i + bw_)] += s_.h * m1(i, j);
+        ns_ = (P - 1) * bw_;
+        auto interior = [&](int t) {
+            const auto [a, b] = owned_range(t);
+            return std::make_pair(t > 0 ? a + bw_ : a, b);
+        };
+        for (int t = 0; t < P; ++t) {
+            const auto [a, b] = interior(t);
+            require(b - a >= bw_ + 1, "MPI: every rank needs more owned layers than the bandwidth");
+        }
+        // banded LDL^T of an interior block [a, b)
+        auto factor = [&](int a, int b, std::vector<double> &L, std::vector<double> &D) {
+            const int n = b - a, w = bw_;
+            L.assign(std::size_t(n) * w, 0.), D.assign(n, 0.);
+            for (int i = 0; i < n; ++i) {
+                for (int j = std::max(0, i - w); j < i; ++j) {
+                    double v = band(a + i, a + j);
+                    for (int k = std::max(0, i - w); k < j; ++k)
+                        v -= L[std::size_t(i) * w + (k - i + w)] * L[std::size_t(j) * w + (k - j + w)] * D[k];
+                    L[std::size_t(i) * w + (j - i + w)] = v / D[j];
+                }
+                double v = band(a + i, a + i);
+                for (int k = std::max(0, i - w); k < i; ++k)
+                    v -= L[std::size_t(i) * w + (k - i + w)] * L[std::size_t(i) * w + (k - i + w)] * D[k];
+                D[i] = v;
+            }
+        };
+        auto solve = [&](const std::vector<double> &L, const std::vector<double> &D, std::vector<double> &x) {
+            const int n = int(D.size()), w = bw_;
+            for (int i = 0; i < n; ++i)
+                for (int k = std::max(0, i - w); k < i; ++k)
+                    x[i] -= L[std::size_t(i) * w + (k - i + w)] * x[k];
+            for (int i = 0; i < n; ++i)
+                x[i] /= D[i];
+            for (int i = n - 1; i >= 0; --i)
+                for (int k = std::max(0, i - w); k < i; ++k)
+                    x[k] -= L[std::size_t(i) * w + (k - i + w)] * x[i];
+        };
+        Mat S = Mat::Zero(ns_, ns_);
+        for (int u = 0; u < ns_; ++u)
+            for (int v = 0; v < ns_; ++v)
+                S(u, v) = band(sep_layer(u), sep_layer(v));
+        for (int t = 0; t < P; ++t) {
+            const auto [a, b] = interior(t);
+            std::vector<double> L, D;
+            factor(a, b, L, D);
+            std::vector<int> adj; // separator unknowns coupled to [a, b)
+            for (int u = 0; u < ns_; ++u) {
+                const int k = sep_layer(u);
+                if (k >= a - bw_ && k < b + bw_)
+                    adj.push_back(u);
+            }
+            std::vector<double> W(std::size_t(b - a) * adj.size());
+            for (std::size_t m = 0; m < adj.size(); ++m) {
+                std::vector<double> x(b - a, 0.);
+                for (int i = a; i < b; ++i)
+                    x[i - a] = band(i, sep_layer(adj[m]));
+                solve(L, D, x);
+                for (int i = a; i < b; ++i)
+                    W[std::size_t(i - a) * adj.size() + m] = x[i - a];
+                for (std::size_t mu = 0; mu < adj.size(); ++mu) { // S -= M_{S,I} W
+                    double v = 0;
+                    for (int i = a; i < b; ++i)
+                        v += band(sep_layer(adj[mu]), i) * x[i - a];
+                    S(adj[mu], adj[m]) -= v;
+                }
+            }
+            if (t == r) {
+                I0_ = a, I1_ = b, iL_ = L, iD_ = D, adj_ = adj, spike_ = W;
+            }
+        }
+        schur_inverse_ = S.inverse();
+        require(schur_inverse_.allFinite(), "MPI: Schur complement of the line mass not invertible");
+    }
     std::vector<char> owned(s_.nodes, 0);
     for (int i = 0; i < s_.nodes; ++i) {
         const int k = L0_ + i / layer_size_;
@@ -198,6 +282,10 @@ void ElementWenoMpi::exchange(Field &f) const {
 }
 
 void ElementWenoMpi::solve_axis(Field &b) const {
+    if (schur_) {
+        solve_axis_schur(b);
+        return;
+    }
     if (thread_multiple_) {
         solve_axis_threaded(b);
         return;
@@ -502,7 +590,7 @@ void ElementWenoMpi::solve_axis_threaded(Field &b) const {
 // starts ready phases as OpenMP tasks and sends what finished phases produced; the other threads execute the tasks.
 // Within a block the operations are those of the serial solve_line, so the result is bitwise the serial one.
 void ElementWenoMpi::solve_axis_overlap(Field &b, int count, const std::function<void(int)> &filler) const {
-    if (tasks_ && !thread_multiple_) {
+    if (tasks_ && !thread_multiple_ && !schur_) {
         solve_axis_tasks(b, count, &filler);
         return;
     }
@@ -743,6 +831,107 @@ void ElementWenoMpi::solve_axis_tasks(Field &b, int fillers, const std::function
     MPI_Waitall(int(rreq.size()), rreq.data(), MPI_STATUSES_IGNORE);
     MPI_Waitall(int(sreq.size()), sreq.data(), MPI_STATUSES_IGNORE);
     t_wait += wait;
+    t_solve += MPI_Wtime() - start;
+}
+
+// Partitioned solve along the axis (see schur_ in the header). Per call: interior solves (line-parallel, in
+// cache), the separator right-hand side g = b_S - M_SI z_I (one Allreduce over the ranks), x_S = S^-1 g on every
+// rank, and x_I = z_I - W x_S.
+void ElementWenoMpi::solve_axis_schur(Field &b) const {
+    const double start = MPI_Wtime();
+    const int q = int(b.cols()), lines = layer_size_, n = I1_ - I0_, w = bw_;
+    const std::size_t K = std::size_t(lines) * q;
+    // 1. interior: z = M_II^-1 b_I, line by line
+    parallel_for(lines, [&](int t) {
+        thread_local std::vector<double> work;
+        work.resize(std::size_t(n) * q);
+        for (int i = 0; i < n; ++i)
+            std::copy_n(layer(b, I0_ + i) + std::size_t(t) * q, q, &work[std::size_t(i) * q]);
+        for (int i = 0; i < n; ++i) {
+            double *xi = &work[std::size_t(i) * q];
+            for (int k = std::max(0, i - w); k < i; ++k) {
+                const double l = iL_[std::size_t(i) * w + (k - i + w)];
+                const double *xk = &work[std::size_t(k) * q];
+                for (int c = 0; c < q; ++c) xi[c] -= l * xk[c];
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            const double inv = 1. / iD_[i];
+            double *xi = &work[std::size_t(i) * q];
+            for (int c = 0; c < q; ++c) xi[c] *= inv;
+        }
+        for (int i = n - 1; i >= 0; --i) {
+            const double *xi = &work[std::size_t(i) * q];
+            for (int k = std::max(0, i - w); k < i; ++k) {
+                const double l = iL_[std::size_t(i) * w + (k - i + w)];
+                double *xk = &work[std::size_t(k) * q];
+                for (int c = 0; c < q; ++c) xk[c] -= l * xi[c];
+            }
+        }
+        for (int i = 0; i < n; ++i)
+            std::copy_n(&work[std::size_t(i) * q], q, layer(b, I0_ + i) + std::size_t(t) * q);
+    });
+    // 2. separator right-hand side: own separator rows (b_S) minus M_{S,I} z_I near my interior
+    std::vector<double> g(std::size_t(ns_) * K, 0.);
+    const int me = part_.rank;
+    for (int u : adj_) {
+        const int ks = sep_layer(u);
+        double *gu = g.data() + std::size_t(u) * K;
+        const bool mine = owner_[ks] == me;
+        parallel_for(int((K + 4095) / 4096), [&](int blk) {
+            const std::size_t from = std::size_t(blk) * 4096, to = std::min(K, from + 4096);
+            if (mine) {
+                const double *bs = layer(b, ks);
+                for (std::size_t x = from; x < to; ++x) gu[x] = bs[x];
+            }
+            for (int i = std::max(I0_, ks - w); i < std::min(I1_, ks + w + 1); ++i) {
+                const double m = band(ks, i);
+                if (m == 0)
+                    continue;
+                const double *zi = layer(b, i);
+                for (std::size_t x = from; x < to; ++x) gu[x] -= m * zi[x];
+            }
+        });
+    }
+    const double c0 = MPI_Wtime();
+    MPI_Allreduce(MPI_IN_PLACE, g.data(), int(g.size()), MPI_DOUBLE, MPI_SUM, comm_);
+    t_wait += MPI_Wtime() - c0;
+    // 3. x_S = S^-1 g (small dense, every rank), only the unknowns I need: adjacent ones and my own separator
+    std::vector<int> need = adj_;
+    std::sort(need.begin(), need.end());
+    std::vector<double> xs(need.size() * K);
+    parallel_for(int((K + 4095) / 4096), [&](int blk) {
+        const std::size_t from = std::size_t(blk) * 4096, to = std::min(K, from + 4096);
+        for (std::size_t m = 0; m < need.size(); ++m) {
+            double *out = &xs[m * K];
+            for (std::size_t x = from; x < to; ++x) out[x] = 0;
+            for (int v = 0; v < ns_; ++v) {
+                const double a = schur_inverse_(need[m], v);
+                const double *gv = g.data() + std::size_t(v) * K;
+                for (std::size_t x = from; x < to; ++x) out[x] += a * gv[x];
+            }
+        }
+    });
+    // 4. interior correction x_I = z_I - W x_S, and my separator layers
+    std::vector<int> slot(ns_, -1);
+    for (std::size_t m = 0; m < need.size(); ++m)
+        slot[need[m]] = int(m);
+    const std::size_t na = adj_.size();
+    parallel_for(n, [&](int i) {
+        double *xi = layer(b, I0_ + i);
+        for (std::size_t m = 0; m < na; ++m) {
+            const double wv = spike_[std::size_t(i) * na + m];
+            if (wv == 0)
+                continue;
+            const double *x = &xs[std::size_t(slot[adj_[m]]) * K];
+            for (std::size_t c = 0; c < K; ++c) xi[c] -= wv * x[c];
+        }
+    });
+    for (std::size_t m = 0; m < need.size(); ++m) {
+        const int ks = sep_layer(need[m]);
+        if (owner_[ks] == me)
+            std::copy_n(&xs[m * K], K, layer(b, ks));
+    }
     t_solve += MPI_Wtime() - start;
 }
 
