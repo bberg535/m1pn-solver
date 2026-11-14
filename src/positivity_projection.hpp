@@ -85,6 +85,7 @@ PositivityProjectionOutcome project_positive_moments(int q, const double *ox, co
 // Statistics accumulated over all projected boundary nodes (merged by rate()).
 struct PositivityProjectionStats {
     long calls = 0, identities = 0, failures = 0, vacuum = 0, scaled = 0;
+    long capped = 0; // converged projections whose outgoing mass exceeded rho (loose tolerance near vacuum), capped
     long augmented = 0, certificates = 0, diracs = 0, farkas = 0;
     long iterations = 0, backtracks = 0;
     int max_iterations = 0;
@@ -99,6 +100,7 @@ struct PositivityProjectionStats {
     std::array<double, 6> c6_diff_side{};
     void merge(const PositivityProjectionStats &o) {
         calls += o.calls, identities += o.identities, failures += o.failures, vacuum += o.vacuum, scaled += o.scaled;
+        capped += o.capped;
         augmented += o.augmented, certificates += o.certificates, diracs += o.diracs, farkas += o.farkas;
         iterations += o.iterations, backtracks += o.backtracks;
         max_iterations = std::max(max_iterations, o.max_iterations);

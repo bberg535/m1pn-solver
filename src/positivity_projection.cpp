@@ -180,6 +180,15 @@ PositivityProjectionOutcome project_positive_moments(int q, const double *ox, co
     if (!out.certificate) {
         out.result = project_positive(q, ox, oy, oz, w, y, U, z, options, warm ? warm->xi : Four::Zero());
         out.newton_iterations = out.result.iterations;
+        // A warm start that stalls (line search, max_iterations) must not decide the solution: retry cold before
+        // augmenting, so that the result does not depend on the history of the node. A Farkas certificate is
+        // rigorous and needs no retry.
+        if (!out.result.converged && !out.result.infeasible && warm && !warm->xi.isZero(0)) {
+            const int first = out.result.iterations;
+            out.result = project_positive(q, ox, oy, oz, w, y, U, z, options, Four::Zero());
+            out.result.iterations += first;
+            out.newton_iterations = out.result.iterations;
+        }
         out.farkas = out.result.infeasible;
         if (out.result.converged)
             return out;
@@ -226,6 +235,12 @@ PositivityProjectionOutcome project_positive_moments(int q, const double *ox, co
     }
     out.result = project_positive(q + 1, ax.data(), ay.data(), az.data(), aw.data(), ayv.data(), U, azv.data(),
                                   aopt, xi0);
+    if (!out.result.converged && !out.result.infeasible && !xi0.isZero(0)) { // history-independent, as above
+        const int first = out.result.iterations;
+        out.result = project_positive(q + 1, ax.data(), ay.data(), az.data(), aw.data(), ayv.data(), U, azv.data(),
+                                      aopt, Four::Zero());
+        out.result.iterations += first;
+    }
     out.newton_iterations += out.result.iterations;
     std::copy(azv.begin(), azv.begin() + q, z);
     out.atom = wstar * azv[q] * Four(1, jhat[0], jhat[1], jhat[2]);

@@ -26,6 +26,9 @@ Gegenüber `bdd5d3f`: **Gesamtlaufzeit 1.6–3.0× schneller, Randpfad 2–8×**
 Regel N+1 und 2N+1 liefern im Solver dieselbe Genauigkeit (Unterschied ≤ 0.1 %). Beim glatten Ausfluss verschlechtert
 die Projektion den Streifenfehler: die Projektion ist auf der ganzen Kugel definiert; negative Keulen auf der
 einlaufenden Hälfte verschieben über ξ auch die auslaufenden Momente, die C6 unverändert übernimmt.
+Der Ghost wirkt nur über den Limiter (für θ = 1 ist die Randlast die PN-Hochordnungslast des unprojizierten Traces);
+die Projektion vergrößert die Korrektur h = P b^H − b^L und damit die Limitierung am Ausflussrand (E=32, N=7: 711 statt
+452 limitierte Randknoten), siehe docs/POSITIVITY_PROJECTION.md, Abschnitt 2b. Seit 14.11.2026 ist die Projektion Standard.
 
 ## 3. Skalierbarkeit des Optimierungsproblems
 

@@ -89,8 +89,9 @@ struct ElementWenoOptions {
     // fullsphere_ghost. Instead of max(0, psi_N) on the outgoing hemisphere and a cone scaling, the nodal PN
     // trace on the full sphere is projected onto {z >= 0, sum w m z = (rho_i, J_i)} (four multipliers, semismooth
     // Newton); the ghost uses the outgoing half-range moments of z. A failed projection is counted and falls back
-    // to the C6 ghost of that node, or throws with projection_strict.
-    bool positivity_projection = false;
+    // to the C6 ghost of that node, or throws with projection_strict. Default since 2026-11-14 (more accurate
+    // outgoing state than C6, docs/POSITIVITY_PROJECTION.md 2b); set false for the C6 ghost.
+    bool positivity_projection = true;
     bool projection_strict = false;
     // Exactness parameter n of sphere_rule(n, +-1) per hemisphere (0: N + 1; the C6 ghost uses 2N + 1). Moment
     // consistency (identity for nonnegative PN traces) needs n >= N + 1.

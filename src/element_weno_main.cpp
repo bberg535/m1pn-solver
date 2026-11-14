@@ -16,7 +16,7 @@ struct Args {
     std::string problem = "smooth", output = "tmp/element_weno";
     bool weno = true, limit = true, stabilize = true, legacy_boundary = false, symmetric_residual = false, ssprk43 = false,
          reduce_angular = true;
-    bool positivity_projection = false, projection_strict = false, projection_warm_start = true;
+    bool positivity_projection = true, projection_strict = false, projection_warm_start = true;
     int projection_rule = 0;
     // smooth-outflow (docs/POSITIVITY_PROJECTION.md): angular concentration, direction (degrees), pulse width,
     // reference angular rule and sample points per axis of the error.
@@ -59,7 +59,8 @@ Args parse(int argc, char **argv) {
         else if (key == "--no-stabilization") a.stabilize = false;
         else if (key == "--legacy-boundary") a.legacy_boundary = true; // commit 8efe517 behaviour (docs/BOUNDARY_FIXES.md)
         else if (key == "--symmetric-residual") a.symmetric_residual = true;
-        else if (key == "--positivity-projection") a.positivity_projection = true; // docs/POSITIVITY_PROJECTION.md
+        else if (key == "--positivity-projection") a.positivity_projection = true; // default, docs/POSITIVITY_PROJECTION.md
+        else if (key == "--c6-ghost") a.positivity_projection = false;          // previous default ghost (C6)
         else if (key == "--projection-strict") a.projection_strict = true;
         else if (key == "--projection-cold-start") a.projection_warm_start = false;
         else if (key == "--projection-incoming-weight") a.projection_incoming_weight = std::stod(next());
@@ -84,6 +85,7 @@ Args parse(int argc, char **argv) {
     }
     require(a.problem == "smooth" || a.problem == "crossing-study" || a.problem == "smooth-outflow",
             "Problem must be smooth, crossing-study or smooth-outflow");
+    if (a.legacy_boundary) a.positivity_projection = false; // the projection replaces the C6 ghost, which legacy disables
     return a;
 }
 } // namespace
@@ -369,7 +371,7 @@ int main(int argc, char **argv) {
             const auto &p = stats.projection;
             summary << ",\"projection\":{\"rule\":" << args.projection_rule << ",\"calls\":" << p.calls
                     << ",\"identities\":" << p.identities << ",\"failures\":" << p.failures
-                    << ",\"vacuum\":" << p.vacuum << ",\"scaled\":" << p.scaled
+                    << ",\"vacuum\":" << p.vacuum << ",\"scaled\":" << p.scaled << ",\"capped\":" << p.capped
                     << ",\"augmented\":" << p.augmented << ",\"certificates\":" << p.certificates
                     << ",\"diracs\":" << p.diracs << ",\"farkas\":" << p.farkas
                     << ",\"warm_start\":" << (args.projection_warm_start ? "true" : "false")

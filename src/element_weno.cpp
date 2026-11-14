@@ -1456,6 +1456,14 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 // The atom of an augmented rule belongs to the outgoing half if Omega*.n > 0.
                 if (o.augmented && o.atom_direction.dot(b.n) > 0)
                     m += o.atom;
+                // The exact projection has outgoing mass <= U[0] (z >= 0, total mass U[0]). The Newton tolerance is
+                // relative to the trace scale sum w|y| + rho; near vacuum the trace can exceed rho by orders of
+                // magnitude (e.g. rho ~ 1e-33 next to a beam), and the converged moments may then overshoot rho.
+                // A ghost with rho_o >> rho turns ext - F_n(ext) into a cancellation that leaves the cone, so cap it.
+                if (m[0] > U[0] * (1 + 64 * std::numeric_limits<double>::epsilon())) {
+                    ++ps.capped;
+                    m *= U[0] > 0 ? U[0] / m[0] : 0.;
+                }
             } else {
                 ++ps.failures;
                 if (options.projection_strict)
@@ -1610,6 +1618,16 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                         own += b.n[d] * block(low_flux, i, d);
                     const Four outer = Levermore(ext).flux(b.n);
                     state = .5 * (ui + own) + .5 * (ext - outer);
+                    // Both halves are cone elements in exact arithmetic, but each is a cancellation: for a beam
+                    // u = rho (1, -n) (incoming at this side) 1/2 (u + F_n(u)) = 0 exactly and evaluates to
+                    // O(eps rho), possibly outside the cone by much more than an ulp of the (tiny) result. Before,
+                    // the spurious outgoing mass of the C6 ghost usually masked this; the projection gives the exact
+                    // zero ghost. Outward rounding relative to the size of the summands (C1 philosophy).
+                    if (options.outward_bar_rounding && !exact::cone(state)) {
+                        const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
+                        if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
+                            state[0] = norm_up(state);
+                    }
                     if (memo)
                         memo_valid[n] = 1, memo_moments[n] = data.moments, memo_state[n] = state;
                 }

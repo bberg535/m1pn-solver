@@ -11,7 +11,8 @@ Der C6-Ghost (`fullsphere_ghost`, [BOUNDARY_FIXES.md](BOUNDARY_FIXES.md)) setzt 
     ext = m_in(g) + λ · m_out(max(ψ_N,i, 0)),     λ = min(1, b/a_ext)
 
 mit den auslaufenden Halbraummomenten des **punktweise abgeschnittenen** PN-Traces. Das Abschneiden ändert die
-Momente, und λ < 1 skaliert sie nachträglich. Neu (Option `positivity_projection`, CLI `--positivity-projection`):
+Momente, und λ < 1 skaliert sie nachträglich. Neu (Option `positivity_projection`, **seit 14.11.2026 Standard**;
+C6 mit `--c6-ghost` bzw. `positivity_projection = false`, `--legacy-boundary` schaltet sie mit ab):
 Der Trace wird auf der **ganzen Kugel** auf die nichtnegativen, momententreuen Winkelmaße projiziert (Notiz, Gl. 4)
 
     min_z ½ Σ_k w_k (z_k − y_k)²   u. d. N.   z_k ≥ 0,   Σ_k w_k m_k z_k = U_i = (ρ_i, J_i),
@@ -73,9 +74,36 @@ Verglichen an den **exakten kinetischen Halbraummomenten** der Randknoten (Optio
 
 Der globale Lösungsfehler reagiert kaum auf die Güte des Ghosts (er wird vom PN-Fehler im Inneren dominiert); die
 leichte Verschlechterung im glatten Ausflusstest (+0.5…1.2 %) geht daher nicht auf einen schlechteren Randzustand
-zurück. **Regel:** N+1 je Halbkugel liefert dieselben Ghost-Momente und Lösungen wie 2N+1 und 4N+3 (3–4 Stellen) bei
+zurück.
+
+**Warum der globale Fehler trotzdem leicht steigt (Befund 14.11.2026).** Die Randlast ist
+`A(bar − u) + θ h` mit `h = P b^H − b^L`; der Ghost geht nur in die Tiefordnungsteile (bar, b^L) ein, und für θ = 1
+heben sie sich heraus: die Randlast ist dann die PN-Hochordnungslast P b^H **aus dem unprojizierten Trace**, unabhängig
+vom Ghost. Der Ghost wirkt also nur über den Limiter (Kegelschranke, C2-Vorzeichenlimiter). Für einen auslaufend
+positiven Trace ist C6 gleich den Halbraummomenten des Traces, also konsistent mit b^H (h klein). Die Projektion
+verschiebt über ξ·m auch die auslaufenden Werte, sobald die einlaufende Hälfte negative Keulen hat; dann ist h größer
+und es wird öfter limitiert (glatter Ausfluss, E=32, N=7, Q1: 711 statt 452 limitierte Randknoten), was am
+Ausflussrand diffundiert. Beim Crossing wird ohnehin limitiert, dort hilft der bessere Tiefordnungszustand; bei N=15
+ist der Trace positiv (Identität, kein Unterschied). Konsequenz: den Gewinn hebt erst ein Hochordnungsrandfluss, der
+für die auslaufende Hälfte ebenfalls z* statt ψ_N verwendet (offen).
+
+**Regel:** N+1 je Halbkugel liefert dieselben Ghost-Momente und Lösungen wie 2N+1 und 4N+3 (3–4 Stellen) bei
 2.5–3× geringeren Kosten und ist seitdem Standard (`--projection-rule` überschreibt); Aufpreis im Gesamtsolver damit
 +0.5…+5.5 % (nx, E=64–256).
+
+### Robustheit (14.11.2026, beim Umschalten des Standards)
+
+- Warmstart: Stockt Newton vom Warmstart aus (Liniensuche, max_iterations), wird kalt neu gestartet, bevor die Regel
+  ergänzt wird. Vorher entschied der Verlauf eines Knotens in seltenen Fällen über die Ergänzung (DLRA-Test: 8e−6
+  zwischen zwei Pfaden mit gemeinsamem Warmstart-Speicher, jetzt 2e−14). Der Warmstart beeinflusst damit nur noch
+  die Iterationszahl.
+- Auslaufende Masse ≤ ρ: die exakte Projektion erfüllt sie (z ≥ 0, Gesamtmasse ρ); die Newton-Toleranz ist relativ
+  zu Σw|y| + ρ, nahe am Vakuum kann der Trace ρ um Größenordnungen übersteigen. Überschreitungen werden gekappt und
+  als `capped` gezählt (glatter Ausfluss E=32: 154 von 67320, Relativgröße ~1e−12).
+- Rand-Bar-Zustand ½(u + F_n(u)) + ½(ext − F_n(ext)): für einen einlaufenden Strahl u = ρ(1, −n) ist der erste Teil
+  exakt 0 und entsteht durch Auslöschung (O(eps ρ_u)), weit mehr als ein ulp des winzigen Ergebnisses. Der unechte
+  auslaufende C6-Ghost hat das verdeckt; mit dem exakten Null-Ghost der Projektion schlug der C1-Test fehl. Jetzt
+  Rundung nach außen relativ zur Größe der Summanden (≤ 64 eps, Option `outward_bar_rounding`).
 
 ## 3. Optimierung des Randpfads (vorab, Methode unverändert)
 
@@ -130,7 +158,7 @@ bei N=15 sitzt das Maximum am Ausflussrand (RMS 2e−5).
 cmake --build tmp/build --target m1pn_element_weno m1pn_positivity_projection_tests m1pn_positivity_projection_bench
 OMP_NUM_THREADS=1 tmp/build/m1pn_positivity_projection_tests            # 150 Checks, Referenz: Dykstra
 tmp/build/m1pn_element_weno --problem crossing-study --dimension 2 --elements 64 --degree 2 \
-    --pn-order 7 --time .8 --positivity-projection [--projection-rule R] [--projection-strict] \
+    --pn-order 7 --time .8 [--c6-ghost] [--projection-rule R] [--projection-strict] \
     [--projection-tolerance 1e-12] [--projection-cold-start] --output tmp/my_run
 tmp/build/m1pn_positivity_projection_bench --orders 3,7,15 --states 2000   # Kernkosten je Randknoten
 ```
@@ -138,7 +166,7 @@ tmp/build/m1pn_positivity_projection_bench --orders 3,7,15 --states 2000   # Ker
 `summary.json` enthält zusätzlich `kinetic_l2_error` (gegen die exakte kinetische Dichte, enthält den
 PN-Modellfehler), `kinetic_l2_error_outflow_strip` (nur max(x,y) > 1 − 4·Breite), `exact_mass`, `seconds.ghost`
 und bei Projektion `projection{calls, identities, augmented, certificates, diracs, farkas, failures, iterations,
-backtracks, max_iterations, max_residual, min_active_fraction}`. `--projection-rule R` setzt die Hemisphärenregel
+backtracks, max_iterations, max_residual, min_active_fraction, capped}`. `--projection-rule R` setzt die Hemisphärenregel
 (Standard N+1 für die Projektion, C6 behält 2N+1; Minimum N+1 für Momentenkonsistenz).
 
 NX-Kampagne: `scripts/positivity/campaign.py prepare|submit|collect`, Auswertung `scripts/positivity/analyze.py`.

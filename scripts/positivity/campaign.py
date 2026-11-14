@@ -28,7 +28,7 @@ REPO = Path(__file__).resolve().parents[2]
 COMMON = ["--problem", "crossing-study", "--dimension", "2", "--time", ".8", "--cfl", ".9", "--sample-grid", "256"]
 VARIANTS = {
     "ref": ("ref", []),
-    "c6": ("new", []),
+    "c6": ("new", ["--c6-ghost"]),  # the projection is the default since 2026-11-14
     "proj": ("new", ["--positivity-projection"]),
     "projN1": ("new", ["--positivity-projection", "--projection-rule", "N+1"]),
 }

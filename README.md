@@ -28,7 +28,7 @@ zeigt die Wirkung der abgeschalteten M1-Kopplung bei gleichen Anfangsdaten
 und gleicher Schrittweite.
 
 Die [momententreue Positivitätsprojektion am Rand](docs/POSITIVITY_PROJECTION.md)
-(`m1pn_element_weno --positivity-projection`) ersetzt den C6-Ghost durch die Projektion des PN-Traces auf
+(Standard seit 14.11.2026, C6 mit `m1pn_element_weno --c6-ghost`) ersetzt den C6-Ghost durch die Projektion des PN-Traces auf
 nichtnegative, momententreue Winkelmaße; der Randpfad wurde vorab optimiert (Ergebnisse unter
 [results/positivity](results/positivity/README.md)).
 
