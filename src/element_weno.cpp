@@ -1142,25 +1142,31 @@ Field ElementWeno::projected_gradient(const Field &a, int d) const {
         solve_lines(out, d, true);
         return out;
     }
-    parallel_for(lines, [&](int line) {
-        const int start = (line / s) * (s * per_direction) + line % s;
-        thread_local std::vector<double> work;
-        work.resize(std::size_t(per_direction) * q);
-        for (int k = 0; k < per_direction; ++k) {
-            double *__restrict y = &work[std::size_t(natural.perm[k]) * q];
-            std::fill_n(y, q, 0.);
-            for (int e = outer[k]; e < outer[k + 1]; ++e) {
-                const double c = value[e];
-                const double *x = data + std::size_t(start + inner[e] * s) * q;
-#pragma omp simd
-                for (int j = 0; j < q; ++j) y[j] += c * x[j];
-            }
-        }
-        solve_line(natural, work.data(), q);
-        for (int k = 0; k < per_direction; ++k)
-            std::copy_n(&work[std::size_t(natural.perm[k]) * q], q, &out.coeffRef(start + k * s, 0));
-    });
+    parallel_for(lines, [&](int line) { gradient_line(a, d, line, out); });
     return out;
+}
+void ElementWeno::gradient_line(const Field &a, int d, int line, Field &out) const {
+    const int q = a.cols(), s = stride(d), per_direction = nodes_per_axis[d];
+    const LineFactor &natural = natural_[d];
+    const int *outer = convection_1d_[d].outerIndexPtr(), *inner = convection_1d_[d].innerIndexPtr();
+    const double *value = convection_1d_[d].valuePtr();
+    const double *data = a.data();
+    const int start = (line / s) * (s * per_direction) + line % s;
+    thread_local std::vector<double> work;
+    work.resize(std::size_t(per_direction) * q);
+    for (int k = 0; k < per_direction; ++k) {
+        double *__restrict y = &work[std::size_t(natural.perm[k]) * q];
+        std::fill_n(y, q, 0.);
+        for (int e = outer[k]; e < outer[k + 1]; ++e) {
+            const double c = value[e];
+            const double *x = data + std::size_t(start + inner[e] * s) * q;
+#pragma omp simd
+            for (int j = 0; j < q; ++j) y[j] += c * x[j];
+        }
+    }
+    solve_line(natural, work.data(), q);
+    for (int k = 0; k < per_direction; ++k)
+        std::copy_n(&work[std::size_t(natural.perm[k]) * q], q, &out.coeffRef(start + k * s, 0));
 }
 Field ElementWeno::gather_load(const Field &local, double scale) const {
     const int q = local.cols() / local_nodes;
@@ -1872,8 +1878,48 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     // g_d = M^-1 C_d a serves twice: in s_h and as the advective rate -sum_d g_d A_d (A_d acts on the PN index only).
     const double stabilization_start = clock;
     std::array<Field, 3> gradient;
-    for (int d = 0; d < dimension; ++d)
-        gradient[d] = projected_gradient(a, d);
+    if (dist_) {
+        // Distributed: the line solve along the axis is a pipeline over the ranks; the gradients of the other
+        // directions (independent, rank-local lines) fill its idle threads. Same arithmetic as projected_gradient.
+        const int D = dist_->axis, q = a.cols();
+        Field &g = gradient[D];
+        g.resize(nodes, q);
+        {
+            const int s = stride(D), per_direction = nodes_per_axis[D], lines = nodes / per_direction;
+            const int *outer = convection_1d_[D].outerIndexPtr(), *inner = convection_1d_[D].innerIndexPtr();
+            const double *value = convection_1d_[D].valuePtr();
+            const double *data = a.data();
+            parallel_for(lines, [&](int line) {
+                const int start = (line / s) * (s * per_direction) + line % s;
+                for (int k = 0; k < per_direction; ++k) {
+                    double *__restrict y = &g.coeffRef(start + k * s, 0);
+                    std::fill_n(y, q, 0.);
+                    for (int e = outer[k]; e < outer[k + 1]; ++e) {
+                        const double c = value[e];
+                        const double *x = data + std::size_t(start + inner[e] * s) * q;
+#pragma omp simd
+                        for (int j = 0; j < q; ++j) y[j] += c * x[j];
+                    }
+                }
+            });
+        }
+        std::vector<std::array<int, 3>> blocks; // direction, first line, end line
+        for (int d = 0; d < dimension; ++d) {
+            if (d == D)
+                continue;
+            gradient[d].resize(nodes, q);
+            const int lines = nodes / nodes_per_axis[d], per = std::max(1, lines / (4 * max_threads()));
+            for (int l = 0; l < lines; l += per)
+                blocks.push_back({d, l, std::min(lines, l + per)});
+        }
+        dist_->solve_axis_overlap(g, int(blocks.size()), [&](int i) {
+            for (int line = blocks[i][1]; line < blocks[i][2]; ++line)
+                gradient_line(a, blocks[i][0], line, gradient[blocks[i][0]]);
+        });
+        dist_->exchange(g);
+    } else
+        for (int d = 0; d < dimension; ++d)
+            gradient[d] = projected_gradient(a, d);
     lap(timing.t_gradient_solve);
     // Gathered -s_h and the projected low moments of the element loads P s_h^e(phi_i, a).
     Field stabilization_low;

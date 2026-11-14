@@ -98,6 +98,8 @@ Args parse(int argc, char **argv) {
 }
 } // namespace
 int main(int argc, char **argv) {
+    // Task priorities (MPI line pipeline before filler work); read by the OpenMP runtime at its start.
+    setenv("OMP_MAX_TASK_PRIORITY", "1", 0);
     int mpi_rank = 0, mpi_size = 1;
 #ifdef M1PN_MPI
     {

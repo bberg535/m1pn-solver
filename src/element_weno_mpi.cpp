@@ -501,7 +501,16 @@ void ElementWenoMpi::solve_axis_threaded(Field &b) const {
 // may start once the messages it reads have arrived. One thread (the master) posts all receives up front, tests them,
 // starts ready phases as OpenMP tasks and sends what finished phases produced; the other threads execute the tasks.
 // Within a block the operations are those of the serial solve_line, so the result is bitwise the serial one.
-void ElementWenoMpi::solve_axis_tasks(Field &b) const {
+void ElementWenoMpi::solve_axis_overlap(Field &b, int count, const std::function<void(int)> &filler) const {
+    if (tasks_ && !thread_multiple_) {
+        solve_axis_tasks(b, count, &filler);
+        return;
+    }
+    parallel_for(count, [&](int i) { filler(i); });
+    solve_axis(b);
+}
+
+void ElementWenoMpi::solve_axis_tasks(Field &b, int fillers, const std::function<void(int)> *filler) const {
     const double start = MPI_Wtime();
     const int me = part_.rank, q = int(b.cols());
     const int T = std::max(1, omp_get_max_threads());
@@ -650,13 +659,19 @@ void ElementWenoMpi::solve_axis_tasks(Field &b) const {
         touched[c] = c;
     std::vector<MPI_Request> sreq;
     double wait = 0;
-    if (R == 0) { // owns no positions (cannot happen with owned layers); nothing to do
+    if (R == 0) { // owns no positions (cannot happen with owned layers)
+        parallel_for(fillers, [&](int i) { (*filler)(i); });
         MPI_Waitall(int(rreq.size()), rreq.data(), MPI_STATUSES_IGNORE);
         return;
     }
 #pragma omp parallel num_threads(T)
 #pragma omp single
     {
+        // Fillers first, at low priority: idle workers take them, pipeline phases (priority 1) go ahead.
+        for (int i = 0; i < fillers; ++i) {
+#pragma omp task firstprivate(i) priority(0)
+            (*filler)(i);
+        }
         int finished = 0;
         std::vector<int> idx(rreq.size());
         while (finished < C) {
@@ -709,7 +724,7 @@ void ElementWenoMpi::solve_axis_tasks(Field &b) const {
                 if (!running[c] && next[c] < phases && ready(c, next[c])) {
                     running[c] = 1;
                     const int k = next[c];
-#pragma omp task firstprivate(c, k)
+#pragma omp task firstprivate(c, k) priority(1)
                     {
                         execute(c, k);
                         const std::lock_guard<std::mutex> lock(finished_lock);

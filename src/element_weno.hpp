@@ -168,6 +168,12 @@ struct DistributedHooks {
     virtual void solve_axis(Field &b) const = 0;
     // Halo rows of f (rows = local nodes, any column count) from their owners.
     virtual void exchange(Field &f) const = 0;
+    // solve_axis while `count` independent pieces of work filler(0..count-1) run on otherwise idle threads.
+    virtual void solve_axis_overlap(Field &b, int count, const std::function<void(int)> &filler) const {
+        for (int i = 0; i < count; ++i)
+            filler(i);
+        solve_axis(b);
+    }
     virtual double sum(double local) const = 0;
     virtual double min(double local) const = 0;
 };
@@ -378,6 +384,8 @@ private:
     Field gather_load(const Field &local, double scale = 1.) const;
     // M^-1 C_d a along the grid lines of direction d, and the element loads of s_h for given gradients.
     Field projected_gradient(const Field &a, int direction) const;
+    // One grid line of M^-1 C_d a (natural factor; the body of projected_gradient without mirror sides).
+    void gradient_line(const Field &a, int direction, int line, Field &out) const;
     Field stabilization_load(const Field &a, const Vec &gamma, const std::array<Field, 3> &gradient,
                              ElementWenoStats * = nullptr) const;
     // Node-wise gathered -s_h(phi_i, a) plus (optionally) the projected low moments of the element loads.
