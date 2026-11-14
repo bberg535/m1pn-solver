@@ -55,4 +55,22 @@ Knoten ist gesperrt; `mpirun` startet trotzdem auf allen Knoten der Allokation.
 
 ## Messung (NX, Crossing-Studie 2D, Q1, T = 0.1, feste Schrittweite)
 
-Siehe Abschnitt „Ergebnisse“ unten (wird mit den Läufen von Job 160223 gefüllt).
+Job 160224 (`nx/tmp/mpi_ucx5_20261114`, Commit in `commit.txt`, SHA256 der Binaries in `sha256.txt`). Ein Rang pro
+Sockel (32 Kerne), 2 Ränge pro Server. Alle Endzustände sind bitgleich zum Ein-Rang-Lauf.
+
+| Fall | 1 Rang | 2 Ränge (1 Server) | 4 Ränge (2 Server) | 6 Ränge (3 Server) |
+|---|---|---|---|---|
+| E=512, N=15 | 59.2 s | 43.3 s (1.37×) | 27.3 s (2.17×) | 24.6 s (2.41×) |
+| E=512, N=31 | 218.5 s | 198.2 s (1.10×) | 246.8 s (0.89×) | 70.4 s (3.10×) |
+| E=1024, N=15 | 510.8 s | 425.0 s (1.20×) | 195.6 s (2.61×) | 143.7 s (3.56×) |
+
+Zum Vergleich: ein Prozess mit 64 Threads auf einem ganzen Server braucht bei E=512, N=15 47.4 s.
+
+Bewertung:
+- Die lokalen Kerne skalieren nahezu ideal: Stabilisierung, Limiter und Rand teilen sich durch die Rangzahl.
+- Der Halo-Austausch kostet über InfiniBand 1.6–2 s; über TCP waren es 17–23 s.
+- Begrenzend ist die verteilte y-Linienlösung (Spalte `t_axis_solve_max` in `summary.json`).
+- Offen: Bei N=31 sind 2 und 4 Ränge auffällig langsam (Linienlösung 93 bzw. 183 s, 6 Ränge 33 s). Vermutet wird
+  ein Protokolleffekt großer Nachrichten (UCX-Rendezvous) in der Task-Pipeline; noch nicht untersucht.
+- Größere Gitter skalieren besser (E=1024: 3.56× auf 3 Servern), weil die Rechenarbeit pro Pipeline-Block mit
+  der Gittergröße wächst.
