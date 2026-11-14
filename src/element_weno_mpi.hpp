@@ -55,6 +55,8 @@ class ElementWenoMpi : public DistributedHooks {
     int p_ = 1, layer_size_ = 0, L0_ = 0, layers_ = 0, O0_ = 0, O1_ = 0, chunks_ = 1;
     bool thread_multiple_ = false; // MPI_THREAD_MULTIPLE: every thread pipelines its own column blocks
     void solve_axis_threaded(Field &b) const;
+    void solve_axis_tasks(Field &b) const; // default: one MPI thread, OpenMP tasks per block of whole lines
+    bool tasks_ = true;
     std::vector<int> owner_;                     // global layer -> rank
     // Global 1D mass factor (as in the ElementWeno constructor): CSC of L, D, perm (layer -> position), inverse.
     std::vector<int> outer_, inner_, perm_, inv_;

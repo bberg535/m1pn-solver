@@ -17,7 +17,7 @@ int main(int argc, char **argv) {
         Angular pn(N);
         ElementWenoOptions o;
         o.degree = 1, o.dimension = 2, o.elements = E, o.periodic = false;
-        const SlabPartition part = slab_partition(E, size, rank, 1, 6);
+        const SlabPartition part = slab_partition(E, size, rank, 1, 2);
         ElementWeno local(pn, slab_options(o, part));
         ElementWenoMpi mpi(local, MPI_COMM_WORLD, part);
         Field l = Field::Random(local.nodes, local.moments);

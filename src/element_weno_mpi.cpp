@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <map>
 #include <omp.h>
+#include <atomic>
 #include <cstdlib>
 
 namespace m1pn {
@@ -37,6 +38,8 @@ ElementWenoOptions slab_options(const ElementWenoOptions &g, const SlabPartition
 
 ElementWenoMpi::ElementWenoMpi(ElementWeno &scheme, MPI_Comm comm, const SlabPartition &part, int chunks)
     : s_(scheme), comm_(comm), part_(part), chunks_(chunks) {
+    if (const char *env = std::getenv("M1PN_MPI_CHUNKS"))
+        chunks_ = std::atoi(env);
     const int D = part.axis, r = part.rank, P = part.ranks, E = part.elements;
     axis = D;
     p_ = s_.degree;
@@ -146,6 +149,7 @@ ElementWenoMpi::ElementWenoMpi(ElementWeno &scheme, MPI_Comm comm, const SlabPar
         MPI_Query_thread(&provided);
         // Opt-in only: with UCX, 32 threads blocking in MPI_Recv contend badly (NX: 4 ranks 1665 s instead of 47 s).
         thread_multiple_ = provided >= MPI_THREAD_MULTIPLE && std::getenv("M1PN_MPI_THREADED_PIPELINE");
+        tasks_ = !std::getenv("M1PN_MPI_CHUNK_SPLIT"); // M1PN_MPI_CHUNK_SPLIT: the earlier block-split pipeline
     }
     std::vector<char> owned(s_.nodes, 0);
     for (int i = 0; i < s_.nodes; ++i) {
@@ -195,6 +199,10 @@ void ElementWenoMpi::exchange(Field &f) const {
 void ElementWenoMpi::solve_axis(Field &b) const {
     if (thread_multiple_) {
         solve_axis_threaded(b);
+        return;
+    }
+    if (tasks_) {
+        solve_axis_tasks(b);
         return;
     }
     const double start = MPI_Wtime();
@@ -484,6 +492,229 @@ void ElementWenoMpi::solve_axis_threaded(Field &b) const {
         MPI_Waitall(int(req.size()), req.data(), MPI_STATUSES_IGNORE);
     }
     t_wait += wait_total / T;
+    t_solve += MPI_Wtime() - start;
+}
+
+// Task pipeline. The columns are cut into C blocks of whole grid lines (C ~ 3 threads). For every block the forward
+// sweep runs through this rank's runs in order, then the backward sweep in reverse order (diagonal fused); a phase
+// may start once the messages it reads have arrived. One thread (the master) posts all receives up front, tests them,
+// starts ready phases as OpenMP tasks and sends what finished phases produced; the other threads execute the tasks.
+// Within a block the operations are those of the serial solve_line, so the result is bitwise the serial one.
+void ElementWenoMpi::solve_axis_tasks(Field &b) const {
+    const double start = MPI_Wtime();
+    const int me = part_.rank, q = int(b.cols());
+    const int T = std::max(1, omp_get_max_threads());
+    const int lines = layer_size_;
+    const int C = chunks_ > 0 ? chunks_ : std::max(1, std::min(lines, 3 * T));
+    std::vector<std::size_t> cs(C + 1);
+    for (int c = 0; c <= C; ++c)
+        cs[c] = std::size_t(long(lines) * c / C) * q;
+    const std::size_t len = std::size_t(lines) * q;
+    auto alloc = [&](const std::vector<Message> &msgs) {
+        std::vector<std::vector<double>> out(msgs.size());
+        for (std::size_t l = 0; l < msgs.size(); ++l)
+            out[l].resize(msgs[l].positions.size() * len);
+        return out;
+    };
+    auto fr = alloc(fwd_recv_), fs = alloc(fwd_send_), br = alloc(bwd_recv_), bs = alloc(bwd_send_);
+    auto slot = [&](const std::vector<double> &buf, std::size_t npos, int c, std::size_t m) {
+        return const_cast<double *>(buf.data()) + npos * cs[c] + m * (cs[c + 1] - cs[c]);
+    };
+    std::map<int, std::pair<int, int>> where;
+    for (std::size_t l = 0; l < bwd_recv_.size(); ++l)
+        for (std::size_t m = 0; m < bwd_recv_[l].positions.size(); ++m)
+            where[bwd_recv_[l].positions[m]] = {int(l), int(m)};
+    auto tag = [&](int run, int c, bool backward) { return 100 + int((long(run) * C + c) * 2 + backward) % 30000; };
+    // Phases of a block: forward over my runs (ascending), then backward over my runs (descending).
+    std::vector<int> mine;
+    for (std::size_t g = 0; g < runs_.size(); ++g)
+        if (runs_[g].owner == me)
+            mine.push_back(int(g));
+    const int R = int(mine.size()), phases = 2 * R;
+    // Receives: all posted up front; arrived[dir][msg][c].
+    const int nf = int(fwd_recv_.size()), nb = int(bwd_recv_.size());
+    std::vector<MPI_Request> rreq;
+    std::vector<std::array<int, 3>> rinfo; // dir, msg, chunk
+    for (int c = 0; c < C; ++c) {
+        const std::size_t cl = cs[c + 1] - cs[c];
+        for (int l = 0; l < nf; ++l) {
+            const std::size_t np = fwd_recv_[l].positions.size();
+            rreq.emplace_back();
+            MPI_Irecv(slot(fr[l], np, c, 0), int(np * cl), MPI_DOUBLE, fwd_recv_[l].peer, tag(fwd_recv_[l].run, c, false),
+                      comm_, &rreq.back());
+            rinfo.push_back({0, l, c});
+        }
+        for (int l = 0; l < nb; ++l) {
+            const std::size_t np = bwd_recv_[l].positions.size();
+            rreq.emplace_back();
+            MPI_Irecv(slot(br[l], np, c, 0), int(np * cl), MPI_DOUBLE, bwd_recv_[l].peer, tag(bwd_recv_[l].run, c, true),
+                      comm_, &rreq.back());
+            rinfo.push_back({1, l, c});
+        }
+    }
+    std::vector<char> arrived_f(std::size_t(nf) * C, 0), arrived_b(std::size_t(nb) * C, 0);
+    // Readiness of phase k of block c (only the master evaluates it).
+    auto ready = [&](int c, int k) {
+        if (k < R) {
+            const int g = mine[k];
+            for (int l = 0; l < nf; ++l)
+                if (fwd_recv_[l].run < g && !arrived_f[std::size_t(l) * C + c])
+                    return false;
+        } else {
+            const int g = mine[phases - 1 - k];
+            for (int l = 0; l < nb; ++l)
+                if (bwd_recv_[l].run > g && !arrived_b[std::size_t(l) * C + c])
+                    return false;
+        }
+        return true;
+    };
+    // Execute phase k of block c (any thread).
+    std::vector<std::vector<char>> applied(C, std::vector<char>(nf, 0));
+    auto execute = [&](int c, int k) {
+        const std::size_t cl = cs[c + 1] - cs[c];
+        if (k < R) {
+            const int g = mine[k];
+            for (int l = 0; l < nf; ++l) { // foreign columns of earlier runs, in run (= position) order
+                const Message &msg = fwd_recv_[l];
+                if (msg.run >= g || applied[c][l])
+                    continue;
+                applied[c][l] = 1;
+                const std::size_t np = msg.positions.size();
+                const double *base = slot(fr[l], np, c, 0);
+                for (std::size_t m = 0; m < np; ++m) {
+                    const int j = msg.positions[m];
+                    const double *yj = base + m * cl;
+                    for (int kk = outer_[j]; kk < outer_[j + 1]; ++kk) {
+                        const int i = inner_[kk];
+                        if (i == j || owner_[inv_[i]] != me)
+                            continue;
+                        const double v = values_[kk];
+                        double *yi = layer(b, inv_[i]) + cs[c];
+                        for (std::size_t t = 0; t < cl; ++t) yi[t] -= v * yj[t];
+                    }
+                }
+            }
+            for (int j = runs_[g].first; j < runs_[g].end; ++j) {
+                const double *yj = layer(b, inv_[j]) + cs[c];
+                for (int kk = outer_[j]; kk < outer_[j + 1]; ++kk) {
+                    const int i = inner_[kk];
+                    if (i == j || owner_[inv_[i]] != me)
+                        continue;
+                    const double v = values_[kk];
+                    double *yi = layer(b, inv_[i]) + cs[c];
+                    for (std::size_t t = 0; t < cl; ++t) yi[t] -= v * yj[t];
+                }
+            }
+            for (std::size_t l = 0; l < fwd_send_.size(); ++l)
+                if (fwd_send_[l].run == g) {
+                    const auto &pos = fwd_send_[l].positions;
+                    for (std::size_t m = 0; m < pos.size(); ++m)
+                        std::copy_n(layer(b, inv_[pos[m]]) + cs[c], cl, slot(fs[l], pos.size(), c, m));
+                }
+        } else {
+            const int g = mine[phases - 1 - k];
+            for (int j = runs_[g].end - 1; j >= runs_[g].first; --j) {
+                double *yj = layer(b, inv_[j]) + cs[c];
+                const double inv = 1. / diag_[j];
+                for (std::size_t t = 0; t < cl; ++t) yj[t] *= inv;
+                for (int kk = outer_[j]; kk < outer_[j + 1]; ++kk) {
+                    const int i = inner_[kk];
+                    if (i == j)
+                        continue;
+                    const double v = values_[kk];
+                    const double *yi;
+                    if (owner_[inv_[i]] == me)
+                        yi = layer(b, inv_[i]) + cs[c];
+                    else {
+                        const auto [l, m] = where.at(i);
+                        yi = slot(br[l], bwd_recv_[l].positions.size(), c, m);
+                    }
+                    for (std::size_t t = 0; t < cl; ++t) yj[t] -= v * yi[t];
+                }
+            }
+            for (std::size_t l = 0; l < bwd_send_.size(); ++l)
+                if (bwd_send_[l].run == g) {
+                    const auto &pos = bwd_send_[l].positions;
+                    for (std::size_t m = 0; m < pos.size(); ++m)
+                        std::copy_n(layer(b, inv_[pos[m]]) + cs[c], cl, slot(bs[l], pos.size(), c, m));
+                }
+        }
+    };
+    std::vector<int> next(C, 0);                  // next phase of each block
+    std::vector<std::atomic<int>> done(C);        // finished phases (written by the task, read by the master)
+    for (auto &d : done)
+        d.store(0);
+    std::vector<char> running(C, 0);
+    std::vector<MPI_Request> sreq;
+    double wait = 0;
+    if (R == 0) { // owns no positions (cannot happen with owned layers); nothing to do
+        MPI_Waitall(int(rreq.size()), rreq.data(), MPI_STATUSES_IGNORE);
+        return;
+    }
+#pragma omp parallel num_threads(T)
+#pragma omp single
+    {
+        int finished = 0;
+        std::vector<int> idx(rreq.size());
+        while (finished < C) {
+            bool progress = false;
+            // arrivals
+            if (!rreq.empty()) {
+                int count = 0;
+                MPI_Testsome(int(rreq.size()), rreq.data(), &count, idx.data(), MPI_STATUSES_IGNORE);
+                if (count > 0 && count != MPI_UNDEFINED) {
+                    progress = true;
+                    for (int n = 0; n < count; ++n) {
+                        const auto &info = rinfo[idx[n]];
+                        (info[0] ? arrived_b : arrived_f)[std::size_t(info[1]) * C + info[2]] = 1;
+                    }
+                }
+            }
+            for (int c = 0; c < C; ++c) {
+                if (running[c]) {
+                    if (done[c].load(std::memory_order_acquire) == next[c] + 1) { // phase finished: send its products
+                        running[c] = 0;
+                        const int k = next[c]++;
+                        const bool backward = k >= R;
+                        const int g = backward ? mine[phases - 1 - k] : mine[k];
+                        const auto &msgs = backward ? bwd_send_ : fwd_send_;
+                        auto &bufs = backward ? bs : fs;
+                        const std::size_t cl = cs[c + 1] - cs[c];
+                        for (std::size_t l = 0; l < msgs.size(); ++l)
+                            if (msgs[l].run == g) {
+                                const std::size_t np = msgs[l].positions.size();
+                                sreq.emplace_back();
+                                MPI_Isend(slot(bufs[l], np, c, 0), int(np * cl), MPI_DOUBLE, msgs[l].peer,
+                                          tag(g, c, backward), comm_, &sreq.back());
+                            }
+                        if (next[c] == phases)
+                            ++finished;
+                        progress = true;
+                    }
+                    continue;
+                }
+                if (next[c] < phases && ready(c, next[c])) {
+                    running[c] = 1;
+                    const int k = next[c];
+#pragma omp task firstprivate(c, k)
+                    {
+                        execute(c, k);
+                        done[c].store(k + 1, std::memory_order_release);
+                    }
+                    progress = true;
+                }
+            }
+            if (!progress) {
+                const double w0 = MPI_Wtime();
+#pragma omp taskyield
+                wait += MPI_Wtime() - w0;
+            }
+        }
+#pragma omp taskwait
+    }
+    MPI_Waitall(int(rreq.size()), rreq.data(), MPI_STATUSES_IGNORE);
+    MPI_Waitall(int(sreq.size()), sreq.data(), MPI_STATUSES_IGNORE);
+    t_wait += wait;
     t_solve += MPI_Wtime() - start;
 }
 
