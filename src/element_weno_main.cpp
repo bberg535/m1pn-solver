@@ -1,6 +1,7 @@
 // Stand-alone driver for the element-based WENO variant.
 #include "element_weno.hpp"
 #include "element_weno_mpi.hpp"
+#include <cstdlib>
 #include "hardware.hpp"
 #include <filesystem>
 #include <malloc.h>
@@ -101,6 +102,9 @@ int main(int argc, char **argv) {
 #ifdef M1PN_MPI
     {
         int provided = 0;
+        // UCX: the line pipeline sends many messages of some 10 KB from a thread that is rarely inside MPI; the
+        // rendezvous protocol (default above a few KB) then stalls (NX, N=31, 4 ranks: 49 s -> 18.5 s with 4 MB).
+        setenv("UCX_RNDV_THRESH", "4mb", 0); // keeps a value set by the user
         MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided); // MULTIPLE: threaded line pipeline
         MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
         MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);

@@ -1,12 +1,16 @@
 // MPI tests of the slab-decomposed element WENO (src/element_weno_mpi.hpp): the distributed line solves and the
 // projected gradient against the serial global scheme, bitwise. Run with mpirun -np 2..4.
 #include "element_weno_mpi.hpp"
+#include <cstdlib>
 #include <cstdio>
 #include <random>
 #include <string>
 using namespace m1pn;
 int main(int argc, char **argv) {
     int provided = 0;
+    // UCX: the line pipeline sends many messages of some 10 KB from a thread that is rarely inside MPI; the
+    // rendezvous protocol (default above a few KB) then stalls (NX, N=31, 4 ranks: 49 s -> 18.5 s with 4 MB).
+    setenv("UCX_RNDV_THRESH", "4mb", 0); // keeps a value set by the user
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
