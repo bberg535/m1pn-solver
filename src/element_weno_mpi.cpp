@@ -6,6 +6,7 @@
 #include <map>
 #include <omp.h>
 #include <atomic>
+#include <mutex>
 #include <cstdlib>
 
 namespace m1pn {
@@ -552,22 +553,23 @@ void ElementWenoMpi::solve_axis_tasks(Field &b) const {
             rinfo.push_back({1, l, c});
         }
     }
-    std::vector<char> arrived_f(std::size_t(nf) * C, 0), arrived_b(std::size_t(nb) * C, 0);
-    // Readiness of phase k of block c (only the master evaluates it).
-    auto ready = [&](int c, int k) {
-        if (k < R) {
-            const int g = mine[k];
-            for (int l = 0; l < nf; ++l)
-                if (fwd_recv_[l].run < g && !arrived_f[std::size_t(l) * C + c])
-                    return false;
-        } else {
-            const int g = mine[phases - 1 - k];
-            for (int l = 0; l < nb; ++l)
-                if (bwd_recv_[l].run > g && !arrived_b[std::size_t(l) * C + c])
-                    return false;
-        }
-        return true;
+    // Missing messages per (block, phase): phase k of block c may start when missing[c * phases + k] == 0.
+    std::vector<int> missing(std::size_t(C) * phases, 0);
+    auto phase_of_recv = [&](int dir, int l, int k) { // does phase k wait for message l of direction dir?
+        if (dir == 0)
+            return k < R && fwd_recv_[l].run < mine[k];
+        return k >= R && bwd_recv_[l].run > mine[phases - 1 - k];
     };
+    for (int c = 0; c < C; ++c)
+        for (int k = 0; k < phases; ++k) {
+            int m = 0;
+            for (int l = 0; l < nf; ++l)
+                m += phase_of_recv(0, l, k);
+            for (int l = 0; l < nb; ++l)
+                m += phase_of_recv(1, l, k);
+            missing[std::size_t(c) * phases + k] = m;
+        }
+    auto ready = [&](int c, int k) { return missing[std::size_t(c) * phases + k] == 0; };
     // Execute phase k of block c (any thread).
     std::vector<std::vector<char>> applied(C, std::vector<char>(nf, 0));
     auto execute = [&](int c, int k) {
@@ -640,11 +642,12 @@ void ElementWenoMpi::solve_axis_tasks(Field &b) const {
                 }
         }
     };
-    std::vector<int> next(C, 0);                  // next phase of each block
-    std::vector<std::atomic<int>> done(C);        // finished phases (written by the task, read by the master)
-    for (auto &d : done)
-        d.store(0);
+    std::vector<int> next(C, 0); // next phase of each block
     std::vector<char> running(C, 0);
+    std::mutex finished_lock;
+    std::vector<int> finished_blocks, touched(C);
+    for (int c = 0; c < C; ++c)
+        touched[c] = c;
     std::vector<MPI_Request> sreq;
     double wait = 0;
     if (R == 0) { // owns no positions (cannot happen with owned layers); nothing to do
@@ -658,7 +661,7 @@ void ElementWenoMpi::solve_axis_tasks(Field &b) const {
         std::vector<int> idx(rreq.size());
         while (finished < C) {
             bool progress = false;
-            // arrivals
+            // arrivals: decrement the missing counts of the phases that wait for them
             if (!rreq.empty()) {
                 int count = 0;
                 MPI_Testsome(int(rreq.size()), rreq.data(), &count, idx.data(), MPI_STATUSES_IGNORE);
@@ -666,44 +669,54 @@ void ElementWenoMpi::solve_axis_tasks(Field &b) const {
                     progress = true;
                     for (int n = 0; n < count; ++n) {
                         const auto &info = rinfo[idx[n]];
-                        (info[0] ? arrived_b : arrived_f)[std::size_t(info[1]) * C + info[2]] = 1;
+                        for (int k = 0; k < phases; ++k)
+                            if (phase_of_recv(info[0], info[1], k))
+                                --missing[std::size_t(info[2]) * phases + k];
+                        touched.push_back(info[2]);
                     }
                 }
             }
-            for (int c = 0; c < C; ++c) {
-                if (running[c]) {
-                    if (done[c].load(std::memory_order_acquire) == next[c] + 1) { // phase finished: send its products
-                        running[c] = 0;
-                        const int k = next[c]++;
-                        const bool backward = k >= R;
-                        const int g = backward ? mine[phases - 1 - k] : mine[k];
-                        const auto &msgs = backward ? bwd_send_ : fwd_send_;
-                        auto &bufs = backward ? bs : fs;
-                        const std::size_t cl = cs[c + 1] - cs[c];
-                        for (std::size_t l = 0; l < msgs.size(); ++l)
-                            if (msgs[l].run == g) {
-                                const std::size_t np = msgs[l].positions.size();
-                                sreq.emplace_back();
-                                MPI_Isend(slot(bufs[l], np, c, 0), int(np * cl), MPI_DOUBLE, msgs[l].peer,
-                                          tag(g, c, backward), comm_, &sreq.back());
-                            }
-                        if (next[c] == phases)
-                            ++finished;
-                        progress = true;
-                    }
-                    continue;
+            // finished phases (tasks append their block to `finished_blocks` under a lock)
+            {
+                std::vector<int> fin;
+                {
+                    const std::lock_guard<std::mutex> lock(finished_lock);
+                    fin.swap(finished_blocks);
                 }
-                if (next[c] < phases && ready(c, next[c])) {
+                for (int c : fin) {
+                    running[c] = 0;
+                    const int k = next[c]++;
+                    const bool backward = k >= R;
+                    const int g = backward ? mine[phases - 1 - k] : mine[k];
+                    const auto &msgs = backward ? bwd_send_ : fwd_send_;
+                    auto &bufs = backward ? bs : fs;
+                    const std::size_t cl = cs[c + 1] - cs[c];
+                    for (std::size_t l = 0; l < msgs.size(); ++l)
+                        if (msgs[l].run == g) {
+                            const std::size_t np = msgs[l].positions.size();
+                            sreq.emplace_back();
+                            MPI_Isend(slot(bufs[l], np, c, 0), int(np * cl), MPI_DOUBLE, msgs[l].peer,
+                                      tag(g, c, backward), comm_, &sreq.back());
+                        }
+                    if (next[c] == phases)
+                        ++finished;
+                    touched.push_back(c);
+                    progress = true;
+                }
+            }
+            // start ready phases of the touched blocks
+            for (int c : touched)
+                if (!running[c] && next[c] < phases && ready(c, next[c])) {
                     running[c] = 1;
                     const int k = next[c];
 #pragma omp task firstprivate(c, k)
                     {
                         execute(c, k);
-                        done[c].store(k + 1, std::memory_order_release);
+                        const std::lock_guard<std::mutex> lock(finished_lock);
+                        finished_blocks.push_back(c);
                     }
-                    progress = true;
                 }
-            }
+            touched.clear();
             if (!progress) {
                 const double w0 = MPI_Wtime();
 #pragma omp taskyield
