@@ -124,6 +124,7 @@ int main(int argc, char **argv) {
 #endif
     try {
         const Args args = parse(argc, argv);
+        const double zc = args.dimension == 3 ? .5 : 0.; // crossing-study pulse centre height (3D: mid-plane)
         Angular pn(args.pn);
         ElementWenoOptions options;
         options.degree = args.degree;
@@ -169,14 +170,14 @@ int main(int argc, char **argv) {
                 return bgo / (4 * pi) + gauss2(x - t * o - ocenter) * fdist(o);
             };
         } else if (!smooth) {
-            require(args.dimension == 2, "crossing-study is 2D");
+            require(args.dimension >= 2, "crossing-study is 2D or 3D (3D: pulses at z = 0.5, no kinetic metrics)");
             const double bg = args.background, w = args.width;
             inflow.density = [bg](const V3 &, double, const V3 &) { return bg / (4 * pi); };
             inflow.constant_density = bg / (4 * pi);
-            inflow.atoms = [w](const V3 &x, double t) {
+            inflow.atoms = [w, zc](const V3 &x, double t) {
                 auto p = [w](const V3 &d) { return std::exp(-d.squaredNorm() / (2 * w * w)); };
-                return std::vector<Atom>{{V3::UnitX(), p(x - t * V3::UnitX() - V3(.3, .5, 0))},
-                                         {V3::UnitY(), p(x - t * V3::UnitY() - V3(.5, .3, 0))}};
+                return std::vector<Atom>{{V3::UnitX(), p(x - t * V3::UnitX() - V3(.3, .5, zc))},
+                                         {V3::UnitY(), p(x - t * V3::UnitY() - V3(.5, .3, zc))}};
             };
         }
         // MPI: every rank integrates its slab (plus halo) of the global mesh; rank 0 evaluates the gathered final
@@ -215,8 +216,8 @@ int main(int argc, char **argv) {
                 auto p = [&](const V3 &d) { return std::exp(-d.squaredNorm() / (2 * args.width * args.width)); };
                 Vec s = Vec::Zero(pn.q);
                 s[0] = args.background / std::sqrt(4 * pi);
-                s += p(x - V3(.3, .5, 0)) * harmonics(pn.order, V3::UnitX());
-                s += p(x - V3(.5, .3, 0)) * harmonics(pn.order, V3::UnitY());
+                s += p(x - V3(.3, .5, zc)) * harmonics(pn.order, V3::UnitX());
+                s += p(x - V3(.5, .3, zc)) * harmonics(pn.order, V3::UnitY());
                 return s;
             });
         }
@@ -247,9 +248,9 @@ int main(int argc, char **argv) {
                 auto p = [w](const V3 &d) { return std::exp(-(d[0] * d[0] + d[1] * d[1]) / (2 * w * w)); };
                 const V3 ex = V3::UnitX(), ey = V3::UnitY();
                 if (ex.dot(n) > 0)
-                    m += p(x - tt * ex - V3(.3, .5, 0)) * Four(1, 1, 0, 0);
+                    m += p(x - tt * ex - V3(.3, .5, zc)) * Four(1, 1, 0, 0);
                 if (ey.dot(n) > 0)
-                    m += p(x - tt * ey - V3(.5, .3, 0)) * Four(1, 0, 1, 0);
+                    m += p(x - tt * ey - V3(.5, .3, zc)) * Four(1, 0, 1, 0);
             }
             return m;
         };
@@ -364,7 +365,7 @@ int main(int argc, char **argv) {
             exact_mass = bgo;
             for (const auto &p : rule)
                 exact_mass += p.weight * line(ocenter[0] + T * p.omega[0]) * line(ocenter[1] + T * p.omega[1]);
-        } else if (!smooth) {
+        } else if (!smooth && args.dimension == 2) {
             const double w = args.width, bg = args.background, T = t;
             const V3 c1(.3 + T, .5, 0), c2(.5, .3 + T, 0);
             auto rho = [&](const V3 &x) {
