@@ -112,6 +112,33 @@ void wait(Context *, int event);       // host waits for the event
 void snapshot_counters(Context *);     // queue a copy of the counters into pinned memory
 Counters snapshot(Context *);          // the last queued snapshot (call after waiting for a later event)
 void reset_fallbacks(Context *);       // queue zeroing of the two fallback counters
+// Ghost moments with the positivity projection on the device (one warp per ghost pair, src/element_weno_gpu.cu).
+// Plain projections only: pairs that need the hull certificate / augmented rule / host retry are flagged and done by
+// the host with project_positive_moments.
+struct GhostSetup {
+    int pairs = 0, max_points = 0;
+    const int *node = nullptr, *side = nullptr; // per pair
+    int points[6] = {}, outgoing[6] = {}, facets[6] = {};
+    const double *harmonics[6] = {};             // points x q, row-major
+    const double *ox[6] = {}, *oy[6] = {}, *oz[6] = {}, *w[6] = {};
+    const double *fnx[6] = {}, *fny[6] = {}, *fnz[6] = {}, *fh[6] = {};
+    double inradius[6] = {};
+    const double *normal[6] = {};                // 3 per side
+    const double *sigma = nullptr;               // ghost trace filter per moment (null: none)
+    double tolerance = 1e-12;
+    bool warm_start = true;
+};
+struct GhostStats {
+    long long calls = 0, identities = 0, vacuum = 0, failures = 0, scaled = 0, capped = 0, iterations = 0,
+              backtracks = 0, flagged = 0;
+    int max_iterations = 0;
+    double max_residual = 0, min_active_fraction = 1;
+};
+void ghost_setup(Context *, const GhostSetup &);
+// Queue the ghost kernel for stage input `state` and the asynchronous copies of the outgoing moments (pairs x 4), the
+// flag count and the flagged pair list into pinned host memory.
+void ghost(Context *, const double *state, double *pinned_moments, int *pinned_flags);
+GhostStats ghost_stats(Context *); // cumulative (synchronous)
 // Fallback lists (device index arrays; count from counters()).
 const int *closure_fallback_list(Context *);
 const int *limiter_fallback_list(Context *);

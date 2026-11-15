@@ -548,7 +548,8 @@ int main(int argc, char **argv) {
                     << device->t_boundary << ",\"host_boundary_high\":" << device->t_boundary_high << ",\"host_face_data\":" << device->t_face_data << ",\"host_correction\":" << device->t_correction << ",\"host_fallback\":"
                     << device->t_fallback << ",\"wait\":" << device->t_wait << ",\"sync\":" << device->t_sync
                     << ",\"closure_fallbacks\":" << device->closure_fallbacks << ",\"limiter_fallbacks\":"
-                    << device->limiter_fallbacks << "}";
+                    << device->limiter_fallbacks << ",\"ghost_flagged\":" << device->ghost_flagged << ",\"wait_ghost\":"
+                    << device->t_wait_ghost << "}";
 #endif
         summary << mpi_json << "}";
         std::ofstream(args.output + "/summary.json") << summary.str() << "\n";

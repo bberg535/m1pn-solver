@@ -21,6 +21,8 @@ public:
     // Host-side profile.
     double t_boundary = 0, t_boundary_high = 0, t_face_data = 0, t_correction = 0, t_fallback = 0, t_wait = 0, t_sync = 0;
     long closure_fallbacks = 0, limiter_fallbacks = 0;
+    long ghost_flagged = 0; // ghost pairs solved by the host (device projection flagged them)
+    double t_wait_ghost = 0;
 
 private:
     const ElementWeno &s_;
@@ -42,7 +44,12 @@ private:
     std::array<std::vector<Incoming>, 2> face_data_;
     std::array<double, 2> face_time_{{std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()}};
     int face_points_ = 0, last_face_ = -1;
-    bool closure_ready_ = false; // the closure of the next stage input was computed by the last finish_stage
+    bool closure_ready_ = false;
+    bool device_ghost_ = false; // positivity projection of the ghost on the device
+    double *pin_ghost_m_ = nullptr;
+    int *pin_ghost_flags_ = nullptr;
+    long ghost_flagged_merged = 0;
+    PositivityProjectionStats ghost_merged_; // the closure of the next stage input was computed by the last finish_stage
     // Per buffer also the datum part of the PN face load, DB = D llf_datum^T (face rows x q), and whether a side has a
     // nonzero datum (time-dependent only, so prepared ahead as well).
     std::array<Field, 2> DB_;
