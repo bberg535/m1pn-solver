@@ -44,24 +44,27 @@ des Prozesses einschließlich Aufbau und Auswertung, Schleife = `wall_seconds`.
 
 | Lauf | Gesamt | Schleife | GPU schneller (gesamt / Schleife) |
 |---|---|---|---|
-| NX, 3 Server (6 Ränge x 32 Threads, MPI-Branch) | 49,3 s | 46,0 s | 3,3x / 3,9x |
-| NX, 1 Sockel (32 Threads) | – | 88,9 s | – / 7,5x |
-| tardis nur CPU (16 Kerne, 32 Threads) | 157,5 s | 154,1 s | 10,6x / 13x |
-| **tardis A100** | **14,8 s** | **11,9 s** | |
+| NX, 3 Server (6 Ränge x 32 Threads, MPI-Branch) | 49,3 s | 46,0 s | 3,6x / 4,2x |
+| NX, 1 Sockel (32 Threads) | – | 88,9 s | – / 8,2x |
+| tardis nur CPU (16 Kerne, 32 Threads) | 157,5 s | 154,1 s | 11,5x / 14x |
+| **tardis A100** | **13,7 s** | **10,85 s** | |
 
-Drei GPU-Läufe: Schleife 11,86 / 11,95 / 11,94 s, Aufbau 2,0 s (davon Spektralradius auf der GPU 0,3 s),
-Auswertung 0,45 s.
+Drei GPU-Läufe: Schleife 10,84 / 10,85 / 10,87 s (bitgleich), Aufbau 1,95 s (davon Spektralradius auf der GPU
+0,3 s), Auswertung 0,45 s.
 
-1024² Elemente (2886 Schritte): NX 3 Server 223,5 s gesamt (Schleife 216,2 s), A100 94,9 s (89,4 s), also 2,4x.
+1024² Elemente (2886 Schritte): NX 3 Server 223,5 s gesamt (Schleife 216,2 s), A100 87,5 s (82,0 s), also 2,6x.
 Die 3 NX-Server skalieren mit der Größe besser (Kette und Rand fallen weniger ins Gewicht), die GPU braucht pro Stufe
 etwa 4x so lang bei 4x so vielen Knoten.
 
 Entwicklung der Schleifenzeit (512²): 22,6 s (erste Version) → 21,4 s (asynchrone Pipeline, Rand geteilt) →
-15,8 s (Kernel) → 13,7 s (Inflow-Daten vorab) → 11,9 s (Limiter pro Knoten, Statistik per Warp-Reduktion).
-Pro Stufe (2,74 ms) rechnet die GPU etwa 2,6 ms: Linienlösungen 0,96 ms (nahe der Bandbreite), Kombination 0,47 ms,
-Stabilisierung 0,41 ms, Limiter 0,27 ms, Rest 0,5 ms. Der Host-Rand (Projektion, Faces) braucht mit 32 Threads etwa
+15,8 s (Kernel) → 13,7 s (Inflow-Daten vorab) → 11,9 s (Limiter pro Knoten, Statistik per Warp-Reduktion) →
+10,85 s (Fluss im ELL-Format, Stabilisierung mit vorskalierten Koeffizienten, Software-Pipelining der Linienlösungen).
+Pro Stufe (2,5 ms) rechnet die GPU fast durchgehend: Linienlösungen 0,9 ms (latenzgebunden, nur 19k Threads pro
+Richtung), Kombination 0,4 ms, Stabilisierung 0,32 ms, Limiter 0,27 ms, Rest 0,5 ms. Der Host-Rand (Projektion, Faces) braucht mit 32 Threads etwa
 1 ms pro Stufe und liegt neben der GPU-Arbeit. Verworfen: Linienlösung im Shared Memory (8 Komponenten pro Block,
-3x langsamer), Limiter mit Shared-Memory-Staging (langsamer), Chunk 32 statt 16 in den Linienlösungen.
+3x langsamer), Limiter mit Shared-Memory-Staging (langsamer), Chunk 32 statt 16 in den Linienlösungen, Kombination
+der M1-Zeilen im Knoten-Kernel (unkoalesziert, langsamer). Streifenlänge der Stabilisierung: 16 (8/32/64 gleich oder
+langsamer). Die Projektion auf die GPU zu bringen hilft nicht: der Host-Rand liegt vollständig neben der GPU-Arbeit.
 
 ## Abweichung
 
@@ -73,16 +76,16 @@ sind bitgleich), Maximum relativ zur maximalen Dichte und L² relativ:
 | 64², T = 0.32 | 2,5e-12 / 5,9e-13 | |
 | 512², T = 0.02 | 9,2e-12 / 6,0e-13 | 1,3e-11 / 1,6e-12 |
 | 512², T = 0.08 | 1,9e-10 / 7,0e-12 | 1,8e-10 / 7,9e-12 |
-| 512², T = 0.32 | 9,5e-5 / 8,1e-6 | 3,1e-5 / 4,6e-6 |
+| 512², T = 0.32 | 9,1e-5 / 7,3e-6 | 3,1e-5 / 4,6e-6 |
 | 1024², T = 0.08 | 1,9e-9 / 5,7e-11 | |
 | 1024², T = 0.16 | 1,5e-5 / 1,1e-6 | |
-| 1024², T = 0.32 | 1,2e-2 / 7,2e-4 | 1,5e-2 / 7,9e-4 |
+| 1024², T = 0.32 | 1,4e-2 / 8,0e-4 | 1,5e-2 / 7,9e-4 |
 
 "CPU ohne FMA" ist derselbe CPU-Code mit `-mno-fma`, also dasselbe Verfahren mit anderer Rundung. Er weicht genauso
 stark ab wie die GPU. Die Abweichung ist keine Eigenschaft des GPU-Codes, sondern die Rundungsempfindlichkeit des
 Verfahrens bei diesem Problem: Sie wächst exponentiell mit der Zeit (Limiter- und Kegelentscheidungen kippen an
 Schwellen), bei 1024² stärker als bei 512². Integrale Größen bleiben dabei stabil: kinetischer L²-Fehler 0,0116131 /
-0,0116132 (512²) und 0,0123535 / 0,0123541 (1024²), Masse auf 8 Stellen gleich. Eine Abweichungsschranke von 1e-8 bei
+0,0116132 (512²) und 0,0123551 / 0,0123541 (1024²), Masse auf 8 Stellen gleich. Eine Abweichungsschranke von 1e-8 bei
 T = 0.32 kann daher keine Änderung einhalten, die nicht bitgleich ist (auch kein anderer Compiler-Schalter).
 
 Rohdaten und Skripte: `nx/tmp/gpu_20261115/` (nicht versioniert).

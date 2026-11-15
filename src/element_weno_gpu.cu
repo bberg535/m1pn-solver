@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -64,6 +65,9 @@ struct View {
     // Column-major (SoA, entry (row, c) at c * rows + row): low, low_flux, closure, moment_rate (rows = nodes) and
     // stab_low, element_limited (rows = cells), so that the per-element kernels read and write coalesced.
     double *low, *low_flux, *closure, *gradient[3], *stab_low, *gamma, *moment_rate, *element_limited, *load;
+    const double *ell_val; // dimension x q x flux_width
+    const int *ell_idx;
+    int flux_width;
     int *closure_list, *limiter_list, *segment_list;
     double *seg_ubar, *seg_lim; // cells x 4 local: bar states and clipped contributions of queued elements
     DeviceCounters *counters;
@@ -453,17 +457,18 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
             win[j] = kk >= 0 && kk < n ? sbase[std::size_t(kk) * step] : 0.;
         }
     }
-    for (int k0 = 0; k0 < n; k0 += CH) {
-        double buf[CH];
-        if (src) {
+    // Software pipelining: the loads of chunk k + 1 are issued before chunk k is computed (forward: the chunk ahead is
+    // not written yet; backward: the chunk below is not written yet).
+    auto load_fwd = [&](int k0, double *buf) {
 #pragma unroll
-            for (int j = 0; j < CH; ++j)
+        for (int j = 0; j < CH; ++j) {
+            if (src)
                 buf[j] = k0 + j + P < n ? sbase[std::size_t(k0 + j + P) * step] : 0.;
-        } else {
-#pragma unroll
-            for (int j = 0; j < CH; ++j)
+            else
                 buf[j] = k0 + j < n ? base[std::size_t(k0 + j) * step] : 0.;
         }
+    };
+    auto fwd = [&](int k0, const double *buf) {
 #pragma unroll
         for (int j = 0; j < CH; ++j) {
             const int k = k0 + j;
@@ -492,14 +497,27 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
                 hist[0] = y;
             base[std::size_t(k) * step] = y * ID[k];
         }
+    };
+    double bufA[CH], bufB[CH];
+    load_fwd(0, bufA);
+    for (int k0 = 0; k0 < n; k0 += 2 * CH) {
+        if (k0 + CH < n)
+            load_fwd(k0 + CH, bufB);
+        fwd(k0, bufA);
+        if (k0 + CH >= n)
+            break;
+        if (k0 + 2 * CH < n)
+            load_fwd(k0 + 2 * CH, bufA);
+        fwd(k0 + CH, bufB);
     }
     for (int m = 0; m < P; ++m)
         hist[m] = 0;
-    for (int k1 = n - 1; k1 >= 0; k1 -= CH) {
-        double buf[CH];
+    auto load_bwd = [&](int k1, double *buf) {
 #pragma unroll
         for (int j = 0; j < CH; ++j)
             buf[j] = k1 - j >= 0 ? base[std::size_t(k1 - j) * step] : 0.;
+    };
+    auto bwd = [&](int k1, const double *buf) {
 #pragma unroll
         for (int j = 0; j < CH; ++j) {
             const int k = k1 - j;
@@ -517,6 +535,17 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
                 hist[0] = x;
             base[std::size_t(k) * step] = x;
         }
+    };
+    load_bwd(n - 1, bufA);
+    for (int k1 = n - 1; k1 >= 0; k1 -= 2 * CH) {
+        if (k1 - CH >= 0)
+            load_bwd(k1 - CH, bufB);
+        bwd(k1, bufA);
+        if (k1 - CH < 0)
+            break;
+        if (k1 - 2 * CH >= 0)
+            load_bwd(k1 - 2 * CH, bufA);
+        bwd(k1 - CH, bufB);
     }
 }
 // residual(i, c) = -sum_{(e, l) at i} s_h^e(phi_l, a)_c; stab_low(e, 4 l + .) = projected element loads.
@@ -551,7 +580,7 @@ __global__ void k_stabilization(View v, const double *a, double *result, bool wa
     }
     result[t] = out;
 }
-__constant__ double cK[16], cC0[16], cC1[16]; // 2D Q1 element tables (stiffness rows, C_d^T rows)
+__constant__ double cK[16], cKv[16], cC0[16], cC1[16]; // 2D Q1 element tables (stiffness rows, C_d^T rows)
 // 2D Q1: the gathered residual of node i only involves its 3 x 3 neighbourhood. One thread per (x, component) walks a
 // strip of SY rows in y with a sliding 3 x 3 window of a, g_0, g_1 in registers (9 loads per output); the four elements
 // around a node are visited as quadrants with compile-time local indices.
@@ -589,16 +618,17 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
                 const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
                 const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
                 const double weight = -v.viscosity * g;
-                double term = 0;
+                // nu K a + weight (C_0^T g_0 + C_1^T g_1), nu K prescaled (cKv)
+                double stiff = 0, conv = 0;
 #pragma unroll
                 for (int my = 0; my < 2; ++my)
 #pragma unroll
                     for (int mx = 0; mx < 2; ++mx) {
                         const int m = mx + 2 * my;
-                        term += (v.viscosity * cK[4 * l + m]) * W[0][qy + my][qx + mx] +
-                                (weight * cC0[4 * l + m]) * W[1][qy + my][qx + mx] +
-                                (weight * cC1[4 * l + m]) * W[2][qy + my][qx + mx];
+                        stiff += cKv[4 * l + m] * W[0][qy + my][qx + mx];
+                        conv += cC0[4 * l + m] * W[1][qy + my][qx + mx] + cC1[4 * l + m] * W[2][qy + my][qx + mx];
                     }
+                const double term = stiff + weight * conv;
                 if (want_low && c < 4) {
                     const int slot = c == 0 ? 0 : (c == 1 ? 2 : (c == 2 ? 3 : 1));
                     v.stab_low[std::size_t(4 * l + slot) * v.cells + e] = (c == 0 ? v.s0 : v.s1) * term;
@@ -623,42 +653,30 @@ __global__ void k_add_rows(int q, double *field, const int *index, const double 
     field[std::size_t(index[k]) * q + c] += rows[t];
 }
 // A_d^T rows in shared memory: values, inner indices, outer offsets per direction (dynamic shared size).
+// A_d^T (active moments) in padded ELL form in shared memory: row j of direction d has `width` entries
+// (value, index), zero-padded after the CSR entries (same summation order; the padding adds +0).
 struct FluxShared {
     const double *val;
-    const int *inner, *outer;
-    int q;
-    __device__ double apply(const View &v, int i, int j) const { // sum_d (A_d^T g_d(i))_j accumulated as -s_0 - s_1 ...
-        double value = 0;
-        for (int d = 0; d < v.dimension; ++d) {
-            const double *g = v.gradient[d] + std::size_t(i) * q;
-            double s = 0;
-            for (int e = outer[d * (q + 1) + j]; e < outer[d * (q + 1) + j + 1]; ++e)
-                s += val[e] * g[inner[e]];
-            value += -s;
-        }
-        return value;
+    const int *idx;
+    int q, width;
+    __device__ double row(const double *g, int d, int j) const {
+        const int base = (d * q + j) * width;
+        double s = 0;
+        for (int w = 0; w < width; ++w)
+            s += val[base + w] * g[idx[base + w]];
+        return s;
     }
 };
 __device__ FluxShared stage_flux(const View &v, double *shared) {
-    const int q = v.q;
-    int offset[3], total = 0;
-    for (int d = 0; d < v.dimension; ++d) {
-        offset[d] = total;
-        total += v.flux_outer[d][q];
-    }
+    const int total = v.dimension * v.q * v.flux_width;
     double *val = shared;
-    int *inner = reinterpret_cast<int *>(shared + total);
-    int *outer = inner + total;
-    for (int d = 0; d < v.dimension; ++d) {
-        for (int k = threadIdx.x; k < v.flux_outer[d][q]; k += blockDim.x) {
-            val[offset[d] + k] = v.flux_value[d][k];
-            inner[offset[d] + k] = v.flux_inner[d][k];
-        }
-        for (int k = threadIdx.x; k <= q; k += blockDim.x)
-            outer[d * (q + 1) + k] = v.flux_outer[d][k] + offset[d];
+    int *idx = reinterpret_cast<int *>(shared + total);
+    for (int k = threadIdx.x; k < total; k += blockDim.x) {
+        val[k] = v.ell_val[k];
+        idx[k] = v.ell_idx[k];
     }
     __syncthreads();
-    return FluxShared{val, inner, outer, q};
+    return FluxShared{val, idx, v.q, v.flux_width};
 }
 // moments_only: one thread per (node, j < 4), moment_rate = project(field + flux) without writing field; otherwise
 // field += flux for all entries (and moment_rate when want_moments).
@@ -675,10 +693,7 @@ __global__ void k_flux_rows(View v, double *field, bool want_moments, bool momen
     double value = field[at];
     for (int d = 0; d < v.dimension; ++d) {
         const double *g = v.gradient[d] + std::size_t(i) * q;
-        double s = 0;
-        for (int e = F.outer[d * (q + 1) + j]; e < F.outer[d * (q + 1) + j + 1]; ++e)
-            s += F.val[e] * g[F.inner[e]];
-        value += -s;
+        value += -F.row(g, d, j);
     }
     if (!moments_only)
         field[at] = value;
@@ -1069,10 +1084,7 @@ __global__ void k_combine(View v, double *r, const double *x, const double *a, d
     if (with_flux && c >= 4) {
         for (int d = 0; d < v.dimension; ++d) {
             const double *g = v.gradient[d] + std::size_t(i) * q;
-            double s = 0;
-            for (int e = F.outer[d * (q + 1) + c]; e < F.outer[d * (q + 1) + c + 1]; ++e)
-                s += F.val[e] * g[F.inner[e]];
-            rate += -s;
+            rate += -F.row(g, d, c);
         }
     }
     if (c < 4) {
@@ -1084,10 +1096,19 @@ __global__ void k_combine(View v, double *r, const double *x, const double *a, d
 }
 __device__ __forceinline__ void admissible_node(const View &v, double *r, int i);
 // closure_next: also the closure of the next stage (its input is r), fused into the same pass over the rows.
-__global__ void k_admissible(View v, double *r, bool closure_next) {
+// low: first the stage combination of the four low rows (rate = load / lumped), as k_combine part 2.
+__global__ void k_admissible(View v, double *r, bool closure_next, bool low, const double *x, const double *a, double old,
+                             double fresh, double tau) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= v.nodes)
         return;
+    if (low)
+        for (int c = 0; c < 4; ++c) {
+            const std::size_t t = std::size_t(i) * v.q + c;
+            const int slot = c == 0 ? 0 : (c == 3 ? 1 : (c == 1 ? 2 : 3));
+            const double rate = (v.load[std::size_t(i) * 4 + slot] / v.lumped[i]) / (c == 0 ? v.s0 : v.s1);
+            r[t] = old == 0 ? fresh * (x[t] + tau * rate) : old * a[t] + fresh * (x[t] + tau * rate);
+        }
     admissible_node(v, r, i);
     if (closure_next)
         closure_node(v, r, i);
@@ -1221,6 +1242,23 @@ Context *create(const Setup &s) {
             v.flux_value[d] = nullptr;
         }
     }
+    {
+        int width = 1;
+        for (int d = 0; d < s.dimension; ++d)
+            for (int j = 0; j < s.q; ++j)
+                width = std::max(width, s.flux_outer[d][j + 1] - s.flux_outer[d][j]);
+        std::vector<double> ev(std::size_t(s.dimension) * s.q * width, 0.);
+        std::vector<int> ei(ev.size(), 0);
+        for (int d = 0; d < s.dimension; ++d)
+            for (int j = 0; j < s.q; ++j)
+                for (int e = s.flux_outer[d][j], w = 0; e < s.flux_outer[d][j + 1]; ++e, ++w) {
+                    ev[(std::size_t(d) * s.q + j) * width + w] = s.flux_value[d][e];
+                    ei[(std::size_t(d) * s.q + j) * width + w] = s.flux_inner[d][e];
+                }
+        v.flux_width = width;
+        v.ell_val = own(dcopy(ev.data(), ev.size()));
+        v.ell_idx = own(dcopy(ei.data(), ei.size()));
+    }
     const std::size_t pairs = std::size_t(n) * (n - 1);
     v.pair_j = own(dcopy(s.pair_j, pairs));
     v.pair_d = own(dcopy(s.pair_d, pairs));
@@ -1231,6 +1269,10 @@ Context *create(const Setup &s) {
     v.lumped = own(dcopy(s.lumped, std::size_t(s.nodes)));
     if (s.dimension == 2 && s.degree == 1) {
         CK(cudaMemcpyToSymbol(cK, s.stiffness_rows, 16 * sizeof(double)));
+        double kv[16];
+        for (int k = 0; k < 16; ++k)
+            kv[k] = s.viscosity * s.stiffness_rows[k];
+        CK(cudaMemcpyToSymbol(cKv, kv, 16 * sizeof(double)));
         CK(cudaMemcpyToSymbol(cC0, s.convection_t_rows[0], 16 * sizeof(double)));
         CK(cudaMemcpyToSymbol(cC1, s.convection_t_rows[1], 16 * sizeof(double)));
     }
@@ -1347,9 +1389,19 @@ void gradients(Context *ctx, const double *state) {
 void stabilization(Context *ctx, const double *state, double *out, bool want_low, double constant_gamma) {
     const View &v = ctx->v;
     if (v.dimension == 2 && v.degree == 1) {
-        constexpr int SY = 32;
-        const dim3 grid(blocks(std::size_t(v.npa[0]) * v.q, 128), (v.npa[1] + SY - 1) / SY);
-        k_stabilization_strip<SY><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+        static const int sy = [] {
+            const char *e = std::getenv("M1PN_GPU_STRIP");
+            return e ? std::atoi(e) : 16;
+        }();
+        const dim3 grid(blocks(std::size_t(v.npa[0]) * v.q, 128), (v.npa[1] + sy - 1) / sy);
+        if (sy == 8)
+            k_stabilization_strip<8><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+        else if (sy == 16)
+            k_stabilization_strip<16><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+        else if (sy == 64)
+            k_stabilization_strip<64><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+        else
+            k_stabilization_strip<32><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
     }
     else
         k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, state, out, want_low, constant_gamma);
@@ -1364,10 +1416,7 @@ void mass_solve(Context *ctx, double *field) {
 }
 namespace {
 std::size_t flux_shared(Context *ctx) {
-    int total = 0;
-    for (int d = 0; d < ctx->v.dimension; ++d)
-        total += ctx->flux_nnz[d];
-    return std::size_t(total) * (sizeof(double) + sizeof(int)) + sizeof(int) * ctx->v.dimension * (ctx->v.q + 1);
+    return std::size_t(ctx->v.dimension) * ctx->v.q * ctx->v.flux_width * (sizeof(double) + sizeof(int));
 }
 } // namespace
 void flux_moments(Context *ctx, const double *field) {
@@ -1406,7 +1455,7 @@ void finish_stage(Context *ctx, double *r, const double *x, const double *a, dou
         k_combine<<<blocks(std::size_t(v.nodes) * 4), 256>>>(v, r, x, a, old, fresh, tau, false, 2);
     else
         k_combine<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx)>>>(v, r, x, a, old, fresh, tau, true, 0);
-    k_admissible<<<blocks(v.nodes), 256>>>(v, r, closure_next);
+    k_admissible<<<blocks(v.nodes), 256>>>(v, r, closure_next, false, x, a, old, fresh, tau);
 }
 double norm(Context *ctx, const double *field) {
     CK(cudaMemset(ctx->norm_accumulator, 0, sizeof(double)));
