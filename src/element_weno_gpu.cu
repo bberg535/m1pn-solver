@@ -82,6 +82,9 @@ struct Context {
     std::size_t scratch_double_size[8] = {};
     double *norm_accumulator = nullptr;
     cudaEvent_t events[8] = {};
+    // Ghost projection (ghost_setup).
+    struct GhostDevice *ghost = nullptr;
+    cudaStream_t aux = nullptr; // non-blocking stream of the ghost kernel (overlaps the volume kernels)
     struct ReactionDevice *reaction = nullptr;
     int flux_nnz[3] = {0, 0, 0};
     DeviceCounters *pinned_counters = nullptr;
@@ -551,36 +554,45 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
 }
 // Element-wise stabilization (any degree and dimension): one thread per (element, component) loads the element rows
 // of a and g_d once and forms the loads of all local nodes; k_gather_stab sums them per node (residual = -sum).
-template <int N> __global__ void k_stab_element(View v, const double *a, double *local_out, bool want_low,
-                                                double constant_gamma) {
-    constexpr int NA = N > 0 ? N : max_local;
+template <int N, int DIM>
+__global__ void __launch_bounds__(128) k_stab_element(View v, const double *a, double *local_out, bool want_low,
+                                                      double constant_gamma) {
+    // Element matrices in shared memory: viscosity * K (n x n), then C_d^T rows (n x n each).
+    __shared__ double sK[N * N], sC[DIM][N * N];
+    for (int k = threadIdx.x; k < N * N; k += blockDim.x) {
+        sK[k] = v.viscosity * v.stiffness_rows[k];
+#pragma unroll
+        for (int d = 0; d < DIM; ++d)
+            sC[d][k] = v.convection_t_rows[d][k];
+    }
+    __syncthreads();
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= std::size_t(v.cells) * v.q)
         return;
-    const int e = int(t / v.q), c = int(t % v.q), n = N > 0 ? N : v.local, q = v.q;
-    const int *map = v.connectivity + std::size_t(e) * n;
-    double av[NA], gv[3][NA];
-    for (int m = 0; m < n; ++m) {
+    const int e = int(t / v.q), c = int(t % v.q), q = v.q;
+    const int *map = v.connectivity + std::size_t(e) * N;
+    double av[N], gv[DIM][N];
+#pragma unroll
+    for (int m = 0; m < N; ++m) {
         const std::size_t r = std::size_t(map[m]) * q + c;
         av[m] = a[r];
-        for (int d = 0; d < v.dimension; ++d)
+#pragma unroll
+        for (int d = 0; d < DIM; ++d)
             gv[d][m] = v.gradient[d][r];
     }
     const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
     const double weight = -v.viscosity * g;
-    for (int l = 0; l < n; ++l) {
-        const double *K = v.stiffness_rows + std::size_t(l) * n;
+    for (int l = 0; l < N; ++l) {
         double stiff = 0, conv = 0;
-        for (int m = 0; m < n; ++m)
-            stiff += K[m] * av[m];
-        if (weight != 0)
-            for (int d = 0; d < v.dimension; ++d) {
-                const double *Ct = v.convection_t_rows[d] + std::size_t(l) * n;
-                for (int m = 0; m < n; ++m)
-                    conv += Ct[m] * gv[d][m];
-            }
-        const double term = v.viscosity * stiff + weight * conv;
-        local_out[(std::size_t(e) * n + l) * q + c] = term;
+#pragma unroll
+        for (int m = 0; m < N; ++m) {
+            stiff += sK[l * N + m] * av[m];
+#pragma unroll
+            for (int d = 0; d < DIM; ++d)
+                conv += sC[d][l * N + m] * gv[d][m];
+        }
+        const double term = stiff + weight * conv;
+        local_out[(std::size_t(e) * N + l) * q + c] = term;
         if (want_low && c < 4) {
             const int slot = c == 0 ? 0 : (c == 1 ? 2 : (c == 2 ? 3 : 1));
             v.stab_low[std::size_t(4 * l + slot) * v.cells + e] = (c == 0 ? v.s0 : v.s1) * term;
@@ -1190,6 +1202,8 @@ __device__ __forceinline__ void admissible_node(const View &v, double *r, int i)
     project4(v, row, u);
     if (!cone(u, uncertain) || uncertain) {
         fail(v.counters, uncertain ? 7 : 6);
+
+
         return;
     }
     if (row[0] != before) {
@@ -1242,13 +1256,419 @@ inline unsigned blocks(std::size_t work, int threads = 256) { return unsigned((w
 // ---------------------------------------------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------------------------------------------
-// Local reaction and FCS collision source.
+// Positivity projection of the ghost traces (src/positivity_projection.cpp, plain rule), one warp per ghost pair.
+struct GhostDeviceStats {
+    unsigned long long calls, identities, vacuum, failures, scaled, capped, iterations, backtracks;
+    int max_iterations, flagged;
+    unsigned long long max_residual_bits, min_active_bits;
+};
+struct GhostView {
+    int pairs, max_points, q;
+    const int *node, *side;
+    int points[6], outgoing[6], facets[6];
+    const double *harmonics[6], *ox[6], *oy[6], *oz[6], *w[6], *fnx[6], *fny[6], *fnz[6], *fh[6], *normal[6];
+    double inradius[6];
+    const double *sigma;
+    double tolerance;
+    bool warm_start;
+    double *xi;       // pairs x 4: warm start
+    double *moments;  // pairs x 4: outgoing ghost moments
+    int *flag_list;   // flagged pairs (host)
+    GhostDeviceStats *stats;
+};
+struct GhostDevice {
+    GhostView g;
+    std::vector<void *> owned;
+};
 __device__ inline double warp_sum(double v) {
 #pragma unroll
     for (int o = 16; o > 0; o /= 2)
         v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
+__device__ inline double warp_min(double v) {
+#pragma unroll
+    for (int o = 16; o > 0; o /= 2)
+        v = fmin(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ inline double warp_max(double v) {
+#pragma unroll
+    for (int o = 16; o > 0; o /= 2)
+        v = fmax(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+struct GEval {
+    double F[4], H[10], phi, min_xm; // H: 00 01 02 03 11 12 13 22 23 33
+    int active;
+};
+// One pass over the points at multiplier xi (all lanes get the same reduced values).
+__device__ GEval gevaluate(int P, const double *ox, const double *oy, const double *oz, const double *w,
+                           const double *y, const double *U, const double *xi) {
+    double f0 = 0, f1 = 0, f2 = 0, f3 = 0, zz = 0, mn = dinf(), h[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    double act = 0;
+    for (int k = threadIdx.x & 31; k < P; k += 32) {
+        const double xm = xi[0] + xi[1] * ox[k] + xi[2] * oy[k] + xi[3] * oz[k];
+        const double r = y[k] - xm;
+        const double pos = r > 0 ? 1. : 0.;
+        const double z = pos * r, wz = w[k] * z, wa = w[k] * pos;
+        f0 += wz, f1 += wz * ox[k], f2 += wz * oy[k], f3 += wz * oz[k], zz += wz * z;
+        h[0] += wa, h[1] += wa * ox[k], h[2] += wa * oy[k], h[3] += wa * oz[k];
+        h[4] += wa * ox[k] * ox[k], h[5] += wa * ox[k] * oy[k], h[6] += wa * ox[k] * oz[k];
+        h[7] += wa * oy[k] * oy[k], h[8] += wa * oy[k] * oz[k], h[9] += wa * oz[k] * oz[k];
+        act += pos;
+        mn = fmin(mn, xm);
+    }
+    GEval e;
+    e.F[0] = warp_sum(f0) - U[0], e.F[1] = warp_sum(f1) - U[1], e.F[2] = warp_sum(f2) - U[2];
+    e.F[3] = warp_sum(f3) - U[3];
+    for (int k = 0; k < 10; ++k)
+        e.H[k] = warp_sum(h[k]);
+    e.phi = -.5 * warp_sum(zz) - (xi[0] * U[0] + xi[1] * U[1] + xi[2] * U[2] + xi[3] * U[3]);
+    e.min_xm = warp_min(mn);
+    e.active = int(warp_sum(act) + .5);
+    return e;
+}
+__device__ inline double maxabs4(const double *v) {
+    return fmax(fmax(fabs(v[0]), fabs(v[1])), fmax(fabs(v[2]), fabs(v[3])));
+}
+// (H + mu I) d = F by LDL^T with symmetric diagonal pivoting; false if a pivot is not positive.
+__device__ bool ldlt_solve4(const double *Hp, double mu, const double *F, double *d) {
+    double A[4][4];
+    const int map[4][4] = {{0, 1, 2, 3}, {1, 4, 5, 6}, {2, 5, 7, 8}, {3, 6, 8, 9}};
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            A[i][j] = Hp[map[i][j]] + (i == j ? mu : 0.);
+    int perm[4] = {0, 1, 2, 3};
+    double D[4];
+    for (int k = 0; k < 4; ++k) {
+        int piv = k;
+        for (int i = k + 1; i < 4; ++i)
+            if (fabs(A[i][i]) > fabs(A[piv][piv]))
+                piv = i;
+        if (piv != k) {
+            for (int j = 0; j < 4; ++j) {
+                const double t = A[k][j];
+                A[k][j] = A[piv][j], A[piv][j] = t;
+            }
+            for (int i = 0; i < 4; ++i) {
+                const double t = A[i][k];
+                A[i][k] = A[i][piv], A[i][piv] = t;
+            }
+            const int t = perm[k];
+            perm[k] = perm[piv], perm[piv] = t;
+        }
+        D[k] = A[k][k];
+        if (!(D[k] > 0) || !isfinite(D[k]))
+            return false;
+        for (int i = k + 1; i < 4; ++i)
+            A[i][k] /= D[k];
+        for (int i = k + 1; i < 4; ++i)
+            for (int j = k + 1; j <= i; ++j) {
+                A[i][j] -= A[i][k] * A[j][k] * D[k];
+                A[j][i] = A[i][j];
+            }
+    }
+    double x[4];
+    for (int i = 0; i < 4; ++i)
+        x[i] = F[perm[i]];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < i; ++j)
+            x[i] -= A[i][j] * x[j];
+    for (int i = 0; i < 4; ++i)
+        x[i] /= D[i];
+    for (int i = 3; i >= 0; --i)
+        for (int j = i + 1; j < 4; ++j)
+            x[i] -= A[j][i] * x[j];
+    for (int i = 0; i < 4; ++i)
+        d[perm[i]] = x[i];
+    return true;
+}
+struct GResult {
+    bool converged, identity, infeasible;
+    int iterations, backtracks, active;
+    double residual, xi[4];
+};
+// project_positive() of src/positivity_projection.cpp (unweighted); y in shared memory, z not stored.
+__device__ GResult gproject(int P, const double *ox, const double *oy, const double *oz, const double *w,
+                            const double *y, const double *U, const double *xi0, double tolerance) {
+    GResult out{};
+    double sy = 0, ymin = dinf(), F0[4] = {0, 0, 0, 0};
+    for (int k = threadIdx.x & 31; k < P; k += 32) {
+        const double wy = w[k] * y[k];
+        sy += fabs(wy);
+        ymin = fmin(ymin, y[k]);
+        F0[0] += wy, F0[1] += wy * ox[k], F0[2] += wy * oy[k], F0[3] += wy * oz[k];
+    }
+    sy = warp_sum(sy), ymin = warp_min(ymin);
+    for (int c = 0; c < 4; ++c)
+        F0[c] = warp_sum(F0[c]) - U[c];
+    const double scale = sy + fabs(U[0]), tol = tolerance * scale;
+    if (ymin > 0 && maxabs4(F0) <= tol) {
+        out.identity = out.converged = true;
+        out.active = P;
+        out.residual = maxabs4(F0) / scale;
+        return out;
+    }
+    double xi[4];
+    bool finite = true;
+    for (int c = 0; c < 4; ++c)
+        finite &= isfinite(xi0[c]);
+    for (int c = 0; c < 4; ++c)
+        xi[c] = finite ? xi0[c] : 0.;
+    GEval e = gevaluate(P, ox, oy, oz, w, y, U, xi);
+    auto done = [&]() {
+        for (int c = 0; c < 4; ++c)
+            out.xi[c] = xi[c];
+        out.active = e.active;
+        out.residual = scale > 0 ? maxabs4(e.F) / scale : maxabs4(e.F);
+        return out;
+    };
+    for (int it = 0; it < 60; ++it) {
+        if (maxabs4(e.F) <= tol) {
+            out.converged = true;
+            break;
+        }
+        const double xu = xi[0] * U[0] + xi[1] * U[1] + xi[2] * U[2] + xi[3] * U[3];
+        const double xn = sqrt(xi[0] * xi[0] + xi[1] * xi[1] + xi[2] * xi[2] + xi[3] * xi[3]);
+        if (e.min_xm >= 0 && xu < -1e-14 * xn * U[0]) {
+            out.infeasible = true;
+            return done();
+        }
+        const double trace = e.H[0] + e.H[4] + e.H[7] + e.H[9];
+        double mu = 1e-14 * fmax(trace, 1e-300), d[4];
+        for (int attempt = 0;; ++attempt) {
+            if (ldlt_solve4(e.H, mu, e.F, d)) {
+                const double df = d[0] * e.F[0] + d[1] * e.F[1] + d[2] * e.F[2] + d[3] * e.F[3];
+                if (isfinite(d[0]) && isfinite(d[1]) && isfinite(d[2]) && isfinite(d[3]) && df > 0)
+                    break;
+            }
+            if (attempt > 30)
+                return done();
+            mu = fmax(mu * 100, 1e-12 * fmax(trace, 1e-300));
+        }
+        const double slope = d[0] * e.F[0] + d[1] * e.F[1] + d[2] * e.F[2] + d[3] * e.F[3];
+        double t = 1;
+        GEval trial;
+        bool accepted = false;
+        for (int b = 0; b <= 40; ++b) {
+            double cand[4];
+            for (int c = 0; c < 4; ++c)
+                cand[c] = xi[c] + t * d[c];
+            trial = gevaluate(P, ox, oy, oz, w, y, U, cand);
+            if (trial.phi >= e.phi + 1e-4 * t * slope || maxabs4(trial.F) <= tol) {
+                for (int c = 0; c < 4; ++c)
+                    xi[c] = cand[c];
+                accepted = true;
+                break;
+            }
+            t *= .5;
+            ++out.backtracks;
+        }
+        ++out.iterations;
+        if (!accepted || !(isfinite(xi[0]) && isfinite(xi[1]) && isfinite(xi[2]) && isfinite(xi[3])))
+            return done();
+        e = trial;
+    }
+    if (!out.converged && maxabs4(e.F) <= tol)
+        out.converged = true;
+    return done();
+}
+__global__ void __launch_bounds__(128) k_ghost(View v, GhostView g, const double *a) {
+    extern __shared__ double ys[]; // max_points per warp
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int k = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (k >= g.pairs)
+        return; // whole warps exit together
+    double *y = ys + std::size_t(warp) * g.max_points;
+    const int node = g.node[k], sd = g.side[k], P = g.points[sd], Pout = g.outgoing[sd], q = g.q;
+    const double *ox = g.ox[sd], *oy = g.oy[sd], *oz = g.oz[sd], *w = g.w[sd];
+    const double *row = a + std::size_t(node) * q;
+    // PN trace at the rule points (filtered coefficients if a ghost filter is set).
+    for (int j = lane; j < P; j += 32) {
+        const double *Hj = g.harmonics[sd] + std::size_t(j) * q;
+        double s = 0;
+        for (int c = 0; c < q; ++c)
+            s += Hj[c] * (g.sigma ? g.sigma[c] * row[c] : row[c]);
+        y[j] = s;
+    }
+    __syncwarp();
+    double U[4];
+    for (int c = 0; c < 4; ++c)
+        U[c] = v.low[std::size_t(c) * v.nodes + node];
+    const double *nrm = g.normal[sd];
+    GhostDeviceStats *S = g.stats;
+    auto positive_part = [&](double *m) {
+        double m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+        for (int j = lane; j < Pout; j += 32) {
+            const double val = fmax(0., y[j]) * w[j];
+            m0 += val, m1 += val * ox[j], m2 += val * oy[j], m3 += val * oz[j];
+        }
+        m[0] = warp_sum(m0), m[1] = warp_sum(m1), m[2] = warp_sum(m2), m[3] = warp_sum(m3);
+    };
+    auto flag = [&]() {
+        if (lane == 0) {
+            const int f = atomicAdd(&S->flagged, 1);
+            g.flag_list[f] = k;
+        }
+    };
+    double m[4] = {0, 0, 0, 0};
+    bool projected = false;
+    const double rho = U[0], jn = sqrt(U[1] * U[1] + U[2] * U[2] + U[3] * U[3]);
+    const bool finiteU = isfinite(U[0]) && isfinite(U[1]) && isfinite(U[2]) && isfinite(U[3]);
+    if (lane == 0)
+        atomicAdd(&S->calls, 1ull);
+    if (!finiteU || rho < jn) { // outside R1: failure, C6 ghost
+        if (lane == 0)
+            atomicAdd(&S->failures, 1ull);
+        positive_part(m);
+    } else if (!(rho > 0)) { // vacuum: z = 0, converged (J = 0 here)
+        projected = true;
+        if (lane == 0)
+            atomicAdd(&S->vacuum, 1ull);
+    } else {
+        // Hull certificate (exact solvability test of the plain rule): such pairs go to the host.
+        bool certificate = false;
+        if (jn >= .999 * g.inradius[sd] * rho) {
+            const double ux = U[1] / rho, uy = U[2] / rho, uz = U[3] / rho;
+            double mg = -dinf();
+            for (int f = lane; f < g.facets[sd]; f += 32)
+                mg = fmax(mg, g.fnx[sd][f] * ux + g.fny[sd][f] * uy + g.fnz[sd][f] * uz - g.fh[sd][f]);
+            certificate = warp_max(mg) > -1e-9;
+        }
+        if (certificate) {
+            flag();
+            return;
+        }
+        double xi0[4];
+        for (int c = 0; c < 4; ++c)
+            xi0[c] = g.warm_start ? g.xi[std::size_t(k) * 4 + c] : 0.;
+        GResult r = gproject(P, ox, oy, oz, w, y, U, xi0, g.tolerance);
+        int newton = r.iterations;
+        const bool warm_nonzero = xi0[0] != 0 || xi0[1] != 0 || xi0[2] != 0 || xi0[3] != 0;
+        if (!r.converged && !r.infeasible && g.warm_start && warm_nonzero) {
+            const double zero[4] = {0, 0, 0, 0};
+            r = gproject(P, ox, oy, oz, w, y, U, zero, g.tolerance);
+            r.iterations += newton;
+            newton = r.iterations;
+        }
+        if (!r.converged) { // Farkas or no convergence: augmented rule on the host
+            flag();
+            return;
+        }
+        projected = true;
+        if (lane == 0) {
+            for (int c = 0; c < 4; ++c)
+                g.xi[std::size_t(k) * 4 + c] = r.xi[c];
+            if (r.identity)
+                atomicAdd(&S->identities, 1ull);
+            atomicAdd(&S->iterations, (unsigned long long)newton);
+            atomicAdd(&S->backtracks, (unsigned long long)r.backtracks);
+            atomicMax(&S->max_iterations, newton);
+            atomicMax(&S->max_residual_bits, bits(r.residual));
+            atomicMin(&S->min_active_bits, bits(double(r.active) / P));
+        }
+        // Outgoing half moments of z = max(0, y - xi.m) (z = y for the identity).
+        double m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+        for (int j = lane; j < Pout; j += 32) {
+            const double xm = r.xi[0] + r.xi[1] * ox[j] + r.xi[2] * oy[j] + r.xi[3] * oz[j];
+            const double z = r.identity ? y[j] : fmax(0., y[j] - xm);
+            const double val = z * w[j];
+            m0 += val, m1 += val * ox[j], m2 += val * oy[j], m3 += val * oz[j];
+        }
+        m[0] = warp_sum(m0), m[1] = warp_sum(m1), m[2] = warp_sum(m2), m[3] = warp_sum(m3);
+        if (m[0] > U[0] * (1 + 64 * 2.220446049250313e-16)) {
+            if (lane == 0)
+                atomicAdd(&S->capped, 1ull);
+            const double f = U[0] > 0 ? U[0] / m[0] : 0.;
+            for (int c = 0; c < 4; ++c)
+                m[c] *= f;
+        }
+    }
+    // Vacuum outflow property: a_ext <= b of the node (cone scaling otherwise).
+    const double b_node = U[0] + nrm[0] * U[1] + nrm[1] * U[2] + nrm[2] * U[3];
+    const double a_ext = m[0] - (nrm[0] * m[1] + nrm[1] * m[2] + nrm[2] * m[3]);
+    if (a_ext > b_node) {
+        if (projected && lane == 0)
+            atomicAdd(&S->scaled, 1ull);
+        const double f = b_node > 0 ? b_node / a_ext : 0.;
+        for (int c = 0; c < 4; ++c)
+            m[c] *= f;
+    }
+    if (lane == 0)
+        for (int c = 0; c < 4; ++c)
+            g.moments[std::size_t(k) * 4 + c] = m[c];
+}
+void ghost_setup(Context *ctx, const GhostSetup &s) {
+    GhostDevice *gd = new GhostDevice;
+    GhostView &g = gd->g;
+    auto own = [&](auto *p) {
+        gd->owned.push_back((void *)p);
+        return p;
+    };
+    g.pairs = s.pairs, g.max_points = s.max_points, g.q = ctx->v.q;
+    g.node = own(dcopy(s.node, std::size_t(s.pairs)));
+    g.side = own(dcopy(s.side, std::size_t(s.pairs)));
+    for (int sd = 0; sd < 6; ++sd) {
+        g.points[sd] = s.points[sd], g.outgoing[sd] = s.outgoing[sd], g.facets[sd] = s.facets[sd];
+        g.inradius[sd] = s.inradius[sd];
+        if (!s.points[sd]) {
+            g.harmonics[sd] = g.ox[sd] = g.oy[sd] = g.oz[sd] = g.w[sd] = nullptr;
+            g.fnx[sd] = g.fny[sd] = g.fnz[sd] = g.fh[sd] = g.normal[sd] = nullptr;
+            continue;
+        }
+        const std::size_t P = s.points[sd], F = s.facets[sd];
+        g.harmonics[sd] = own(dcopy(s.harmonics[sd], P * g.q));
+        g.ox[sd] = own(dcopy(s.ox[sd], P)), g.oy[sd] = own(dcopy(s.oy[sd], P)), g.oz[sd] = own(dcopy(s.oz[sd], P));
+        g.w[sd] = own(dcopy(s.w[sd], P));
+        g.fnx[sd] = own(dcopy(s.fnx[sd], F)), g.fny[sd] = own(dcopy(s.fny[sd], F)), g.fnz[sd] = own(dcopy(s.fnz[sd], F));
+        g.fh[sd] = own(dcopy(s.fh[sd], F));
+        g.normal[sd] = own(dcopy(s.normal[sd], 3));
+    }
+    g.sigma = s.sigma ? own(dcopy(s.sigma, std::size_t(g.q))) : nullptr;
+    g.tolerance = s.tolerance, g.warm_start = s.warm_start;
+    g.xi = own(dalloc<double>(std::size_t(s.pairs) * 4));
+    g.moments = own(dalloc<double>(std::size_t(s.pairs) * 4));
+    g.flag_list = own(dalloc<int>(std::size_t(s.pairs) + 1));
+    g.stats = own(dalloc<GhostDeviceStats>(1));
+    GhostDeviceStats st{};
+    const double one = 1;
+    std::memcpy(&st.min_active_bits, &one, 8);
+    CK(cudaMemcpy(g.stats, &st, sizeof st, cudaMemcpyHostToDevice));
+    ctx->ghost = gd;
+    int least = 0, greatest = 0; // numerically larger = lower priority
+    CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    CK(cudaStreamCreateWithPriority(&ctx->aux, cudaStreamNonBlocking, least));
+}
+// On the aux stream after the work queued so far on the default stream (event 3); completion is event 2.
+void ghost(Context *ctx, const double *state, double *pinned_moments, int *pinned_flags) {
+    GhostView &g = ctx->ghost->g;
+    cudaStream_t st = ctx->aux;
+    CK(cudaEventRecord(ctx->events[3], 0));
+    CK(cudaStreamWaitEvent(st, ctx->events[3], 0));
+    CK(cudaMemsetAsync(&g.stats->flagged, 0, sizeof(int), st));
+    const int warps = 4;
+    k_ghost<<<(g.pairs + warps - 1) / warps, 32 * warps, std::size_t(warps) * g.max_points * sizeof(double), st>>>(
+        ctx->v, g, state);
+    CK(cudaMemcpyAsync(pinned_moments, g.moments, std::size_t(g.pairs) * 4 * sizeof(double), cudaMemcpyDeviceToHost, st));
+    CK(cudaMemcpyAsync(pinned_flags, &g.stats->flagged, sizeof(int), cudaMemcpyDeviceToHost, st));
+    CK(cudaMemcpyAsync(pinned_flags + 1, g.flag_list, std::size_t(g.pairs) * sizeof(int), cudaMemcpyDeviceToHost, st));
+    CK(cudaEventRecord(ctx->events[2], st));
+}
+GhostStats ghost_stats(Context *ctx) {
+    GhostDeviceStats d;
+    CK(cudaMemcpy(&d, ctx->ghost->g.stats, sizeof d, cudaMemcpyDeviceToHost));
+    GhostStats o;
+    o.calls = d.calls, o.identities = d.identities, o.vacuum = d.vacuum, o.failures = d.failures, o.scaled = d.scaled;
+    o.capped = d.capped, o.iterations = d.iterations, o.backtracks = d.backtracks;
+    o.max_iterations = d.max_iterations;
+    std::memcpy(&o.max_residual, &d.max_residual_bits, 8);
+    std::memcpy(&o.min_active_fraction, &d.min_active_bits, 8);
+    return o;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Local reaction and FCS collision source.
 struct ReactionView {
     const double *sigma_a, *sigma_s, *source, *filter;
     double sa, ss;
@@ -1508,6 +1928,13 @@ void destroy(Context *ctx) {
         cudaFree(ctx->reaction->r.table);
         delete ctx->reaction;
     }
+    if (ctx->aux)
+        cudaStreamDestroy(ctx->aux);
+    if (ctx->ghost) {
+        for (void *p : ctx->ghost->owned)
+            cudaFree(p);
+        delete ctx->ghost;
+    }
     for (auto &e : ctx->events)
         cudaEventDestroy(e);
     cudaFreeHost(ctx->pinned_counters);
@@ -1598,13 +2025,20 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
     } else {
         double *local_out = device_doubles(ctx, 7, std::size_t(v.cells) * v.local * v.q);
         const unsigned g = blocks(std::size_t(v.cells) * v.q, 128);
-        switch (v.local) {
-        case 8: k_stab_element<8><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
-        case 9: k_stab_element<9><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
-        case 16: k_stab_element<16><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
-        case 25: k_stab_element<25><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
-        case 27: k_stab_element<27><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
-        default: k_stab_element<0><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
+        const bool d3 = v.dimension == 3;
+        if (v.local == 9 && !d3)
+            k_stab_element<9, 2><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+        else if (v.local == 16 && !d3)
+            k_stab_element<16, 2><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+        else if (v.local == 25 && !d3)
+            k_stab_element<25, 2><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+        else if (v.local == 8 && d3)
+            k_stab_element<8, 3><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+        else if (v.local == 27 && d3)
+            k_stab_element<27, 3><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+        else {
+            k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, state, out, want_low, constant_gamma);
+            return;
         }
         k_gather_stab<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, local_out, out);
     }

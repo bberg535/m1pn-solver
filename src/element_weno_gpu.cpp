@@ -4,6 +4,7 @@
 #include "parallel.hpp"
 #include "uncollided.hpp"
 #include <random>
+#include <cstdlib>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -220,12 +221,60 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         }
         gpu::reaction_setup(ctx_, r);
     }
+    // Ghost projection on the device (plain full-sphere rule, unweighted); M1PN_GPU_GHOST=0 keeps it on the host.
+    // Default: on the device when the boundary work (ghost pairs x rule points) is large against the volume work
+    // (nodes x moments); measured break-even ~0.1 (2D P7 512^2: 0.08, host faster; 2D P21 256^2: 0.14 and 3D: device
+    // faster). M1PN_GPU_GHOST=0/1 forces host/device.
+    const char *env = std::getenv("M1PN_GPU_GHOST");
+    int max_points = 0;
+    for (int side = 0; side < 6; ++side)
+        if (s.boundaries_[side])
+            max_points = std::max(max_points, int(s.out_rules_[side].weight.size()));
+    const double ratio = double(s.ghost_node_.size()) * max_points / (double(s.nodes) * s.moments);
+    device_ghost_ = (env ? std::atoi(env) != 0 : ratio > .1) && o.fullsphere_ghost && o.positivity_projection &&
+                    !o.projection_half_range && !s.ghost_node_.empty();
+    for (int side = 0; side < 6 && device_ghost_; ++side)
+        if (s.boundaries_[side] && s.out_rules_[side].c.size())
+            device_ghost_ = false;
+    if (device_ghost_) {
+        gpu::GhostSetup g;
+        g.pairs = int(s.ghost_node_.size());
+        g.node = s.ghost_node_.data();
+        g.side = s.ghost_side_.data();
+        std::array<std::vector<double>, 6> normals;
+        for (int side = 0; side < 6; ++side) {
+            if (!s.boundaries_[side])
+                continue;
+            const auto &out = s.out_rules_[side];
+            g.points[side] = int(out.weight.size());
+            g.outgoing[side] = out.outgoing;
+            g.max_points = std::max(g.max_points, g.points[side]);
+            g.harmonics[side] = s.out_harmonics_[side].data();
+            g.ox[side] = out.ox.data(), g.oy[side] = out.oy.data(), g.oz[side] = out.oz.data();
+            g.w[side] = out.weight.data();
+            g.facets[side] = out.facets.count();
+            g.fnx[side] = out.facets.nx.data(), g.fny[side] = out.facets.ny.data(), g.fnz[side] = out.facets.nz.data();
+            g.fh[side] = out.facets.h.data();
+            g.inradius[side] = out.facets.inradius;
+            const V3 n = s.boundaries_[side]->n;
+            normals[side] = {n[0], n[1], n[2]};
+            g.normal[side] = normals[side].data();
+        }
+        g.sigma = s.ghost_sigma_.size() ? s.ghost_sigma_.data() : nullptr;
+        g.tolerance = o.projection_tolerance;
+        g.warm_start = o.projection_warm_start;
+        gpu::ghost_setup(ctx_, g);
+        pin_ghost_m_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * 4 * g.pairs));
+        pin_ghost_flags_ = static_cast<int *>(gpu::host_alloc(sizeof(int) * (g.pairs + 1)));
+    }
 }
 ElementWenoGpu::~ElementWenoGpu() {
     gpu::host_free(pin_fetch_);
     gpu::host_free(pin_high_);
     gpu::host_free(pin_load_);
     gpu::host_free(pin_load_up_);
+    if (pin_ghost_m_)
+        gpu::host_free(pin_ghost_m_), gpu::host_free(pin_ghost_flags_);
     gpu::destroy(ctx_);
 }
 // Phase A of add_boundary: the PN face load sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum] per
@@ -451,7 +500,28 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
         }
         outgoing_[k] = m;
     };
-    if (ghost) {
+    if (ghost && device_ghost_) {
+        // Device projection (gpu::ghost): outgoing moments of all pairs; the flagged ones (hull certificate, augmented
+        // rule) on the host with the original code.
+        {
+            const double t0 = seconds();
+            gpu::wait(ctx_, 2);
+            t_wait_ghost += seconds() - t0;
+        }
+        const int pairs = int(s.ghost_node_.size());
+        for (int k = 0; k < pairs; ++k)
+            outgoing_[k] = Four(pin_ghost_m_[4 * k], pin_ghost_m_[4 * k + 1], pin_ghost_m_[4 * k + 2], pin_ghost_m_[4 * k + 3]);
+        const int flagged = pin_ghost_flags_[0];
+        ghost_flagged += flagged;
+        parallel_for(flagged, [&](int f) {
+            const int k = pin_ghost_flags_[1 + f], side = s.ghost_side_[k];
+            Vec coeff = a_h_.row(s.ghost_node_[k]).transpose();
+            if (s.ghost_sigma_.size())
+                coeff = s.ghost_sigma_.cwiseProduct(coeff);
+            const Vec psi = s.out_rules_[side].harmonics * coeff;
+            ghost_pair(k, psi);
+        });
+    } else if (ghost) {
         const int ghost_block = std::clamp(int(s.ghost_node_.size()) / std::max(1, 4 * omp_threads()), 4, 32);
         std::vector<std::array<int, 3>> tasks;
         for (int side = 0; side < 6; ++side)
@@ -854,6 +924,8 @@ void ElementWenoGpu::stage(double time, const double *x, double *out, double *u,
     fetch();
     gpu::snapshot_counters(ctx_);
     gpu::record(ctx_, 0);
+    if (device_ghost_) // concurrent with the volume kernels below (aux stream, after the closure)
+        gpu::ghost(ctx_, x, pin_ghost_m_, pin_ghost_flags_);
     gpu::weno_gamma(ctx_, x);
     gpu::gradients(ctx_, x);
     gpu::stabilization(ctx_, x, out, true, -1);
@@ -991,6 +1063,23 @@ Field ElementWenoGpu::end(ElementWenoStats &stats) {
     stats.nudge_mass += c.nudge_mass - merged_.nudge_mass;
     stats.min_gamma = std::min(stats.min_gamma, c.min_gamma);
     merged_ = c;
+    if (device_ghost_) {
+        // Device projections (flagged pairs are counted by the host when it solves them).
+        const gpu::GhostStats g = gpu::ghost_stats(ctx_);
+        PositivityProjectionStats p;
+        p.calls = long(g.calls) - (ghost_flagged - ghost_flagged_merged);
+        p.identities = g.identities, p.vacuum = g.vacuum, p.failures = g.failures, p.scaled = g.scaled;
+        p.capped = g.capped, p.iterations = g.iterations, p.backtracks = g.backtracks;
+        p.max_iterations = g.max_iterations, p.max_residual = g.max_residual, p.min_active_fraction = g.min_active_fraction;
+        PositivityProjectionStats delta = p; // stats are cumulative on the device: merge only the increment
+        delta.calls -= ghost_merged_.calls, delta.identities -= ghost_merged_.identities;
+        delta.vacuum -= ghost_merged_.vacuum, delta.failures -= ghost_merged_.failures;
+        delta.scaled -= ghost_merged_.scaled, delta.capped -= ghost_merged_.capped;
+        delta.iterations -= ghost_merged_.iterations, delta.backtracks -= ghost_merged_.backtracks;
+        stats.projection.merge(delta);
+        ghost_merged_ = p;
+        ghost_flagged_merged = ghost_flagged;
+    }
     if (s_.reacts()) {
         const gpu::Ledger l = gpu::ledger(ctx_);
         stats.absorbed += l.absorbed - ledger_absorbed_, stats.injected += l.injected - ledger_injected_;
