@@ -549,6 +549,54 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
         bwd(k1 - CH, bufB);
     }
 }
+// Element-wise stabilization (any degree and dimension): one thread per (element, component) loads the element rows
+// of a and g_d once and forms the loads of all local nodes; k_gather_stab sums them per node (residual = -sum).
+template <int N> __global__ void k_stab_element(View v, const double *a, double *local_out, bool want_low,
+                                                double constant_gamma) {
+    constexpr int NA = N > 0 ? N : max_local;
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(v.cells) * v.q)
+        return;
+    const int e = int(t / v.q), c = int(t % v.q), n = N > 0 ? N : v.local, q = v.q;
+    const int *map = v.connectivity + std::size_t(e) * n;
+    double av[NA], gv[3][NA];
+    for (int m = 0; m < n; ++m) {
+        const std::size_t r = std::size_t(map[m]) * q + c;
+        av[m] = a[r];
+        for (int d = 0; d < v.dimension; ++d)
+            gv[d][m] = v.gradient[d][r];
+    }
+    const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
+    const double weight = -v.viscosity * g;
+    for (int l = 0; l < n; ++l) {
+        const double *K = v.stiffness_rows + std::size_t(l) * n;
+        double stiff = 0, conv = 0;
+        for (int m = 0; m < n; ++m)
+            stiff += K[m] * av[m];
+        if (weight != 0)
+            for (int d = 0; d < v.dimension; ++d) {
+                const double *Ct = v.convection_t_rows[d] + std::size_t(l) * n;
+                for (int m = 0; m < n; ++m)
+                    conv += Ct[m] * gv[d][m];
+            }
+        const double term = v.viscosity * stiff + weight * conv;
+        local_out[(std::size_t(e) * n + l) * q + c] = term;
+        if (want_low && c < 4) {
+            const int slot = c == 0 ? 0 : (c == 1 ? 2 : (c == 2 ? 3 : 1));
+            v.stab_low[std::size_t(4 * l + slot) * v.cells + e] = (c == 0 ? v.s0 : v.s1) * term;
+        }
+    }
+}
+__global__ void k_gather_stab(View v, const double *local_out, double *result) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(v.nodes) * v.q)
+        return;
+    const int i = int(t / v.q), c = int(t % v.q);
+    double out = 0;
+    for (int k = v.node_offsets[i]; k < v.node_offsets[i + 1]; ++k)
+        out -= local_out[std::size_t(v.node_entries[k]) * v.q + c];
+    result[t] = out;
+}
 // residual(i, c) = -sum_{(e, l) at i} s_h^e(phi_l, a)_c; stab_low(e, 4 l + .) = projected element loads.
 __global__ void k_stabilization(View v, const double *a, double *result, bool want_low, double constant_gamma) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -861,16 +909,17 @@ template <int N> __global__ void __launch_bounds__(128, 4) k_limiter(View v) {
 // One thread per (element, local node) for N = 4 or 8 (a power of two): node-local bar states and contributions,
 // element sums through warp shuffles in the host's sequential order. Elements whose factor needs the segment search
 // go to k_limiter_segment, elements with a stable base bar to the host (as in k_limiter).
-template <int N> __global__ void __launch_bounds__(256) k_limiter_group(View v) {
+// NG = N rounded up to a power of two (lanes i >= N of a group are idle but take part in the shuffles).
+template <int N, int NG> __global__ void __launch_bounds__(256) k_limiter_group(View v) {
     const unsigned FULL = 0xffffffffu;
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    const int e = t / N, i = t % N, lane = threadIdx.x & 31, base = lane & ~(N - 1);
-    const bool valid = e < v.cells;
+    const int e = t / NG, i = t % NG, lane = threadIdx.x & 31, base = lane & ~(NG - 1);
+    const bool valid = e < v.cells && i < N;
     const int dim = v.dimension;
     const std::size_t NN = v.nodes;
     double ub[4] = {0, 0, 0, 0}, fi[4] = {0, 0, 0, 0}, ui[4] = {0, 0, 0, 0};
     bool bad = false, uncertain = false;
-    const double tv = v.total_viscosity[i];
+    const double tv = i < N ? v.total_viscosity[i] : 1.;
     if (valid) {
         const int *map = v.connectivity + std::size_t(e) * N;
         const int ni = map[i];
@@ -917,7 +966,7 @@ template <int N> __global__ void __launch_bounds__(256) k_limiter_group(View v) 
     }
     int flag = valid && (bad || uncertain);
 #pragma unroll
-    for (int o = 1; o < N; o <<= 1)
+    for (int o = 1; o < NG; o <<= 1)
         flag |= __shfl_xor_sync(FULL, flag, o);
     // Raw zero sum (statistics) in node order.
     double raw = 0;
@@ -957,7 +1006,7 @@ template <int N> __global__ void __launch_bounds__(256) k_limiter_group(View v) 
     }
     int vote = need | (flag << 1);
 #pragma unroll
-    for (int o = 1; o < N; o <<= 1)
+    for (int o = 1; o < NG; o <<= 1)
         vote |= __shfl_xor_sync(FULL, vote, o);
     double after = 0;
     if (valid) {
@@ -1546,9 +1595,19 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
             k_stabilization_strip<64><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
         else
             k_stabilization_strip<32><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+    } else {
+        double *local_out = device_doubles(ctx, 7, std::size_t(v.cells) * v.local * v.q);
+        const unsigned g = blocks(std::size_t(v.cells) * v.q, 128);
+        switch (v.local) {
+        case 8: k_stab_element<8><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
+        case 9: k_stab_element<9><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
+        case 16: k_stab_element<16><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
+        case 25: k_stab_element<25><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
+        case 27: k_stab_element<27><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
+        default: k_stab_element<0><<<g, 128>>>(v, state, local_out, want_low, constant_gamma); break;
+        }
+        k_gather_stab<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, local_out, out);
     }
-    else
-        k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, state, out, want_low, constant_gamma);
 }
 void add_rows(Context *ctx, double *field, const int *index, const double *rows, int count) {
     if (count)
@@ -1573,15 +1632,26 @@ void flux_rows(Context *ctx, double *field, bool want_moments) {
 }
 void limiter(Context *ctx) {
     const View &v = ctx->v;
+    const unsigned b4 = blocks(std::size_t(v.cells) * 4, 256), b8 = blocks(std::size_t(v.cells) * 8, 256),
+                   b16 = blocks(std::size_t(v.cells) * 16, 256), b32 = blocks(std::size_t(v.cells) * 32, 256);
     if (v.local == 4) {
-        k_limiter_group<4><<<blocks(std::size_t(v.cells) * 4, 256), 256>>>(v);
+        k_limiter_group<4, 4><<<b4, 256>>>(v);
         k_limiter_segment<4><<<blocks(v.cells, 64), 64>>>(v);
     } else if (v.local == 8) {
-        k_limiter<8><<<blocks(v.cells, 128), 128>>>(v);
+        k_limiter_group<8, 8><<<b8, 256>>>(v);
         k_limiter_segment<8><<<blocks(v.cells, 64), 64>>>(v);
     } else if (v.local == 9) {
-        k_limiter<9><<<blocks(v.cells, 128), 128>>>(v);
+        k_limiter_group<9, 16><<<b16, 256>>>(v);
         k_limiter_segment<9><<<blocks(v.cells, 64), 64>>>(v);
+    } else if (v.local == 16) {
+        k_limiter_group<16, 16><<<b16, 256>>>(v);
+        k_limiter_segment<16><<<blocks(v.cells, 64), 64>>>(v);
+    } else if (v.local == 25) {
+        k_limiter_group<25, 32><<<b32, 256>>>(v);
+        k_limiter_segment<25><<<blocks(v.cells, 64), 64>>>(v);
+    } else if (v.local == 27) {
+        k_limiter_group<27, 32><<<b32, 256>>>(v);
+        k_limiter_segment<27><<<blocks(v.cells, 64), 64>>>(v);
     } else {
         k_limiter<0><<<blocks(v.cells, 128), 128>>>(v);
         k_limiter_segment<0><<<blocks(v.cells, 64), 64>>>(v);

@@ -183,6 +183,8 @@ def flags(t: dict, output: Path, threads: int, **kwargs):
             set_value("--mirror-reduction", "off")
             args.append("--gpu")
         set_value("--angular-reduction", "auto")
+        if t.get("stabilization", "element-weno") == "element-weno":
+            set_value("--sample-moments", "low")  # the analysis uses u0..u3 only; full PN columns cost minutes
         if t.get("fcs"):
             args += ["--fcs", "analytic"]
     return args
