@@ -63,7 +63,8 @@ Wählbar über Optionen:
 | Line Source (Garrett–Hauck) | `--case line-source --domain-length 3 --pulse-width .03 --background 1e-4 --sigma-s 1 --time 1` (nur B; Referenz `scripts/line_source/reference.py`) |
 
 Element-WENO läuft auf generierten kartesischen Gittern (konstante isotrope Streuung
-und Absorption möglich, keine Quellen) und nutzt SSPRK3. Die Felddateien enthalten dieselben Spalten wie der Q1-Pfad, ausgewertet
+und Absorption möglich, keine Quellen) und nutzt SSPRK(4,3) (Standard seit 15.11.2026, gleiche Genauigkeit,
+1,36-1,5x schneller; `--ssprk3` für das frühere SSPRK3). Die Felddateien enthalten dieselben Spalten wie der Q1-Pfad, ausgewertet
 auf einem gleichmäßigen Gitter mit `elements*degree` Zellen pro Achse. Details in
 [docs/ELEMENT_WENO.md](docs/ELEMENT_WENO.md). Die bisherige `m1pn_nn_filter`
 behält ihre alten Defaults, damit bestehende Studien reproduzierbar bleiben.
