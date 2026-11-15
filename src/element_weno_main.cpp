@@ -14,7 +14,7 @@ struct Args {
     int sample_grid = 0;
     double filter_strength = 0;
     std::string problem = "smooth", output = "tmp/element_weno";
-    bool weno = true, limit = true, stabilize = true, legacy_boundary = false, symmetric_residual = false, ssprk43 = false,
+    bool weno = true, limit = true, stabilize = true, legacy_boundary = false, symmetric_residual = false, ssprk43 = true,
          reduce_angular = true;
     bool positivity_projection = true, projection_strict = false, projection_warm_start = true;
     int projection_rule = 0;
@@ -54,7 +54,8 @@ Args parse(int argc, char **argv) {
         else if (key == "--output") a.output = next();
         else if (key == "--no-weno") a.weno = false;
         else if (key == "--no-limit") a.limit = false;
-        else if (key == "--ssprk43") a.ssprk43 = true; // SSPRK(4,3) instead of SSPRK3
+        else if (key == "--ssprk43") a.ssprk43 = true; // SSPRK(4,3) (default since 2026-11-15, docs/SPEEDUP_OPTIONS.md)
+        else if (key == "--ssprk3") a.ssprk43 = false; // Shu-Osher SSPRK3 (former default)
         else if (key == "--no-angular-reduction") a.reduce_angular = false; // both problems are even in 1D/2D
         else if (key == "--no-stabilization") a.stabilize = false;
         else if (key == "--legacy-boundary") a.legacy_boundary = true; // commit 8efe517 behaviour (docs/BOUNDARY_FIXES.md)
