@@ -1,0 +1,88 @@
+# Element WENO auf der GPU (experimentell, 15.11.2026)
+
+Branch `experimental/gpu-a100` (von `feature/element-weno-mpi`, `afb1c55`), Option `--gpu` von
+`m1pn_element_weno`. Build nur mit `-DM1PN_ELEMENT_ONLY=ON -DENABLE_MPI=OFF -DM1PN_ELEMENT_GPU=ON` und CUDA
+(`/sfw/cuda/12.6`, Zielarchitektur sm_80). Ziel: A100 80 GB PCIe auf `tardis` (Slurm: `--constraint=ampere
+--gres=gpu:1`, 16 Kerne EPYC 7343 mit SMT; `-w tardis` wird von Slurm abgelehnt, `--constraint=ampere` geht).
+
+## Aufbau
+
+Der Zustand bleibt während der ganzen Zeitschleife auf der GPU. Pro Stufe:
+
+| Teil | Wo | Bemerkung |
+|---|---|---|
+| Closure (Levermore), Dichtespalte | GPU | fusioniert in den letzten Kernel der Vorstufe |
+| WENO-Gewichte | GPU | ein Thread pro Element |
+| Gradienten `M^-1 C_d a` | GPU | Konvektion im Vorwärtssweep, gebänderte LDL^T in natürlicher Ordnung |
+| Stabilisierung (gesammelt) | GPU | 2D Q1: Streifen-Kernel, 3x3-Fenster in Registern |
+| PN-Randlast (Teil A) | Host | nur Randknoten; Datum-Anteil `D B_datum` vorab für die nächste Stufe |
+| Massenlösung, Fluss der Momente | GPU | |
+| Limiter | GPU | ein Thread pro (Element, Knoten), Elementsummen per Warp-Shuffle in Host-Reihenfolge |
+| Ghost (Positivitätsprojektion), Face-Zustände (Teil B) | Host | überlappt mit der GPU-Arbeit |
+| Randkorrekturen | Host | nur Randknoten |
+| SSP-Kombination, Kegel-Nudge | GPU | PN-Zeilen vor den Randkorrekturen, M1-Zeilen danach |
+
+Der Rand bleibt auf dem Host (Newton-Verfahren der Projektion, Inflow-Funktionen). Er braucht nur die Randzeilen
+(512²: 2052 Knoten), die per Pinned-Memory und Events asynchron übertragen werden. Inflow-Daten hängen nur von der
+Zeit ab und werden für die nächste Stufe vorbereitet, während der Host auf die GPU wartet.
+
+Exaktheit: Das exakte M1-Kegelprädikat ist auf der GPU exakt (Filter wie auf dem Host, sonst fehlerfreie Produkte
+und Shewchuk-Expansion nach exakter Zweierpotenz-Skalierung). Pfade, die auf dem Host `long double` brauchen
+(Levermore nahe am Strahl, stabile Basis-Bar), werden markiert und auf dem Host mit dem Originalcode nachgerechnet
+(in den Läufen hier nie aufgetreten). Gleiche Ergebnisse wie die CPU bis auf Rundung: andere Summationsreihenfolge,
+FMA, die Linienfaktoren in natürlicher statt AMD-Ordnung. Ein GPU-Lauf ist deterministisch (drei Läufe bitgleich).
+
+Nicht unterstützt (Abbruch mit Meldung): MPI, periodisch, Spiegel, symmetrisches Residuum, Reaktion/Filter,
+M1-Target, `projection_high_order/hybrid/diagnostics`, äußere Zustände (`exterior_state`).
+
+## Laufzeit
+
+Crossing-Studie (Breite 0,1, Hintergrund 0,01), Q1, P7, T = 0.32, automatisches dt (SSPRK3). Gesamt = Wandzeit
+des Prozesses einschließlich Aufbau und Auswertung, Schleife = `wall_seconds`.
+
+512² Elemente (1443 Schritte):
+
+| Lauf | Gesamt | Schleife | GPU schneller (gesamt / Schleife) |
+|---|---|---|---|
+| NX, 3 Server (6 Ränge x 32 Threads, MPI-Branch) | 49,3 s | 46,0 s | 3,3x / 3,9x |
+| NX, 1 Sockel (32 Threads) | – | 88,9 s | – / 7,5x |
+| tardis nur CPU (16 Kerne, 32 Threads) | 157,5 s | 154,1 s | 10,6x / 13x |
+| **tardis A100** | **14,8 s** | **11,9 s** | |
+
+Drei GPU-Läufe: Schleife 11,86 / 11,95 / 11,94 s, Aufbau 2,0 s (davon Spektralradius auf der GPU 0,3 s),
+Auswertung 0,45 s.
+
+1024² Elemente (2886 Schritte): NX 3 Server 223,5 s gesamt (Schleife 216,2 s), A100 94,9 s (89,4 s), also 2,4x.
+Die 3 NX-Server skalieren mit der Größe besser (Kette und Rand fallen weniger ins Gewicht), die GPU braucht pro Stufe
+etwa 4x so lang bei 4x so vielen Knoten.
+
+Entwicklung der Schleifenzeit (512²): 22,6 s (erste Version) → 21,4 s (asynchrone Pipeline, Rand geteilt) →
+15,8 s (Kernel) → 13,7 s (Inflow-Daten vorab) → 11,9 s (Limiter pro Knoten, Statistik per Warp-Reduktion).
+Pro Stufe (2,74 ms) rechnet die GPU etwa 2,6 ms: Linienlösungen 0,96 ms (nahe der Bandbreite), Kombination 0,47 ms,
+Stabilisierung 0,41 ms, Limiter 0,27 ms, Rest 0,5 ms. Der Host-Rand (Projektion, Faces) braucht mit 32 Threads etwa
+1 ms pro Stufe und liegt neben der GPU-Arbeit. Verworfen: Linienlösung im Shared Memory (8 Komponenten pro Block,
+3x langsamer), Limiter mit Shared-Memory-Staging (langsamer), Chunk 32 statt 16 in den Linienlösungen.
+
+## Abweichung
+
+Dichte (sqrt(4 pi) a_0 an allen Knoten) gegen den CPU-Referenzlauf (deterministisch; NX-MPI, NX-Sockel und tardis-CPU
+sind bitgleich), Maximum relativ zur maximalen Dichte und L² relativ:
+
+| Fall | GPU gegen CPU | CPU ohne FMA gegen CPU |
+|---|---|---|
+| 64², T = 0.32 | 2,5e-12 / 5,9e-13 | |
+| 512², T = 0.02 | 9,2e-12 / 6,0e-13 | 1,3e-11 / 1,6e-12 |
+| 512², T = 0.08 | 1,9e-10 / 7,0e-12 | 1,8e-10 / 7,9e-12 |
+| 512², T = 0.32 | 9,5e-5 / 8,1e-6 | 3,1e-5 / 4,6e-6 |
+| 1024², T = 0.08 | 1,9e-9 / 5,7e-11 | |
+| 1024², T = 0.16 | 1,5e-5 / 1,1e-6 | |
+| 1024², T = 0.32 | 1,2e-2 / 7,2e-4 | 1,5e-2 / 7,9e-4 |
+
+"CPU ohne FMA" ist derselbe CPU-Code mit `-mno-fma`, also dasselbe Verfahren mit anderer Rundung. Er weicht genauso
+stark ab wie die GPU. Die Abweichung ist keine Eigenschaft des GPU-Codes, sondern die Rundungsempfindlichkeit des
+Verfahrens bei diesem Problem: Sie wächst exponentiell mit der Zeit (Limiter- und Kegelentscheidungen kippen an
+Schwellen), bei 1024² stärker als bei 512². Integrale Größen bleiben dabei stabil: kinetischer L²-Fehler 0,0116131 /
+0,0116132 (512²) und 0,0123535 / 0,0123541 (1024²), Masse auf 8 Stellen gleich. Eine Abweichungsschranke von 1e-8 bei
+T = 0.32 kann daher keine Änderung einhalten, die nicht bitgleich ist (auch kein anderer Compiler-Schalter).
+
+Rohdaten und Skripte: `nx/tmp/gpu_20261115/` (nicht versioniert).
