@@ -82,6 +82,7 @@ struct Context {
     std::size_t scratch_double_size[8] = {};
     double *norm_accumulator = nullptr;
     cudaEvent_t events[8] = {};
+    struct ReactionDevice *reaction = nullptr;
     int flux_nnz[3] = {0, 0, 0};
     DeviceCounters *pinned_counters = nullptr;
 };
@@ -1190,6 +1191,143 @@ inline unsigned blocks(std::size_t work, int threads = 256) { return unsigned((w
 } // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------------------------
+// Local reaction and FCS collision source.
+__device__ inline double warp_sum(double v) {
+#pragma unroll
+    for (int o = 16; o > 0; o /= 2)
+        v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+struct ReactionView {
+    const double *sigma_a, *sigma_s, *source, *filter;
+    double sa, ss;
+    int P; // FCS points per element (0: no FCS)
+    const double *fx, *fy, *fw, *fss, *fshape, *fmass;
+    double *q;      // cells x P
+    double *local;  // cells x local
+    double *fcs;    // nodes
+    double *table;  // FCS radial table
+    double *ledger; // absorbed, injected
+};
+struct ReactionDevice {
+    ReactionView r;
+    std::vector<void *> owned;
+    std::size_t table_size = 0;
+};
+__global__ void k_fcs_points(View v, ReactionView r, int n, double dr, double cx, double cy) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(v.cells) * r.P)
+        return;
+    const double dx = r.fx[t] - cx, dy = r.fy[t] - cy, rr = sqrt(dx * dx + dy * dy) / dr;
+    double rho = 0;
+    if (rr < n - 2) {
+        const int i = int(rr);
+        const double f = rr - i, *p = r.table + i;
+        const double val = p[1] + .5 * f * (p[2] - p[0] + f * (2 * p[0] - 5 * p[1] + 4 * p[2] - p[3] +
+                                                              f * (3 * (p[1] - p[2]) + p[3] - p[0])));
+        rho = fmax(val, 0.);
+    }
+    r.q[t] = r.fw[t] * r.fss[t] * rho;
+}
+__global__ void k_fcs_element(View v, ReactionView r) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(v.cells) * v.local)
+        return;
+    const int e = int(t / v.local), l = int(t % v.local);
+    double s = 0;
+    for (int k = 0; k < r.P; ++k)
+        s += r.fshape[std::size_t(l) * r.P + k] * r.q[std::size_t(e) * r.P + k];
+    r.local[t] = s;
+}
+__global__ void k_fcs_gather(View v, ReactionView r) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= v.nodes)
+        return;
+    double s = 0;
+    for (int k = v.node_offsets[i]; k < v.node_offsets[i + 1]; ++k)
+        s += r.local[v.node_entries[k]];
+    r.fcs[i] = s / r.fmass[i];
+}
+__global__ void k_react(View v, ReactionView r, double *a, double tau, bool fcs) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double absorbed = 0, injected = 0;
+    if (i < v.nodes) {
+        const double sa = r.sigma_a ? r.sigma_a[i] : r.sa, ss = r.sigma_s ? r.sigma_s[i] : r.ss;
+        const double q0 = (r.source ? r.source[i] : 0.) + (fcs ? r.fcs[i] : 0.);
+        const double c0 = 1 / v.s0, z = -sa * tau, decay0 = exp(z), phi1 = z == 0 ? 1. : expm1(z) / z;
+        double *row = a + std::size_t(i) * v.q;
+        const double rho = row[0] / c0;
+        row[0] = decay0 * row[0] + c0 * q0 * tau * phi1;
+        for (int k = 1; k < v.q; ++k)
+            row[k] *= exp(-tau * (sa + ss + r.filter[k]));
+        absorbed = v.lumped[i] * (-expm1(z) * rho + q0 * tau * (1 - phi1));
+        injected = v.lumped[i] * q0 * tau;
+    }
+    absorbed = warp_sum(absorbed), injected = warp_sum(injected);
+    if ((threadIdx.x & 31) == 0) {
+        atomicAdd(&r.ledger[0], absorbed);
+        atomicAdd(&r.ledger[1], injected);
+    }
+}
+void reaction_setup(Context *ctx, const ReactionSetup &s) {
+    ReactionDevice *rd = new ReactionDevice;
+    ReactionView &r = rd->r;
+    auto own = [&](auto *p) {
+        rd->owned.push_back((void *)p);
+        return p;
+    };
+    const View &v = ctx->v;
+    const std::size_t N = v.nodes;
+    r.sigma_a = s.sigma_a ? own(dcopy(s.sigma_a, N)) : nullptr;
+    r.sigma_s = s.sigma_s ? own(dcopy(s.sigma_s, N)) : nullptr;
+    r.source = s.source ? own(dcopy(s.source, N)) : nullptr;
+    r.sa = s.sa, r.ss = s.ss;
+    r.filter = own(dcopy(s.filter, std::size_t(v.q)));
+    r.P = s.fcs_points;
+    if (r.P) {
+        const std::size_t CP = std::size_t(v.cells) * r.P;
+        r.fx = own(dcopy(s.fcs_x, CP)), r.fy = own(dcopy(s.fcs_y, CP));
+        r.fw = own(dcopy(s.fcs_weight, CP)), r.fss = own(dcopy(s.fcs_sigma_s, CP));
+        r.fshape = own(dcopy(s.fcs_shape, std::size_t(v.local) * r.P));
+        r.fmass = own(dcopy(s.fcs_node_mass, N));
+        r.q = own(dalloc<double>(CP));
+        r.local = own(dalloc<double>(std::size_t(v.cells) * v.local));
+        r.fcs = own(dalloc<double>(N));
+    } else
+        r.fx = r.fy = r.fw = r.fss = r.fshape = r.fmass = nullptr, r.q = r.local = r.fcs = nullptr;
+    r.table = nullptr;
+    r.ledger = own(dalloc<double>(2));
+    ctx->reaction = rd;
+}
+void react(Context *ctx, double *state, double tau, const double *host_table, int n, double dr, double cx, double cy) {
+    ReactionDevice *rd = ctx->reaction;
+    ReactionView &r = rd->r;
+    const View &v = ctx->v;
+    const bool fcs = host_table != nullptr;
+    if (fcs) {
+        if (std::size_t(n + 1) > rd->table_size) {
+            cudaFree(r.table);
+            rd->table_size = std::size_t(n + 1) * 2;
+            CK(cudaMalloc(&r.table, rd->table_size * sizeof(double)));
+        }
+        CK(cudaMemcpy(r.table, host_table, std::size_t(n + 1) * sizeof(double), cudaMemcpyHostToDevice));
+        k_fcs_points<<<blocks(std::size_t(v.cells) * r.P), 256>>>(v, r, n, dr, cx, cy);
+        k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256>>>(v, r);
+        k_fcs_gather<<<blocks(v.nodes), 256>>>(v, r);
+    }
+    k_react<<<blocks(v.nodes), 256>>>(v, r, state, tau, fcs);
+    k_admissible<<<blocks(v.nodes), 256>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
+}
+Ledger ledger(Context *ctx) {
+    double h[2];
+    CK(cudaMemcpy(h, ctx->reaction->r.ledger, sizeof h, cudaMemcpyDeviceToHost));
+    Ledger l;
+    l.absorbed = h[0], l.injected = h[1];
+    return l;
+}
+
 Context *create(const Setup &s) {
     if (double(s.nodes) * s.q >= 4294967295.)
         throw std::runtime_error("GPU path: nodes x moments must stay below 2^32");
@@ -1315,6 +1453,12 @@ void destroy(Context *ctx) {
         return;
     for (void *p : ctx->owned)
         cudaFree(p);
+    if (ctx->reaction) {
+        for (void *p : ctx->reaction->owned)
+            cudaFree(p);
+        cudaFree(ctx->reaction->r.table);
+        delete ctx->reaction;
+    }
     for (auto &e : ctx->events)
         cudaEventDestroy(e);
     cudaFreeHost(ctx->pinned_counters);

@@ -112,6 +112,24 @@ void wait(Context *, int event);       // host waits for the event
 void snapshot_counters(Context *);     // queue a copy of the counters into pinned memory
 Counters snapshot(Context *);          // the last queued snapshot (call after waiting for a later event)
 void reset_fallbacks(Context *);       // queue zeroing of the two fallback counters
+// Exact local reaction (ElementWeno::react): per node rho' = e^{-sa tau} rho + q0 tau phi1(-sa tau),
+// a_k' = e^{-tau (sa + ss + f_k)} a_k (k >= 1), q0 = source + FCS collision source; then the admissible-row nudge.
+struct ReactionSetup {
+    const double *sigma_a = nullptr, *sigma_s = nullptr, *source = nullptr; // nodes (material) or null
+    double sa = 0, ss = 0;                                                  // constant coefficients (no material)
+    const double *filter = nullptr;                                         // per moment: f (l / (N+1))^4
+    // FCS (2D line source): quadrature points (cells x P), weights, sigma_s, shape (local x P, row-major), node mass.
+    int fcs_points = 0;
+    const double *fcs_x = nullptr, *fcs_y = nullptr, *fcs_weight = nullptr, *fcs_sigma_s = nullptr;
+    const double *fcs_shape = nullptr, *fcs_node_mass = nullptr;
+};
+void reaction_setup(Context *, const ReactionSetup &);
+// table: rho_u at r = (k - 1) dr, k = 0..n (cubic interpolation as uncollided::GaussianPulse::density); null: no FCS.
+void react(Context *, double *state, double tau, const double *host_table, int n, double dr, double cx, double cy);
+struct Ledger {
+    double absorbed = 0, injected = 0;
+};
+Ledger ledger(Context *); // cumulative (synchronous)
 // Fallback lists (device index arrays; count from counters()).
 const int *closure_fallback_list(Context *);
 const int *limiter_fallback_list(Context *);

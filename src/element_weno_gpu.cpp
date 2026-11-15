@@ -2,6 +2,7 @@
 #include "base_bar.hpp"
 #include "element_weno_gpu_device.hpp"
 #include "parallel.hpp"
+#include "uncollided.hpp"
 #include <random>
 #ifdef _OPENMP
 #include <omp.h>
@@ -67,8 +68,10 @@ std::vector<double> row_major(const Mat &m) {
 ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     const ElementWenoOptions &o = s.options;
     require(!s.dist_, "GPU path: serial scheme only (no MPI)");
-    require(!o.periodic && !o.symmetric_residual && !o.m1_target && !s.reacts(),
-            "GPU path: open mesh, standard residual, PN target, no reaction/filter");
+    require(!o.periodic && !o.symmetric_residual && !o.m1_target,
+            "GPU path: open mesh, standard residual, PN target");
+    require(!o.uncollided_density || (o.uncollided_pulse && s.dimension == 2),
+            "GPU path: FCS needs the analytic line-source pulse (ElementWenoOptions::uncollided_pulse, 2D)");
     require(std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; }), "GPU path: no mirror sides");
     require(!o.projection_high_order && !o.projection_hybrid && !o.projection_diagnostics,
             "GPU path: projection_high_order/hybrid/diagnostics are not supported");
@@ -192,6 +195,31 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     IN_ = Vec::Zero(face_rows);
     face_datum_.assign(s.faces_.size(), 0);
     require(!s.inflow.exterior_state && !s.inflow.exterior_m1, "GPU path: kinetic inflow data only (no exterior state)");
+    if (s.reacts()) {
+        gpu::ReactionSetup r;
+        const bool material = bool(o.material);
+        if (material)
+            r.sigma_a = s.node_sigma_a.data(), r.sigma_s = s.node_sigma_s.data(), r.source = s.node_source.data();
+        r.sa = o.sigma_a, r.ss = o.sigma_s;
+        std::vector<double> filter(q);
+        for (int k = 0; k < q; ++k) {
+            const int l = int(std::sqrt(double(s.active[k]) + .5));
+            filter[k] = o.filter_strength * std::pow(double(l) / (s.pn.order + 1), 4);
+        }
+        r.filter = filter.data();
+        std::vector<double> fx, fy, shape;
+        if (o.uncollided_density) {
+            pulse_ = o.uncollided_pulse.get();
+            r.fcs_points = s.fcs_per_element_;
+            fx.resize(s.fcs_points_.size()), fy.resize(s.fcs_points_.size());
+            for (std::size_t k = 0; k < fx.size(); ++k)
+                fx[k] = s.fcs_points_[k][0], fy[k] = s.fcs_points_[k][1];
+            shape = row_major(s.fcs_shape_);
+            r.fcs_x = fx.data(), r.fcs_y = fy.data(), r.fcs_weight = s.fcs_weight_.data();
+            r.fcs_sigma_s = s.fcs_sigma_s_.data(), r.fcs_shape = shape.data(), r.fcs_node_mass = s.fcs_node_mass_.data();
+        }
+        gpu::reaction_setup(ctx_, r);
+    }
 }
 ElementWenoGpu::~ElementWenoGpu() {
     gpu::host_free(pin_fetch_);
@@ -900,51 +928,89 @@ void ElementWenoGpu::stage(double time, const double *x, double *out, double *u,
     gpu::finish_stage(ctx_, out, x, u, old, fresh, tau, true, true);
     closure_ready_ = true;
 }
-Field ElementWenoGpu::run(double time, double dt, int steps, const Field &a, ElementWenoStats *stats_in) {
+void ElementWenoGpu::begin(const Field &a) {
     require(a.rows() == s_.nodes && a.cols() == s_.moments, "GPU path: invalid state");
-    ElementWenoStats scratch;
-    ElementWenoStats &stats = stats_in ? *stats_in : scratch;
-    const int q = s_.moments;
     const gpu::Buffers b = gpu::buffers(ctx_);
-    double *u = b.a, *b1 = b.x, *b2 = b.r;
-    gpu::upload(u, a.data(), sizeof(double) * std::size_t(s_.nodes) * q);
+    u_ = b.a, b1_ = b.x, b2_ = b.r;
+    gpu::upload(u_, a.data(), sizeof(double) * std::size_t(s_.nodes) * s_.moments);
     gpu::reset_counters(ctx_);
     closure_ready_ = false;
+}
+// Exact local reaction over tau on the device state (FCS: radial table of rho_u at source_time from the host).
+void ElementWenoGpu::react(double tau, double source_time, ElementWenoStats &stats) {
+    const double start = seconds();
+    if (pulse_) {
+        const uncollided::GaussianPulse &p = *pulse_;
+        const double dr = p.width / 8, reach = std::max(source_time, 0.) + 10 * p.width;
+        const int n = int(std::ceil(reach / dr)) + 3;
+        table_.assign(n + 1, 0.);
+        parallel_for(n, [&](int k) { table_[k + 1] = p.line(k * dr, source_time); });
+        table_[0] = table_[2];
+        gpu::react(ctx_, u_, tau, table_.data(), n, dr, p.centre[0], p.centre[1]);
+    } else
+        gpu::react(ctx_, u_, tau, nullptr, 0, 0, 0, 0);
+    closure_ready_ = false; // the fused closure of the last stage belongs to the state before the reaction
+    stats.t_reaction += seconds() - start;
+}
+void ElementWenoGpu::step(double t, double dt, double next, ElementWenoStats &stats) {
+    const bool four = s_.options.ssprk43, reacts = s_.reacts();
+    if (reacts)
+        react(.5 * dt, t + .25 * dt, stats);
+    double *u = u_, *b1 = b1_, *b2 = b2_;
+    if (!four) {
+        stage(t, u, b1, u, 0, 1, dt, 1. / 6, dt, stats, t + dt);
+        stage(t + dt, b1, b2, u, .75, .25, dt, 1. / 6, dt, stats, t + .5 * dt);
+        stage(t + .5 * dt, b2, b1, u, 1. / 3, 2. / 3, dt, 2. / 3, dt, stats, next);
+        std::swap(u, b1);
+    } else {
+        const double half = .5 * dt;
+        stage(t, u, b1, u, 0, 1, half, 1. / 6, dt, stats, t + half);
+        stage(t + half, b1, b2, u, 0, 1, half, 1. / 6, dt, stats, t + dt);
+        stage(t + dt, b2, b1, u, 2. / 3, 1. / 3, half, 1. / 6, dt, stats, t + half);
+        stage(t + half, b1, b2, u, 0, 1, half, .5, dt, stats, next);
+        std::swap(u, b2);
+    }
+    u_ = u, b1_ = b1, b2_ = b2;
+    if (reacts)
+        react(.5 * dt, t + .75 * dt, stats);
+}
+Field ElementWenoGpu::state() {
+    gpu::synchronize();
+    Field out(s_.nodes, s_.moments);
+    gpu::download(out.data(), u_, sizeof(double) * std::size_t(s_.nodes) * s_.moments);
+    return out;
+}
+Field ElementWenoGpu::end(ElementWenoStats &stats) {
+    const gpu::Counters c = gpu::counters(ctx_);
+    check_error();
+    stats.limited_elements += c.limited_elements - merged_.limited_elements;
+    stats.min_limiter = std::min(stats.min_limiter, c.min_limiter);
+    stats.max_raw_zero_sum = std::max(stats.max_raw_zero_sum, c.max_raw_zero_sum);
+    stats.max_limited_zero_sum = std::max(stats.max_limited_zero_sum, c.max_limited_zero_sum);
+    stats.nudged_states += (c.nudged_bars + c.nudged_rows) - (merged_.nudged_bars + merged_.nudged_rows);
+    stats.nudge_mass += c.nudge_mass - merged_.nudge_mass;
+    stats.min_gamma = std::min(stats.min_gamma, c.min_gamma);
+    merged_ = c;
+    if (s_.reacts()) {
+        const gpu::Ledger l = gpu::ledger(ctx_);
+        stats.absorbed += l.absorbed - ledger_absorbed_, stats.injected += l.injected - ledger_injected_;
+        ledger_absorbed_ = l.absorbed, ledger_injected_ = l.injected;
+    }
+    return state();
+}
+Field ElementWenoGpu::run(double time, double dt, int steps, const Field &a, ElementWenoStats *stats_in) {
+    ElementWenoStats scratch;
+    ElementWenoStats &stats = stats_in ? *stats_in : scratch;
+    begin(a);
     double t = time;
-    const bool four = s_.options.ssprk43;
     const double nan = std::numeric_limits<double>::quiet_NaN();
     for (int n = 0; n < steps; ++n) {
         double tn = t; // the next step starts at t + dt (accumulated as the driver does)
         tn += dt;
-        const double next = n + 1 < steps ? tn : nan;
-        if (!four) {
-            stage(t, u, b1, u, 0, 1, dt, 1. / 6, dt, stats, t + dt);
-            stage(t + dt, b1, b2, u, .75, .25, dt, 1. / 6, dt, stats, t + .5 * dt);
-            stage(t + .5 * dt, b2, b1, u, 1. / 3, 2. / 3, dt, 2. / 3, dt, stats, next);
-            std::swap(u, b1);
-        } else {
-            const double half = .5 * dt;
-            stage(t, u, b1, u, 0, 1, half, 1. / 6, dt, stats, t + half);
-            stage(t + half, b1, b2, u, 0, 1, half, 1. / 6, dt, stats, t + dt);
-            stage(t + dt, b2, b1, u, 2. / 3, 1. / 3, half, 1. / 6, dt, stats, t + half);
-            stage(t + half, b1, b2, u, 0, 1, half, .5, dt, stats, next);
-            std::swap(u, b2);
-        }
+        step(t, dt, n + 1 < steps ? tn : nan, stats);
         t = tn;
     }
-    // Counters of the last stage.
-    const gpu::Counters c = gpu::counters(ctx_);
-    check_error();
-    stats.limited_elements += c.limited_elements;
-    stats.min_limiter = std::min(stats.min_limiter, c.min_limiter);
-    stats.max_raw_zero_sum = std::max(stats.max_raw_zero_sum, c.max_raw_zero_sum);
-    stats.max_limited_zero_sum = std::max(stats.max_limited_zero_sum, c.max_limited_zero_sum);
-    stats.nudged_states += c.nudged_bars + c.nudged_rows;
-    stats.nudge_mass += c.nudge_mass;
-    stats.min_gamma = std::min(stats.min_gamma, c.min_gamma);
-    Field out(s_.nodes, q);
-    gpu::download(out.data(), u, sizeof(double) * std::size_t(s_.nodes) * q);
-    return out;
+    return end(stats);
 }
 double ElementWenoGpu::spectral_radius() {
     const int q = s_.moments;

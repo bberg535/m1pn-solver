@@ -17,6 +17,9 @@
 #include <memory>
 #include <string>
 namespace m1pn {
+namespace uncollided {
+struct GaussianPulse;
+}
 // Space-dependent isotropic reaction data (docs/ELEMENT_HETEROGENEOUS.md). sigma_a, sigma_s >= 0 in 1/length,
 // source = isotropic particle density rate q0(x) >= 0 (units of rho per time; PN coefficient q0 / sqrt(4 pi)).
 // Nodal values are the positive averages int sigma phi_i / int phi_i (Bernstein phi_i >= 0) by composite
@@ -91,6 +94,8 @@ struct ElementWenoOptions {
     // int sigma_s rho_u phi_i / int phi_i by Gauss quadrature (uncollided_points per element and direction,
     // 0: degree + 3), evaluated at the midpoint of each Strang half step (second order in time).
     std::function<void(double, const std::vector<V3> &, std::vector<double> &)> uncollided_density;
+    // The same analytic pulse as an object (GPU path: the device evaluates its radial table, src/element_weno_gpu.cpp).
+    std::shared_ptr<const uncollided::GaussianPulse> uncollided_pulse;
     int uncollided_points = 0;
     // Moment-preserving positivity projection of the C6 ghost (docs/POSITIVITY_PROJECTION.md). Requires
     // fullsphere_ghost. Instead of max(0, psi_N) on the outgoing hemisphere and a cone scaling, the nodal PN

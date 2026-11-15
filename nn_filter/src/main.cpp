@@ -4,6 +4,9 @@
 #include "pn_uncoupled.hpp"
 #include "filter.hpp"
 #include "uncollided.hpp"
+#ifdef M1PN_ELEMENT_GPU
+#include "element_weno_gpu.hpp"
+#endif
 #include "element_weno.hpp"
 #include "element_weno_dlra.hpp"
 #include "hardware.hpp"
@@ -53,6 +56,7 @@ struct Options {
     double dlra_tolerance = 1e-3, dlra_absolute = 0;
     int dlra_rank = 8, dlra_min_rank = 4, dlra_max_rank = 0;
     bool dlra_fixed = false;
+    bool gpu = false; // element-weno: time loop on the GPU (src/element_weno_gpu.cpp, experimental)
     std::string fcs = "off"; // element-weno: first-collision source with analytic uncollided pulse (docs/FCS.md)
     bool weno = true, element_limit = true;
     std::string problem = "smooth", inflow = "vacuum", output = std::string(PN_AFC_ROOT) + "/tmp/run", pair_limiter = "scalar", coupling = "m1pn";
@@ -129,6 +133,10 @@ Options parse(int argc, char **argv) {
         }
         if (key == "--material-jump") {
             o.jump = true;
+            continue;
+        }
+        if (key == "--gpu") {
+            o.gpu = true;
             continue;
         }
         if (key == "--skip-fields") {
@@ -691,6 +699,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         eo.uncollided_density = [pulse](double t, const std::vector<V3> &x, std::vector<double> &out) {
             pulse.density(t, x, out);
         };
+        eo.uncollided_pulse = std::make_shared<const uncollided::GaussianPulse>(pulse);
     }
     eo.weno_q = o.weno_q;
     eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
@@ -869,6 +878,19 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     for (int i = 0; i < scheme.nodes; ++i)
         a.row(i) = scheme.reduce(initial[i]).transpose();
     std::vector<Vec>().swap(initial);
+#ifdef M1PN_ELEMENT_GPU
+    std::unique_ptr<ElementWenoGpu> device;
+    double gpu_radius_seconds = 0;
+    if (o.gpu) {
+        require(!mirrored && !dlra_on, "--gpu: no mirror reduction (use --mirror-reduction off) and no DLRA");
+        device = std::make_unique<ElementWenoGpu>(scheme);
+        const double r0 = seconds();
+        scheme.set_spectral_radius(device->spectral_radius());
+        gpu_radius_seconds = seconds() - r0;
+    }
+#else
+    require(!o.gpu, "--gpu: built without M1PN_ELEMENT_GPU");
+#endif
     const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.step_bound();
     require(selected <= scheme.realizability_step() * (1 + 1e-12), "Requested dt violates the element realizability bound");
     if (selected > scheme.high_order_step())
@@ -1034,6 +1056,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"cfl_safety\":" << o.cfl << ",\"element_dt_bound\":" << scheme.dt_bound
                << ",\"realizability_step\":" << scheme.realizability_step()
                << ",\"high_order_step\":" << scheme.high_order_step()
+               << ",\"gpu\":" << (o.gpu ? "true" : "false")
+
                << ",\"threads\":" << o.threads << beam_metadata(o, dim)
                << ",\"compiler\":" << std::quoted(__VERSION__) << "\n}\n";
     }
@@ -1062,6 +1086,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                 << stats.boundary_outflow * domain_factor << "," << stats.nudge_mass * domain_factor << "," << mm << "\n";
     };
     record(0);
+#ifdef M1PN_ELEMENT_GPU
+    if (device)
+        device->begin(a);
+#endif
     while (t < o.final_time) {
         require(steps < o.max_steps, "Maximum step count exceeded");
         double dt = std::min(selected, o.final_time - t);
@@ -1069,15 +1097,32 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         if (dlra_on) {
             dlra_state = dlra->advance(t, dt, dlra_state, &stats, &dlra_stats);
             a = dlra_state.low;
-        } else
+        }
+#ifdef M1PN_ELEMENT_GPU
+        else if (device) {
+            const double after = t + dt, next = after < o.final_time ? after : std::numeric_limits<double>::quiet_NaN();
+            device->step(t, dt, next, stats);
+        }
+#endif
+        else
             a = scheme.advance(t, dt, a, &stats);
         solver_seconds += seconds() - start;
         t = (o.final_time - (t + dt) <= 8 * std::numeric_limits<double>::epsilon() * o.final_time) ? o.final_time : t + dt;
         ++steps;
         if (dlra_on) rank_log << steps << "," << t << "," << dlra_state.rank() << "\n";
         if (steps % 10 == 0) progress("running", t, steps);
-        if (o.history_stride > 0 && steps % o.history_stride == 0) record(steps);
+        if (o.history_stride > 0 && steps % o.history_stride == 0) {
+#ifdef M1PN_ELEMENT_GPU
+            if (device)
+                a = device->state();
+#endif
+            record(steps);
+        }
     }
+#ifdef M1PN_ELEMENT_GPU
+    if (device)
+        a = device->end(stats);
+#endif
     if (o.history_stride <= 0 || steps % o.history_stride) record(steps);
     for (int i = 0; i < scheme.nodes; ++i) {
         const Four u = project(a.row(i).transpose());
@@ -1132,6 +1177,17 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     std::ofstream result(o.output + "/summary.json");
     result << std::setprecision(17) << "{\"status\":\"completed\",\"method\":\"element-weno\",\"steps\":" << steps
            << ",\"time\":" << t << ",\"total_seconds\":" << seconds() - begin << ",\"solver_seconds\":" << solver_seconds
+#ifdef M1PN_ELEMENT_GPU
+               << (device ? ",\"gpu_timing\":{\"spectral_radius\":" + std::to_string(gpu_radius_seconds) +
+                                ",\"host_boundary\":" + std::to_string(device->t_boundary) +
+                                ",\"host_boundary_high\":" + std::to_string(device->t_boundary_high) +
+                                ",\"host_face_data\":" + std::to_string(device->t_face_data) +
+                                ",\"host_correction\":" + std::to_string(device->t_correction) +
+                                ",\"wait\":" + std::to_string(device->t_wait) + ",\"sync\":" + std::to_string(device->t_sync) +
+                                ",\"fallbacks\":" + std::to_string(device->closure_fallbacks + device->limiter_fallbacks) + "}"
+                          : std::string())
+#endif
+           
            << ",\"initialization_seconds\":" << initialization << ",\"peak_rss_kib_rank0\":" << usage.ru_maxrss
            << ",\"minimum_coefficient_density\":" << min_density << ",\"minimum_cone_margin\":" << min_margin
            << ",\"minimum_cone_margin_recorded_steps\":" << min_margin_steps

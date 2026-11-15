@@ -4,9 +4,13 @@
 // runs on the host on the boundary rows only, overlapped with the device work. Same scheme as ElementWeno::advance up
 // to rounding (summation order, fused multiply-adds, natural-order line factors).
 #include "element_weno.hpp"
+#include "element_weno_gpu_device.hpp"
 namespace m1pn {
 namespace gpu {
 struct Context;
+}
+namespace uncollided {
+struct GaussianPulse;
 }
 class ElementWenoGpu {
 public:
@@ -16,6 +20,13 @@ public:
     ElementWenoGpu &operator=(const ElementWenoGpu &) = delete;
     // `steps` steps of size dt from `time` (options.ssprk43 selects the integrator); returns the final state.
     Field run(double time, double dt, int steps, const Field &a, ElementWenoStats *stats);
+    // Stepwise use (drivers with their own time loop): begin uploads the state, step advances it on the device
+    // (Strang reaction half steps when the scheme reacts; `next` = start time of the next step, NaN if none),
+    // state() downloads it, end() merges the device counters into stats and returns the state.
+    void begin(const Field &a);
+    void step(double time, double dt, double next, ElementWenoStats &stats);
+    Field state();
+    Field end(ElementWenoStats &stats);
     // Spectral radius of high_order_step() (same power iteration, on the device).
     double spectral_radius();
     // Host-side profile.
@@ -57,6 +68,12 @@ private:
     std::vector<Four> outgoing_;
     void boundary_high(int buffer);
     void boundary_low(int buffer, PositivityProjectionStats *projection);
+    double *u_ = nullptr, *b1_ = nullptr, *b2_ = nullptr; // device state and stage buffers
+    const uncollided::GaussianPulse *pulse_ = nullptr;    // FCS: analytic uncollided pulse
+    std::vector<double> table_;
+    gpu::Counters merged_;
+    double ledger_absorbed_ = 0, ledger_injected_ = 0;
+    void react(double tau, double source_time, ElementWenoStats &stats);
     void stage(double time, const double *x, double *out, double *u, double old, double fresh, double tau,
                double weight, double dt, ElementWenoStats &stats, double next_time);
     void closure_fallback(const double *x);
