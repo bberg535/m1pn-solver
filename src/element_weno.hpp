@@ -157,6 +157,7 @@ struct ElementWenoDebug {
 };
 class ElementWenoDlra;
 class ElementWenoMpi;
+class ElementWenoGpu;
 // Hooks of a distributed (MPI) run, implemented by ElementWenoMpi. The scheme then lives on a slab of the global mesh
 // plus halo layers along `axis` (the last axis); `owned` marks the nodes this rank owns.
 struct DistributedHooks {
@@ -180,6 +181,7 @@ struct DistributedHooks {
 class ElementWeno {
     friend class ElementWenoDlra; // factored (low-rank) evaluation of the same operators, src/element_weno_dlra.cpp
     friend class ElementWenoMpi;
+    friend class ElementWenoGpu; // device time loop, src/element_weno_gpu.cpp (experimental)
 public:
     // Distributed run (null: serial). owned: one flag per local node.
     void set_distributed(const DistributedHooks *hooks, std::vector<char> owned);

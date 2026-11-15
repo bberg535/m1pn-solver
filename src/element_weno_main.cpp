@@ -1,6 +1,9 @@
 // Stand-alone driver for the element-based WENO variant.
 #include "element_weno.hpp"
 #include "element_weno_mpi.hpp"
+#ifdef M1PN_ELEMENT_GPU
+#include "element_weno_gpu.hpp"
+#endif
 #include <cstdlib>
 #include "hardware.hpp"
 #include <filesystem>
@@ -32,6 +35,7 @@ struct Args {
     double ghost_study_filter = 16;
     int mpi_halo = 2, mpi_chunks = 0; // MPI slab decomposition (src/element_weno_mpi.hpp)
     std::string step_cache;           // file of stored spectral radii (keyed by configuration and an operator probe)
+    bool gpu = false;
     std::string dump_state;           // binary dump of the final coefficients (rows, cols, row-major doubles)
 };
 Args parse(int argc, char **argv) {
@@ -63,6 +67,7 @@ Args parse(int argc, char **argv) {
         else if (key == "--output") a.output = next();
         else if (key == "--no-weno") a.weno = false;
         else if (key == "--no-limit") a.limit = false;
+        else if (key == "--gpu") a.gpu = true; // experimental device time loop (src/element_weno_gpu.cpp)
         else if (key == "--ssprk43") a.ssprk43 = true; // SSPRK(4,3) instead of SSPRK3
         else if (key == "--no-angular-reduction") a.reduce_angular = false; // both problems are even in 1D/2D
         else if (key == "--no-stabilization") a.stabilize = false;
@@ -200,6 +205,19 @@ int main(int argc, char **argv) {
 #endif
             holder = std::make_unique<ElementWeno>(pn, options, inflow);
         ElementWeno *sp = holder.get();
+#ifdef M1PN_ELEMENT_GPU
+        std::unique_ptr<ElementWenoGpu> device;
+        double gpu_radius_seconds = 0;
+        if (args.gpu) {
+            require(mpi_size == 1 && args.ghost_study == 0, "--gpu: one process, no ghost study");
+            device = std::make_unique<ElementWenoGpu>(*sp);
+            const double r0 = seconds();
+            sp->set_spectral_radius(device->spectral_radius());
+            gpu_radius_seconds = seconds() - r0;
+        }
+#else
+        require(!args.gpu, "--gpu: built without M1PN_ELEMENT_GPU");
+#endif
         for (int k = 0; k <= 8; ++k) // both problems have data even in the unresolved directions; verify the inflow
             require(sp->dropped_inflow(args.time * k / 8.) <= 1e-12, "Inflow is not even; use --no-angular-reduction");
         Field a;
@@ -311,7 +329,16 @@ int main(int argc, char **argv) {
         double setup_seconds = start - program_start, rebuild_seconds = 0;
         double t = 0;
         double study_seconds = 0;
-        for (int n = 0; n < steps; ++n) {
+#ifdef M1PN_ELEMENT_GPU
+        if (device) {
+            const double step_start = seconds();
+            a = device->run(t, dt, steps, a, &stats);
+            stats.t_advance += seconds() - step_start;
+            for (int n = 0; n < steps; ++n)
+                t += dt;
+        }
+#endif
+        for (int n = 0; n < (args.gpu ? 0 : steps); ++n) {
             const double step_start = seconds();
             a = sp->advance(t, dt, a, &stats);
             stats.t_advance += seconds() - step_start;
@@ -515,6 +542,14 @@ int main(int argc, char **argv) {
         }
         summary << ",\"phases\":{\"setup\":" << setup_seconds << ",\"post\":" << seconds() - post_start
                 << ",\"post_rebuild\":" << rebuild_seconds << "}";
+#ifdef M1PN_ELEMENT_GPU
+        if (device)
+            summary << ",\"gpu\":{\"spectral_radius_seconds\":" << gpu_radius_seconds << ",\"host_boundary\":"
+                    << device->t_boundary << ",\"host_boundary_high\":" << device->t_boundary_high << ",\"host_face_data\":" << device->t_face_data << ",\"host_correction\":" << device->t_correction << ",\"host_fallback\":"
+                    << device->t_fallback << ",\"wait\":" << device->t_wait << ",\"sync\":" << device->t_sync
+                    << ",\"closure_fallbacks\":" << device->closure_fallbacks << ",\"limiter_fallbacks\":"
+                    << device->limiter_fallbacks << "}";
+#endif
         summary << mpi_json << "}";
         std::ofstream(args.output + "/summary.json") << summary.str() << "\n";
         std::cout << summary.str() << std::endl;

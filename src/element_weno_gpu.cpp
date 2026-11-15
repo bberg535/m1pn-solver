@@ -1,0 +1,978 @@
+#include "element_weno_gpu.hpp"
+#include "base_bar.hpp"
+#include "element_weno_gpu_device.hpp"
+#include "parallel.hpp"
+#include <random>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+namespace m1pn {
+namespace {
+int omp_threads() {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+int omp_thread() {
+#ifdef _OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
+}
+// Copies of the file-local helpers of src/element_weno.cpp (same code).
+double norm_up(const Four &v) {
+    const double scale = std::ldexp(1., 600);
+    const bool tiny = std::max({std::abs(v[1]), std::abs(v[2]), std::abs(v[3])}) < 1e-290;
+    const double s = tiny ? scale : 1.;
+    const double n = std::sqrt((v[1] * s) * (v[1] * s) + (v[2] * s) * (v[2] * s) + (v[3] * s) * (v[3] * s));
+    double up = n * (1 + 8 * std::numeric_limits<double>::epsilon());
+    up = tiny ? up / scale : up;
+    return std::nextafter(up, std::numeric_limits<double>::infinity());
+}
+bool nudge_into_cone(Four &v) {
+    if (exact::cone(v))
+        return false;
+    for (int k = 0; k < 256 && !exact::cone(v); ++k)
+        v[0] = std::nextafter(v[0], std::numeric_limits<double>::infinity());
+    if (!exact::cone(v) && v[0] < 1e-290) {
+        v[0] = std::max(v[0], norm_up(v));
+        for (int k = 0; k < 256 && !exact::cone(v); ++k)
+            v[0] = std::nextafter(v[0], std::numeric_limits<double>::infinity());
+    }
+    cone_require(exact::cone(v), "State left the M1 cone beyond rounding (bar state, 256 ulp)");
+    return true;
+}
+void add_flux(const Sparse &at, const double *x, double scale, double *out, int count) {
+    const int *outer = at.outerIndexPtr(), *inner = at.innerIndexPtr();
+    const double *value = at.valuePtr();
+    for (int j = 0; j < count; ++j) {
+        double sum = 0;
+        for (int k = outer[j]; k < outer[j + 1]; ++k)
+            sum += value[k] * x[inner[k]];
+        out[j] += scale * sum;
+    }
+}
+std::vector<double> row_major(const Mat &m) {
+    std::vector<double> out(std::size_t(m.rows()) * m.cols());
+    for (int r = 0; r < m.rows(); ++r)
+        for (int c = 0; c < m.cols(); ++c)
+            out[std::size_t(r) * m.cols() + c] = m(r, c);
+    return out;
+}
+} // namespace
+
+ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
+    const ElementWenoOptions &o = s.options;
+    require(!s.dist_, "GPU path: serial scheme only (no MPI)");
+    require(!o.periodic && !o.symmetric_residual && !o.m1_target && !s.reacts(),
+            "GPU path: open mesh, standard residual, PN target, no reaction/filter");
+    require(std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; }), "GPU path: no mirror sides");
+    require(!o.projection_high_order && !o.projection_hybrid && !o.projection_diagnostics,
+            "GPU path: projection_high_order/hybrid/diagnostics are not supported");
+    require(s.degree <= 4 && s.local_nodes <= gpu::max_local, "GPU path: degree <= 4 and at most 27 local nodes");
+    const int n = s.local_nodes, p = s.degree, q = s.moments;
+    gpu::Setup g;
+    g.dimension = s.dimension, g.degree = p, g.nodes = s.nodes, g.cells = s.cells, g.local = n, g.q = q;
+    for (int d = 0; d < 3; ++d)
+        g.nodes_per_axis[d] = s.nodes_per_axis[d], g.count[d] = s.count[d], g.stride[d] = s.stride(d);
+    g.viscosity = s.viscosity;
+    g.connectivity = s.connectivity_.data();
+    g.neighbors = s.neighbors_.data();
+    g.node_offsets = s.node_offsets_.data();
+    g.node_entries = s.node_entries_.data();
+    g.stiffness_rows = s.stiffness_rows_.data();
+    const std::vector<double> semi = row_major(s.seminorm_);
+    g.seminorm = semi.data();
+    std::array<std::array<std::vector<double>, 2>, 3> ext;
+    std::array<std::vector<double>, 3> band, lower, diagonal;
+    for (int d = 0; d < s.dimension; ++d) {
+        g.convection_t_rows[d] = s.convection_t_rows_[d].data();
+        for (int side = 0; side < 2; ++side) {
+            ext[d][side] = row_major(s.extension_[d][side]);
+            g.extension[d][side] = ext[d][side].data();
+        }
+        // Banded 1D convection rows.
+        const int n1 = s.nodes_per_axis[d], w = 2 * p + 1;
+        band[d].assign(std::size_t(n1) * w, 0.);
+        const Sparse &C = s.convection_1d_[d];
+        for (int k = 0; k < n1; ++k)
+            for (int e = C.outerIndexPtr()[k]; e < C.outerIndexPtr()[k + 1]; ++e) {
+                const int col = C.innerIndexPtr()[e];
+                require(std::abs(col - k) <= p, "GPU path: 1D convection is not banded");
+                band[d][std::size_t(k) * w + (col - k + p)] = C.valuePtr()[e];
+            }
+        // Natural-order banded LDL^T of the 1D mass.
+        const Sparse &M = s.mass_1d_[d];
+        auto entry = [&](int r, int c) {
+            for (int e = M.outerIndexPtr()[r]; e < M.outerIndexPtr()[r + 1]; ++e)
+                if (M.innerIndexPtr()[e] == c)
+                    return M.valuePtr()[e];
+            return 0.;
+        };
+        lower[d].assign(std::size_t(n1) * p, 0.);
+        diagonal[d].assign(n1, 0.);
+        auto L = [&](int r, int c) -> double & { return lower[d][std::size_t(r) * p + (r - c) - 1]; };
+        for (int k = 0; k < n1; ++k) {
+            for (int j = std::max(0, k - p); j < k; ++j) {
+                double v = entry(k, j);
+                for (int i = std::max(0, k - p); i < j; ++i)
+                    v -= L(k, i) * L(j, i) * diagonal[d][i];
+                L(k, j) = v / diagonal[d][j];
+            }
+            double v = entry(k, k);
+            for (int j = std::max(0, k - p); j < k; ++j)
+                v -= L(k, j) * L(k, j) * diagonal[d][j];
+            require(v > 0, "GPU path: 1D mass factorization failed");
+            diagonal[d][k] = v;
+        }
+        g.convection_band[d] = band[d].data();
+        g.lower[d] = lower[d].data();
+        g.diagonal[d] = diagonal[d].data();
+        const Sparse &F = s.flux_t_[d];
+        require(F.isCompressed(), "GPU path: flux matrix not compressed");
+        g.flux_outer[d] = F.outerIndexPtr();
+        g.flux_inner[d] = F.innerIndexPtr();
+        g.flux_value[d] = F.valuePtr();
+        g.flux_nnz[d] = int(F.nonZeros());
+    }
+    const std::size_t pairs = s.pair_table_.size();
+    std::vector<int> pj(pairs);
+    std::vector<double> pd(pairs), pm(pairs), pc(3 * pairs), pct(3 * pairs);
+    for (std::size_t k = 0; k < pairs; ++k) {
+        const auto &pe = s.pair_table_[k];
+        pj[k] = pe.j, pd[k] = pe.d, pm[k] = pe.m;
+        for (int d = 0; d < 3; ++d)
+            pc[3 * k + d] = pe.c[d], pct[3 * k + d] = pe.ct[d];
+    }
+    g.pair_j = pj.data(), g.pair_d = pd.data(), g.pair_m = pm.data(), g.pair_c = pc.data(), g.pair_ct = pct.data();
+    g.total_viscosity = s.total_viscosity_.data();
+    g.lumped = s.lumped.data();
+    g.weno = o.weno, g.stabilize = o.stabilize, g.limit = o.limit, g.outward_bar_rounding = o.outward_bar_rounding;
+    g.scale_invariant_weno = o.scale_invariant_weno;
+    g.weno_q = o.weno_q, g.weno_r = o.weno_r, g.weno_epsilon = o.weno_epsilon, g.weno_linear = o.weno_linear;
+    g.positivity_fraction = o.positivity_fraction, g.element_theta = o.element_theta;
+    ctx_ = gpu::create(g);
+    nb_ = int(s.boundary_nodes_.size());
+    d_bnodes_ = gpu::device_ints(ctx_, 3, std::max(1, nb_));
+    if (nb_)
+        gpu::upload(d_bnodes_, s.boundary_nodes_.data(), sizeof(int) * nb_);
+    a_h_ = Field::Zero(s.nodes, q);
+    low_h_ = Field::Zero(s.nodes, 4);
+    low_flux_h_ = Field::Zero(s.nodes, 12);
+    closure_h_ = Field::Zero(s.nodes, 12);
+    boundary_low_ = Field::Zero(s.nodes, 4);
+    flux_area_ = Field::Zero(s.nodes, 3);
+    boundary_bar_ = Field::Zero(s.nodes, 4);
+    boundary_area_ = Vec::Zero(s.nodes);
+    boundary_inflow_ = Vec::Zero(s.nodes);
+    boundary_high_ = Field::Zero(nb_, q);
+    load_b_ = Field::Zero(nb_, 4);
+    const std::size_t nb = std::size_t(std::max(1, nb_));
+    pin_fetch_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * nb * (q + 28)));
+    pin_high_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * nb * q));
+    pin_load_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * nb * 4));
+    pin_load_up_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * nb * 4));
+    // Split boundary buffers.
+    const int face_rows = s.side_row_start_[6];
+    for (int side = 0; side < 6; ++side)
+        face_points_ = std::max(face_points_, int(s.rules_[side].weights.size()));
+    if (!s.inflow.steady)
+        for (auto &buffer : face_data_)
+            buffer.resize(s.faces_.size() * std::size_t(face_points_));
+    G_ = Field::Zero(face_rows, q);
+    D_ = Field::Zero(face_rows, s.canonical_ ? s.canonical_->r : 1);
+    H_ = Field::Zero(face_rows, q);
+    L_ = Field::Zero(face_rows, 4);
+    BR_ = Field::Zero(face_rows, 4);
+    FA_ = Field::Zero(face_rows, 3);
+    AR_ = Vec::Zero(face_rows);
+    IN_ = Vec::Zero(face_rows);
+    face_datum_.assign(s.faces_.size(), 0);
+    require(!s.inflow.exterior_state && !s.inflow.exterior_m1, "GPU path: kinetic inflow data only (no exterior state)");
+}
+ElementWenoGpu::~ElementWenoGpu() {
+    gpu::host_free(pin_fetch_);
+    gpu::host_free(pin_high_);
+    gpu::host_free(pin_load_);
+    gpu::host_free(pin_load_up_);
+    gpu::destroy(ctx_);
+}
+// Phase A of add_boundary: the PN face load sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum] per
+// boundary node (compact rows of boundary_high_). Same operations as add_boundary; the per-point inflow data are kept
+// in face_data_ for phase B.
+int ElementWenoGpu::select_face(double time) {
+    if (s_.inflow.steady) {
+        if (!steady_ready_) {
+            fill_datum(0);
+            steady_ready_ = true;
+        }
+        return 0;
+    }
+    for (int k = 0; k < 2; ++k)
+        if (face_time_[k] == time)
+            return last_face_ = k;
+    prepare_face_data(time);
+    return select_face(time);
+}
+void ElementWenoGpu::prepare_face_data(double time) {
+    const ElementWeno &s = s_;
+    if (s.inflow.steady)
+        return;
+    for (int k = 0; k < 2; ++k)
+        if (face_time_[k] == time)
+            return;
+    const int keep = last_face_ == 0 ? 1 : 0; // never the buffer of the current stage
+    std::vector<Incoming> &buffer = face_data_[keep];
+    parallel_for(int(s.faces_.size()), [&](int index) {
+        const auto &f = s.faces_[index];
+        const int side_id = 2 * f.direction + f.side;
+        const auto &rule = s.rules_[side_id];
+        V3 origin;
+        s.element_origin(f.element, origin);
+        for (int point = 0; point < rule.weights.size(); ++point) {
+            V3 x = origin;
+            for (int d = 0; d < s.dimension; ++d)
+                x[d] += s.h * rule.points(point, d);
+            s.face_data_into(side_id, x, time, buffer[std::size_t(index) * face_points_ + point]);
+        }
+    });
+    fill_datum(keep);
+    face_time_[keep] = time;
+}
+// Face datum loads D (rows n of a face: sum_points w phi_n d) and DB = D llf_datum^T, as in add_boundary.
+void ElementWenoGpu::fill_datum(int k) {
+    const ElementWeno &s = s_;
+    const int face_rows = s.side_row_start_[6];
+    if (DB_[k].rows() != face_rows)
+        DB_[k] = Field::Zero(face_rows, s.moments);
+    parallel_for(int(s.faces_.size()), [&](int index) {
+        const auto &f = s.faces_[index];
+        const int side_id = 2 * f.direction + f.side;
+        const auto &rule = s.rules_[side_id];
+        const int nf = rule.local.size(), r0 = s.face_row_[index];
+        auto datum = D_.middleRows(r0, nf);
+        datum.setZero();
+        for (int point = 0; point < rule.weights.size(); ++point) {
+            const Incoming &data = s.inflow.steady ? s.steady_data_[std::size_t(index) * rule.weights.size() + point]
+                                                   : face_data_[k][std::size_t(index) * face_points_ + point];
+            for (int n = 0; n < nf; ++n) {
+                const double weight = rule.weights[point] * rule.shape(n, point);
+                if (weight == 0)
+                    continue;
+                datum.row(n).noalias() += weight * data.d.transpose();
+            }
+        }
+        face_datum_[index] = !datum.isZero(0);
+    });
+    datum_zero_[k].fill(true);
+    for (std::size_t index = 0; index < s.faces_.size(); ++index)
+        if (face_datum_[index])
+            datum_zero_[k][2 * s.faces_[index].direction + s.faces_[index].side] = false;
+    constexpr int rows_per_task = 16;
+    std::vector<std::array<int, 3>> tasks;
+    for (int side = 0; side < 6; ++side)
+        if (s.boundaries_[side] && !datum_zero_[k][side])
+            for (int r = s.side_row_start_[side]; r < s.side_row_start_[side + 1]; r += rows_per_task)
+                tasks.push_back({side, r, std::min(rows_per_task, s.side_row_start_[side + 1] - r)});
+    parallel_for(int(tasks.size()), [&](int t) {
+        const auto [side, r, n] = tasks[t];
+        DB_[k].middleRows(r, n).noalias() = D_.middleRows(r, n).lazyProduct(s.datum_t_[side]);
+    });
+}
+// Phase A of add_boundary: the PN face load sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum] per
+// boundary node (compact rows of boundary_high_), with the datum part DB prepared ahead.
+void ElementWenoGpu::boundary_high(int buffer) {
+    const ElementWeno &s = s_;
+    const int q = s.moments;
+    parallel_for(int(s.faces_.size()), [&](int index) {
+        const auto &f = s.faces_[index];
+        const int side_id = 2 * f.direction + f.side;
+        const auto &rule = s.rules_[side_id];
+        const int nf = rule.local.size(), r0 = s.face_row_[index];
+        thread_local Mat traces;
+        traces.resize(nf, q);
+        for (int n = 0; n < nf; ++n)
+            traces.row(n) = a_h_.row(s.connectivity_[f.element * s.local_nodes + rule.local[n]]);
+        G_.middleRows(r0, nf).noalias() = rule.mass * traces;
+    });
+    constexpr int rows_per_task = 16;
+    std::vector<std::array<int, 3>> tasks;
+    for (int side = 0; side < 6; ++side)
+        if (s.boundaries_[side])
+            for (int r = s.side_row_start_[side]; r < s.side_row_start_[side + 1]; r += rows_per_task)
+                tasks.push_back({side, r, std::min(rows_per_task, s.side_row_start_[side + 1] - r)});
+    const Field &DB = DB_[buffer];
+    const bool *zero = datum_zero_[buffer].data();
+    parallel_for(int(tasks.size()), [&](int t) {
+        const auto [side, r, n] = tasks[t];
+        H_.middleRows(r, n).noalias() = G_.middleRows(r, n).lazyProduct(s.boundary_flux_t_[side]);
+        if (!zero[side])
+            H_.middleRows(r, n) -= DB.middleRows(r, n);
+    });
+    parallel_for(nb_, [&](int k) {
+        boundary_high_.row(k).setZero();
+        for (int e = s.boundary_row_offsets_[k]; e < s.boundary_row_offsets_[k + 1]; ++e)
+            boundary_high_.row(k) += H_.row(s.boundary_rows_[e]);
+    });
+}
+// Phase B of add_boundary: ghost moments (C6 / positivity projection) and the low-order face terms, reduced into the
+// node rows of boundary_low_, flux_area_, boundary_bar_, boundary_area_, boundary_inflow_.
+void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *projection) {
+    const ElementWeno &s = s_;
+    const std::vector<Incoming> *fd = s.inflow.steady ? nullptr : &face_data_[buffer];
+    const ElementWenoOptions &options = s.options;
+    const int dimension = s.dimension;
+    const Field &low = low_h_, &low_flux = low_flux_h_;
+    const double ghost_start = seconds();
+    const bool ghost = options.fullsphere_ghost;
+    outgoing_.resize(ghost ? s.ghost_node_.size() : 0);
+    const bool project = ghost && options.positivity_projection;
+    PositivityProjectionOptions popt;
+    popt.tolerance = options.projection_tolerance;
+    std::vector<PositivityProjectionStats> pstats(project ? std::max(1, omp_threads()) : 0);
+    auto ghost_pair = [&](int k, const Vec &psi) {
+        const int side_id = s.ghost_side_[k], node = s.ghost_node_[k];
+        const auto &out = s.out_rules_[side_id];
+        const Boundary &b = *s.boundaries_[side_id];
+        thread_local Vec z;
+        auto positive_part = [&]() {
+            Four m = Four::Zero();
+            for (int j = 0; j < out.outgoing; ++j) {
+                const double v = std::max(0., psi[j]) * out.weight[j];
+                m[0] += v;
+                m[1] += v * out.omega(j, 0);
+                m[2] += v * out.omega(j, 1);
+                m[3] += v * out.omega(j, 2);
+            }
+            return m;
+        };
+        Four m;
+        bool projected = false;
+        if (project) {
+            PositivityProjectionStats &ps = pstats[omp_thread()];
+            const bool half = options.projection_half_range;
+            Four U(low(node, 0), low(node, 1), low(node, 2), low(node, 3));
+            if (half) {
+                U.setZero();
+                for (int j = 0; j < out.outgoing; ++j) {
+                    const double v = psi[j] * out.weight[j];
+                    U[0] += v, U[1] += v * out.omega(j, 0), U[2] += v * out.omega(j, 1), U[3] += v * out.omega(j, 2);
+                }
+            }
+            const int q = half ? out.outgoing : int(psi.size());
+            z.resize(q);
+            PositivityProjectionWarm &warm = s.projection_warm_[k];
+            PositivityProjectionOptions nopt = popt;
+            nopt.augment = !half;
+            if (out.c.size())
+                nopt.c = out.c.data(), nopt.cinv = out.cinv.data();
+            const auto o = project_positive_moments(q, out.ox.data(), out.oy.data(), out.oz.data(), out.weight.data(),
+                                                    psi.data(), U, z.data(), nopt,
+                                                    options.projection_warm_start ? &warm : nullptr, &out.facets);
+            const auto &r = o.result;
+            ++ps.calls;
+            ps.certificates += o.certificate;
+            ps.farkas += o.farkas;
+            if (r.converged) {
+                if (!o.augmented)
+                    warm.xi = r.xi;
+                else if (!o.dirac)
+                    warm.xi_augmented = r.xi;
+                projected = true;
+                ps.identities += r.identity;
+                ps.vacuum += !(U[0] > 0);
+                ps.augmented += o.augmented;
+                ps.diracs += o.dirac;
+                ps.iterations += o.newton_iterations;
+                ps.backtracks += r.backtracks;
+                ps.max_iterations = std::max(ps.max_iterations, o.newton_iterations);
+                ps.max_residual = std::max(ps.max_residual, r.residual);
+                if (U[0] > 0 && !o.augmented)
+                    ps.min_active_fraction = std::min(ps.min_active_fraction, double(r.active) / q);
+                m.setZero();
+                for (int j = 0; j < out.outgoing; ++j) {
+                    const double v = z[j] * out.weight[j];
+                    m[0] += v;
+                    m[1] += v * out.omega(j, 0);
+                    m[2] += v * out.omega(j, 1);
+                    m[3] += v * out.omega(j, 2);
+                }
+                if (o.augmented && o.atom_direction.dot(b.n) > 0)
+                    m += o.atom;
+                if (m[0] > U[0] * (1 + 64 * std::numeric_limits<double>::epsilon())) {
+                    ++ps.capped;
+                    m *= U[0] > 0 ? U[0] / m[0] : 0.;
+                }
+            } else {
+                ++ps.failures;
+                if (options.projection_strict)
+                    throw StepRejected("Positivity projection failed at boundary node " + std::to_string(node));
+            }
+        }
+        if (!projected)
+            m = positive_part();
+        const double b_node = low(node, 0) + b.n[0] * low(node, 1) + b.n[1] * low(node, 2) + b.n[2] * low(node, 3);
+        const double a_ext = m[0] - b.n.dot(m.tail<3>());
+        if (a_ext > b_node) {
+            if (projected)
+                ++pstats[omp_thread()].scaled;
+            m *= b_node > 0 ? b_node / a_ext : 0.;
+        }
+        outgoing_[k] = m;
+    };
+    if (ghost) {
+        const int ghost_block = std::clamp(int(s.ghost_node_.size()) / std::max(1, 4 * omp_threads()), 4, 32);
+        std::vector<std::array<int, 3>> tasks;
+        for (int side = 0; side < 6; ++side)
+            for (int begin = 0; begin < int(s.ghost_by_side_[side].size()); begin += ghost_block)
+                tasks.push_back({side, begin, std::min<int>(begin + ghost_block, s.ghost_by_side_[side].size())});
+        parallel_for(int(tasks.size()), [&](int t) {
+            const auto [side, begin, end] = tasks[t];
+            const std::vector<int> &list = s.ghost_by_side_[side];
+            thread_local Mat at, traces;
+            thread_local Vec psi;
+            at.resize(s.moments, end - begin);
+            for (int j = begin; j < end; ++j)
+                at.col(j - begin) = a_h_.row(s.ghost_node_[list[j]]).transpose();
+            if (s.ghost_sigma_.size())
+                at = s.ghost_sigma_.asDiagonal() * at;
+            if (s.separable_[side])
+                s.separable_[side]->evaluate(at, traces);
+            else
+                traces.noalias() = s.out_rules_[side].harmonics * at;
+            for (int j = begin; j < end; ++j) {
+                psi = traces.col(j - begin);
+                ghost_pair(list[j], psi);
+            }
+        });
+    }
+    if (project && projection)
+        for (const auto &ps : pstats)
+            projection->merge(ps);
+    const double ghost_end = seconds();
+    if (projection)
+        projection->seconds += ghost_end - ghost_start;
+    parallel_for(int(s.faces_.size()), [&](int index) {
+        const auto &f = s.faces_[index];
+        const int side_id = 2 * f.direction + f.side;
+        const auto &rule = s.rules_[side_id];
+        const Boundary &b = *s.boundaries_[side_id];
+        const int nf = rule.local.size(), r0 = s.face_row_[index];
+        thread_local std::vector<int> global;
+        global.resize(nf);
+        auto load_row = L_.middleRows(r0, nf), bar_row = BR_.middleRows(r0, nf), fa_row = FA_.middleRows(r0, nf);
+        load_row.setZero(), bar_row.setZero(), fa_row.setZero();
+        AR_.segment(r0, nf).setZero(), IN_.segment(r0, nf).setZero();
+        for (int n = 0; n < nf; ++n)
+            global[n] = s.connectivity_[f.element * s.local_nodes + rule.local[n]];
+        const int *ghost_id = &s.ghost_of_face_[std::size_t(index) * nf];
+        thread_local std::vector<char> memo_valid;
+        thread_local std::vector<Four> memo_moments, memo_state;
+        memo_valid.assign(nf, 0);
+        memo_moments.resize(nf), memo_state.resize(nf);
+        for (int point = 0; point < rule.weights.size(); ++point) {
+            const Incoming &data = s.inflow.steady ? s.steady_data_[std::size_t(index) * rule.weights.size() + point]
+                                                   : (*fd)[std::size_t(index) * face_points_ + point];
+            for (int n = 0; n < nf; ++n) {
+                const double weight = rule.weights[point] * rule.shape(n, point);
+                if (weight == 0)
+                    continue;
+                const int i = global[n];
+                const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
+                IN_[r0 + n] += weight * std::max(0., -data.kinetic[0]);
+                Four state;
+                if (memo_valid[n] && (memo_moments[n].array() == data.moments.array()).all())
+                    state = memo_state[n];
+                else {
+                    Four ext = data.moments;
+                    if (ghost)
+                        ext += outgoing_[ghost_id[n]];
+                    bool in_cone = exact::cone(ext);
+                    for (int k = 0; ghost && k < 64 && !in_cone; ++k) {
+                        ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
+                        in_cone = exact::cone(ext);
+                    }
+                    cone_require(in_cone, "M1 exterior state outside cone");
+                    Four own = Four::Zero();
+                    for (int d = 0; d < dimension; ++d)
+                        own += b.n[d] * Four(low_flux(i, 4 * d), low_flux(i, 4 * d + 1), low_flux(i, 4 * d + 2),
+                                             low_flux(i, 4 * d + 3));
+                    const Four outer = Levermore(ext).flux(b.n);
+                    state = .5 * (ui + own) + .5 * (ext - outer);
+                    if (options.outward_bar_rounding && !exact::cone(state)) {
+                        const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
+                        if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
+                            state[0] = norm_up(state);
+                    }
+                    memo_valid[n] = 1, memo_moments[n] = data.moments, memo_state[n] = state;
+                }
+                AR_[r0 + n] += weight;
+                bar_row.row(n) += weight * state.transpose();
+                for (int d = 0; d < dimension; ++d)
+                    fa_row(n, d) += weight * b.n[d];
+                load_row.row(n) += weight * (state - ui).transpose();
+            }
+        }
+    });
+    if (projection)
+        projection->face_seconds += seconds() - ghost_end;
+    parallel_for(nb_, [&](int k) {
+        const int i = s.boundary_nodes_[k];
+        boundary_low_.row(i).setZero();
+        flux_area_.row(i).setZero();
+        boundary_bar_.row(i).setZero();
+        boundary_area_[i] = 0;
+        boundary_inflow_[i] = 0;
+        for (int e = s.boundary_row_offsets_[k]; e < s.boundary_row_offsets_[k + 1]; ++e) {
+            const int r = s.boundary_rows_[e];
+            boundary_low_.row(i) += L_.row(r);
+            boundary_bar_.row(i) += BR_.row(r);
+            flux_area_.row(i) += FA_.row(r);
+            boundary_area_[i] += AR_[r];
+            boundary_inflow_[i] += IN_[r];
+        }
+    });
+}
+void ElementWenoGpu::check_error() {
+    const gpu::Counters c = gpu::counters(ctx_);
+    if (!c.error)
+        return;
+    static const char *what[] = {"",
+                                 "Levermore state outside the stored cone",
+                                 "",
+                                 "bar state left the M1 cone beyond rounding (256 ulp)",
+                                 "low-order base bar outside the stored cone",
+                                 "limiter endpoint rounding check failed",
+                                 "stored row left the M1 cone beyond rounding (4096 ulp)",
+                                 "stored row outside the exact device range of the cone predicate"};
+    throw StepRejected(std::string("GPU path: ") + (c.error < 8 ? what[c.error] : "unknown device error"));
+}
+// Closure rows of near-beam nodes with the host Levermore closure (long double gap).
+void ElementWenoGpu::closure_fallback(const double *x) {
+    const gpu::Counters c = gpu::counters(ctx_);
+    const int count = c.closure_fallbacks;
+    if (!count)
+        return;
+    require(count <= (1 << 16), "GPU path: too many closure fallbacks");
+    const double start = seconds();
+    const int q = s_.moments;
+    const int *list = gpu::closure_fallback_list(ctx_);
+    std::vector<double> rows(std::size_t(count) * q), low(std::size_t(count) * 4, 0.), lf(std::size_t(count) * 12, 0.),
+        cl(std::size_t(count) * 12, 0.);
+    gpu::gather_device(ctx_, x, q, list, count, rows.data());
+    for (int k = 0; k < count; ++k) {
+        const double *row = &rows[std::size_t(k) * q];
+        const Four u = project(Eigen::Map<const Vec>(row, q));
+        for (int r = 0; r < 4; ++r)
+            low[std::size_t(k) * 4 + r] = u[r];
+        const Levermore closure_state(u);
+        for (int d = 0; d < s_.dimension; ++d) {
+            V3 n = V3::Zero();
+            n[d] = 1;
+            const Four fl = closure_state.flux(n);
+            Four head = Four::Zero();
+            add_flux(s_.flux_t_[d], row, 1., head.data(), 4);
+            const Four fh = project(head);
+            for (int r = 0; r < 4; ++r) {
+                lf[std::size_t(k) * 12 + 4 * d + r] = fl[r];
+                cl[std::size_t(k) * 12 + 4 * d + r] = fh[r] - fl[r];
+            }
+        }
+    }
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    gpu::scatter_device(ctx_, b.low, 4, list, count, low.data(), false, s_.nodes);
+    gpu::scatter_device(ctx_, b.low_flux, 12, list, count, lf.data(), false, s_.nodes);
+    gpu::scatter_device(ctx_, b.closure, 12, list, count, cl.data(), false, s_.nodes);
+    closure_fallbacks += count;
+    t_fallback += seconds() - start;
+}
+// Elements whose limiter needs the stable base bar (long double): the element body of limited_low_load on the host.
+void ElementWenoGpu::limiter_fallback(ElementWenoStats &stats) {
+    const gpu::Counters c = gpu::counters(ctx_);
+    const int count = c.limiter_fallbacks;
+    if (!count)
+        return;
+    require(count <= (1 << 16), "GPU path: too many limiter fallbacks");
+    const double start = seconds();
+    const int n = s_.local_nodes, dimension = s_.dimension;
+    const ElementWenoOptions &options = s_.options;
+    std::vector<int> elements(count);
+    gpu::download(elements.data(), gpu::limiter_fallback_list(ctx_), sizeof(int) * count);
+    std::vector<int> nodes(std::size_t(count) * n);
+    for (int k = 0; k < count; ++k)
+        for (int l = 0; l < n; ++l)
+            nodes[std::size_t(k) * n + l] = s_.connectivity_[std::size_t(elements[k]) * n + l];
+    int *d_nodes = gpu::device_ints(ctx_, 1, int(nodes.size()));
+    gpu::upload(d_nodes, nodes.data(), sizeof(int) * nodes.size());
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    const int m = int(nodes.size());
+    std::vector<double> low(std::size_t(m) * 4), lf(std::size_t(m) * 12), cl(std::size_t(m) * 12), mr(std::size_t(m) * 4),
+        stab(std::size_t(count) * 4 * n), out(std::size_t(count) * 4 * n);
+    gpu::gather_device(ctx_, b.low, 4, d_nodes, m, low.data(), s_.nodes);
+    gpu::gather_device(ctx_, b.low_flux, 12, d_nodes, m, lf.data(), s_.nodes);
+    gpu::gather_device(ctx_, b.closure, 12, d_nodes, m, cl.data(), s_.nodes);
+    gpu::gather_device(ctx_, b.moment_rate, 4, d_nodes, m, mr.data(), s_.nodes);
+    const int *d_elements = gpu::limiter_fallback_list(ctx_);
+    gpu::gather_device(ctx_, b.stab_low, 4 * n, d_elements, count, stab.data(), s_.cells);
+    const Vec &total_viscosity = s_.total_viscosity_;
+    using Quad = Eigen::Map<const Four>;
+    for (int k = 0; k < count; ++k) {
+        std::vector<double> copies(std::size_t(32) * n);
+        for (int l = 0; l < n; ++l) {
+            const std::size_t r = std::size_t(k) * n + l;
+            double *cp = &copies[std::size_t(32) * l];
+            std::copy_n(&low[r * 4], 4, cp);
+            std::copy_n(&lf[r * 12], 12, cp + 4);
+            std::copy_n(&cl[r * 12], 12, cp + 16);
+            std::copy_n(&mr[r * 4], 4, cp + 28);
+        }
+        std::vector<Four> ubar(n), contribution(n), limited;
+        long nudged = 0, outward = 0;
+        for (int i = 0; i < n; ++i) {
+            const double *ci = &copies[std::size_t(32) * i];
+            const Four ui = Quad(ci), qi = Quad(ci + 28);
+            Four weighted = Four::Zero(), fi = Four::Zero();
+            const auto *pairs = &s_.pair_table_[std::size_t(i) * (n - 1)];
+            for (int kk = 0; kk < n - 1; ++kk) {
+                const auto &pe = pairs[kk];
+                const int j = pe.j;
+                const double dij = pe.d;
+                const double *cj = &copies[std::size_t(32) * j];
+                const Four uj = Quad(cj);
+                V3 edge = V3::Zero();
+                Four flux_difference = Four::Zero(), closure_term = Four::Zero();
+                for (int d = 0; d < dimension; ++d) {
+                    const double cij = pe.c[d], cji = pe.ct[d];
+                    edge[d] = cij;
+                    flux_difference += cij * (Quad(cj + 4 + 4 * d) - Quad(ci + 4 + 4 * d));
+                    closure_term += cji * Quad(ci + 16 + 4 * d) - cij * Quad(cj + 16 + 4 * d);
+                }
+                if (dij > 0) {
+                    Four pair_bar = .5 * (ui + uj) - flux_difference / (2 * dij);
+                    if (!exact::cone(pair_bar)) {
+                        if (options.outward_bar_rounding) {
+                            int raised = 0;
+                            pair_bar = stable_base_bar_outward(ui, uj, edge, dij, &raised);
+                            outward += raised > 0;
+                        } else
+                            pair_bar = stable_base_bar(ui, uj, edge, dij);
+                    }
+                    weighted += dij * pair_bar;
+                    fi += dij * (ui - uj);
+                }
+                fi += pe.m * (qi - Quad(cj + 28)) + closure_term;
+            }
+            if (options.stabilize)
+                fi -= Quad(&stab[std::size_t(k) * 4 * n + 4 * i]);
+            Four bar = weighted / total_viscosity[i];
+            if (nudge_into_cone(bar))
+                ++nudged;
+            ubar[i] = bar;
+            contribution[i] = fi;
+        }
+        Four sum = Four::Zero();
+        for (const auto &f : contribution)
+            sum += f;
+        const double raw_sum = sum.cwiseAbs().maxCoeff();
+        limited = contribution;
+        double factor = 1;
+        if (options.limit) {
+            double pos = 0, neg = 0;
+            std::vector<double> clipped(n);
+            for (int i = 0; i < n; ++i) {
+                const double fmin = -2 * total_viscosity[i] * (1 - options.positivity_fraction) * ubar[i][0];
+                clipped[i] = std::max(contribution[i][0], fmin);
+                (clipped[i] > 0 ? pos : neg) += clipped[i];
+            }
+            for (int i = 0; i < n; ++i) {
+                double value = clipped[i];
+                if (value > 0 && pos + neg > 0)
+                    value *= -neg / pos;
+                else if (value < 0 && pos + neg < 0)
+                    value *= -pos / neg;
+                limited[i][0] = value;
+            }
+            for (int i = 0; i < n; ++i) {
+                const Four g = limited[i] / (2 * total_viscosity[i]);
+                if (exact::cone(ubar[i] + g))
+                    continue;
+                factor = std::min(factor, options.element_theta * segment(ubar[i], g));
+            }
+            for (auto &f : limited)
+                f *= factor;
+        }
+        Four after = Four::Zero();
+        for (const auto &f : limited)
+            after += f;
+        for (int i = 0; i < n; ++i) {
+            const Four ui = Quad(&copies[std::size_t(32) * i]);
+            const Four lo = 2 * total_viscosity[i] * (ubar[i] - ui);
+            const Four o4 = lo + limited[i];
+            for (int r = 0; r < 4; ++r)
+                out[std::size_t(k) * 4 * n + 4 * i + r] = o4[r];
+        }
+        stats.min_limiter = std::min(stats.min_limiter, factor);
+        stats.limited_elements += factor < 1;
+        stats.max_raw_zero_sum = std::max(stats.max_raw_zero_sum, raw_sum);
+        stats.max_limited_zero_sum = std::max(stats.max_limited_zero_sum, after.cwiseAbs().maxCoeff());
+        stats.nudged_states += nudged;
+        stats.outward_bars += outward;
+    }
+    gpu::scatter_device(ctx_, b.element_limited, 4 * n, d_elements, count, out.data(), false, s_.cells);
+    limiter_fallbacks += count;
+    t_fallback += seconds() - start;
+}
+// Boundary corrections of limited_low_load (load_b_ in boundary-slot order, closure_h_ etc. on the boundary rows).
+void ElementWenoGpu::boundary_correction(ElementWenoStats &stats) {
+    const ElementWenoOptions &options = s_.options;
+    const int dimension = s_.dimension;
+    const auto &sorted = s_.boundary_nodes_sorted_;
+    const int nb = int(sorted.size());
+    std::vector<double> node_theta(nb, 1.), node_sign(nb, 1.), node_mass(nb, 0.);
+    std::vector<char> node_signed(nb, 0);
+    const Field &low = low_h_, &low_flux = low_flux_h_, &closure = closure_h_;
+    auto block = [](const Field &f, int row, int d) {
+        return Four(f(row, 4 * d), f(row, 4 * d + 1), f(row, 4 * d + 2), f(row, 4 * d + 3));
+    };
+    parallel_for(nb, [&](int k) {
+        const int i = sorted[k];
+        if (boundary_area_[i] <= 0)
+            return;
+        const int slot = s_.boundary_slot_[i];
+        Four correction = project(boundary_high_.row(slot).transpose()) -
+                          Four(boundary_low_(i, 0), boundary_low_(i, 1), boundary_low_(i, 2), boundary_low_(i, 3));
+        for (int d = 0; d < dimension; ++d)
+            correction -= flux_area_(i, d) * block(closure, i, d);
+        Four bar(boundary_bar_(i, 0), boundary_bar_(i, 1), boundary_bar_(i, 2), boundary_bar_(i, 3));
+        bar /= boundary_area_[i];
+        nudge_into_cone(bar);
+        double theta = 1.;
+        if (options.limit) {
+            const Four g = correction / boundary_area_[i];
+            if (!exact::cone(bar + g))
+                theta = options.element_theta * segment(bar, g);
+            if (options.vacuum_sign_limit) {
+                double lo_rate = boundary_area_[i] * (bar[0] - low(i, 0));
+                for (int d = 0; d < dimension; ++d)
+                    lo_rate -= flux_area_(i, d) * low_flux(i, 4 * d);
+                const double allowance = std::max(0., boundary_inflow_[i] - lo_rate);
+                if (correction[0] > allowance) {
+                    double factor = allowance / correction[0];
+                    while (factor > 0 && factor * correction[0] > allowance)
+                        factor = std::nextafter(factor, 0.);
+                    theta = std::min(theta, factor);
+                    node_sign[k] = factor;
+                    node_signed[k] = 1;
+                }
+            }
+        }
+        node_theta[k] = theta;
+        const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
+        const Four base = boundary_area_[i] * (bar - ui);
+        load_b_.row(slot) += (base + theta * correction).transpose();
+        double m = base[0] + theta * correction[0];
+        for (int d = 0; d < dimension; ++d)
+            m -= flux_area_(i, d) * low_flux(i, 4 * d);
+        node_mass[k] = m;
+    });
+    double min_boundary = 1, min_sign = 1, boundary_mass_rate = 0;
+    long limited_boundary = 0, sign_limited = 0;
+    for (int k = 0; k < nb; ++k) {
+        if (boundary_area_[sorted[k]] <= 0)
+            continue;
+        boundary_mass_rate += node_mass[k];
+        if (options.limit) {
+            min_boundary = std::min(min_boundary, node_theta[k]);
+            limited_boundary += node_theta[k] < 1;
+            if (node_signed[k]) {
+                min_sign = std::min(min_sign, node_sign[k]);
+                ++sign_limited;
+            }
+        }
+    }
+    stats.min_boundary_limiter = std::min(stats.min_boundary_limiter, min_boundary);
+    stats.last_boundary_mass_rate = boundary_mass_rate;
+    stats.sign_limited_nodes += sign_limited;
+    stats.min_sign_factor = std::min(stats.min_sign_factor, min_sign);
+    stats.limited_boundary_nodes += limited_boundary;
+}
+void ElementWenoGpu::stage(double time, const double *x, double *out, double *u, double old, double fresh, double tau,
+                           double weight, double dt, ElementWenoStats &stats, double next_time) {
+    const int q = s_.moments;
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    const auto &bn = s_.boundary_nodes_;
+    double *fx = pin_fetch_, *fl = fx + std::size_t(nb_) * q, *ff = fl + std::size_t(nb_) * 4,
+           *fc = ff + std::size_t(nb_) * 12;
+    auto unpack = [&]() {
+        parallel_for(nb_, [&](int k) {
+            std::copy_n(fx + std::size_t(k) * q, q, &a_h_.coeffRef(bn[k], 0));
+            std::copy_n(fl + std::size_t(k) * 4, 4, &low_h_.coeffRef(bn[k], 0));
+            std::copy_n(ff + std::size_t(k) * 12, 12, &low_flux_h_.coeffRef(bn[k], 0));
+            std::copy_n(fc + std::size_t(k) * 12, 12, &closure_h_.coeffRef(bn[k], 0));
+        });
+    };
+    auto fetch = [&]() {
+        gpu::gather_async(ctx_, x, q, d_bnodes_, nb_, fx, 0);
+        gpu::gather_async(ctx_, b.low, 4, d_bnodes_, nb_, fl, 1, s_.nodes);
+        gpu::gather_async(ctx_, b.low_flux, 12, d_bnodes_, nb_, ff, 2, s_.nodes);
+        gpu::gather_async(ctx_, b.closure, 12, d_bnodes_, nb_, fc, 3, s_.nodes);
+    };
+    // Device: closure, boundary rows to the host, counter snapshot (event 0); then the volume work that needs x only.
+    if (!closure_ready_)
+        gpu::closure(ctx_, x);
+    fetch();
+    gpu::snapshot_counters(ctx_);
+    gpu::record(ctx_, 0);
+    gpu::weno_gamma(ctx_, x);
+    gpu::gradients(ctx_, x);
+    gpu::stabilization(ctx_, x, out, true, -1);
+    // While the device works: the inflow data of this stage (normally prepared already) and of the next one.
+    const int buffer = select_face(time);
+    if (!std::isnan(next_time)) {
+        const double t1 = seconds();
+        prepare_face_data(next_time);
+        t_face_data += seconds() - t1;
+    }
+    {
+        const double t0 = seconds();
+        gpu::wait(ctx_, 0);
+        t_sync += seconds() - t0;
+    }
+    if (gpu::snapshot(ctx_).closure_fallbacks) { // rare: near-beam closures on the host, then fetch again
+        gpu::synchronize();
+        closure_fallback(x);
+        fetch();
+        gpu::synchronize();
+    }
+    unpack();
+    // Host phase A: PN boundary load rows, added before the mass solve.
+    {
+        const double t0 = seconds();
+        boundary_high(buffer);
+        std::copy_n(boundary_high_.data(), std::size_t(nb_) * q, pin_high_);
+        double *rows = gpu::device_doubles(ctx_, 4, std::size_t(std::max(1, nb_)) * q);
+        gpu::upload_async(rows, pin_high_, sizeof(double) * std::size_t(nb_) * q);
+        gpu::add_rows(ctx_, out, d_bnodes_, rows, nb_);
+        t_boundary_high += seconds() - t0;
+    }
+    gpu::mass_solve(ctx_, out);
+    gpu::flux_moments(ctx_, out); // the advective term of the PN rows is added in finish_stage
+    gpu::limiter(ctx_);
+    gpu::gather_load(ctx_);
+    gpu::snapshot_counters(ctx_);
+    gpu::gather_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_, 5);
+    gpu::record(ctx_, 1);
+    gpu::combine_pn(ctx_, out, x, u, old, fresh, tau); // PN rows: independent of the boundary corrections
+    // Host phase B (overlaps the device work above): ghost moments and low-order face terms.
+    {
+        const double t0 = seconds();
+        boundary_low(buffer, &stats.projection);
+        t_boundary += seconds() - t0;
+    }
+    {
+        const double t0 = seconds();
+        gpu::wait(ctx_, 1);
+        t_wait += seconds() - t0;
+    }
+    const gpu::Counters c = gpu::snapshot(ctx_);
+    if (c.error)
+        check_error();
+    if (c.limiter_fallbacks) { // rare: stable base bars on the host, then gather again
+        gpu::synchronize();
+        limiter_fallback(stats);
+        gpu::gather_load(ctx_);
+        gpu::gather_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_, 5);
+        gpu::synchronize();
+    }
+    {
+        const double t0 = seconds();
+        std::copy_n(pin_load_, std::size_t(nb_) * 4, load_b_.data());
+        boundary_correction(stats);
+        std::copy_n(load_b_.data(), std::size_t(nb_) * 4, pin_load_up_);
+        gpu::scatter_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_up_, false, 6);
+        t_correction += seconds() - t0;
+    }
+    stats.boundary_outflow -= dt * weight * stats.last_boundary_mass_rate;
+    gpu::reset_fallbacks(ctx_); // the fused closure below records the fallbacks of the next stage
+    gpu::finish_stage(ctx_, out, x, u, old, fresh, tau, true, true);
+    closure_ready_ = true;
+}
+Field ElementWenoGpu::run(double time, double dt, int steps, const Field &a, ElementWenoStats *stats_in) {
+    require(a.rows() == s_.nodes && a.cols() == s_.moments, "GPU path: invalid state");
+    ElementWenoStats scratch;
+    ElementWenoStats &stats = stats_in ? *stats_in : scratch;
+    const int q = s_.moments;
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    double *u = b.a, *b1 = b.x, *b2 = b.r;
+    gpu::upload(u, a.data(), sizeof(double) * std::size_t(s_.nodes) * q);
+    gpu::reset_counters(ctx_);
+    closure_ready_ = false;
+    double t = time;
+    const bool four = s_.options.ssprk43;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    for (int n = 0; n < steps; ++n) {
+        double tn = t; // the next step starts at t + dt (accumulated as the driver does)
+        tn += dt;
+        const double next = n + 1 < steps ? tn : nan;
+        if (!four) {
+            stage(t, u, b1, u, 0, 1, dt, 1. / 6, dt, stats, t + dt);
+            stage(t + dt, b1, b2, u, .75, .25, dt, 1. / 6, dt, stats, t + .5 * dt);
+            stage(t + .5 * dt, b2, b1, u, 1. / 3, 2. / 3, dt, 2. / 3, dt, stats, next);
+            std::swap(u, b1);
+        } else {
+            const double half = .5 * dt;
+            stage(t, u, b1, u, 0, 1, half, 1. / 6, dt, stats, t + half);
+            stage(t + half, b1, b2, u, 0, 1, half, 1. / 6, dt, stats, t + dt);
+            stage(t + dt, b2, b1, u, 2. / 3, 1. / 3, half, 1. / 6, dt, stats, t + half);
+            stage(t + half, b1, b2, u, 0, 1, half, .5, dt, stats, next);
+            std::swap(u, b2);
+        }
+        t = tn;
+    }
+    // Counters of the last stage.
+    const gpu::Counters c = gpu::counters(ctx_);
+    check_error();
+    stats.limited_elements += c.limited_elements;
+    stats.min_limiter = std::min(stats.min_limiter, c.min_limiter);
+    stats.max_raw_zero_sum = std::max(stats.max_raw_zero_sum, c.max_raw_zero_sum);
+    stats.max_limited_zero_sum = std::max(stats.max_limited_zero_sum, c.max_limited_zero_sum);
+    stats.nudged_states += c.nudged_bars + c.nudged_rows;
+    stats.nudge_mass += c.nudge_mass;
+    stats.min_gamma = std::min(stats.min_gamma, c.min_gamma);
+    Field out(s_.nodes, q);
+    gpu::download(out.data(), u, sizeof(double) * std::size_t(s_.nodes) * q);
+    return out;
+}
+double ElementWenoGpu::spectral_radius() {
+    const int q = s_.moments;
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<double> uniform(-1, 1);
+    double radius = 0;
+    for (double gamma_value : {0., 1.}) {
+        Field x(s_.nodes, q);
+        for (int i = 0; i < s_.nodes; ++i)
+            for (int c = 0; c < q; ++c)
+                x(i, c) = uniform(rng);
+        x /= x.norm();
+        gpu::upload(b.x, x.data(), sizeof(double) * std::size_t(s_.nodes) * q);
+        const int iterations = 60;
+        for (int k = 0; k < iterations; ++k) {
+            gpu::gradients(ctx_, b.x);
+            gpu::stabilization(ctx_, b.x, b.r, false, gamma_value);
+            gpu::mass_solve(ctx_, b.r);
+            gpu::flux_rows(ctx_, b.r, false);
+            const double growth = gpu::norm(ctx_, b.r);
+            require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed (GPU)");
+            if (k >= iterations - 15)
+                radius = std::max(radius, growth);
+            gpu::divide(ctx_, b.x, b.r, growth);
+        }
+    }
+    gpu::synchronize();
+    return radius;
+}
+} // namespace m1pn
