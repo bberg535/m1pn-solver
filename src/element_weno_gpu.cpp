@@ -3,6 +3,7 @@
 #include "element_weno_gpu_device.hpp"
 #include "parallel.hpp"
 #include "uncollided.hpp"
+#include <algorithm>
 #include <random>
 #include <cstdlib>
 #ifdef _OPENMP
@@ -80,6 +81,9 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     const int n = s.local_nodes, p = s.degree, q = s.moments;
     gpu::Setup g;
     g.dimension = s.dimension, g.degree = p, g.nodes = s.nodes, g.cells = s.cells, g.local = n, g.q = q;
+    // Fallback lists hold every node / element, so a stage can never overflow them (2048^2 grids exceed 2^16).
+    g.fallback_capacity = std::max({1 << 16, s.nodes, s.cells});
+    fallback_capacity_ = g.fallback_capacity;
     for (int d = 0; d < 3; ++d)
         g.nodes_per_axis[d] = s.nodes_per_axis[d], g.count[d] = s.count[d], g.stride[d] = s.stride(d);
     g.viscosity = s.viscosity;
@@ -654,7 +658,7 @@ void ElementWenoGpu::closure_fallback(const double *x) {
     const int count = c.closure_fallbacks;
     if (!count)
         return;
-    require(count <= (1 << 16), "GPU path: too many closure fallbacks");
+    require(count <= fallback_capacity_, "GPU path: too many closure fallbacks");
     const double start = seconds();
     const int q = s_.moments;
     const int *list = gpu::closure_fallback_list(ctx_);
@@ -693,7 +697,7 @@ void ElementWenoGpu::limiter_fallback(ElementWenoStats &stats) {
     const int count = c.limiter_fallbacks;
     if (!count)
         return;
-    require(count <= (1 << 16), "GPU path: too many limiter fallbacks");
+    require(count <= fallback_capacity_, "GPU path: too many limiter fallbacks");
     const double start = seconds();
     const int n = s_.local_nodes, dimension = s_.dimension;
     const ElementWenoOptions &options = s_.options;

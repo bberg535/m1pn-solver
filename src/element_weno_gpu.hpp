@@ -32,6 +32,7 @@ public:
     // Host-side profile.
     double t_boundary = 0, t_boundary_high = 0, t_face_data = 0, t_correction = 0, t_fallback = 0, t_wait = 0, t_sync = 0;
     long closure_fallbacks = 0, limiter_fallbacks = 0;
+    int fallback_capacity_ = 1 << 16;
     long ghost_flagged = 0; // ghost pairs solved by the host (device projection flagged them)
     double t_wait_ghost = 0;
 
