@@ -31,8 +31,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import nx_convergence as nx  # noqa: E402  (frozen next to this file inside a campaign)
 
-PROFILES = ("tardis-smoke", "tardis-paper", "tardis-fcs", "tardis-hetero")
-HETERO = ("tardis-hetero",)
+PROFILES = ("tardis-smoke", "tardis-paper", "tardis-fcs", "tardis-hetero", "tardis-lattice")
+HETERO = ("tardis-hetero", "tardis-lattice")
 nx.HETERO_PROFILES = tuple(nx.HETERO_PROFILES) + HETERO
 # Calibration (A100, SSPRK(4,3), Q1 512^2 P7, 37 moments, 722 steps: 7.2 s): seconds per node x moment x step, plus a
 # fixed device/host overhead per stage. Estimates only (factor ~2).
@@ -149,6 +149,15 @@ def make_tardis_tasks(profile: str) -> list[dict]:
                 for n in grids:
                     out.append(task("lattice3d", "fast", "lattice-3d", "vacuum", 3, n, p, pn, 3.2, kind="lattice3d",
                                     background=1e-10, skip_fields=True, expect_mirror=[False, False, False]))
+    if profile == "tardis-lattice":
+        # Lattice 2D, Q1 (most accurate per unknown in tardis-hetero), larger grids and higher N. Grids limited by the
+        # A100 memory (~100 B per node x moment, kept below ~60 GB) and ~2 h per run.
+        lat = dict(background=1e-10, expect_mirror=[True, False, False])
+        for pn, grids in [(7, [224, 448, 896, 1792]), (15, [224, 448, 896, 1792]), (21, [224, 448, 896, 1344]),
+                          (35, [224, 448, 896]), (45, [224, 448, 672])]:
+            for n in grids:
+                out.append(task("lattice", "fast", "lattice-paul", "vacuum", 2, n, 1, pn, 3.2, kind="lattice",
+                                tag="std", **lat))
     seen = set()
     for number, t in enumerate(out):
         if t["label"] in seen:
@@ -187,6 +196,8 @@ def flags(t: dict, output: Path, threads: int, **kwargs):
             set_value("--sample-moments", "low")  # the analysis uses u0..u3 only; full PN columns cost minutes
         if t.get("fcs"):
             args += ["--fcs", "analytic"]
+        if t["pn_order"] >= 40:
+            set_value("--memory-mib", "16384")  # angular setup (32 q^2 doubles) exceeds the 1 GiB default
     return args
 
 
