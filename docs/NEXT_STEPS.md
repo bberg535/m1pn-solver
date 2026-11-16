@@ -29,9 +29,11 @@ scripts/build.sh tmp/build_gpu` (tardis). Cluster-Hinweise in `nx/README.md`.
 - Strang-Splitting: Ordnung 2 bestätigt, Zeitfehler bei CFL 1 2–3 Größenordnungen unter dem Ortsfehler; keine höhere
   Ordnung nötig (docs/ELEMENT_WENO.md, Abschnitt „Zeitordnung mit Reaktion“).
 
-## Laufend
+## Konvergenzkampagne `tardis-lattice-mc` — erledigt (16.11.2026)
 
-- Konvergenzkampagne `tardis-lattice-mc` (Lattice 2D bis 1344², P35; 3D bis 224³, ± FCS) gegen die MC-Referenz.
+- 2D: P35 896² mit FCS −0.044 / +0.075 / +0.074 % gegen MC; ab 896² dominiert der PN-Fehler. 3D: P7 168³ −5.8 %,
+  mit FCS 112³ −3.0 % (Masse); PN-Anteil ab 112³ wesentlich (docs/LATTICE_MC.md,
+  `results/convergence/tardis_lattice_mc_20261116/`). Offen: P15 auf 168³ (Trennung Ort/PN in 3D).
 
 ## Block 4 — teilweise erledigt (Performance)
 

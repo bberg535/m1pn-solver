@@ -32,6 +32,29 @@ def mc_final(path: Path) -> dict:
     return out
 
 
+def campaign_rows(campaign: Path) -> list[dict]:
+    """Runs of a tardis campaign read from runs/<label>/summary.json. With --fcs the top-level mass/ledger hold the
+    collided part only; the totals are in the lattice_fcs block."""
+    rows: list[dict] = []
+    for summary in sorted(campaign.glob("runs/*/summary.json")):
+        label = summary.parent.name
+        d = json.loads(summary.read_text())
+        cfg = json.loads((summary.parent / "config.json").read_text())
+        fcs = "lattice_fcs" in d and "total_mass_final" in d["lattice_fcs"]
+        if fcs:
+            l = d["lattice_fcs"]
+            q = (l["total_mass_final"], l["total_absorbed"], l["total_absorption_rate_final"])
+        else:
+            q = (d["final_density_mass"], d["ledger"]["absorbed"], d["absorption_rate_final"])
+        parts = label.split("_")  # family_P<N>_p<p>_E<n>_<tag>
+        rows.append({"case": "lattice-3d" if parts[0] == "lattice3d" else "lattice-paul",
+                     "source": f"{campaign.name} (A100)", "label": label, "pn": int(parts[1][1:]),
+                     "p": int(parts[2][1:]), "elements": int(parts[3][1:]), "fcs": "analytic" if fcs else "off",
+                     "mass": q[0], "absorbed": q[1], "rate": q[2], "solver_seconds": d.get("solver_seconds"),
+                     "steps": d.get("steps")})
+    return rows
+
+
 def solver_rows() -> list[dict]:
     rows: list[dict] = []
     fcs = ROOT / "results/heterogeneous/lattice_fcs_20261116/results.csv"
@@ -60,9 +83,13 @@ def main() -> None:
     ap.add_argument("--mc2d", type=Path, required=True)
     ap.add_argument("--mc3d", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--campaign", type=Path, action="append", default=[],
+                    help="tardis campaign folder(s) with runs/*/summary.json (added to the versioned tables)")
     a = ap.parse_args()
     mc = {"lattice-paul": mc_final(a.mc2d), "lattice-3d": mc_final(a.mc3d)}
     rows = solver_rows()
+    for c in a.campaign:
+        rows += campaign_rows(c)
     for r in rows:
         ref = mc[r["case"]]
         for q in QOIS:
