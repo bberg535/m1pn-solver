@@ -29,11 +29,20 @@ NX per Slurm (`--partition=long --constraint=nx`; Login-Knoten hat 1 Kern; NFS-Z
    standard-20261116 enthalten sind (gpu-a100, gpu-projection, gpu-campaign, lattice-fcs, element-weno-mpi,
    positivity-projection, element-weno-fcs, hetero3d, ssp43 …); ungetrackte Logs im Haupt-Checkout.
 
-## Block 2 — zurückgestellt (Kombinierbarkeit)
+## Block 2 — in Arbeit (Kombinierbarkeit), Branch `feature/combine-202611`, Worktree `.claude/worktrees/combine`
 
-- GPU mit Spiegelreduktion (Lattice/Line Source 2–4× weniger Arbeit), periodischen Gittern, DLRA, MPI+GPU.
-- Lattice-FCS für `lattice-3d`; MPI + Lattice-FCS testen (Tabelle pro Rang).
-- Entscheidung des Nutzers: Element-WENO als Default von `m1pn_fast` (derzeit Massenkorrektur).
+Erledigt (16.11.2026):
+- DLRA entfernt (Nutzerentscheidung; `0cead11`, bitgleich zum Standard für alle übrigen Läufe).
+- Element-WENO ist Default von `m1pn_fast`, CFL 1.0 nach CFL-Scan (`results/cfl_scan_20261116`, `c039a16`).
+- GPU mit Spiegelreduktion und periodischen Gittern (`c039a16`; `tests/gpu_validate.sh` 24/24, ≤ 4e-10); Spiegel auf
+  der A100 1.8× (Lattice 224² P15) bis 3.0× (Line Source 512² P7).
+
+Offen:
+- MPI im Element-WENO-Pfad von `m1pn_fast` (bisher nur ein Rang; MPI nur in `m1pn_element_weno` für Crossing und
+  glatten Ausfluss). Voraussetzung für MPI + Lattice-FCS (Tabelle pro Rang) und für MPI+GPU in `m1pn_fast`.
+- MPI+GPU (für einen künftigen Cluster mit mehreren GPUs; tardis hat eine A100, also nur Funktionstest).
+- Lattice-FCS für `lattice-3d`: neue Quadratur (Winkelintegral über die sichtbaren Würfelflächen der Quellzelle,
+  Knicke an projizierten Voxelkanten); Verfahren mit dem Nutzer abstimmen.
 
 ## Block 3 — zurückgestellt (Numerik fürs Paper)
 

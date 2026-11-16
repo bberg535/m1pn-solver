@@ -161,4 +161,15 @@ Validierung (`tests/gpu_validate.sh`, tardis, Job 160904, gleiches Binary; Schwe
 | periodisch 2D Q1 64², Q2 32², Q4 16², P7 | 7.5e-16 / 8.4e-16 / 1.9e-15 | |
 | periodisch 3D Q2 8³, P3 | 8.4e-16 | |
 
+Laufzeit auf der A100 (Job 160905, CFL 0.2, Löserzeit voll → Spiegel, Masse jeweils auf 8 Stellen gleich):
+
+| Fall | voll | Spiegel (Viertel) | Faktor |
+|---|---:|---:|---:|
+| Lattice Q1 224², P15, T = 3.2 | 20.6 s | 11.7 s | 1.8 |
+| Lattice + FCS Q1 224², P15 | 20.9 s | 11.9 s | 1.8 |
+| Line Source Q1 512², P7, T = 0.3 | 33.7 s | 12.4 s | 2.7 |
+| Line Source + FCS Q1 512², P7 | 33.1 s | 11.2 s | 3.0 |
+
+Weniger als Faktor 4, weil das Viertelgebiet die GPU schlechter auslastet und der Host-Randpfad nicht mitschrumpft.
+
 `lattice-3d` ist absichtlich asymmetrisch (Zelle (4,2,2) frei, (3,3,1) Absorber) und wird nicht gespiegelt.
