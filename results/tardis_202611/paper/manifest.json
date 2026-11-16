@@ -1,0 +1,37 @@
+{
+  "checksums": {
+    "analysis.py": "f76ee321c5515bc4f72b0c3af363ae2afa468000a426a2c40769b900ffbd6923",
+    "bin/fast": "f5b831b329ae1910063534e2ac6c903218d3d9720e9a32f1db54e2a3f22d0003",
+    "bin/standalone": "9b291dc04fda78bf0fc301af32440857e19d8ee67ea392f2d6130c3816d3f4e0",
+    "nx/batches/element_weno_pack.sbatch": "bd58013facab72839ff614c26556923150c6523378fcd15de58e6ad386e562b6",
+    "nx_convergence.py": "803f193b1e8515ecfce089da5e6b2e5769decb207e4dbec704b49406414a56d4",
+    "plot.py": "6e90f9f0c44b58df9035227bf2978675abd2e07b44950cb3e344469c4f82ca6d",
+    "reference.py": "7ef3f6f57a07caf460e817ede9f2a0d411559f5d5f5479eec905a3b61ac02001",
+    "scripts/element_weno/pack_node.py": "fcb3c33d83c7d6047a489c6bb526f882ce01e76a12561b1588162105c4820c2c",
+    "study.py": "803f193b1e8515ecfce089da5e6b2e5769decb207e4dbec704b49406414a56d4",
+    "tardis.py": "078a49183ce7c52a52e4627737d077f9fb2f34e7045fc2f20ed2bc1aaa547040",
+    "tasks.json": "b40d839d1b421a5da0d9723694758c35c7c39b6a54b5a558ee082a6f20373fe3"
+  },
+  "compiler_from": "config.json of every run",
+  "created_utc": "2026-11-15T14:07:01Z",
+  "format": "nx_convergence_v1",
+  "git_head": "970c94e60fc7b92af2b77f298687deb346c7715d",
+  "interpretation": "kinetic reference includes PN truncation; temporal self reference only",
+  "machine": "tardis (NVIDIA A100 80GB PCIe, EPYC 7343); GPU tasks: m1pn_fast --gpu",
+  "mfem_version": "unknown",
+  "profile": "tardis-paper",
+  "reactions": "Strang exact half steps",
+  "repository": "bberg535/m1pn-solver",
+  "root": "/home/warehouse15/bberg/phd/03_projects/M1PN_Solver/.claude/worktrees/gpu-campaign",
+  "solver_flags": "GPU tasks: --gpu --mirror-reduction off; all fast tasks: --angular-reduction auto",
+  "task_count": 201,
+  "amendments": [
+    {
+      "utc": "2026-11-15",
+      "file": "bin/fast",
+      "old_sha256": "f39a5f80896e736a3cff6ddc2f2efc23bfc7524279968801c7f4bb0598407461",
+      "new_sha256": "f5b831b329ae1910063534e2ac6c903218d3d9720e9a32f1db54e2a3f22d0003",
+      "reason": "GPU fallback lists sized max(2^16, nodes, cells) instead of 2^16 (2048^2 runs aborted: too many limiter fallbacks); no numerical change; old binary kept as bin/fast.pre-capacity; failed attempts in status_failed_capacity/"
+    }
+  ]
+}

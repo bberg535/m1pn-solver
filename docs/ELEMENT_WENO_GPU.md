@@ -112,7 +112,10 @@ gegen die CPU wie zuvor auf dem Rundungsniveau des Problems (512², T = 0.32: 5,
 
 ## Validierung des Systemstands (16.11.2026, `feature/system-202611`)
 
-Gleiches Binary, CPU gegen `--gpu` (tardis, A100), Dichte am Ende:
+Gleiches Binary, CPU gegen `--gpu` (tardis, A100), Dichte am Ende. Reproduzierbar mit
+`sbatch tests/gpu_validate.sh [m1pn_fast] [Ausgabeordner]` (Standard `tmp/build_gpu/m1pn_fast`; Schwelle 1e-8 für
+max- und L2-Abweichung, gleiche Schrittzahl, bei Lattice-FCS zusätzlich die Integrale; `GPU_VALIDATE_TIMING=1` ergänzt
+den Zeitlauf 224², P15). Nachgerechnet 16.11.2026 (Job 160891, `93fa881`): alle Fälle bestanden, Werte wie unten.
 
 | Fall | max rel | L2 rel |
 |---|---:|---:|

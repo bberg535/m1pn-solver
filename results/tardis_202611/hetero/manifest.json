@@ -1,0 +1,28 @@
+{
+  "checksums": {
+    "analysis.py": "f76ee321c5515bc4f72b0c3af363ae2afa468000a426a2c40769b900ffbd6923",
+    "bin/fast": "f39a5f80896e736a3cff6ddc2f2efc23bfc7524279968801c7f4bb0598407461",
+    "bin/standalone": "9b291dc04fda78bf0fc301af32440857e19d8ee67ea392f2d6130c3816d3f4e0",
+    "nx/batches/element_weno_pack.sbatch": "bd58013facab72839ff614c26556923150c6523378fcd15de58e6ad386e562b6",
+    "nx_convergence.py": "803f193b1e8515ecfce089da5e6b2e5769decb207e4dbec704b49406414a56d4",
+    "plot.py": "6e90f9f0c44b58df9035227bf2978675abd2e07b44950cb3e344469c4f82ca6d",
+    "reference.py": "7ef3f6f57a07caf460e817ede9f2a0d411559f5d5f5479eec905a3b61ac02001",
+    "scripts/element_weno/pack_node.py": "fcb3c33d83c7d6047a489c6bb526f882ce01e76a12561b1588162105c4820c2c",
+    "study.py": "803f193b1e8515ecfce089da5e6b2e5769decb207e4dbec704b49406414a56d4",
+    "tardis.py": "078a49183ce7c52a52e4627737d077f9fb2f34e7045fc2f20ed2bc1aaa547040",
+    "tasks.json": "197090a860c08b7516c16d8b9774ca3bca7fa3aac52e2835e84370bb56fec17d"
+  },
+  "compiler_from": "config.json of every run",
+  "created_utc": "2026-11-15T14:06:59Z",
+  "format": "nx_convergence_v2",
+  "git_head": "970c94e60fc7b92af2b77f298687deb346c7715d",
+  "interpretation": "kinetic reference includes PN truncation; temporal self reference only",
+  "machine": "tardis (NVIDIA A100 80GB PCIe, EPYC 7343); GPU tasks: m1pn_fast --gpu",
+  "mfem_version": "unknown",
+  "profile": "tardis-hetero",
+  "reactions": "Strang exact half steps",
+  "repository": "bberg535/m1pn-solver",
+  "root": "/home/warehouse15/bberg/phd/03_projects/M1PN_Solver/.claude/worktrees/gpu-campaign",
+  "solver_flags": "GPU tasks: --gpu --mirror-reduction off; all fast tasks: --angular-reduction auto",
+  "task_count": 61
+}

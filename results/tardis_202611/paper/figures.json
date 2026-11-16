@@ -1,0 +1,12 @@
+{
+  "figures": [
+    "smooth_error_exact_PN_L2",
+    "boundary_error_kinetic_L2",
+    "crossing_error_kinetic_L2",
+    "crossing_error_spatial_self_L2_to_next",
+    "line_error_kinetic_L2",
+    "time_smooth_error_temporal_self_L2",
+    "time_crossing_error_temporal_self_L2",
+    "ablation_wall_seconds"
+  ]
+}
