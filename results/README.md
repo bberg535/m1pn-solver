@@ -6,6 +6,7 @@ nicht versioniert). Jeder Ordner hat ein README mit Herkunft (Commit, Binary-SHA
 | Ordner | Inhalt | Doku |
 |---|---|---|
 | `convergence/tardis_202611/` | Konvergenzkampagnen auf der A100: paper (glatt, Rand, Crossing, Line Source, Zeit, Ablation), fcs, hetero, lattice | docs/TARDIS_RESULTS.md |
+| `convergence/tardis_lattice_mc_20261116/` | Lattice 2D/3D gegen die MC-Referenz (A100, CFL 1, bis 1344² bzw. 224³) | docs/LATTICE_MC.md |
 | `convergence/cfl_scan_20261116/` | CFL-Scan 0.1-1.0 (Grundlage für den Default CFL 1) | docs/ELEMENT_WENO.md |
 | `heterogeneous/nx_hetero_20261111/` | Material, Lattice, 3D-Lattice, Shadow auf NX; Reaktionsmodell-Studie | docs/ELEMENT_HETEROGENEOUS.md |
 | `heterogeneous/lattice_fcs_20261116/` | Lattice mit und ohne First-Collision-Source (NX, CPU) | docs/FCS_LATTICE.md |

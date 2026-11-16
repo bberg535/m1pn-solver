@@ -93,3 +93,42 @@ Mit FCS (P3, docs/FCS_LATTICE.md): 28³ −15.9 / −2.5 / −5.5 %, 56³ −7.6
 diesen Gittern weit von der Konvergenz entfernt: Die Masse konvergiert ohne FCS etwa mit erster Ordnung (Fehler
 halbiert sich je Verdopplung), die Quellzelle hat bei 28³ nur 4³ Elemente. FCS verkleinert den Massenfehler auf 56³
 um den Faktor 2.8. Bisherige 3D-Aussagen waren nur Selbstvergleiche; diese Zahlen ersetzen sie.
+
+## Konvergenzkampagne `tardis-lattice-mc` (16.11.2026)
+
+tardis, eine A100, Stand 4fdcb35 (Block 3 + 4 gemergt), Binary SHA256 7b920fff…, Q1, CFL 1, T = 3.2, Job 161108
+(20 Läufe, 0 Fehler). Profil `tardis-lattice-mc` in `scripts/element_weno/tardis_convergence.py`; Auswertung
+`results/convergence/tardis_lattice_mc_20261116/` (`lattice_mc_compare.py --campaign`; FCS-Summen aus
+`summary.json` → `lattice_fcs.total_*`).
+
+**2D** (Masse / Absorption / Rate gegen MC; in Klammern gegen Literatur):
+
+| Lauf | mit FCS | ohne FCS | Lösezeit |
+|---|---|---|---:|
+| 896², P15 | −0.111 / +0.200 / +0.257 % | | 161 s |
+| 1344², P15 | −0.102 / +0.187 / +0.249 % | | 663 s |
+| 896², P21 | −0.070 / +0.124 / +0.153 % | −0.102 / +0.190 / +0.207 % | 298 s |
+| 1344², P21 | −0.059 / +0.108 / +0.147 % | | 1112 s |
+| 896², P35 | −0.044 / +0.075 / +0.074 % (Lit. −0.011 / +0.040 / +0.068) | | 660 s |
+
+Ab 896² ändert die Gitterverfeinerung wenig (P21: −0.070 → −0.059 %); der Rest ist überwiegend PN-Fehler und fällt
+mit N (P15 → P21 → P35). FCS verkleinert auch hier die Abweichung (P21 896²: −0.070 gegen −0.102 %). Gegen die
+Literaturtabelle sähe der beste Lauf um den Faktor 4 genauer aus (−0.011 %), als er ist.
+
+**3D**, Masse (Absorption, Rate) gegen MC:
+
+| Gitter | P3 | P7 | P15 | P7 mit FCS |
+|---|---|---|---|---|
+| 56³ | −21.3 % | −20.1 % | −20.0 % | −7.1 % (+0.12, −1.30) |
+| 112³ | −11.6 % | −8.9 % | −8.2 % | −3.0 % (+0.39, −0.18) |
+| 168³ | −9.0 % | −5.8 % | – | – |
+| 224³ | −8.1 % | – | – | – |
+
+- PN-Anteil: ab 112³ wesentlich (168³: P3 −9.0 gegen P7 −5.8 %); P3 sättigt bei etwa −8 %.
+- Ortskonvergenz P7: 56³ → 112³ Faktor 2.3, 112³ → 168³ Faktor 1.5 (beobachtete Ordnung ≈ 1.1 einschließlich des
+  unbekannten PN-Grenzfehlers; mit einem angenommenen P7-Grenzfehler um −3 % läge sie bei 1.5–1.8). Die
+  Präasymptotik-Hypothese (docs/MATH_AUDIT.md, B.8) ist damit weder bestätigt noch widerlegt; nötig wäre P15 auf 168³
+  (ohne FCS, ~40 GB).
+- FCS verbessert die 3D-Masse um den Faktor 2.8–3.0 bei gleichem Gitter.
+- Laufzeiten (A100): 168³ P7 336 s, 224³ P3 403 s, 112³ P15 432 s; mit FCS kommt die Tabellen- und Ausgabezeit
+  dazu (112³: +300 s).

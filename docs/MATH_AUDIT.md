@@ -261,8 +261,10 @@ im Paper erwähnen.
 
 ### D.2 Konkrete, unbestätigte Hypothesen
 
-1. **3D-Lattice präasymptotisch** (B.8). Test: Ein Würfel mit einem Absorber neben der Quelle, gleiche Daten,
-   Gitter mit σh = 2 … 0.1, gegen `m1pn_lattice_mc`. Erwartung: Ordnung steigt bei σh < 0.3.
+1. **3D-Lattice präasymptotisch** (B.8). Kampagne `tardis-lattice-mc` (docs/LATTICE_MC.md): P7 56³ → 112³ → 168³
+   (σh 1.25 → 0.42) Masse −20.1 → −8.9 → −5.8 %; der PN-Fehler ist ab 112³ wesentlich (P3/P7 auf 168³ −9.0/−5.8 %).
+   Ohne den PN-Grenzfehler nicht entscheidbar; offen. Nächster Test: P15 auf 168³ bzw. ein Würfel mit einem Absorber
+   (σh = 2 … 0.1) gegen `m1pn_lattice_mc`.
 2. **FCS-on/off-Unterschied enthält einen Diskretisierungsanteil** (B.3). Test: homogenes Medium ohne Absorber,
    reine Streuung, beide Varianten auf feinem Gitter gegen MC. Der Unterschied sollte wie h² fallen, unabhängig vom
    FCS-Gewinn bei grober Auflösung.
