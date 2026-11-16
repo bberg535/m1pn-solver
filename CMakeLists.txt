@@ -62,6 +62,9 @@ target_link_libraries(m1pn_lattice_mc PRIVATE m1pn_element)
 # Study of the WENO activation at the rounding limit (smooth periodic case; docs/ELEMENT_WENO.md). Not a ctest.
 add_executable(m1pn_weno_roundoff_study tests/weno_roundoff_study.cpp)
 target_link_libraries(m1pn_weno_roundoff_study PRIVATE m1pn_element)
+# WENO sensor gamma per element on a stored m1pn_fast state (2D, unit square). Study tool, not a ctest.
+add_executable(m1pn_weno_gamma_field tests/weno_gamma_field.cpp)
+target_link_libraries(m1pn_weno_gamma_field PRIVATE m1pn_element)
 
 include(CTest)
 if(BUILD_TESTING)
