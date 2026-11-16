@@ -1,0 +1,62 @@
+# First-Collision-Source für den Lattice (Stand 16.11.2026)
+
+Branch `experimental/lattice-fcs` (von `experimental/gpu-campaign`). Erweitert [FCS.md](FCS.md) vom homogenen
+Line-Source-Puls auf den heterogenen Lattice (Moujaes/Kuzmin/Baeumer (44)-(45), Schotthöfer/Hauck (12)):
+σ_a = 10 auf den elf Absorberzellen, σ_s = 1 sonst, Quelle q0 = 1 auf [3,4]² ab t = 0, Vakuumrand.
+
+## Formulierung
+
+Wie in FCS.md: ψ = ψ_u + ψ_c. Die gesamte Quelle geht in ψ_u; das Gitter (Element-WENO M1PN) trägt ψ_c mit der
+isotropen Quelle σ_s ρ_u, Anfangswert der Boden 1e-10. Ausgewertet werden die Summen (Masse, Absorptionsrate,
+absorbierte Gesamtmenge).
+
+**ψ_u exakt per Strahlverfolgung** (`src/uncollided_lattice.hpp`). Felder hängen von (x, y) ab, Richtungen sind 3D,
+μ = sin θ. Mit dem ebenen Abstand l = sμ (sin θ dθ ds = dθ dl):
+
+    ρ_u(x, t) = q0/(2π) ∫dφ ∫_0^{π/2} dθ ∫_0^{tμ} χ_S(l) e^{−T(l)/μ} dl,
+
+T(l) die ebene optische Tiefe entlang x − l(cos φ, sin φ). S ist konvex, ein Strahl trifft S in [l_in, l_out]
+mit σ_S = 1 dort, T_in = T(l_in) aus dem Zelldurchlauf (≤ 14 Zellen). Das l-Integral ist geschlossen:
+e^{−T_in/μ} μ/σ_S (1 − e^{−σ_S L/μ}), L = min(l_out, tμ) − l_in.
+
+**Quadratur.** φ über das Fenster, in dem S von x aus sichtbar ist, geteilt an den Winkeln aller Gitterecken
+(konstante Zellfolge) und an den Schnittpunkten des Kreises vom Radius t mit dem Rand von S (l_in = t bzw. l_out = t);
+auf jedem Stück Gauß-Legendre (8) nach der Substitution φ = a + (c − a)(3s² − 2s³), die das (t − l_in)^{3/2}-Verhalten
+an den Frontpunkten glättet. θ geteilt bei μ = l_in/t und l_out/t, dazu geometrische Panels lo·2^k (Randschicht von
+e^{−l/μ}), je 10 Gauß-Punkte. Relativer Quadraturfehler < 1e-9.
+
+**Zeittabelle.** ρ_u an den FCS-Quadraturpunkten (Gauß p+1 je Richtung und Element, exakt für ∫φ_i) für
+t_m = 0.01 m, kubisch interpoliert (Fehler ≤ 5e-6 absolut); Zeitintegral für die ungestoßene Absorption mit
+Simpson auf der Tabelle. Kosten ≈ 120 µs pro Punkt und Tabellenzeit auf einem Kern
+(56²: 16 s auf 32 Kernen, 224² ≈ 4 min, 448² ≈ 16 min).
+
+## Tests (`tests/uncollided_lattice.cpp`, `--full` für 5 und 6)
+
+1. Quellmitte, t ≤ 0.5: ρ_u = 1 − e^{−t}, Fehler ≤ 1e-15.
+2. Quadraturkonvergenz (Standard gegen 16/20 Punkte): < 1e-9 relativ.
+3. Null vor Ankunft der Front.
+4. Zeittabelle gegen direkte Auswertung: 4.9e-6 absolut; Zeitintegral in der Mitte 8e-9.
+5. Unabhängige Formulierung als Flächenintegral über S mit dem Kern der unendlichen Linienquelle
+   K = 1/(2πr) ∫_0^{acos(r/t)} e^{−τ/cos a} da, τ durch feines Abschreiten: ohne Absorber auf dem Weg 1e-11 bis 6e-7;
+   mit Absorbern konvergiert die Referenz mit der Schrittzahl (2.4e-4 → 1.1e-4, 2.8e-4 → 3.2e-5 bei 4e3 → 4e4 Schritten).
+6. Bilanz ohne Ausstrom (t < 3): dM_u/dt = 1 − ∫σ_t ρ_u. Residuum 3.5e-4 → 8.7e-5 → 2.2e-5 (t = 1) und
+   6.0e-4 → 1.5e-4 → 3.8e-5 (t = 2.5) bei Halbierung der Raumquadratur: zweite Ordnung gegen null.
+
+## Treiber
+
+`m1pn_fast --case lattice-paul --stabilization element-weno --fcs analytic` (nur CPU; der GPU-Pfad kennt nur den
+Line-Source-Puls). `summary.json` → `lattice_fcs`: ungestoßene Masse/Rate/Absorption, Summen `total_*`,
+Tabellenzeit. `final.csv`: `u0` = Gesamtdichte, `rho_uncollided` direkt ausgewertet. `history.csv` und `ledger`
+beziehen sich auf den gestoßenen Anteil (Bilanz dort ≤ 1e-12). `nx_convergence.py` vergleicht bei FCS die Summen.
+
+Erster Lauf Q1 56², P7, T = 3.2 (Abweichung gegen Schotthöfer/Hauck Tab. 1 / 2π):
+
+| | Masse | Absorption gesamt | Rate |
+|---|---:|---:|---:|
+| ohne FCS | −5.27 % | +9.81 % | +5.19 % |
+| mit FCS | −3.59 % | +5.27 % | +3.48 % |
+
+## Studie
+
+`scripts/element_weno/lattice_fcs_study.py` (NX, CPU, eine Aufgabe = ein Sockel): Q1 56²-448², N = 3, 7, 15, 21
+(35 auf 112², 224²), jeweils mit und ohne FCS; Kampagne `nx/tmp/lattice_fcs`. Ergebnisse folgen.
