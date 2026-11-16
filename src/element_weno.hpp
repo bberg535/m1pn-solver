@@ -55,6 +55,12 @@ struct ElementWenoOptions {
     // Constant angular filter (former nn_filter study): d a_lm/dt = -sigma (l/(N+1))^4 a_lm,
     // half a step before and after each SSPRK3 step. Zero switches it off.
     double filter_strength = 0;
+    // Prototype (study, CPU): adaptive angular filter. Per node i the strength is filter_strength * s_i with
+    // s_i in [0, 1] from the angular spectrum at the start of each reaction half step (Persson-Peraire type):
+    // S_i = log10((E_N + E_{N-1}) / sum_l E_l), E_l = sum_m a_lm^2; s_i = 0 for S < s0 - kappa, 1 for S > s0 + kappa,
+    // sine ramp in between. Density untouched, cone preserved (damping of l >= 1 only).
+    bool adaptive_filter = false;
+    double adaptive_s0 = -4, adaptive_kappa = 1;
     // Constant isotropic scattering and absorption (unit speed):
     // d a_lm/dt = -(sigma_a + sigma_s [l >= 1]) a_lm. Integrated exactly together
     // with the filter in the same two half steps; the density is kept by
@@ -147,6 +153,9 @@ struct ElementWenoStats {
     long limited_elements = 0, limited_boundary_nodes = 0, nudged_states = 0;
     // Diagnostics: rate() calls and those in which no element and no boundary node was limited.
     long rate_calls = 0, unlimited_rate_calls = 0;
+    // Adaptive filter prototype: sum of the node factors s_i and number of node evaluations.
+    double adaptive_filter_sum = 0;
+    long adaptive_filter_evals = 0, adaptive_filter_active = 0;
     // C1/C2 counters: outward-rounded base bars; boundary nodes whose correction was reduced by the sign condition.
     long outward_bars = 0, sign_limited_nodes = 0;
     double min_sign_factor = 1;
@@ -245,6 +254,8 @@ public:
     Vec weno_gamma(const Field &a) const;
     // Exact local reaction exp(-tau R): filter, isotropic scattering, absorption.
     Field angular_filter(const Field &a, double tau) const;
+    // Adaptive filter prototype: node factors s_i (all ones without adaptive_filter); counts into stats.
+    Vec filter_sensor(const Field &a, ElementWenoStats * = nullptr) const;
     // True when the reaction step changes anything (filter, scattering, absorption or source).
     bool reacts() const {
         return options.filter_strength != 0 || options.sigma_s != 0 || options.sigma_a != 0 || bool(options.material) ||

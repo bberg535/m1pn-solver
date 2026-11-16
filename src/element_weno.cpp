@@ -2337,9 +2337,55 @@ double ElementWeno::high_order_step() const {
     const double limit = options.ssprk43 ? 5.149486147 : 2.512745327;
     return .9 * limit / spectral_radius_;
 }
+Vec ElementWeno::filter_sensor(const Field &a, ElementWenoStats *stats) const {
+    Vec s = Vec::Ones(nodes);
+    if (!options.adaptive_filter)
+        return s;
+    const int N = pn.order;
+    std::vector<int> degree(moments);
+    for (int k = 0; k < moments; ++k)
+        degree[k] = int(std::sqrt(double(active[k]) + .5));
+    const double s0 = options.adaptive_s0, kappa = options.adaptive_kappa;
+    parallel_for(nodes, [&](int i) {
+        double total = 0, tail = 0;
+        for (int k = 0; k < moments; ++k) {
+            const double e = a(i, k) * a(i, k);
+            total += e;
+            if (degree[k] >= N - 1)
+                tail += e;
+        }
+        double v = 0;
+        if (total > 0 && tail > 0) {
+            const double S = std::log10(tail / total);
+            v = S <= s0 - kappa ? 0. : S >= s0 + kappa ? 1. : .5 * (1 + std::sin(pi * (S - s0) / (2 * kappa)));
+        }
+        s[i] = v;
+    });
+    if (stats) {
+        long active_nodes = 0;
+        double sum = 0;
+        for (int i = 0; i < nodes; ++i)
+            if (is_owned(i))
+                sum += s[i], active_nodes += s[i] > 0, ++stats->adaptive_filter_evals;
+        stats->adaptive_filter_sum += sum, stats->adaptive_filter_active += active_nodes;
+    }
+    return s;
+}
 Field ElementWeno::angular_filter(const Field &a, double tau) const {
     if (options.filter_strength == 0 && options.sigma_s == 0 && options.sigma_a == 0)
         return a;
+    if (options.adaptive_filter) { // prototype: node-wise strength
+        const Vec s = filter_sensor(a, nullptr);
+        Field out(a.rows(), a.cols());
+        parallel_for(int(a.rows()), [&](int i) {
+            for (int k = 0; k < moments; ++k) {
+                const int l = int(std::sqrt(double(active[k]) + .5));
+                out(i, k) = a(i, k) * std::exp(-tau * (s[i] * options.filter_strength * std::pow(double(l) / (pn.order + 1), 4) +
+                                                       options.sigma_a + (l > 0 ? options.sigma_s : 0.)));
+            }
+        });
+        return out;
+    }
     Vec decay(moments);
     for (int k = 0; k < moments; ++k) {
         const int l = int(std::sqrt(double(active[k]) + .5)); // full index l^2 + l + m
@@ -2410,6 +2456,7 @@ Field ElementWeno::react(const Field &a, double tau, ElementWenoStats *stats, do
     const bool fcs = bool(options.uncollided_density);
     require(!fcs || std::isfinite(source_time), "FCS: react() needs the source time");
     const double react_start = seconds();
+    const Vec node_filter = filter_sensor(a, stats); // ones without the adaptive prototype
     const Vec fcs_source = fcs ? collided_source(source_time, nullptr, stats) : Vec();
     if (!options.material) {
         if (fcs) {
@@ -2461,7 +2508,7 @@ Field ElementWeno::react(const Field &a, double tau, ElementWenoStats *stats, do
         const double rho = in[0] / c0;
         o[0] = decay0 * in[0] + c0 * q0 * tau * phi1;
         for (int k = 1; k < q; ++k)
-            o[k] = std::exp(-tau * (sa + ss + filter[k])) * in[k];
+            o[k] = std::exp(-tau * (sa + ss + node_filter[i] * filter[k])) * in[k];
         absorbed[i] = lumped[i] * (-std::expm1(z) * rho + q0 * tau * (1 - phi1));
         injected[i] = lumped[i] * q0 * tau;
     });

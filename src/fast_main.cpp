@@ -44,7 +44,7 @@ struct Options {
     double shadow_sigma = 1e7, beam_density = 1;
     int material_subcells = 0, history_stride = 0;
     bool skip_fields = false;
-    double filter_strength = 0;
+    double filter_strength = 0, filter_s0 = -4, filter_kappa = 1;
     Mesh mesh;
     Budget budget;
     int order = 3, rk = 4, max_steps = 100000, threads = 1;
@@ -116,10 +116,14 @@ Options parse(int argc, char **argv) {
             return int(x);
         };
         if (key == "--filter") {
-            require(v == "off" || v == "constant", "--filter must be off or constant");
+            require(v == "off" || v == "constant" || v == "adaptive", "--filter must be off, constant or adaptive");
             o.filter_mode = v;
         } else if (key == "--filter-strength")
             o.filter_strength = real();
+        else if (key == "--filter-s0")
+            o.filter_s0 = real();
+        else if (key == "--filter-kappa")
+            o.filter_kappa = real();
         else if (key == "--pn-order")
             o.order = integer();
         else if (key == "--elements")
@@ -552,7 +556,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     }
     eo.weno_q = o.weno_q;
     eo.weno_deadband = o.weno_deadband, eo.weno_floor = o.weno_floor;
-    eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
+    eo.filter_strength = o.filter_mode != "off" ? o.filter_strength : 0.;
+    eo.adaptive_filter = o.filter_mode == "adaptive";
+    eo.adaptive_s0 = o.filter_s0, eo.adaptive_kappa = o.filter_kappa;
+    require(!eo.adaptive_filter || !o.gpu, "--filter adaptive: CPU only (prototype)");
     eo.sigma_s = o.sigma_s;
     eo.sigma_a = o.sigma_a;
     eo.ssprk43 = o.rk == 4;
@@ -896,6 +903,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                << ",\"weno_q\":" << o.weno_q << ",\"weno_deadband\":" << o.weno_deadband
                << ",\"weno_floor\":" << o.weno_floor << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
                << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength
+               << ",\"filter_s0\":" << o.filter_s0 << ",\"filter_kappa\":" << o.filter_kappa
                << ",\"sigma_s\":" << o.sigma_s << ",\"sigma_a\":" << o.sigma_a
                << ",\"reaction_integration\":\"exact_exponential_half_steps_around_ssprk\""
                << ",\"reaction_model\":" << (material ? "\"nodal_average_int_sigma_phi_over_int_phi\"" : "\"constant\"")
@@ -1127,6 +1135,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
            << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
            << lattice_fcs_json
            << ",\"min_weno_gamma\":" << stats.min_gamma
+           << ",\"adaptive_filter\":{\"mean_factor\":"
+           << (stats.adaptive_filter_evals ? stats.adaptive_filter_sum / stats.adaptive_filter_evals : 0.)
+           << ",\"active_fraction\":"
+           << (stats.adaptive_filter_evals ? double(stats.adaptive_filter_active) / stats.adaptive_filter_evals : 0.) << "}"
            << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << out_scheme.cells
            << ",\"mpi_ranks\":" << ranks
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states
