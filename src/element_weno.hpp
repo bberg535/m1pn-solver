@@ -403,6 +403,11 @@ private:
     Incoming face_data(int side_id, const V3 &x, double time) const;
     void face_data_into(int side_id, const V3 &x, double time, Incoming &data) const;
     std::vector<Incoming> steady_data_; // per (face, point) when inflow.steady
+    // Uniform faces (steady inflow without exterior callbacks, all point data bitwise equal, e.g. vacuum): the
+    // low-order face terms and the PN datum load are point-independent per face node, so the point loop reduces to
+    // the face weights W_r = sum_points w_p phi_n(x_p) (row r = face_row_[f] + n). Only the summation order changes.
+    std::vector<char> face_uniform_;
+    Vec face_weight_;
     std::vector<int> boundary_nodes_sorted_;
     struct PairEntry {
         int j;

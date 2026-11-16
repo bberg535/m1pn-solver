@@ -5,6 +5,8 @@
 // Levermore states, the stable base bar) are flagged and recomputed by the host with the original code.
 #include "element_weno_gpu_device.hpp"
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -93,6 +95,7 @@ struct Context {
     struct GhostDevice *ghost = nullptr;
     cudaStream_t aux = nullptr; // non-blocking stream of the ghost kernel (overlaps the volume kernels)
     struct ReactionDevice *reaction = nullptr;
+    struct BoundaryHighDevice *bhigh = nullptr;
     int flux_nnz[3] = {0, 0, 0};
     DeviceCounters *pinned_counters = nullptr;
 };
@@ -2178,6 +2181,107 @@ Context *create(const Setup &s) {
     reset_counters(ctx);
     return ctx;
 }
+// ---- Phase A of the boundary (BoundaryHighSetup) -------------------------------------------------------------------
+struct BoundaryHighDevice {
+    BoundaryHighSetup s;
+    int *row_nodes = nullptr, *offsets = nullptr, *rows_list = nullptr;
+    double *row_mass = nullptr, *flux_t[6] = {}, *G = nullptr, *H = nullptr, *db = nullptr, *low4 = nullptr;
+    cublasHandle_t handle = nullptr;
+};
+namespace {
+void cublas_check(cublasStatus_t e, const char *what) {
+    if (e != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(std::string("cuBLAS: ") + what + " failed (" + std::to_string(int(e)) + ")");
+}
+__global__ void k_face_traces(int q, int rows, int nf, const int *row_nodes, const double *row_mass, const double *x,
+                              double *G) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(rows) * q)
+        return;
+    const int r = int(t / q), c = int(t % q);
+    double sum = 0;
+    for (int m = 0; m < nf; ++m)
+        sum += row_mass[std::size_t(r) * nf + m] * x[std::size_t(row_nodes[std::size_t(r) * nf + m]) * q + c];
+    G[t] = sum;
+}
+__global__ void k_sub(double *a, const double *b, std::size_t n) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t < n)
+        a[t] -= b[t];
+}
+__global__ void k_boundary_rows_add(int q, int nb, const int *offsets, const int *rows_list, const int *bnodes,
+                                    const double *H, double *out, double *low4) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(nb) * q)
+        return;
+    const int k = int(t / q), c = int(t % q);
+    double sum = 0;
+    for (int e = offsets[k]; e < offsets[k + 1]; ++e)
+        sum += H[std::size_t(rows_list[e]) * q + c];
+    out[std::size_t(bnodes[k]) * q + c] += sum;
+    if (c < 4)
+        low4[std::size_t(k) * 4 + c] = sum;
+}
+} // namespace
+void boundary_high_setup(Context *ctx, const BoundaryHighSetup &s) {
+    auto *d = new BoundaryHighDevice;
+    d->s = s;
+    const std::size_t rq = std::size_t(std::max(1, s.rows)) * s.q, rn = std::size_t(std::max(1, s.rows)) * s.nf;
+    d->row_nodes = dcopy(s.row_nodes, rn);
+    d->row_mass = dcopy(s.row_mass, rn);
+    d->offsets = dcopy(s.offsets, std::size_t(s.nb) + 1);
+    d->rows_list = dcopy(s.rows_list, std::size_t(std::max(1, s.offsets[s.nb])));
+    for (int side = 0; side < 6; ++side)
+        if (s.flux_t[side])
+            d->flux_t[side] = dcopy(s.flux_t[side], std::size_t(s.q) * s.q);
+    d->G = dalloc<double>(rq);
+    d->H = dalloc<double>(rq);
+    d->db = dalloc<double>(rq);
+    d->low4 = dalloc<double>(std::size_t(std::max(1, s.nb)) * 4);
+    cublas_check(cublasCreate(&d->handle), "create");
+    cublas_check(cublasSetStream(d->handle, 0), "set stream"); // legacy default stream, as all kernels here
+    ctx->bhigh = d;
+}
+void destroy_boundary_high(Context *ctx) {
+    BoundaryHighDevice *d = ctx->bhigh;
+    if (!d)
+        return;
+    for (void *p : {(void *)d->row_nodes, (void *)d->offsets, (void *)d->rows_list, (void *)d->row_mass, (void *)d->G,
+                    (void *)d->H, (void *)d->db, (void *)d->low4})
+        cudaFree(p);
+    for (double *p : d->flux_t)
+        cudaFree(p);
+    if (d->handle)
+        cublasDestroy(d->handle);
+    delete d;
+    ctx->bhigh = nullptr;
+}
+void boundary_high(Context *ctx, const double *state, double *out, const double *pinned_db, double *pinned_low4) {
+    BoundaryHighDevice *d = ctx->bhigh;
+    const BoundaryHighSetup &s = d->s;
+    if (s.rows == 0 || s.nb == 0)
+        return;
+    const std::size_t rq = std::size_t(s.rows) * s.q;
+    k_face_traces<<<blocks(rq), 256>>>(s.q, s.rows, s.nf, d->row_nodes, d->row_mass, state, d->G);
+    CK(cudaMemsetAsync(d->H, 0, rq * sizeof(double), 0));
+    const double one = 1, zero = 0;
+    for (int side = 0; side < 6; ++side) {
+        const int r0 = s.side_start[side], n = s.side_start[side + 1] - r0;
+        if (!d->flux_t[side] || n <= 0)
+            continue;
+        // Row-major G (rows x q) is column-major G^T (q x rows): H^T = B^T G^T with B = flux_t (column-major q x q).
+        cublas_check(cublasDgemm(d->handle, CUBLAS_OP_T, CUBLAS_OP_N, s.q, n, s.q, &one, d->flux_t[side], s.q,
+                                 d->G + std::size_t(r0) * s.q, s.q, &zero, d->H + std::size_t(r0) * s.q, s.q),
+                     "dgemm");
+    }
+    if (pinned_db) {
+        CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, 0));
+        k_sub<<<blocks(rq), 256>>>(d->H, d->db, rq);
+    }
+    k_boundary_rows_add<<<blocks(std::size_t(s.nb) * s.q), 256>>>(s.q, s.nb, d->offsets, d->rows_list, s.bnodes, d->H,
+                                                                   out, d->low4);
+    CK(cudaMemcpyAsync(pinned_low4, d->low4, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost, 0));
+}
 void destroy(Context *ctx) {
     if (!ctx)
         return;
@@ -2191,6 +2295,7 @@ void destroy(Context *ctx) {
     }
     if (ctx->aux)
         cudaStreamDestroy(ctx->aux);
+    destroy_boundary_high(ctx);
     if (ctx->ghost) {
         for (void *p : ctx->ghost->owned)
             cudaFree(p);

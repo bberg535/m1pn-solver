@@ -183,6 +183,24 @@ void react_lattice(Context *, double *state, double tau, double source_time);
 // Fallback lists (device index arrays; count from counters()).
 const int *closure_fallback_list(Context *);
 const int *limiter_fallback_list(Context *);
+// Phase A of the boundary on the device (docs/ELEMENT_WENO_GPU.md, Block 4): PN face load
+//   H_r = sum_m M_side(n, m) x_{node(f, m)} B_side - DB_r   (row r = face f, face node n; B_side = (A_n - llf)^T)
+// by a trace kernel, one DGEMM per boundary side (cuBLAS) and the datum part; per boundary node k the rows of
+// boundary_rows in ascending order are summed and added to `out` (as the host phase A). The first four columns of the
+// node sums (l <= 1) go to the host for the boundary corrections.
+struct BoundaryHighSetup {
+    int q = 0, rows = 0, nf = 0, nb = 0;
+    const int *row_nodes = nullptr;    // rows x nf: global nodes of the face of row r
+    const double *row_mass = nullptr;  // rows x nf: M_side(n, m)
+    int side_start[7] = {};            // rows of side s: side_start[s] .. side_start[s + 1]
+    const double *flux_t[6] = {};      // q x q column-major (Eigen) boundary_flux_t_, null for sides without boundary
+    const int *offsets = nullptr;      // nb + 1
+    const int *rows_list = nullptr;    // boundary_rows_
+    const int *bnodes = nullptr;       // device: boundary node of slot k
+};
+void boundary_high_setup(Context *, const BoundaryHighSetup &);
+// pinned_db: rows x q row-major datum part (null: zero datum). pinned_low4: nb x 4 out (async, stream order).
+void boundary_high(Context *, const double *state, double *out, const double *pinned_db, double *pinned_low4);
 // Device scratch for uploading small index/row lists.
 int *device_ints(Context *, int slot, int count);
 double *device_doubles(Context *, int slot, std::size_t count);

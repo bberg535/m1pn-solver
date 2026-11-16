@@ -60,6 +60,9 @@ private:
     int face_points_ = 0, last_face_ = -1;
     bool closure_ready_ = false;
     bool device_ghost_ = false; // positivity projection of the ghost on the device
+    // Phase A (PN face load) on the device (gpu::boundary_high); M1PN_GPU_BOUNDARY_HIGH=0 keeps it on the host.
+    bool device_high_ = false;
+    double *pin_db_ = nullptr, *pin_low4_ = nullptr; // datum rows (row-major) up, l <= 1 node sums down
     double *pin_ghost_m_ = nullptr;
     int *pin_ghost_flags_ = nullptr;
     long ghost_flagged_merged = 0;

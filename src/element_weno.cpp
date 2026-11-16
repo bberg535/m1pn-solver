@@ -921,6 +921,31 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 steady_data_[index * points + point] = face_data(side_id, x, 0.);
             }
         });
+        if (!inflow.exterior_state && !inflow.exterior_m1) {
+            auto same = [](const Incoming &a, const Incoming &b) {
+                return a.d.size() == b.d.size() && (a.d.array() == b.d.array()).all() &&
+                       (a.kinetic.array() == b.kinetic.array()).all() && (a.moments.array() == b.moments.array()).all();
+            };
+            face_uniform_.assign(faces_.size(), 0);
+            face_weight_ = Vec::Zero(side_row_start_[6]);
+            parallel_for(int(faces_.size()), [&](int index) {
+                const FaceRule &rule = rules_[2 * faces_[index].direction + faces_[index].side];
+                const Incoming &first = steady_data_[std::size_t(index) * points];
+                bool uniform = true;
+                for (std::size_t point = 1; point < points && uniform; ++point)
+                    uniform = same(first, steady_data_[std::size_t(index) * points + point]);
+                face_uniform_[index] = uniform;
+                for (int n = 0; n < int(rule.local.size()); ++n) {
+                    double w = 0;
+                    for (std::size_t point = 0; point < points; ++point) {
+                        const double weight = rule.weights[point] * rule.shape(n, point);
+                        if (weight != 0)
+                            w += weight;
+                    }
+                    face_weight_[face_row_[index] + n] = w;
+                }
+            });
+        }
     }
     if (!o.periodic) {
         boundary_nodes_sorted_ = boundary_nodes_;
@@ -1668,6 +1693,56 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         thread_local std::vector<Four> memo_moments, memo_state;
         memo_valid.assign(nf, 0);
         memo_moments.resize(nf), memo_state.resize(nf);
+        // Bar state of face node n at point x (exterior from the data or the callbacks, plus the ghost).
+        auto bar_state = [&](int n, int i, const Four &ui, const Incoming &data, const V3 &x) {
+            Four state;
+            Four ext = inflow.exterior_state ? inflow.exterior_state(x, time, b.n, ui)
+                       : inflow.exterior_m1  ? inflow.exterior_m1(x, time)
+                                             : data.moments;
+            // Sum of two cone elements is in the cone; outward ulp rounding only for binary64 sums.
+            if (ghost)
+                ext += outgoing_moments[ghost_id[n]];
+            bool in_cone = exact::cone(ext);
+            for (int k = 0; ghost && k < 64 && !in_cone; ++k) {
+                ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
+                in_cone = exact::cone(ext);
+            }
+            cone_require(in_cone, "M1 exterior state outside cone");
+            Four own = Four::Zero();
+            for (int d = 0; d < dimension; ++d)
+                own += b.n[d] * block(low_flux, i, d);
+            const Four outer = Levermore(ext).flux(b.n);
+            state = .5 * (ui + own) + .5 * (ext - outer);
+            // Both halves are cone elements in exact arithmetic, but each is a cancellation: for a beam
+            // u = rho (1, -n) (incoming at this side) 1/2 (u + F_n(u)) = 0 exactly and evaluates to
+            // O(eps rho), possibly outside the cone by much more than an ulp of the (tiny) result. Before,
+            // the spurious outgoing mass of the C6 ghost usually masked this; the projection gives the exact
+            // zero ghost. Outward rounding relative to the size of the summands (C1 philosophy).
+            if (options.outward_bar_rounding && !exact::cone(state)) {
+                const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
+                if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
+                    state[0] = norm_up(state);
+            }
+            return state;
+        };
+        if (!face_uniform_.empty() && face_uniform_[index]) { // uniform face: point-independent terms
+            const Incoming &data = steady_data_[std::size_t(index) * rule.weights.size()];
+            for (int n = 0; n < nf; ++n) {
+                const double weight = face_weight_[r0 + n];
+                if (weight == 0)
+                    continue;
+                const int i = global[n];
+                datum.row(n).noalias() = weight * data.d.transpose();
+                const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
+                IN[r0 + n] = weight * std::max(0., -data.kinetic[0]);
+                const Four state = bar_state(n, i, ui, data, origin);
+                AR[r0 + n] = weight;
+                bar_row.row(n) = weight * state.transpose();
+                for (int d = 0; d < dimension; ++d)
+                    fa_row(n, d) = weight * b.n[d];
+                load_row.row(n) = weight * (state - ui).transpose();
+            }
+        } else
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
             for (int d = 0; d < dimension; ++d)
@@ -1689,33 +1764,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 if (memo && memo_valid[n] && (memo_moments[n].array() == data.moments.array()).all())
                     state = memo_state[n];
                 else {
-                    Four ext = inflow.exterior_state ? inflow.exterior_state(x, time, b.n, ui)
-                               : inflow.exterior_m1  ? inflow.exterior_m1(x, time)
-                                                     : data.moments;
-                    // Sum of two cone elements is in the cone; outward ulp rounding only for binary64 sums.
-                    if (ghost)
-                        ext += outgoing_moments[ghost_id[n]];
-                    bool in_cone = exact::cone(ext);
-                    for (int k = 0; ghost && k < 64 && !in_cone; ++k) {
-                        ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
-                        in_cone = exact::cone(ext);
-                    }
-                    cone_require(in_cone, "M1 exterior state outside cone");
-                    Four own = Four::Zero();
-                    for (int d = 0; d < dimension; ++d)
-                        own += b.n[d] * block(low_flux, i, d);
-                    const Four outer = Levermore(ext).flux(b.n);
-                    state = .5 * (ui + own) + .5 * (ext - outer);
-                    // Both halves are cone elements in exact arithmetic, but each is a cancellation: for a beam
-                    // u = rho (1, -n) (incoming at this side) 1/2 (u + F_n(u)) = 0 exactly and evaluates to
-                    // O(eps rho), possibly outside the cone by much more than an ulp of the (tiny) result. Before,
-                    // the spurious outgoing mass of the C6 ghost usually masked this; the projection gives the exact
-                    // zero ghost. Outward rounding relative to the size of the summands (C1 philosophy).
-                    if (options.outward_bar_rounding && !exact::cone(state)) {
-                        const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
-                        if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
-                            state[0] = norm_up(state);
-                    }
+                    state = bar_state(n, i, ui, data, x);
                     if (memo)
                         memo_valid[n] = 1, memo_moments[n] = data.moments, memo_state[n] = state;
                 }

@@ -36,7 +36,7 @@ Ausgabe: `config.json`, `summary.json` (Bilanz, Laufzeiten), `history.csv`, `ini
 
 ```bash
 bash scripts/build.sh tmp/build                  # NX: im Slurm-Job; Eigen, OpenMP, MPI (UCX-OpenMPI, m1pn-ucx)
-GPU=1 bash scripts/build.sh tmp/build_gpu        # tardis: CUDA 12.6, sm_80
+GPU=1 bash scripts/build.sh tmp/build_gpu        # tardis: CUDA 12.6 (mit cuBLAS), sm_80
 bash scripts/test.sh tmp/build                   # ctest + MPI-Linienlöser-Test
 sbatch tests/fast_mpi_equivalence.sh             # NX: 1/2/4 Ränge bitgleich
 sbatch tests/gpu_validate.sh                     # tardis: CPU gegen GPU

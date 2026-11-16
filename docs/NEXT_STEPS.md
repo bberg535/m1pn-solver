@@ -29,12 +29,20 @@ scripts/build.sh tmp/build_gpu` (tardis). Cluster-Hinweise in `nx/README.md`.
 - Strang-Splitting: Ordnung 2 bestätigt, Zeitfehler bei CFL 1 2–3 Größenordnungen unter dem Ortsfehler; keine höhere
   Ordnung nötig (docs/ELEMENT_WENO.md, Abschnitt „Zeitordnung mit Reaktion“).
 
-## Block 4 — zurückgestellt (Performance)
+## Laufend
+
+- Konvergenzkampagne `tardis-lattice-mc` (Lattice 2D bis 1344², P35; 3D bis 224³, ± FCS) gegen die MC-Referenz.
+
+## Block 4 — teilweise erledigt (Performance)
 
 - Host-Fallbacks bei Q1 ohne FCS (bis 4e8, long double): Line Source P3 1024² 1189 s statt 154 s mit FCS;
   Abhilfe double-double auf der GPU (vom Nutzer zunächst verworfen).
-- 3D: Host-Randpfad (Face-Terme) als Engpass. Analyse 16.11.: Phase A (`boundary_high`, dichtes GEMM Randzeilen × q²)
-  liegt auf dem kritischen Pfad, Phase B (Face-Terme) überlappt; Messjob tardis (`tmp/block4_profile`) zur Aufteilung.
+- ~~3D: Host-Randpfad (Face-Terme) als Engpass.~~ Erledigt 16.11.2026 (Branch `feature/block4-host-boundary`):
+  Face-Terme bei je Face konstantem Einstrom über vorab summierte Gewichte (CPU und GPU), PN-Randlast als
+  cuBLAS-DGEMM auf der GPU; Lattice 3D 56³ 12–15× schneller (docs/ELEMENT_WENO_GPU.md, „Host-Randpfad“). Nächster
+  Engpass: Ghost-Kernel auf der GPU (≈ 70 % der GPU-Zeit bei P15 in 3D).
+- 3D mit FCS: Ausgabe wertet die exakte ungestoßene Dichte an allen Ausgabeknoten aus (56³: 12 min); Abhilfe wäre die
+  Zeittabelle bzw. eine gröbere Ausgabe.
 
 Regeln: Abweichungen bis 1e-8 erlaubt, keine mathematischen Änderungen ohne Freigabe; kein Push/Merge ohne Auftrag;
 keine Spack-Installationen ohne Auftrag; Experimente auf eigenen Branches; Antworten auf Deutsch.
