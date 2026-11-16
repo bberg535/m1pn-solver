@@ -173,6 +173,30 @@ Fehler gegen die kinetische Lösung; der Zeitfehler spielt keine Rolle. Mit Stre
 Mit dem Standard-`dt` ändern sich alle bisherigen SSPRK3-Läufe (größerer Schritt); mit `--dt` lassen sie sich
 reproduzieren.
 
+### CFL-Default von `m1pn_fast` (16.11.2026)
+
+Seit 16.11.2026 ist Element-WENO der Standard von `m1pn_fast` mit SSPRK(4,3) und **CFL 1.0**
+(`dt = cfl · step_bound`, `step_bound = min(realizability_step, high_order_step)`, letzteres mit eigenem Faktor 0.9).
+Die Massenkorrektur bleibt mit `--stabilization m1pn_mass_correction` wählbar (SSPRK2, CFL 1, gelumpt).
+Scan auf NX (`results/cfl_scan_20261116`), CFL 0.1-1.0, Abweichung der Dichte gegen CFL 0.1:
+
+| Fall | CFL 0.2 | CFL 0.5 | CFL 0.9 | CFL 1.0 | Zeit 0.2 → 1.0 |
+|---|---:|---:|---:|---:|---:|
+| Crossing Q1 128², P7 | 1.2e-6 | 1.1e-5 | 3.4e-5 | 4.8e-5 | 13.7 → 2.8 s |
+| Crossing Q2 64², P7 | 4.6e-7 | 4.3e-6 | 1.7e-5 | 2.5e-5 | 8.7 → 1.8 s |
+| Crossing Q3 43², P7 | 5.1e-6 | 1.3e-4 | 2.9e-4 | 5.5e-4 | 12.1 → 2.4 s |
+| Crossing Q4 32², P7 | 5.4e-6 | 2.7e-5 | 1.1e-4 | 1.2e-4 | 15.0 → 3.0 s |
+| Glatt mit Rand Q2 32², P7 | 1.5e-9 | 2.8e-8 | 1.4e-7 | 2.6e-7 | 0.7 → 0.1 s |
+| Lattice Q1 112², P7, T = 3.2 | 5.7e-6 | 4.1e-5 | 1.2e-4 | 1.5e-4 | 9.3 → 1.9 s |
+| Lattice 3D Q1 28³, P3, T = 1 | 6.7e-5 | 4.7e-4 | 1.5e-3 | 1.8e-3 | 3.9 → 0.8 s |
+| Line Source + FCS Q1 128², P7 | 7.5e-6 | 7.2e-5 | 2.0e-4 | 2.3e-4 | 7.0 → 1.4 s |
+
+(L2 relativ.) Alle Läufe stabil, kein Nudging, minimaler Kegelabstand unverändert. Der Zeitfehler bei CFL 1 bleibt
+weit unter dem Ortsfehler derselben Gitter (Crossing kinetisch 0.1, Lattice-Masse 112²: Verschiebung 0.008 % bei
+1.9 % Abweichung) und fällt bei Verfeinerung schneller (dritte gegen zweite Ordnung). Bei Q1 liegt `dt` bei CFL 1 genau
+auf der Realisierbarkeitsschranke (für die die Positivitätsaussage gilt), bei Q2-Q4 auf der Hochordnungsschranke.
+Genauigkeitsstudien an der Rundungsgrenze (glatt Q4) und die Kampagnenskripte setzen `--cfl` weiterhin explizit.
+
 ## Winkelreduktion über Parität (11.11.2026)
 
 In 1D und 2D hängt die Lösung nicht von z (2D) bzw. y, z (1D) ab. Die Transportmatrizen der aufgelösten

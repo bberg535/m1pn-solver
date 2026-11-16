@@ -11,13 +11,14 @@ for grid in (256, 512):
         modes = ["off", "constant"] + (["nn"] if order in (3, 7) else [])
         for mode in modes:
             extra = f" --filter {mode}" + (f" --filter-strength {SIGMA[order]}" if mode == "constant" else "")
-            lines.append((f"B_{mode}_g{grid}_P{order}", f"{base} --elements {grid}{extra}"))
+            lines.append((f"B_{mode}_g{grid}_P{order}",
+                          f"{base} --stabilization m1pn_mass_correction --elements {grid}{extra}"))
         for degree in (1, 2, 3, 4):
             n = round(grid / degree)
             for mode in ("off", "constant"):
                 extra = f" --filter constant --filter-strength {SIGMA[order]}" if mode == "constant" else ""
                 lines.append((f"EW_p{degree}_{mode}_g{grid}_P{order}",
-                              f"{base} --stabilization element-weno --degree {degree} --elements {n}{extra}"))
+                              f"{base} --stabilization element-weno --cfl 1 --degree {degree} --elements {n}{extra}"))
 with open(out, "w") as f:
     for name, args in lines:
         f.write(f"{name}\t{args}\n")

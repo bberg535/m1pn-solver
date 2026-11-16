@@ -26,6 +26,11 @@
 #endif
 using namespace m1pn;
 namespace {
+// m1pn_fast default CFL for element WENO (dt = cfl * step_bound). CFL scan of 2026-11-16 (docs/ELEMENT_WENO.md):
+// stable up to 1 in all tested cases (Q1-Q4 crossing, smooth, lattice 2D/3D, line source + FCS); the time error at
+// CFL 1 stays far below the spatial error, and CFL 1 is ~5x faster than 0.2. Accuracy studies at round-off level
+// (smooth Q4) pass a smaller --cfl explicitly.
+[[maybe_unused]] constexpr double kElementWenoFastCfl = 1.0;
 struct Options {
     std::string filter_mode = "off", filter_model;
     std::string angular_reduction = "auto"; // element-weno: auto|on|off (parity reduction in 1D/2D)
@@ -46,7 +51,7 @@ struct Options {
     double domain_length = 1;
     bool jump = false, deterministic = false, mass_mode_explicit = false, pn_only_self_test = false;
     bool cuda_explicit = false, cuda_on = false;
-    bool rk_explicit = false;
+    bool rk_explicit = false, cfl_explicit = false;
     // --stabilization element-weno (Bernstein Q_p, element-based limiting)
     int degree = 2;
     double weno_linear = 1e-3, weno_q = 1;
@@ -62,10 +67,12 @@ Options parse(int argc, char **argv) {
     o.num.ledger_stride = 64;
     o.num.r2 = true;
 #ifdef M1PN_FAST_DEFAULTS
-    // m1pn_fast: production settings of the 512-element runs are the default.
+    // m1pn_fast: element WENO (SSPRK(4,3), CFL kElementWenoFastCfl) is the default since 2026-11-16. The
+    // mass-correction settings of the 512-element runs (SSPRK2, CFL 1, lumped mass, kv_gamma 0) apply with
+    // --stabilization m1pn_mass_correction.
     o.rk = 2;
     o.cfl = 1;
-    o.num.stabilization = "m1pn_mass_correction";
+    o.num.stabilization = "element-weno";
     o.num.mass_mode = "lumped";
     o.num.kv_gamma = 0;
 #ifdef _OPENMP
@@ -114,9 +121,9 @@ Options parse(int argc, char **argv) {
                    "   --mirror-reduction auto|off (open mesh, vacuum inflow, even elements, initial data mirror-\n"
                    "     symmetric about x_d = 1/2 in every direction: compute on [1/2,1]^d with mirror sides)\n"
 #ifdef M1PN_FAST_DEFAULTS
-                   "defaults: --stabilization m1pn_mass_correction --time-integrator ssprk2 --cfl 1 --dt 0\n"
-                   "  --mass-mode lumped --kv-gamma 0 --threads <OpenMP maximum;\n"
-                   "  element-weno: physical cores of one NUMA node unless OMP_NUM_THREADS is set>\n"
+                   "defaults: --stabilization element-weno --time-integrator ssprk43 --cfl <element-weno default> --dt 0\n"
+                   "  --threads <physical cores of one NUMA node unless OMP_NUM_THREADS is set>;\n"
+                   "  --stabilization m1pn_mass_correction: --time-integrator ssprk2 --cfl 1 --mass-mode lumped --kv-gamma 0\n"
 #endif
                    ;
             std::exit(0);
@@ -223,8 +230,10 @@ Options parse(int argc, char **argv) {
             o.final_time = real();
         else if (key == "--dt")
             o.dt = real();
-        else if (key == "--cfl")
+        else if (key == "--cfl") {
             o.cfl = real();
+            o.cfl_explicit = true;
+        }
         else if (key == "--anchor-scale")
             o.num.anchor = real();
         else if (key == "--mass-tolerance")
@@ -325,6 +334,9 @@ Options parse(int argc, char **argv) {
     }
     if (element_weno) {
         if (!o.rk_explicit) o.rk = 4; // SSPRK(4,3), as m1pn_element_weno since 2026-11-15 (--time-integrator ssprk3)
+#ifdef M1PN_FAST_DEFAULTS
+        if (!o.cfl_explicit) o.cfl = kElementWenoFastCfl;
+#endif
         require(o.rk == 3 || o.rk == 4, "element-weno uses SSPRK3 or SSPRK(4,3)");
         require(o.coupling == "m1pn", "element-weno has no pn-only coupling");
         require(o.degree >= 1 && o.degree <= 12, "element-weno degree must lie in [1,12]");
@@ -878,7 +890,6 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     std::unique_ptr<ElementWenoGpu> device;
     double gpu_radius_seconds = 0;
     if (o.gpu) {
-        require(!mirrored, "--gpu: no mirror reduction (use --mirror-reduction off)");
         device = std::make_unique<ElementWenoGpu>(scheme);
         const double r0 = seconds();
         scheme.set_spectral_radius(device->spectral_radius());

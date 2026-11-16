@@ -71,11 +71,9 @@ std::vector<double> row_major(const Mat &m) {
 ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     const ElementWenoOptions &o = s.options;
     require(!s.dist_, "GPU path: serial scheme only (no MPI)");
-    require(!o.periodic && !o.symmetric_residual && !o.m1_target,
-            "GPU path: open mesh, standard residual, PN target");
+    require(!o.symmetric_residual && !o.m1_target, "GPU path: standard residual, PN target");
     require(!o.uncollided_density || ((o.uncollided_pulse || o.uncollided_lattice) && s.dimension == 2),
             "GPU path: FCS needs the line-source pulse or the lattice table (2D)");
-    require(std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; }), "GPU path: no mirror sides");
     require(!o.projection_high_order && !o.projection_hybrid && !o.projection_diagnostics,
             "GPU path: projection_high_order/hybrid/diagnostics are not supported");
     require(s.degree <= 4 && s.local_nodes <= gpu::max_local, "GPU path: degree <= 4 and at most 27 local nodes");
@@ -96,7 +94,8 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     const std::vector<double> semi = row_major(s.seminorm_);
     g.seminorm = semi.data();
     std::array<std::array<std::vector<double>, 2>, 3> ext;
-    std::array<std::vector<double>, 3> band, lower, diagonal;
+    std::array<std::vector<double>, 3> band, lower, diagonal, dlower, ddiagonal, tail;
+    g.periodic = o.periodic;
     for (int d = 0; d < s.dimension; ++d) {
         g.convection_t_rows[d] = s.convection_t_rows_[d].data();
         for (int side = 0; side < 2; ++side) {
@@ -110,8 +109,13 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         for (int k = 0; k < n1; ++k)
             for (int e = C.outerIndexPtr()[k]; e < C.outerIndexPtr()[k + 1]; ++e) {
                 const int col = C.innerIndexPtr()[e];
-                require(std::abs(col - k) <= p, "GPU path: 1D convection is not banded");
-                band[d][std::size_t(k) * w + (col - k + p)] = C.valuePtr()[e];
+                int off = col - k; // periodic: cyclic offset
+                if (o.periodic && off > n1 / 2)
+                    off -= n1;
+                if (o.periodic && off < -n1 / 2)
+                    off += n1;
+                require(std::abs(off) <= p, "GPU path: 1D convection is not banded");
+                band[d][std::size_t(k) * w + (off + p)] += C.valuePtr()[e];
             }
         // Natural-order banded LDL^T of the 1D mass.
         const Sparse &M = s.mass_1d_[d];
@@ -121,31 +125,95 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
                     return M.valuePtr()[e];
             return 0.;
         };
-        lower[d].assign(std::size_t(n1) * p, 0.);
-        diagonal[d].assign(n1, 0.);
-        auto L = [&](int r, int c) -> double & { return lower[d][std::size_t(r) * p + (r - c) - 1]; };
-        for (int k = 0; k < n1; ++k) {
-            for (int j = std::max(0, k - p); j < k; ++j) {
-                double v = entry(k, j);
-                for (int i = std::max(0, k - p); i < j; ++i)
-                    v -= L(k, i) * L(j, i) * diagonal[d][i];
-                L(k, j) = v / diagonal[d][j];
+        // rows first .. first + count - 1 of the mass (count x count principal block, contiguous since a mirror
+        // node is the first or the last on its line).
+        auto factor = [&](int first, int count, std::vector<double> &lo, std::vector<double> &dg) {
+            lo.assign(std::size_t(count) * p, 0.);
+            dg.assign(count, 0.);
+            auto L = [&](int r, int c) -> double & { return lo[std::size_t(r) * p + (r - c) - 1]; };
+            for (int k = 0; k < count; ++k) {
+                for (int j = std::max(0, k - p); j < k; ++j) {
+                    double v = entry(first + k, first + j);
+                    for (int i = std::max(0, k - p); i < j; ++i)
+                        v -= L(k, i) * L(j, i) * dg[i];
+                    L(k, j) = v / dg[j];
+                }
+                double v = entry(first + k, first + k);
+                for (int j = std::max(0, k - p); j < k; ++j)
+                    v -= L(k, j) * L(k, j) * dg[j];
+                require(v > 0, "GPU path: 1D mass factorization failed");
+                dg[k] = v;
             }
-            double v = entry(k, k);
-            for (int j = std::max(0, k - p); j < k; ++j)
-                v -= L(k, j) * L(k, j) * diagonal[d][j];
-            require(v > 0, "GPU path: 1D mass factorization failed");
-            diagonal[d][k] = v;
+        };
+        if (!o.periodic)
+            factor(0, n1, lower[d], diagonal[d]);
+        else {
+            // Cyclic mass: band rows k < nb = n1 - p, dense tail rows (arrow LDL^T, no fill in the band rows).
+            require(n1 >= 2 * p + 2, "GPU path: periodic direction too short for the cyclic line solve");
+            const int nb = n1 - p;
+            lower[d].assign(std::size_t(n1) * p, 0.);
+            diagonal[d].assign(n1, 0.);
+            tail[d].assign(std::size_t(p) * n1, 0.);
+            auto L = [&](int r, int c) -> double { // L(r, c), c < r
+                if (r >= nb)
+                    return tail[d][std::size_t(r - nb) * n1 + c];
+                return r - c <= p ? lower[d][std::size_t(r) * p + (r - c) - 1] : 0.;
+            };
+            for (int k = 0; k < n1; ++k) {
+                const int j0 = k >= nb ? 0 : std::max(0, k - p);
+                for (int j = j0; j < k; ++j) {
+                    double v = entry(k, j);
+                    const int i0 = j >= nb ? 0 : std::max(0, j - p);
+                    for (int i = i0; i < j; ++i)
+                        v -= L(k, i) * L(j, i) * diagonal[d][i];
+                    const double l = v / diagonal[d][j];
+                    if (k >= nb)
+                        tail[d][std::size_t(k - nb) * n1 + j] = l;
+                    else
+                        lower[d][std::size_t(k) * p + (k - j) - 1] = l;
+                }
+                double v = entry(k, k);
+                for (int j = j0; j < k; ++j)
+                    v -= L(k, j) * L(k, j) * diagonal[d][j];
+                require(v > 0, "GPU path: cyclic 1D mass factorization failed");
+                diagonal[d][k] = v;
+            }
+            g.tail[d] = tail[d].data();
         }
         g.convection_band[d] = band[d].data();
         g.lower[d] = lower[d].data();
         g.diagonal[d] = diagonal[d].data();
+        g.mirror_index[d] = s.mirror_index_[d];
+        if (s.mirror_index_[d] >= 0) {
+            require(s.mirror_index_[d] == 0 || s.mirror_index_[d] == n1 - 1, "GPU path: mirror node not at a line end");
+            factor(s.mirror_index_[d] == 0 ? 1 : 0, n1 - 1, dlower[d], ddiagonal[d]);
+            g.dlower[d] = dlower[d].data();
+            g.ddiagonal[d] = ddiagonal[d].data();
+            g.reflected[d] = s.reflected_local_[d].data();
+        }
         const Sparse &F = s.flux_t_[d];
         require(F.isCompressed(), "GPU path: flux matrix not compressed");
         g.flux_outer[d] = F.outerIndexPtr();
         g.flux_inner[d] = F.innerIndexPtr();
         g.flux_value[d] = F.valuePtr();
         g.flux_nnz[d] = int(F.nonZeros());
+    }
+    // Parity bits of the active moments and mirror-plane bits of the nodes (mirror directions only).
+    std::vector<unsigned char> comp_odd, node_mirror;
+    if (std::any_of(s.mirror_index_.begin(), s.mirror_index_.end(), [](int m) { return m >= 0; })) {
+        comp_odd.assign(q, 0);
+        node_mirror.assign(s.nodes, 0);
+        for (int d = 0; d < s.dimension; ++d) {
+            if (s.mirror_index_[d] < 0)
+                continue;
+            for (int c = 0; c < q; ++c)
+                if (s.reflect_odd_[d][c])
+                    comp_odd[c] |= 1u << d;
+            for (int i : s.mirror_nodes_[d])
+                node_mirror[i] |= 1u << d;
+        }
+        g.comp_odd = comp_odd.data();
+        g.node_mirror = node_mirror.data();
     }
     const std::size_t pairs = s.pair_table_.size();
     std::vector<int> pj(pairs);

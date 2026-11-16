@@ -32,8 +32,9 @@ und Shewchuk-Expansion nach exakter Zweierpotenz-Skalierung). Pfade, die auf dem
 (in den Läufen hier nie aufgetreten). Gleiche Ergebnisse wie die CPU bis auf Rundung: andere Summationsreihenfolge,
 FMA, die Linienfaktoren in natürlicher statt AMD-Ordnung. Ein GPU-Lauf ist deterministisch (drei Läufe bitgleich).
 
-Nicht unterstützt (Abbruch mit Meldung): MPI, periodisch, Spiegel, symmetrisches Residuum, Reaktion/Filter,
-M1-Target, `projection_high_order/hybrid/diagnostics`, äußere Zustände (`exterior_state`).
+Nicht unterstützt (Abbruch mit Meldung): MPI, symmetrisches Residuum, M1-Target,
+`projection_high_order/hybrid/diagnostics`, äußere Zustände (`exterior_state`). Spiegelseiten und periodische Gitter
+seit 16.11.2026 (Abschnitt „Spiegelreduktion und periodische Gitter“).
 
 ## Laufzeit
 
@@ -130,3 +131,34 @@ den Zeitlauf 224², P15). Nachgerechnet 16.11.2026 (Job 160891, `93fa881`): alle
 Lattice-FCS: die Tabelle entsteht auf der GPU (Rundung von sin/exp auf dem Gerät, daher 1e-10). Lattice-FCS 224²,
 P15, T = 3.2 auf der GPU: Tabelle 1.5 s (CPU ≈ 55 s), Löser 21.6 s, gesamt 27 s; Masse 2.072102 (−0.39 % gegen
 Schotthöfer/Hauck, wie der CPU-Lauf auf NX).
+
+## Spiegelreduktion und periodische Gitter (16.11.2026, Branch `feature/combine-202611`)
+
+`m1pn_fast --gpu` rechnet jetzt auch mit `--mirror-reduction auto` (Halb-/Viertel-/Achtelgebiet) und auf periodischen
+Gittern (`--periodic`). Gleiche Verfahren wie auf der CPU ([ELEMENT_WENO.md](ELEMENT_WENO.md), Spiegelränder):
+
+- **Spiegel:** Zeilenlöser `k_line_solve` mit Dirichlet-Variante je Komponente (ungerade Momente; beim Gradienten
+  die geraden) auf der Linie ohne Spiegelknoten, eigener bandförmiger LDLᵀ-Faktor (`dlower`), Wert am Spiegelknoten
+  0; WENO-Nachbar hinter dem Spiegel ist das gespiegelte eigene Element (`reflected`); in den Stufenkombinationen
+  (`k_combine`, `k_admissible`) ist die Rate der ungeraden Momente auf der Spiegelebene null (wie `rate()` auf der
+  CPU). Ohne Spiegel laufen exakt dieselben Operationen wie vorher.
+- **Periodisch:** LDLᵀ der zyklischen 1D-Masse in natürlicher Ordnung; Bandzeilen ohne Auffüllung, die letzten p
+  Zeilen dicht („Pfeil“, `tail`). Eigener Kernel `k_line_solve_cyclic`, Konvektionsband mit zyklischen Spalten. Der
+  2D-Q1-Streifenkernel der Stabilisierung setzt das offene Gitter voraus und wird periodisch durch den allgemeinen
+  ersetzt. Bedingung: mindestens 2p + 2 Knoten je periodischer Richtung.
+
+Validierung (`tests/gpu_validate.sh`, tardis, Job 160904, gleiches Binary; Schwelle 1e-8, alle 24 Fälle bestanden):
+
+| Fall | GPU gegen CPU (max rel) | GPU Spiegel gegen GPU voll, gleiches dt |
+|---|---:|---:|
+| Line Source Q1 128², P7 (Viertel) | 3.8e-15 | 1.4e-12 |
+| Line Source + FCS Q1 128², P7 | 8.0e-15 | 1.2e-14 |
+| Line Source Q2 64², P7 | 3.2e-12 | 8.1e-12 |
+| Lattice 56², P7 | 1.5e-15 | 1.1e-15 |
+| Lattice + FCS 56², P7 | 1.4e-16 | 4.3e-10 (FCS-Tabelle auf der GPU) |
+| Glatt 3D Q2 12³, P3, σ_s = 1 (Spiegel in y, z) | 1.3e-15 | 1.3e-15 |
+| periodisch 1D Q3 32, P7 | 7.5e-16 | |
+| periodisch 2D Q1 64², Q2 32², Q4 16², P7 | 7.5e-16 / 8.4e-16 / 1.9e-15 | |
+| periodisch 3D Q2 8³, P3 | 8.4e-16 | |
+
+`lattice-3d` ist absichtlich asymmetrisch (Zelle (4,2,2) frei, (3,3,1) Absorber) und wird nicht gespiegelt.

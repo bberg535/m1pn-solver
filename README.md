@@ -65,18 +65,20 @@ nichtnegative, momententreue Winkelmaße; der Randpfad wurde vorab optimiert (Er
 ## Standardprogramm `m1pn_fast`
 
 `m1pn_fast` ist das Standardprogramm (Quelle `nn_filter/src/main.cpp`, gebaut mit
-`M1PN_FAST_DEFAULTS`). Ohne weitere Optionen rechnet es mit den Einstellungen der
-schnellen 512er-Läufe: Massenkorrektur (`m1pn_mass_correction`), gelumpte Masse,
-SSPRK2, `--cfl 1 --dt 0`, `--kv-gamma 0` und allen OpenMP-Threads. Der Q1-Pfad ist
-bitgleich zur bisherigen `m1pn_nn_filter` mit diesen expliziten Flags.
+`M1PN_FAST_DEFAULTS`). **Seit 16.11.2026 (`feature/combine-202611`)** rechnet es ohne weitere Optionen mit
+Element-WENO, SSPRK(4,3), `--cfl 1 --dt 0` (CFL-Scan: [docs/ELEMENT_WENO.md](docs/ELEMENT_WENO.md)) und den
+physischen Kernen eines NUMA-Knotens. Die Massenkorrektur mit den Einstellungen der schnellen 512er-Läufe
+(gelumpte Masse, SSPRK2, `--cfl 1`, `--kv-gamma 0`) gibt es mit `--stabilization m1pn_mass_correction`; dieser
+Q1-Pfad ist bitgleich zur bisherigen `m1pn_nn_filter` mit diesen expliziten Flags. Ältere Skripte, die sich auf den
+früheren Default verlassen, müssen `--stabilization m1pn_mass_correction` ergänzen.
 
 Wählbar über Optionen:
 
 | Verfahren | Option |
 |---|---|
-| Massenkorrektur (Standard) | `--stabilization m1pn_mass_correction` |
+| Massenkorrektur | `--stabilization m1pn_mass_correction` |
 | Biharmonik | `--stabilization biharmonic-corrected` bzw. `biharmonic-original`, `--biharmonic-gamma G` |
-| Element-WENO (Bernstein `Q_p`, elementbasiertes Limiting) | `--stabilization element-weno --degree p` |
+| Element-WENO (Standard; Bernstein `Q_p`, elementbasiertes Limiting) | `--stabilization element-weno --degree p` |
 | Winkelfilter | `--filter constant --filter-strength S` oder `--filter nn` (nicht mit Element-WENO) |
 | Line Source (Garrett–Hauck) | `--case line-source --domain-length 3 --pulse-width .03 --background 1e-4 --sigma-s 1 --time 1` (nur B; Referenz `scripts/line_source/reference.py`) |
 

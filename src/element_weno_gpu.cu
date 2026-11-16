@@ -53,6 +53,12 @@ struct View {
     const int *connectivity, *neighbors, *node_offsets, *node_entries;
     const double *stiffness_rows, *convection_t_rows[3], *seminorm, *extension[3][2];
     const double *convection_band[3], *lower[3], *invdiag[3];
+    int mirror_index[3];                       // -1: no mirror side in d
+    const double *dlower[3], *dinvdiag[3];     // Dirichlet factor of the 1D mass (mirror directions)
+    const unsigned char *comp_odd, *node_mirror; // q, nodes (node_mirror == nullptr: no mirror sides)
+    const int *reflected[3];                   // local
+    bool periodic;
+    const double *tail[3];                     // periodic: P x n dense tail rows of the cyclic LDL^T
     const int *flux_outer[3], *flux_inner[3];
     const double *flux_value[3];
     const int *pair_j;
@@ -387,10 +393,11 @@ template <int N> __device__ __forceinline__ double weno_element(const View &v, i
     for (int d = 0; d < v.dimension; ++d)
         for (int side = 0; side < 2; ++side) {
             const int next = v.neighbors[e * 2 * v.dimension + 2 * d + side];
-            if (next < 0)
+            if (next == -1)
                 continue;
-            for (int l = 0; l < n; ++l)
-                other[l] = v.density[v.connectivity[next * n + l]];
+            for (int l = 0; l < n; ++l) // -2: mirror side, the neighbour is this element reflected in d
+                other[l] = v.density[next >= 0 ? v.connectivity[next * n + l]
+                                               : v.connectivity[e * n + v.reflected[d][l]]];
             ++m;
             const double *X = v.extension[d][side];
             for (int r = 0; r < n; ++r) {
@@ -446,20 +453,27 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
         return;
     const int c = int(t % v.q), line = int(t / v.q);
     const int start = (line / s) * (s * n) + line % s;
-    const double *L = v.lower[d], *ID = v.invdiag[d];
-    double *base = f + std::size_t(start) * v.q + c;
+    // Mirror side in d (as ElementWeno::solve_lines): components odd under the reflection (even ones for the
+    // gradient, field == nullptr) are solved with the Dirichlet factor on the line without the mirror node, whose
+    // value is then zero. Reduced index k = physical index - off; nn rows.
+    const int mi = v.mirror_index[d];
+    const bool dirichlet = mi >= 0 && bool((v.comp_odd[c] >> d) & 1) != (field == nullptr);
+    const int off = dirichlet && mi == 0 ? 1 : 0, nn = dirichlet ? n - 1 : n;
+    const double *L = dirichlet ? v.dlower[d] : v.lower[d], *ID = dirichlet ? v.dinvdiag[d] : v.invdiag[d];
     const std::size_t step = std::size_t(s) * v.q;
+    double *row0 = f + std::size_t(start) * v.q + c;
+    double *base = row0 + std::size_t(off) * step;
     double hist[P > 0 ? P : 1];
     for (int m = 0; m < P; ++m)
         hist[m] = 0;
-    const double *sbase = src ? src + std::size_t(start) * v.q + c : nullptr;
-    const double *Cb = v.convection_band[d];
-    double win[2 * P + 1]; // win[m + P] = src[k + m]
+    const double *sbase = src ? src + std::size_t(start) * v.q + c + std::size_t(off) * step : nullptr;
+    const double *Cb = v.convection_band[d] + std::size_t(off) * (2 * P + 1);
+    double win[2 * P + 1]; // win[m + P] = src[k + m] (reduced index; physical k + off in [0, n))
     if (src) {
 #pragma unroll
         for (int j = 0; j < 2 * P; ++j) {
             const int kk = j - P;
-            win[j] = kk >= 0 && kk < n ? sbase[std::size_t(kk) * step] : 0.;
+            win[j] = kk >= -off && kk < n - off ? sbase[std::ptrdiff_t(kk) * std::ptrdiff_t(step)] : 0.;
         }
     }
     // Software pipelining: the loads of chunk k + 1 are issued before chunk k is computed (forward: the chunk ahead is
@@ -468,16 +482,16 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
 #pragma unroll
         for (int j = 0; j < CH; ++j) {
             if (src)
-                buf[j] = k0 + j + P < n ? sbase[std::size_t(k0 + j + P) * step] : 0.;
+                buf[j] = k0 + j + P < n - off ? sbase[std::size_t(k0 + j + P) * step] : 0.;
             else
-                buf[j] = k0 + j < n ? base[std::size_t(k0 + j) * step] : 0.;
+                buf[j] = k0 + j < nn ? base[std::size_t(k0 + j) * step] : 0.;
         }
     };
     auto fwd = [&](int k0, const double *buf) {
 #pragma unroll
         for (int j = 0; j < CH; ++j) {
             const int k = k0 + j;
-            if (k >= n)
+            if (k >= nn)
                 break;
             double y;
             if (src) {
@@ -505,13 +519,13 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
     };
     double bufA[CH], bufB[CH];
     load_fwd(0, bufA);
-    for (int k0 = 0; k0 < n; k0 += 2 * CH) {
-        if (k0 + CH < n)
+    for (int k0 = 0; k0 < nn; k0 += 2 * CH) {
+        if (k0 + CH < nn)
             load_fwd(k0 + CH, bufB);
         fwd(k0, bufA);
-        if (k0 + CH >= n)
+        if (k0 + CH >= nn)
             break;
-        if (k0 + 2 * CH < n)
+        if (k0 + 2 * CH < nn)
             load_fwd(k0 + 2 * CH, bufA);
         fwd(k0 + CH, bufB);
     }
@@ -531,7 +545,7 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
             double x = buf[j];
 #pragma unroll
             for (int m = 1; m <= P; ++m)
-                if (k + m < n)
+                if (k + m < nn)
                     x -= L[std::size_t(k + m) * P + m - 1] * hist[m - 1];
 #pragma unroll
             for (int m = P - 1; m > 0; --m)
@@ -541,8 +555,8 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
             base[std::size_t(k) * step] = x;
         }
     };
-    load_bwd(n - 1, bufA);
-    for (int k1 = n - 1; k1 >= 0; k1 -= 2 * CH) {
+    load_bwd(nn - 1, bufA);
+    for (int k1 = nn - 1; k1 >= 0; k1 -= 2 * CH) {
         if (k1 - CH >= 0)
             load_bwd(k1 - CH, bufB);
         bwd(k1, bufA);
@@ -551,6 +565,89 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
         if (k1 - 2 * CH >= 0)
             load_bwd(k1 - 2 * CH, bufA);
         bwd(k1 - CH, bufB);
+    }
+    if (dirichlet)
+        row0[std::size_t(mi) * step] = 0;
+}
+// Periodic direction: in-place solve with the arrow LDL^T of the cyclic 1D mass (band rows k < nb = n - P from
+// v.lower, dense tail rows from v.tail), one thread per (line, component). src != nullptr: right-hand side C_1d src
+// with cyclic column indices (gradients). Not pipelined (periodic runs are small accuracy studies).
+template <int P> __global__ void k_line_solve_cyclic(View v, int first, double *field, const double *src) {
+    const int d = first + blockIdx.y;
+    double *f = field ? field : v.gradient[d];
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int n = v.npa[d], s = v.stride[d], lines = v.nodes / n;
+    if (t >= std::size_t(lines) * v.q)
+        return;
+    const int c = int(t % v.q), line = int(t / v.q);
+    const int start = (line / s) * (s * n) + line % s, nb = n - P;
+    const double *L = v.lower[d], *ID = v.invdiag[d], *T = v.tail[d], *Cb = v.convection_band[d];
+    const std::size_t step = std::size_t(s) * v.q;
+    double *base = f + std::size_t(start) * v.q + c;
+    const double *sb = src ? src + std::size_t(start) * v.q + c : nullptr;
+    double hist[P], acc[P], ytail[P];
+#pragma unroll
+    for (int m = 0; m < P; ++m)
+        hist[m] = acc[m] = ytail[m] = 0;
+    for (int k = 0; k < n; ++k) {
+        double y;
+        if (sb) {
+            y = 0;
+#pragma unroll
+            for (int m = 0; m <= 2 * P; ++m) {
+                int j = k + m - P;
+                j = j < 0 ? j + n : (j >= n ? j - n : j);
+                y += Cb[std::size_t(k) * (2 * P + 1) + m] * sb[std::size_t(j) * step];
+            }
+        } else
+            y = base[std::size_t(k) * step];
+        if (k < nb) {
+#pragma unroll
+            for (int m = 1; m <= P; ++m)
+                if (k - m >= 0)
+                    y -= L[std::size_t(k) * P + m - 1] * hist[m - 1];
+#pragma unroll
+            for (int m = P - 1; m > 0; --m)
+                hist[m] = hist[m - 1];
+            hist[0] = y;
+#pragma unroll
+            for (int r = 0; r < P; ++r)
+                acc[r] += T[std::size_t(r) * n + k] * y;
+        } else {
+            const int r = k - nb;
+            y -= acc[r];
+            for (int j = 0; j < r; ++j)
+                y -= T[std::size_t(r) * n + nb + j] * ytail[j];
+            ytail[r] = y;
+        }
+        base[std::size_t(k) * step] = y * ID[k];
+    }
+    double xt[P];
+    for (int r = P - 1; r >= 0; --r) {
+        const int k = nb + r;
+        double x = base[std::size_t(k) * step];
+        for (int r2 = r + 1; r2 < P; ++r2)
+            x -= T[std::size_t(r2) * n + k] * xt[r2];
+        xt[r] = x;
+        base[std::size_t(k) * step] = x;
+    }
+#pragma unroll
+    for (int m = 0; m < P; ++m)
+        hist[m] = 0;
+    for (int k = nb - 1; k >= 0; --k) {
+        double x = base[std::size_t(k) * step];
+#pragma unroll
+        for (int m = 1; m <= P; ++m)
+            if (k + m < nb)
+                x -= L[std::size_t(k + m) * P + m - 1] * hist[m - 1];
+#pragma unroll
+        for (int r = 0; r < P; ++r)
+            x -= T[std::size_t(r) * n + k] * xt[r];
+#pragma unroll
+        for (int m = P - 1; m > 0; --m)
+            hist[m] = hist[m - 1];
+        hist[0] = x;
+        base[std::size_t(k) * step] = x;
     }
 }
 // Element-wise stabilization (any degree and dimension): one thread per (element, component) loads the element rows
@@ -1157,6 +1254,8 @@ __global__ void k_combine(View v, double *r, const double *x, const double *a, d
         const int slot = c == 0 ? 0 : (c == 3 ? 1 : (c == 1 ? 2 : 3));
         rate = (v.load[std::size_t(i) * 4 + slot] / v.lumped[i]) / (c == 0 ? v.s0 : v.s1);
     }
+    if (v.node_mirror && (v.node_mirror[i] & v.comp_odd[c])) // odd moments vanish on the mirror planes
+        rate = 0;
     r[t] = old == 0 ? fresh * (x[t] + tau * rate) : old * a[t] + fresh * (x[t] + tau * rate);
 }
 __device__ __forceinline__ void admissible_node(const View &v, double *r, int i);
@@ -1171,7 +1270,9 @@ __global__ void k_admissible(View v, double *r, bool closure_next, bool low, con
         for (int c = 0; c < 4; ++c) {
             const std::size_t t = std::size_t(i) * v.q + c;
             const int slot = c == 0 ? 0 : (c == 3 ? 1 : (c == 1 ? 2 : 3));
-            const double rate = (v.load[std::size_t(i) * 4 + slot] / v.lumped[i]) / (c == 0 ? v.s0 : v.s1);
+            double rate = (v.load[std::size_t(i) * 4 + slot] / v.lumped[i]) / (c == 0 ? v.s0 : v.s1);
+            if (v.node_mirror && (v.node_mirror[i] & v.comp_odd[c]))
+                rate = 0;
             r[t] = old == 0 ? fresh * (x[t] + tau * rate) : old * a[t] + fresh * (x[t] + tau * rate);
         }
     admissible_node(v, r, i);
@@ -1932,7 +2033,26 @@ Context *create(const Setup &s) {
             v.flux_outer[d] = v.flux_inner[d] = nullptr;
             v.flux_value[d] = nullptr;
         }
+        v.mirror_index[d] = d < s.dimension ? s.mirror_index[d] : -1;
+        v.dlower[d] = v.dinvdiag[d] = nullptr;
+        v.reflected[d] = nullptr;
+        if (v.mirror_index[d] >= 0) {
+            const int n1 = s.nodes_per_axis[d] - 1, p = s.degree;
+            v.dlower[d] = own(dcopy(s.dlower[d], std::size_t(n1) * p));
+            std::vector<double> inv(n1);
+            for (int k = 0; k < n1; ++k)
+                inv[k] = 1. / s.ddiagonal[d][k];
+            v.dinvdiag[d] = own(dcopy(inv.data(), std::size_t(n1)));
+            v.reflected[d] = own(dcopy(s.reflected[d], std::size_t(n)));
+        }
     }
+    v.periodic = s.periodic;
+    for (int d = 0; d < 3; ++d)
+        v.tail[d] = s.periodic && d < s.dimension
+                        ? own(dcopy(s.tail[d], std::size_t(s.degree) * s.nodes_per_axis[d]))
+                        : nullptr;
+    v.comp_odd = s.node_mirror ? own(dcopy(s.comp_odd, std::size_t(s.q))) : nullptr;
+    v.node_mirror = s.node_mirror ? own(dcopy(s.node_mirror, std::size_t(s.nodes))) : nullptr;
     {
         int width = 1;
         for (int d = 0; d < s.dimension; ++d)
@@ -2079,6 +2199,15 @@ void line_solve(Context *ctx, int d, int count, double *f, const double *src = n
     for (int k = d; k < d + count; ++k)
         work = std::max(work, std::size_t(v.nodes / v.npa[k]) * v.q);
     const dim3 grid(blocks(work, 64), count);
+    if (v.periodic) {
+        switch (v.degree) {
+        case 1: k_line_solve_cyclic<1><<<grid, 64>>>(v, d, f, src); break;
+        case 2: k_line_solve_cyclic<2><<<grid, 64>>>(v, d, f, src); break;
+        case 3: k_line_solve_cyclic<3><<<grid, 64>>>(v, d, f, src); break;
+        default: k_line_solve_cyclic<4><<<grid, 64>>>(v, d, f, src); break;
+        }
+        return;
+    }
     switch (v.degree) {
     case 1: k_line_solve<1, LINE_CHUNK><<<grid, 64>>>(v, d, f, src); break;
     case 2: k_line_solve<2, LINE_CHUNK><<<grid, 64>>>(v, d, f, src); break;
@@ -2093,7 +2222,7 @@ void gradients(Context *ctx, const double *state) {
 }
 void stabilization(Context *ctx, const double *state, double *out, bool want_low, double constant_gamma) {
     const View &v = ctx->v;
-    if (v.dimension == 2 && v.degree == 1) {
+    if (v.dimension == 2 && v.degree == 1 && !v.periodic) { // the strip kernel assumes the open grid
         static const int sy = [] {
             const char *e = std::getenv("M1PN_GPU_STRIP");
             return e ? std::atoi(e) : 16;

@@ -23,6 +23,19 @@ struct Setup {
     // Banded 1D operators per axis (bandwidth = degree): convection rows (n x (2p+1), entry k-p..k+p, row-major),
     // natural-order LDL^T of the 1D mass: lower[k * p + (m - 1)] = L(k, k - m), diagonal[k] = D(k).
     const double *convection_band[3] = {}, *lower[3] = {}, *diagonal[3] = {};
+    // Mirror sides (ElementWenoOptions::mirror): mirror_index[d] = grid-line position of the mirror node (-1: none);
+    // dlower/ddiagonal: banded LDL^T of the 1D mass without the mirror row and column (n - 1 rows, same layout);
+    // comp_odd[c]: bit d set if active moment c is odd under x_d -> -x_d; node_mirror[i]: bit d set if node i lies
+    // on the mirror plane of direction d (nullptr without mirror sides); reflected[d]: local node mirrored in d.
+    int mirror_index[3] = {-1, -1, -1};
+    // Periodic mesh: the natural-order LDL^T of the cyclic 1D mass is banded except for its last `degree` rows,
+    // which are dense: tail[d][r * n + j] = L(n - degree + r, j) (j < n - degree + r); lower holds the band rows
+    // k < n - degree. convection_band then uses cyclic column offsets.
+    bool periodic = false;
+    const double *tail[3] = {};
+    const double *dlower[3] = {}, *ddiagonal[3] = {};
+    const unsigned char *comp_odd = nullptr, *node_mirror = nullptr;
+    const int *reflected[3] = {};
     // A_d^T (active moments) in CSR, q x q.
     const int *flux_outer[3] = {}, *flux_inner[3] = {};
     const double *flux_value[3] = {};

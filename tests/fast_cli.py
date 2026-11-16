@@ -25,12 +25,20 @@ def density(path):
     return [math.sqrt(4 * math.pi) * float(r["u0"]) for r in rows], rows
 crossing = ["--case", "crossing-study", "--inflow", "crossing-study-transport", "--dimension", "2",
             "--elements", "8", "--pn-order", "3", "--time", ".02"]
+EW_DEFAULT_CFL = 1.0  # kElementWenoFastCfl in nn_filter/src/main.cpp
 out = run("default", *crossing)
 if out:
     c = json.load(open(out + "/config.json")); s = json.load(open(out + "/summary.json"))
+    check(c["stabilization"] == "element-weno" and c["time_integrator"] == "ssprk43"
+          and c["cfl_safety"] == EW_DEFAULT_CFL, f"default is element-weno, SSPRK(4,3), CFL {EW_DEFAULT_CFL}")
+    check(s["minimum_cone_margin"] >= 0 and abs(s["ledger"]["balance_relative"]) < 1e-10,
+          "default run stays in the cone with mass balance")
+mc = run("mass_correction", *crossing, "--stabilization", "m1pn_mass_correction")
+if mc:
+    c = json.load(open(mc + "/config.json")); s = json.load(open(mc + "/summary.json"))
     check(c["rk"] == 2 and c["cfl_safety"] == 1 and c["stabilization"] == "m1pn_mass_correction"
-          and c["mass_mode"] == "lumped" and c["kv_gamma"] == 0, "default is mass correction, SSPRK2, CFL 1, lumped")
-    check(s["status"] == "completed" and s["global_Q_balance"] < 1e-12, "default run completes with balance")
+          and c["mass_mode"] == "lumped" and c["kv_gamma"] == 0, "mass correction keeps SSPRK2, CFL 1, lumped")
+    check(s["status"] == "completed" and s["global_Q_balance"] < 1e-12, "mass correction run completes with balance")
 ew = run("element_weno", *crossing, "--stabilization", "element-weno", "--degree", "2", "--elements", "4", "--dt", ".005")
 if ew:
     c = json.load(open(ew + "/config.json")); s = json.load(open(ew + "/summary.json"))
