@@ -4,6 +4,7 @@
 #include "pn_uncoupled.hpp"
 #include "filter.hpp"
 #include "uncollided.hpp"
+#include "uncollided_lattice.hpp"
 #ifdef M1PN_ELEMENT_GPU
 #include "element_weno_gpu.hpp"
 #endif
@@ -680,7 +681,28 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     // known analytically in the homogeneous infinite medium; it feeds sigma_s rho_u into psi_c.
     const bool fcs = o.fcs == "analytic";
     uncollided::GaussianPulse pulse;
-    if (fcs) {
+    // Lattice (docs/FCS_LATTICE.md): the whole source q0 = 1 on [3,4]^2 is uncollided (ray tracing through the
+    // cells, tabulated in time at the FCS quadrature points); the grid gets sigma_s rho_u only.
+    const bool fcs_lattice = fcs && lattice2d;
+    auto lattice_table = std::make_shared<uncollided::LatticeUncollidedTable>();
+    std::function<void(double, const std::vector<V3> &, std::vector<double> &)> sample_uncollided;
+    if (fcs_lattice) {
+        lattice_table->lattice = uncollided::lattice_paul(cases::lattice_paul_absorber_cell);
+        material->source = [](const V3 &) { return 0.; };
+        material->name += ", source uncollided (FCS)";
+        expected_integrals = "{\"volume\":49,\"source\":0,\"sigma_a\":110,\"sigma_s\":38}";
+        const double final_time = o.final_time;
+        eo.uncollided_density = [lattice_table, final_time](double t, const std::vector<V3> &x, std::vector<double> &out) {
+            if (lattice_table->points.empty())
+                lattice_table->build(x, final_time);
+            lattice_table->density(t, x, out);
+        };
+        eo.uncollided_points = o.degree + 1; // exact for int phi_i; the table cost scales with the point count
+        sample_uncollided = [lattice_table](double t, const std::vector<V3> &x, std::vector<double> &out) {
+            out.resize(x.size());
+            parallel_for(int(x.size()), [&](int k) { out[k] = lattice_table->lattice.density(x[k][0], x[k][1], t); });
+        };
+    } else if (fcs) {
         require(o.problem == "line-source" || o.problem == "plane-source", "--fcs analytic needs line-source or plane-source");
         require(!material && o.inflow == "vacuum", "--fcs analytic needs a homogeneous medium and vacuum inflow");
         pulse.sigma_t = o.sigma_a + o.sigma_s;
@@ -700,6 +722,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
             pulse.density(t, x, out);
         };
         eo.uncollided_pulse = std::make_shared<const uncollided::GaussianPulse>(pulse);
+        sample_uncollided = [pulse](double t, const std::vector<V3> &x, std::vector<double> &out) {
+            pulse.density(t, x, out);
+        };
     }
     eo.weno_q = o.weno_q;
     eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
@@ -934,7 +959,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         if (fcs) f << ",rho_uncollided";
         f << "\n";
         std::vector<double> unc;
-        if (fcs) pulse.density(time, where, unc);
+        if (fcs) sample_uncollided(time, where, unc);
         Field values(samples, pn.q);
         parallel_for(int(samples), [&](int s) {
             // Mirror reduction: evaluate at the reflected point and reflect the moments back.
@@ -1171,6 +1196,29 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     const double balance = final_mass - initial_mass + outflow + absorbed - injected - nudge;
     double uncollided_final = 0; // int rho_u(T) over the computed domain by the FCS quadrature
     if (fcs) scheme.collided_source(t, &uncollided_final);
+    // Lattice FCS: uncollided mass, absorption rate and absorbed total (FCS quadrature, time integral of the table),
+    // and the totals that compare with the kinetic reference.
+    std::string lattice_fcs_json;
+    if (fcs_lattice) {
+        const auto &xs = scheme.fcs_points();
+        const auto &ws = scheme.fcs_weights();
+        double mu = 0, ru = 0, au = 0;
+        for (std::size_t k = 0; k < xs.size(); ++k) {
+            const double sa = material->sigma_a(xs[k]), r = lattice_table->value(k, t);
+            mu += ws[k] * r, ru += ws[k] * sa * r;
+            if (sa > 0)
+                au += ws[k] * sa * lattice_table->time_integral(k, t);
+        }
+        mu *= domain_factor, ru *= domain_factor, au *= domain_factor;
+        const double rc = absorption_rate(a);
+        std::ostringstream j;
+        j << std::setprecision(17) << ",\"lattice_fcs\":{\"uncollided_mass_final\":" << mu
+          << ",\"uncollided_absorption_rate_final\":" << ru << ",\"uncollided_absorbed\":" << au
+          << ",\"total_mass_final\":" << final_mass + mu << ",\"total_absorption_rate_final\":" << rc + ru
+          << ",\"total_absorbed\":" << absorbed + au << ",\"table_points\":" << xs.size()
+          << ",\"table_times\":" << lattice_table->M + 1 << ",\"table_seconds\":" << lattice_table->build_seconds << "}";
+        lattice_fcs_json = j.str();
+    }
     const double balance_scale = std::max({std::abs(initial_mass), injected, absorbed, std::abs(outflow), 1e-300});
     struct rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
@@ -1207,7 +1255,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
            << ",\"reaction\":" << dlra_stats.t_reaction << ",\"spatial\":" << dlra_stats.t_spatial
            << ",\"products\":" << dlra_stats.t_products << ",\"limiter\":" << dlra_stats.t_limiter << "}}"
            << ",\"fcs\":" << std::quoted(o.fcs) << ",\"uncollided_mass_final\":" << uncollided_final * domain_factor
-           << ",\"uncollided_mass_exact\":" << (fcs ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
+           << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
+           << lattice_fcs_json
            << ",\"min_weno_gamma\":" << stats.min_gamma
            << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states

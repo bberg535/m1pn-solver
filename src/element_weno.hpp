@@ -285,6 +285,9 @@ public:
     GhostEstimates ghost_estimates(const Field &a, double alpha) const;
     V3 side_normal(int side) const { return boundaries_[side]->n; }
     double l2_density_error(const Field &a, const std::function<double(const V3 &)> &exact) const;
+    // FCS quadrature points and weights (empty without uncollided_density).
+    const std::vector<V3> &fcs_points() const { return fcs_points_; }
+    const std::vector<double> &fcs_weights() const { return fcs_weight_; }
 
 private:
     struct FaceRule {

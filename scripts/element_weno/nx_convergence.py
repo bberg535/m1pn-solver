@@ -707,6 +707,14 @@ def collect_hetero(campaign: Path, tasks: list[dict]) -> int:
                 row["absorption_rate"] = summary.get("absorption_rate_final")
                 for k, v in (summary.get("phase_seconds") or {}).items():
                     row["phase_" + k] = v
+            if "lattice_fcs" in summary:  # FCS: grid = collided part; compare the totals (docs/FCS_LATTICE.md)
+                lf = summary["lattice_fcs"]
+                row["fcs"] = True
+                row["collided_mass"], row["uncollided_mass"] = row["mass"], lf["uncollided_mass_final"]
+                row["mass"] = lf["total_mass_final"]
+                row["ledger_absorbed"] = lf["total_absorbed"]
+                row["absorption_rate"] = lf["total_absorption_rate_final"]
+                row["fcs_table_seconds"] = lf["table_seconds"]
             if t["kind"] == "lattice" and t["stabilization"] == "element-weno":
                 row["dev_mass_kinetic"] = row["mass"] / LATTICE_KINETIC["mass"] - 1
                 row["dev_absorbed_kinetic"] = row["ledger_absorbed"] / LATTICE_KINETIC["absorbed"] - 1
