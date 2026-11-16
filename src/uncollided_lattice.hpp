@@ -36,7 +36,12 @@ struct CellLattice2D {
     std::vector<double> sigma_t; // nx * ny, cell (i, j) at i + nx j
     int source_i = 3, source_j = 3;
     double q0 = 1;
-    int phi_order = 8, theta_order = 10; // Gauss points per piece
+    // Gauss points per piece. With pruning the phi pieces are wide: 24 points give ~2e-6 relative over random (x, t)
+    // (tests/uncollided_lattice.cpp --prune-study; the unpruned 8-point rule had 1e-4 at 2x the cost).
+    int phi_order = 24, theta_order = 10;
+    // Pruning: only lattice corners before the entry into S are breakpoints (the others do not change the cells on
+    // [0, l_in]); times before the front reaches S give zero; rays with T_in > 40 are dropped (< e^-40 q0).
+    bool prune = true;
 
     double sigma(int i, int j) const { return sigma_t[std::size_t(i) + std::size_t(nx) * j]; }
 
@@ -97,7 +102,7 @@ struct CellLattice2D {
     // theta integral of one ray: (l_in, l_out, T_in) at time t.
     double theta_integral(double l_in, double l_out, double T_in, double sS, double t, const std::vector<double> &gx,
                           const std::vector<double> &gw) const {
-        if (t <= l_in)
+        if (t <= l_in || (prune && T_in > 40))
             return 0;
         const double h = .5 * pi;
         const double a1 = std::asin(std::min(1., l_in / t)), a2 = std::asin(std::min(1., l_out / t));
@@ -147,6 +152,11 @@ struct CellLattice2D {
         const double s0 = source_i, s1 = source_i + 1, r0 = source_j, r1 = source_j + 1;
         const double sS = sigma(source_i, source_j);
         const bool inside = x >= s0 && x <= s1 && y >= r0 && y <= r1;
+        if (prune) {
+            const double ex = std::max({s0 - x, 0., x - s1}), ey = std::max({r0 - y, 0., y - r1});
+            if (ex * ex + ey * ey >= t * t)
+                return 0; // the front has not reached S
+        }
         // Angular window [w0, w1] (radians) of directions d that hit S.
         double w0 = 0, w1 = 2 * pi, base = 0;
         if (!inside) {
@@ -173,9 +183,19 @@ struct CellLattice2D {
                 br.push_back(a);
         };
         for (int i = 0; i <= nx; ++i)
-            for (int j = 0; j <= ny; ++j)
-                if (double(i) != x || double(j) != y)
-                    add(std::atan2(j - y, i - x));
+            for (int j = 0; j <= ny; ++j) {
+                if (double(i) == x && double(j) == y)
+                    continue;
+                const bool corner_of_S = (i == source_i || i == source_i + 1) && (j == source_j || j == source_j + 1);
+                if (prune && !corner_of_S) {
+                    // Only corners strictly before the entry into S change the cells crossed on [0, l_in].
+                    const double vx = i - x, vy = j - y, r = std::hypot(vx, vy);
+                    double l_in, l_out;
+                    if (inside || !hit(x, y, vx / r, vy / r, l_in, l_out) || r >= l_in)
+                        continue;
+                }
+                add(std::atan2(j - y, i - x));
+            }
         // Circle of radius t around x against the four edges of S.
         auto circle = [&](double ax, double ay, double bx, double by) {
             const double ex = bx - ax, ey = by - ay, fx = ax - x, fy = ay - y;

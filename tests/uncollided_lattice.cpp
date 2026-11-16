@@ -3,8 +3,10 @@
 //   m1pn_uncollided_lattice_tests --full   adds the area-integral comparison and the balance check (minutes, threads)
 #include "benchmark_cases.hpp"
 #include "uncollided_lattice.hpp"
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <array>
 #include <cstdlib>
 #include <random>
 using namespace m1pn;
@@ -75,6 +77,30 @@ template <class F> static double domain_integral(const CellLattice2D &c, int sub
 int main(int argc, char **argv) {
     const bool full = argc > 1 && !std::strcmp(argv[1], "--full");
     CellLattice2D c = paul();
+    if (argc == 2 && !std::strcmp(argv[1], "--prune-study")) { // pruned breakpoints: phi order vs accuracy/time
+        std::mt19937 rng(11);
+        std::uniform_real_distribution<double> ux(0, 7), ut(0, 3.2);
+        std::vector<std::array<double, 3>> xs(2000);
+        for (auto &p : xs)
+            p = {ux(rng), ux(rng), ut(rng)};
+        CellLattice2D ref = c;
+        ref.prune = false, ref.phi_order = 16, ref.theta_order = 20;
+        std::vector<double> rv(xs.size());
+        for (std::size_t k = 0; k < xs.size(); ++k)
+            rv[k] = ref.density(xs[k][0], xs[k][1], xs[k][2]);
+        for (bool prune : {false, true})
+            for (int po : {8, 12, 16, 24}) {
+                CellLattice2D v = c;
+                v.prune = prune, v.phi_order = po;
+                double worst = 0;
+                auto s0 = std::chrono::steady_clock::now();
+                for (std::size_t k = 0; k < xs.size(); ++k)
+                    worst = std::max(worst, std::abs(v.density(xs[k][0], xs[k][1], xs[k][2]) - rv[k]) / (rv[k] + 1e-4));
+                const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
+                std::printf("prune %d phi %2d: max rel err %.2e  time %.3f s\n", int(prune), po, worst, sec);
+            }
+        return 0;
+    }
     if (argc == 5 && !std::strcmp(argv[1], "--orders")) { // quadrature study at one point: --orders x y t
         const double x = std::atof(argv[2]), y = std::atof(argv[3]), t = std::atof(argv[4]);
         for (int a : {8, 16, 32, 64})
@@ -97,14 +123,34 @@ int main(int argc, char **argv) {
     for (auto &p : pts)
         for (double t : {.7, 1.9, 3.2}) {
             CellLattice2D lo = c, hi = c;
-            hi.phi_order = 16, hi.theta_order = 20;
+            hi.phi_order = 32, hi.theta_order = 20;
             const double a = lo.density(p[0], p[1], t), b = hi.density(p[0], p[1], t);
             const double r = std::abs(a - b) / (b + 1e-5); // relative, absolute floor 1e-14
-            if (r > 1e-10)
+            if (r > 1e-7)
                 std::printf("   x = (%.2f, %.2f), t = %.1f: %.12e vs %.12e (%.1e)\n", p[0], p[1], t, a, b, r);
             worst = std::max(worst, r);
         }
-    check(worst < 1e-9, "default vs high-order quadrature (rel., floor 1e-14)", worst);
+    check(worst < 1e-5, "default vs phi 32 / theta 20 (rel., floor 1e-14)", worst);
+    // 2b. Pruning (corners behind the entry, early zero, T_in cutoff) against the full breakpoint set.
+    {
+        std::mt19937 rng(3);
+        std::uniform_real_distribution<double> ux(0, 7), ut(0, 3.2);
+        CellLattice2D full = c;
+        full.prune = false, full.phi_order = 16, full.theta_order = 20;
+        double worst = 0, t_full = 0, t_prune = 0;
+        for (int k = 0; k < 400; ++k) {
+            const double x = ux(rng), y = ux(rng), t = ut(rng);
+            auto s0 = std::chrono::steady_clock::now();
+            const double a = full.density(x, y, t);
+            auto s1 = std::chrono::steady_clock::now();
+            const double b = c.density(x, y, t);
+            auto s2 = std::chrono::steady_clock::now();
+            t_full += std::chrono::duration<double>(s1 - s0).count(), t_prune += std::chrono::duration<double>(s2 - s1).count();
+            worst = std::max(worst, std::abs(a - b) / (a + 1e-4)); // relative, absolute floor 1e-16
+        }
+        std::printf("   400 random (x, t): full %.3f s, pruned %.3f s (%.1fx)\n", t_full, t_prune, t_full / t_prune);
+        check(worst < 1e-5, "pruned (phi 24) vs all corners (phi 16) (rel., floor 1e-16)", worst);
+    }
     // 3. Zero before arrival, nonnegative.
     check(c.density(0.2, 0.2, 2.5) == 0, "corner (0.2, 0.2) before arrival (dist 3.96)", c.density(0.2, 0.2, 2.5));
     // 4. Time table: cubic interpolation against direct evaluation.

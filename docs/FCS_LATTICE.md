@@ -21,14 +21,20 @@ e^{−T_in/μ} μ/σ_S (1 − e^{−σ_S L/μ}), L = min(l_out, tμ) − l_in.
 
 **Quadratur.** φ über das Fenster, in dem S von x aus sichtbar ist, geteilt an den Winkeln aller Gitterecken
 (konstante Zellfolge) und an den Schnittpunkten des Kreises vom Radius t mit dem Rand von S (l_in = t bzw. l_out = t);
-auf jedem Stück Gauß-Legendre (8) nach der Substitution φ = a + (c − a)(3s² − 2s³), die das (t − l_in)^{3/2}-Verhalten
+auf jedem Stück Gauß-Legendre nach der Substitution φ = a + (c − a)(3s² − 2s³), die das (t − l_in)^{3/2}-Verhalten
 an den Frontpunkten glättet. θ geteilt bei μ = l_in/t und l_out/t, dazu geometrische Panels lo·2^k (Randschicht von
-e^{−l/μ}), je 10 Gauß-Punkte. Relativer Quadraturfehler < 1e-9.
+e^{−l/μ}), je 10 Gauß-Punkte.
+
+**Pruning (16.11.):** Nur Gitterecken vor dem Eintritt in S sind Bruchstellen (die übrigen ändern die Zellen auf
+[0, l_in] nicht); dafür 24 statt 8 Punkte je φ-Stück. Über 2000 zufällige (x, t) gegen die Referenz ohne Pruning
+(16/20 Punkte): alle Ecken mit 8 Punkten 1.0e-4 relativ in 0.083 s, Pruning mit 24 Punkten 1.7e-6 in 0.040 s
+(`--prune-study`; die frühere Angabe < 1e-9 galt nur für die festen Testpunkte). Tabelle 56²: 15.5 s → 5.5 s,
+Summen ändern sich um ≤ 1e-7 relativ.
 
 **Zeittabelle.** ρ_u an den FCS-Quadraturpunkten (Gauß p+1 je Richtung und Element, exakt für ∫φ_i) für
 t_m = 0.01 m, kubisch interpoliert (Fehler ≤ 5e-6 absolut); Zeitintegral für die ungestoßene Absorption mit
 Simpson auf der Tabelle. Kosten ≈ 120 µs pro Punkt und Tabellenzeit auf einem Kern
-(56²: 16 s auf 32 Kernen, 224² ≈ 4 min, 448² ≈ 16 min).
+(vor dem Pruning; 56²: 16 s auf 32 Kernen, 448² ≈ 16 min; danach etwa 2.8x schneller).
 
 ## Tests (`tests/uncollided_lattice.cpp`, `--full` für 5 und 6)
 

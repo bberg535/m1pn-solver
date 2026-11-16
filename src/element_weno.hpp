@@ -134,6 +134,8 @@ struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
     double max_raw_zero_sum = 0, max_limited_zero_sum = 0;
     long limited_elements = 0, limited_boundary_nodes = 0, nudged_states = 0;
+    // Diagnostics: rate() calls and those in which no element and no boundary node was limited.
+    long rate_calls = 0, unlimited_rate_calls = 0;
     // C1/C2 counters: outward-rounded base bars; boundary nodes whose correction was reduced by the sign condition.
     long outward_bars = 0, sign_limited_nodes = 0;
     double min_sign_factor = 1;

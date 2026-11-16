@@ -1957,7 +1957,12 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     {
         const LowOrderInputs inputs{&low, &low_flux, &closure, &moment_rate, &stabilization_low, &boundary_high,
                                     &boundary_low, &flux_area, &boundary_bar, &boundary_area, &boundary_inflow, &gamma};
+        const long before = stats ? stats->limited_elements + stats->limited_boundary_nodes : 0;
         load = limited_low_load(inputs, stats, debug ? &raw_load : nullptr);
+        if (stats) {
+            ++stats->rate_calls;
+            stats->unlimited_rate_calls += stats->limited_elements + stats->limited_boundary_nodes == before;
+        }
     }
     clock = seconds();
     parallel_for(nodes, [&](int i) {

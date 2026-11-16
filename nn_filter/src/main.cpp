@@ -1258,7 +1258,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
            << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
            << lattice_fcs_json
            << ",\"min_weno_gamma\":" << stats.min_gamma
-           << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements
+           << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << scheme.cells
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states
            << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
            << ",\"phase_seconds\":{\"closure\":" << stats.t_closure << ",\"weno\":" << stats.t_weno
