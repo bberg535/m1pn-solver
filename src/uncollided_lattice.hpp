@@ -39,7 +39,7 @@ struct CellLattice2D {
     double q0 = 1;
     // Gauss points per piece. With pruning the phi pieces are wide: 24 points give ~2e-6 relative over random (x, t)
     // (tests/uncollided_lattice.cpp --prune-study; the unpruned 8-point rule had 1e-4 at 2x the cost).
-    int phi_order = 24, theta_order = 10;
+    int phi_order = 24, theta_order = 6; // theta 6 = theta 10 within the phi error (--prune-study)
     // Pruning: only lattice corners before the entry into S are breakpoints (the others do not change the cells on
     // [0, l_in]); times before the front reaches S give zero; rays with T_in > 40 are dropped (< e^-40 q0).
     bool prune = true;

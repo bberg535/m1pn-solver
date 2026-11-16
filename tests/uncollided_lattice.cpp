@@ -89,15 +89,18 @@ int main(int argc, char **argv) {
         for (std::size_t k = 0; k < xs.size(); ++k)
             rv[k] = ref.density(xs[k][0], xs[k][1], xs[k][2]);
         for (bool prune : {false, true})
-            for (int po : {8, 12, 16, 24}) {
+            for (int po : {8, 12, 16, 24})
+                for (int to : {6, 8, 10}) {
+                if (!prune && to != 10)
+                    continue;
                 CellLattice2D v = c;
-                v.prune = prune, v.phi_order = po;
+                v.prune = prune, v.phi_order = po, v.theta_order = to;
                 double worst = 0;
                 auto s0 = std::chrono::steady_clock::now();
                 for (std::size_t k = 0; k < xs.size(); ++k)
                     worst = std::max(worst, std::abs(v.density(xs[k][0], xs[k][1], xs[k][2]) - rv[k]) / (rv[k] + 1e-4));
                 const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
-                std::printf("prune %d phi %2d: max rel err %.2e  time %.3f s\n", int(prune), po, worst, sec);
+                std::printf("prune %d phi %2d theta %2d: max rel err %.2e  time %.3f s\n", int(prune), po, to, worst, sec);
             }
         return 0;
     }
