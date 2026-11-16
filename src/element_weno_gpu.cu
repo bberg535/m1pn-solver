@@ -68,6 +68,7 @@ struct View {
     const double *ell_val; // dimension x q x flux_width
     const int *ell_idx;
     int flux_width;
+    bool flux_in_shared; // ELL table staged in shared memory (fits the default 48 KiB); else read from global
     int *closure_list, *limiter_list, *segment_list;
     double *seg_ubar, *seg_lim; // cells x 4 local: bar states and clipped contributions of queued elements
     DeviceCounters *counters;
@@ -729,6 +730,8 @@ struct FluxShared {
     }
 };
 __device__ FluxShared stage_flux(const View &v, double *shared) {
+    if (!v.flux_in_shared) // high PN orders (q > ~500 in 2D): read-only global loads (uniform branch)
+        return FluxShared{v.ell_val, v.ell_idx, v.q, v.flux_width};
     const int total = v.dimension * v.q * v.flux_width;
     double *val = shared;
     int *idx = reinterpret_cast<int *>(shared + total);
@@ -1278,6 +1281,7 @@ struct GhostView {
 };
 struct GhostDevice {
     GhostView g;
+    int warps = 4; // warps per block of k_ghost (dynamic shared memory: warps x max_points doubles)
     std::vector<void *> owned;
 };
 __device__ inline double warp_sum(double v) {
@@ -1607,6 +1611,20 @@ void ghost_setup(Context *ctx, const GhostSetup &s) {
         return p;
     };
     g.pairs = s.pairs, g.max_points = s.max_points, g.q = ctx->v.q;
+    {
+        // Dynamic shared memory of k_ghost: fewer warps per block for large rules, then the opt-in limit.
+        int device = 0, optin = 0;
+        CK(cudaGetDevice(&device));
+        CK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        const std::size_t per_warp = std::size_t(s.max_points) * sizeof(double);
+        while (gd->warps > 1 && gd->warps * per_warp > 48 * 1024)
+            gd->warps /= 2;
+        const std::size_t bytes = gd->warps * per_warp;
+        if (bytes > std::size_t(optin))
+            throw std::runtime_error("GPU ghost projection: rule too large for shared memory");
+        if (bytes > 48 * 1024)
+            CK(cudaFuncSetAttribute(k_ghost, cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes)));
+    }
     g.node = own(dcopy(s.node, std::size_t(s.pairs)));
     g.side = own(dcopy(s.side, std::size_t(s.pairs)));
     for (int sd = 0; sd < 6; ++sd) {
@@ -1647,9 +1665,10 @@ void ghost(Context *ctx, const double *state, double *pinned_moments, int *pinne
     CK(cudaEventRecord(ctx->events[3], 0));
     CK(cudaStreamWaitEvent(st, ctx->events[3], 0));
     CK(cudaMemsetAsync(&g.stats->flagged, 0, sizeof(int), st));
-    const int warps = 4;
+    const int warps = ctx->ghost->warps;
     k_ghost<<<(g.pairs + warps - 1) / warps, 32 * warps, std::size_t(warps) * g.max_points * sizeof(double), st>>>(
         ctx->v, g, state);
+    CK(cudaGetLastError());
     CK(cudaMemcpyAsync(pinned_moments, g.moments, std::size_t(g.pairs) * 4 * sizeof(double), cudaMemcpyDeviceToHost, st));
     CK(cudaMemcpyAsync(pinned_flags, &g.stats->flagged, sizeof(int), cudaMemcpyDeviceToHost, st));
     CK(cudaMemcpyAsync(pinned_flags + 1, g.flag_list, std::size_t(g.pairs) * sizeof(int), cudaMemcpyDeviceToHost, st));
@@ -1863,6 +1882,7 @@ Context *create(const Setup &s) {
                     ei[(std::size_t(d) * s.q + j) * width + w] = s.flux_inner[d][e];
                 }
         v.flux_width = width;
+        v.flux_in_shared = ev.size() * (sizeof(double) + sizeof(int)) <= 48 * 1024;
         v.ell_val = own(dcopy(ev.data(), ev.size()));
         v.ell_idx = own(dcopy(ei.data(), ei.size()));
     }
@@ -2053,6 +2073,8 @@ void mass_solve(Context *ctx, double *field) {
 }
 namespace {
 std::size_t flux_shared(Context *ctx) {
+    if (!ctx->v.flux_in_shared)
+        return 0;
     return std::size_t(ctx->v.dimension) * ctx->v.q * ctx->v.flux_width * (sizeof(double) + sizeof(int));
 }
 } // namespace
@@ -2121,6 +2143,7 @@ namespace {
 Counters convert(const DeviceCounters &d);
 }
 Counters counters(Context *ctx) {
+    CK(cudaGetLastError()); // launch failures (e.g. resource limits) since the last call
     DeviceCounters d;
     CK(cudaMemcpy(&d, ctx->v.counters, sizeof d, cudaMemcpyDeviceToHost));
     return convert(d);
@@ -2151,7 +2174,10 @@ Counters convert(const DeviceCounters &d) {
 void snapshot_counters(Context *ctx) {
     CK(cudaMemcpyAsync(ctx->pinned_counters, ctx->v.counters, sizeof(DeviceCounters), cudaMemcpyDeviceToHost, 0));
 }
-Counters snapshot(Context *ctx) { return convert(*ctx->pinned_counters); }
+Counters snapshot(Context *ctx) {
+    CK(cudaGetLastError());
+    return convert(*ctx->pinned_counters);
+}
 void reset_fallbacks(Context *ctx) {
     CK(cudaMemsetAsync(&ctx->v.counters->closure_fallbacks, 0, 3 * sizeof(int), 0));
 }
