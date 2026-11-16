@@ -3,6 +3,7 @@
 // translation unit src/element_weno_gpu.cpp can include it. All fields are row-major (rows x columns) device arrays.
 #include <cstddef>
 #include "uncollided_lattice_core.hpp"
+#include "uncollided_lattice3d_core.hpp"
 namespace m1pn {
 namespace gpu {
 constexpr int max_local = 27; // local nodes per element (Q1/Q2 in 3D, up to Q4 in 2D)
@@ -175,6 +176,9 @@ Ledger ledger(Context *); // cumulative (synchronous)
 // t_m = m dt, m = 0..M, built on the device with uncollided::lattice_density (view with host arrays; copied);
 // host_out (points x (M + 1)) receives a copy. react_lattice() then interpolates it at source_time.
 void lattice_table(Context *, const uncollided::LatticeView &host_view, int M, double dt, double *host_out);
+// lattice-3d: the same with uncollided::lattice3d_row, one thread per point (x, y, z: host arrays of the FCS points).
+void lattice3d_table(Context *, const uncollided::Lattice3dView &host_view, const double *x, const double *y,
+                     const double *z, int M, double dt, double *host_out);
 void react_lattice(Context *, double *state, double tau, double source_time);
 // Fallback lists (device index arrays; count from counters()).
 const int *closure_fallback_list(Context *);

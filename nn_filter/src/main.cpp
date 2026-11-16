@@ -5,6 +5,7 @@
 #include "filter.hpp"
 #include "uncollided.hpp"
 #include "uncollided_lattice.hpp"
+#include "uncollided_lattice3d.hpp"
 #ifdef M1PN_ELEMENT_GPU
 #include "element_weno_gpu.hpp"
 #endif
@@ -666,10 +667,43 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     uncollided::GaussianPulse pulse;
     // Lattice (docs/FCS_LATTICE.md): the whole source q0 = 1 on [3,4]^2 is uncollided (ray tracing through the
     // cells, tabulated in time at the FCS quadrature points); the grid gets sigma_s rho_u only.
-    const bool fcs_lattice = fcs && lattice2d;
+    // lattice-3d: the same with the 3D ray tracing over the visible faces of the source cell
+    // (src/uncollided_lattice3d_core.hpp); CPU only.
+    const bool fcs_lattice = fcs && (lattice2d || lattice3d);
     auto lattice_table = std::make_shared<uncollided::LatticeUncollidedTable>();
+    auto lattice3_table = std::make_shared<uncollided::Lattice3dUncollidedTable>();
+    // Table access for the summary (2D or 3D table).
+    auto table_value = [&](std::size_t k, double t) {
+        return lattice3d ? lattice3_table->value(k, t) : lattice_table->value(k, t);
+    };
+    auto table_integral = [&](std::size_t k, double t) {
+        return lattice3d ? lattice3_table->time_integral(k, t) : lattice_table->time_integral(k, t);
+    };
     std::function<void(double, const std::vector<V3> &, std::vector<double> &)> sample_uncollided;
-    if (fcs_lattice) {
+    if (fcs_lattice && lattice3d) {
+        lattice3_table->lattice = uncollided::lattice3d_cells([](int i, int j, int k) {
+            const V3 c(i + .5, j + .5, k + .5);
+            return cases::lattice3d_sigma_a(c) + cases::lattice3d_sigma_s(c);
+        });
+        material->source = [](const V3 &) { return 0.; };
+        material->name += ", source uncollided (FCS)";
+        const std::string from = "\"source\":1,";
+        const auto at = expected_integrals.find(from);
+        require(at != std::string::npos, "lattice-3d FCS: unexpected material integrals");
+        expected_integrals.replace(at, from.size(), "\"source\":0,");
+        lattice3_table->final_time = o.final_time;
+        eo.uncollided_lattice3d = lattice3_table;
+        eo.uncollided_density = [lattice3_table](double t, const std::vector<V3> &x, std::vector<double> &out) {
+            if (lattice3_table->points.empty())
+                lattice3_table->build(x, lattice3_table->final_time);
+            lattice3_table->density(t, x, out);
+        };
+        eo.uncollided_points = o.degree + 1;
+        sample_uncollided = [lattice3_table](double t, const std::vector<V3> &x, std::vector<double> &out) {
+            out.resize(x.size());
+            parallel_for(int(x.size()), [&](int k) { out[k] = lattice3_table->lattice.density(x[k], t); });
+        };
+    } else if (fcs_lattice) {
         lattice_table->lattice = uncollided::lattice_paul(cases::lattice_paul_absorber_cell);
         material->source = [](const V3 &) { return 0.; };
         material->name += ", source uncollided (FCS)";
@@ -1146,10 +1180,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         const auto &ws = scheme.fcs_weights();
         double mu = 0, ru = 0, au = 0;
         for (std::size_t k = 0; k < xs.size(); ++k) {
-            const double sa = material->sigma_a(xs[k]), r = lattice_table->value(k, t);
+            const double sa = material->sigma_a(xs[k]), r = table_value(k, t);
             mu += ws[k] * r, ru += ws[k] * sa * r;
             if (sa > 0)
-                au += ws[k] * sa * lattice_table->time_integral(k, t);
+                au += ws[k] * sa * table_integral(k, t);
         }
         mu *= domain_factor, ru *= domain_factor, au *= domain_factor;
         const double rc = absorption_rate(a);
@@ -1158,7 +1192,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
           << ",\"uncollided_absorption_rate_final\":" << ru << ",\"uncollided_absorbed\":" << au
           << ",\"total_mass_final\":" << final_mass + mu << ",\"total_absorption_rate_final\":" << rc + ru
           << ",\"total_absorbed\":" << absorbed + au << ",\"table_points\":" << xs.size()
-          << ",\"table_times\":" << lattice_table->M + 1 << ",\"table_seconds\":" << lattice_table->build_seconds << "}";
+          << ",\"table_times\":" << (lattice3d ? lattice3_table->M : lattice_table->M) + 1
+          << ",\"table_seconds\":" << (lattice3d ? lattice3_table->build_seconds : lattice_table->build_seconds) << "}";
         lattice_fcs_json = j.str();
     }
     const double balance_scale = std::max({std::abs(initial_mass), injected, absorbed, std::abs(outflow), 1e-300});

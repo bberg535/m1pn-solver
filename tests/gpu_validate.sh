@@ -77,6 +77,9 @@ pair latticefcs_56_P7   1e-8 --fcs-integrals $LAT --elements 56 --pn-order 7 --t
 pair lattice_56_P35     1e-8 - $LAT --elements 56 --pn-order 35 --time 0.2
 pair lattice3d_q2_14_P3 1e-8 - --case lattice-3d --dimension 3 --inflow vacuum --background 1e-10 --elements 14 \
      --degree 2 --pn-order 3 --time 0.1
+# lattice-3d FCS: time table built on the device (lattice3d_row), CPU builds it on the host.
+pair latticefcs3d_q1_28_P3 1e-8 --fcs-integrals --case lattice-3d --dimension 3 --inflow vacuum --background 1e-10 \
+     --elements 28 --degree 1 --pn-order 3 --time 0.5 --fcs analytic
 
 # Periodic meshes (cyclic line solve on the device): smooth transport with exact periodic data.
 PER="--case smooth --periodic --pn-order 7 --time .1"

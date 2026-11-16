@@ -1963,6 +1963,62 @@ void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, doubl
         CK(cudaMemcpy(host_out, table, total * sizeof(double), cudaMemcpyDeviceToHost));
     r.ltable = table, r.lM = M, r.ldt = dt;
 }
+__global__ void k_lattice3d_table(uncollided::Lattice3dView lv, const double *x, const double *y, const double *z,
+                                  std::size_t first, std::size_t count, int M, double dt, double *work,
+                                  double *table) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= count)
+        return;
+    const std::size_t k = first + t;
+    const double p[3] = {x[k], y[k], z[k]};
+    double dist = 0; // the front does not reach x within the table: row stays zero (as the host build)
+    for (int a = 0; a < 3; ++a) {
+        const double e = fmax(fmax(lv.s[a] - p[a], 0.), p[a] - lv.s[a] - 1);
+        dist += e * e;
+    }
+    if (sqrt(dist) >= M * dt) {
+        for (int m = 0; m <= M; ++m)
+            table[k * std::size_t(M + 1) + m] = 0;
+        return;
+    }
+    uncollided::lattice3d_row(lv, p, dt, M, work + t * 3 * std::size_t(M + 2), table + k * std::size_t(M + 1));
+}
+void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const double *hx, const double *hy,
+                     const double *hz, int M, double dt, double *host_out) {
+    ReactionDevice *rd = ctx->reaction;
+    ReactionView &r = rd->r;
+    const View &v = ctx->v;
+    if (!r.P)
+        throw std::runtime_error("lattice3d_table: no FCS points");
+    auto own = [&](auto *p) {
+        rd->owned.push_back((void *)p);
+        return p;
+    };
+    const std::size_t points = std::size_t(v.cells) * r.P, total = points * std::size_t(M + 1);
+    uncollided::Lattice3dView lv = hv; // device copies of the arrays
+    lv.sigma_t = own(dcopy(hv.sigma_t, std::size_t(hv.n[0]) * hv.n[1] * hv.n[2]));
+    lv.outer_x = own(dcopy(hv.outer_x, std::size_t(hv.outer_n)));
+    lv.outer_w = own(dcopy(hv.outer_w, std::size_t(hv.outer_n)));
+    lv.inner_x = own(dcopy(hv.inner_x, std::size_t(hv.inner_n)));
+    lv.inner_w = own(dcopy(hv.inner_w, std::size_t(hv.inner_n)));
+    double *dx = dcopy(hx, points), *dy = dcopy(hy, points), *dz = dcopy(hz, points);
+    double *table = own(dalloc<double>(total));
+    // Batches bound the work arrays (3 (M + 2) doubles per point); the per-thread break lists live in local memory.
+    const std::size_t batch = std::min<std::size_t>(points, 1 << 16);
+    double *work = dalloc<double>(batch * 3 * std::size_t(M + 2));
+    CK(cudaDeviceSetLimit(cudaLimitStackSize, 24 * 1024)); // two break lists of lattice3d_max_breaks doubles
+    for (std::size_t first = 0; first < points; first += batch) {
+        const std::size_t count = std::min(batch, points - first);
+        k_lattice3d_table<<<blocks(count, 64), 64>>>(lv, dx, dy, dz, first, count, M, dt, work, table);
+        CK(cudaGetLastError());
+    }
+    CK(cudaDeviceSynchronize());
+    CK(cudaFree(work));
+    CK(cudaFree(dx)), CK(cudaFree(dy)), CK(cudaFree(dz));
+    if (host_out)
+        CK(cudaMemcpy(host_out, table, total * sizeof(double), cudaMemcpyDeviceToHost));
+    r.ltable = table, r.lM = M, r.ldt = dt;
+}
 void react_lattice(Context *ctx, double *state, double tau, double source_time) {
     ReactionView &r = ctx->reaction->r;
     const View &v = ctx->v;

@@ -37,12 +37,13 @@ Erledigt (16.11.2026):
 - GPU mit Spiegelreduktion und periodischen Gittern (`c039a16`; `tests/gpu_validate.sh` 24/24, ≤ 4e-10); Spiegel auf
   der A100 1.8× (Lattice 224² P15) bis 3.0× (Line Source 512² P7).
 
+- Lattice-FCS für `lattice-3d` (CPU und GPU; docs/FCS_LATTICE.md, Abschnitt 3D; `tests/uncollided_lattice3d.cpp`).
+
+Zurückgestellt (Nutzer, 16.11.): MPI+GPU.
 Offen:
 - MPI im Element-WENO-Pfad von `m1pn_fast` (bisher nur ein Rang; MPI nur in `m1pn_element_weno` für Crossing und
   glatten Ausfluss). Voraussetzung für MPI + Lattice-FCS (Tabelle pro Rang) und für MPI+GPU in `m1pn_fast`.
-- MPI+GPU (für einen künftigen Cluster mit mehreren GPUs; tardis hat eine A100, also nur Funktionstest).
-- Lattice-FCS für `lattice-3d`: neue Quadratur (Winkelintegral über die sichtbaren Würfelflächen der Quellzelle,
-  Knicke an projizierten Voxelkanten); Verfahren mit dem Nutzer abstimmen.
+- MPI+GPU (zurückgestellt; für einen künftigen Cluster mit mehreren GPUs).
 
 ## Block 3 — zurückgestellt (Numerik fürs Paper)
 

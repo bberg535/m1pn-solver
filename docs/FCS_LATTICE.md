@@ -84,3 +84,59 @@ ohne Pruning). Abweichung gegen Schotthöfer/Hauck Tab. 1 / 2π (Masse / Absorpt
   Schritt N = 15 → 21 und bringt mehr (P15 mit FCS −0.13/+0.26 % gegen P21 ohne −0.17/+0.34 %); gegenüber einer
   Gitterverfeinerung (Faktor 3, ~8x Kosten) ist es der billigere Hebel.
 - Die Abweichungen nähern sich der Auflösung der Referenz (4 Stellen, S22, andere Anfangsdichte/Einstrom).
+
+## 3D: `lattice-3d` (16.11.2026, Branch `feature/combine-202611`)
+
+`m1pn_fast --case lattice-3d --fcs analytic` (CPU und `--gpu`). Quelle q0 = 1 auf der Zelle S = [3,4]³, σ_t
+zellweise (Absorber 10, Schicht k = 5 Streuung 5, sonst 1; `src/benchmark_cases.hpp`), Vakuum außerhalb von [0,7]³.
+
+**Formulierung** (`src/uncollided_lattice3d_core.hpp`, Host und Device):
+
+    ρ_u(x, t) = q0/(4π) ∫_{S²} e^{−τ_in(Ω)} (1 − e^{−σ_S L}) / σ_S dΩ,   L = min(s_out, t) − s_in > 0.
+
+Für x außerhalb von S wird über die von x aus sichtbaren Flächen F von S integriert (höchstens drei); der Strahl zum
+Flächenpunkt y tritt dort ein (s_in = |y − x|), dΩ = |n·(y − x)| / |y − x|³ dA. Liegt x in S, sind die sechs Flächen
+Austrittsflächen (s_in = τ_in = 0). τ_in durch Voxel-Traversierung (Amanatides–Woo), s_out durch den Slab-Test.
+
+**Quadratur.** Je Fläche iteriert Gauß (6 Punkte je Stück), außen u, innen v:
+- innen geteilt, wo der Strahl x → y(u, v) eine Gitterkantenlinie (achsenparallele Linie durch ganzzahlige
+  Koordinaten) vor seinem Austritt aus S trifft: dort ändert sich die Zellfolge vor S oder die Austrittsfläche;
+- außen geteilt an den Projektionen der Gitterecken und dort, wo projizierte Kantenlinien die Flächenränder v = v0, v1
+  kreuzen (sonst Sprung der zweiten Ableitung des inneren Integrals in u; ohne diese Teilung nur algebraische
+  Konvergenz, 1e-5);
+- jedes Stück zusätzlich in 8 × 8 gleiche Teile (Front s_in = t bzw. s_out = t: Knick, nicht ausgerichtet).
+
+Ohne Front in S ist die Regel auf 1e-10 bis 1e-15 genau (exponentielle Konvergenz in der Punktzahl); mit Front ≈ 1e-5
+relativ, direkt nach Ankunft der Front (ρ_u winzig) bis 1e-4. Etwa 5 ms je Punkt für eine ganze Zeittabelle.
+
+**Zeittabelle.** Je Strahl ist die Zeitabhängigkeit exakt (0 vor s_in, A(1 − e^{−σ_S(t − s_in)}) bis s_out, danach
+konstant); sie wird über drei Differenzfelder auf dem Gitter t_m = 0.01 m aufsummiert (`lattice3d_row`), also eine
+Auswertung je Punkt für alle Zeiten. Punkte, die die Front bis T nicht erreicht, bleiben null. Interpolation und
+Zeitintegral wie in 2D (`Lattice3dUncollidedTable`, `src/uncollided_lattice3d.hpp`).
+
+**Tests** (`tests/uncollided_lattice3d.cpp`, ctest; `--full` für 6 und 7):
+
+| Test | Ergebnis |
+|---|---|
+| 1. Quellmitte, t ≤ 0.5: ρ_u = 1 − e^{−t} | 9.5e-15 |
+| 2. homogen σ = 1, außerhalb S, gegen Volumenintegral über S (glatt) | 8.9e-15 |
+| 3. null vor Ankunft der Front | ok |
+| 4. Tabelle gegen direkte Auswertung an t_m / zwischen t_m (kubisch) | 1.5e-14 / 1.2e-5 |
+| 5. Standardregel gegen doppelte Teilung und 8 Punkte, 200 zufällige (x, t) | 2.6e-8 (relativ zum Maximum) |
+| 6. mit Absorbern gegen Volumenintegral, τ exakt über Ebenenschnitte (unabhängig von der Traversierung) | 5e-3 → 1e-3 → 1.9e-4 → 3.5e-5 bei sub 8 → 64 (zweite Ordnung der Referenz); ohne Absorber auf dem Weg 1e-15 |
+
+**GPU.** `--gpu` baut die Tabelle auf dem Gerät (`k_lattice3d_table`, ein Thread je Punkt, `lattice3d_row`); die
+Reaktion nutzt denselben Interpolationskern wie in 2D. CPU gegen GPU (`tests/gpu_validate.sh`, 28³, T = 0.5): Dichte
+1.1e-16, FCS-Integrale 1.1e-15.
+
+**Läufe** Q1, P3, T = 3.2, CFL 1 (NX-Sockel bzw. tardis), Summen gestoßen + ungestoßen:
+
+| Gitter | ohne FCS: Masse / Absorption / Rate | mit FCS | Tabelle CPU (NX, 32 Kerne) / GPU (A100) | Gesamt GPU |
+|---:|---|---|---:|---:|
+| 14³ | 0.2375 / 2.9620 / 0.9986 | 0.5150 / 2.1410 / 0.8125 | 2.4 s / – | – |
+| 28³ | 0.4057 / 2.7943 / 0.9981 | 0.5902 / 2.4354 / 0.9391 | 21.7 s / 7.4 s | 9.7 s |
+| 56³ | 0.5524 / 2.6476 / 0.9974 | 0.6489 / 2.5043 / 0.9812 | 169 s / 49 s | 55 s |
+
+Ungestoßene Masse bei T: 0.4230 / 0.4299 / 0.4325. Bilanz des gestoßenen Anteils ≤ 5e-12. Beide Varianten sind auf
+diesen Gittern noch nicht konvergiert (eine Quellzelle hat bei 14³ nur 2³ Elemente); die FCS-Summen ändern sich je
+Verdopplung um etwa die Hälfte weniger als ohne FCS. `lattice-3d` ist ein eigener Fall ohne Literaturreferenz.
