@@ -41,6 +41,7 @@ class ElementWenoMpi : public DistributedHooks {
     double sum(double local) const override;
     double min(double local) const override;
     double max(double local) const;
+    double ordered_sum(const std::vector<double> &owned) const override;
     int rank() const { return part_.rank; }
     int ranks() const { return part_.ranks; }
     long global_id(int local) const { return node_offset + local; }

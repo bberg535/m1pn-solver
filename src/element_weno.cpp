@@ -2215,6 +2215,27 @@ Field ElementWeno::linear_operator(const Field &x, double gamma_value) const {
     });
     return out;
 }
+double ElementWeno::layered_norm(const Field &f) const {
+    const int D = dimension - 1, s = stride(D), n = nodes_per_axis[D];
+    std::vector<double> layer(n, 0.);
+    parallel_for(n, [&](int k) {
+        double sum = 0;
+        for (int i = k * s; i < (k + 1) * s; ++i)
+            sum += f.row(i).squaredNorm();
+        layer[k] = sum;
+    });
+    if (dist_) {
+        std::vector<double> owned; // ownership is per layer along the slab axis
+        for (int k = 0; k < n; ++k)
+            if (is_owned(k * s))
+                owned.push_back(layer[k]);
+        return std::sqrt(dist_->ordered_sum(owned));
+    }
+    double total = 0;
+    for (int k = 0; k < n; ++k)
+        total += layer[k];
+    return std::sqrt(total);
+}
 double ElementWeno::operator_probe() const {
     std::mt19937 rng(4242);
     std::uniform_real_distribution<double> uniform(-1, 1);
@@ -2226,30 +2247,16 @@ double ElementWeno::operator_probe() const {
     } else
         distributed_random(x, rng, uniform);
     const Field y = linear_operator(x, .5);
-    if (!dist_)
-        return y.norm();
-    double s2 = 0;
-    for (int i = 0; i < nodes; ++i)
-        if (owned_[i])
-            s2 += y.row(i).squaredNorm();
-    return std::sqrt(dist_->sum(s2));
+    return layered_norm(y);
 }
 double ElementWeno::high_order_step() const {
     if (spectral_radius_ <= 0) {
         std::mt19937 rng(12345);
         std::uniform_real_distribution<double> uniform(-1, 1);
         double radius = 0;
-        // Distributed: the norms over the owned rows (global sums), the start vector of the same random sequence over
-        // the global node order (rank-independent; equal to serial up to the summation order of the norms).
-        auto norm = [&](const Field &f) {
-            if (!dist_)
-                return f.norm();
-            double s2 = 0;
-            for (int i = 0; i < nodes; ++i)
-                if (owned_[i])
-                    s2 += f.row(i).squaredNorm();
-            return std::sqrt(dist_->sum(s2));
-        };
+        // Norms in a fixed summation order (layered_norm) and the start vector of the same random sequence over the
+        // global node order: the estimate, and so dt, is bitwise independent of the MPI rank and thread count.
+        auto norm = [&](const Field &f) { return layered_norm(f); };
         for (double gamma_value : {0., 1.}) {
             Field x(nodes, moments);
             if (!dist_) {

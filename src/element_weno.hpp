@@ -190,6 +190,9 @@ struct DistributedHooks {
     }
     virtual double sum(double local) const = 0;
     virtual double min(double local) const = 0;
+    // Sum of the owned values of all ranks, sequentially in rank order (ranks own contiguous layers in global order):
+    // the result does not depend on the rank count.
+    virtual double ordered_sum(const std::vector<double> &owned) const = 0;
 };
 class ElementWeno {
     friend class ElementWenoMpi;
@@ -267,6 +270,10 @@ public:
     // identifies the operator (distributed: global norm, collective); set_spectral_radius installs a stored estimate
     // of the same operator, so high_order_step() returns the same value without the power iteration.
     double operator_probe() const;
+    // Euclidean norm of f in a fixed summation order: rows summed sequentially per layer along the last axis, layer sums
+    // added in global layer order. Bitwise independent of the MPI rank count and the thread count (used by the
+    // spectral estimate of high_order_step(), so that dt does not depend on the decomposition).
+    double layered_norm(const Field &f) const;
     void set_spectral_radius(double radius) const { spectral_radius_ = radius; }
     double spectral_radius() const { high_order_step(); return spectral_radius_; }
     // Step limit used by the drivers: min(realizability bound, high_order_step).

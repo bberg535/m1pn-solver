@@ -260,6 +260,20 @@ double ElementWenoMpi::min(double v) const {
     MPI_Allreduce(&v, &out, 1, MPI_DOUBLE, MPI_MIN, comm_);
     return out;
 }
+double ElementWenoMpi::ordered_sum(const std::vector<double> &owned) const {
+    const int P = part_.ranks;
+    int count = int(owned.size());
+    std::vector<int> counts(P), offsets(P + 1, 0);
+    MPI_Allgather(&count, 1, MPI_INT, counts.data(), 1, MPI_INT, comm_);
+    for (int r = 0; r < P; ++r)
+        offsets[r + 1] = offsets[r] + counts[r];
+    std::vector<double> all(offsets[P]);
+    MPI_Allgatherv(owned.data(), count, MPI_DOUBLE, all.data(), counts.data(), offsets.data(), MPI_DOUBLE, comm_);
+    double total = 0;
+    for (double v : all) // rank order = global layer order
+        total += v;
+    return total;
+}
 double ElementWenoMpi::max(double v) const {
     double out = 0;
     MPI_Allreduce(&v, &out, 1, MPI_DOUBLE, MPI_MAX, comm_);

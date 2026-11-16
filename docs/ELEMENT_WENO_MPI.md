@@ -242,9 +242,12 @@ Was dazu nötig war:
 
 **Genauigkeit** (`tests/fast_mpi_equivalence.sh`, NX, ein Knoten, 1/2/4 Ränge): Felder (`initial.csv`,
 `final.csv`, 3D-Schnitte) **bitgleich** für Crossing Q1, Crossing Q2 mit festem dt, Lattice ± FCS, Line Source mit
-FCS, Lattice 3D ± FCS, Shadow; Summen bis 1e-12 (Reduktionsreihenfolge). Mit `--dt 0` und aktiver Hochordnungsschranke
-(Q2 und höher) kann dt in den letzten Bits von der Rangzahl abhängen, weil die Normen der Potenziteration je Rang
-summiert werden (Crossing Q2 64²: dt relativ 3e-15, Dichte 1.2e-10). Bitgleich wird es mit festem `--dt`.
+FCS, Lattice 3D ± FCS, Shadow; Summen bis 1e-12 (Reduktionsreihenfolge). Auch mit `--dt 0` bei aktiver Hochordnungsschranke (Q2 und höher), seit
+die Potenziteration ihre Normen in fester Reihenfolge summiert (`ElementWeno::layered_norm`: je Schicht entlang der
+Zerlegungsachse sequentiell, Schichtsummen in globaler Reihenfolge, unter MPI per Allgatherv). Davor hing dt in den
+letzten Bits von der Rangzahl ab (Crossing Q2 64²: dt 3e-15, Dichte 1.2e-10). Seriell verschiebt die neue
+Summationsreihenfolge dt nur dort, wo die Hochordnungsschranke greift, in den letzten Bits (Lattice 3D Q2 28³: dt
+1.3e-15, Dichte 9e-11, Masse 6e-11 gegen `standard-20261116`); Q1-Fälle (Realisierbarkeitsschranke) bleiben bitgleich.
 
 **Seriell unverändert:** ein Rang gegen das Binary von `standard-20261116` (Job 160992): `final.csv`, Ledger und Masse
 bitgleich für Lattice ± FCS, Line Source mit FCS, Lattice 3D Q2 und Shadow.
