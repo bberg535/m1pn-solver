@@ -1,6 +1,7 @@
 # Offene Arbeit (Stand 16.11.2026)
 
-Basis: Branch `feature/combine-202611` (Worktree `.claude/worktrees/combine`), aufbauend auf Tag `standard-20261116`.
+Basis: Default-Branch `experiment/element-weno`, Tag `standard-20261116-ewonly` (gemergt aus `feature/combine-202611`,
+aufbauend auf Tag `standard-20261116`).
 Seit 16.11.2026 nur noch Element-WENO, ohne MFEM: Massenkorrektur, Biharmonik, NN-Filter und DLRA entfernt (letzter
 Stand mit ihnen: `standard-20261116`). Bauen: `bash scripts/build.sh` (NX, im Slurm-Job; UCX-OpenMPI), `GPU=1 bash
 scripts/build.sh tmp/build_gpu` (tardis). Cluster-Hinweise in `nx/README.md`.
@@ -9,7 +10,7 @@ scripts/build.sh tmp/build_gpu` (tardis). Cluster-Hinweise in `nx/README.md`.
 
 - Block 1: GPU-Validierung im Repo (`tests/gpu_validate.sh`), Kampagnenergebnisse versioniert (`results/`),
   tardis-Lattice-Kampagne ausgewertet (docs/TARDIS_RESULTS.md), Aufräumen (Worktrees, Rohdaten, alter Code).
-- Block 2: Element-WENO Default von `m1pn_fast` mit CFL 1 (CFL-Scan); GPU mit Spiegelreduktion und periodischen
+- Block 2 (abgeschlossen bis auf das zurückgestellte MPI+GPU): Element-WENO Default von `m1pn_fast` mit CFL 1 (CFL-Scan); GPU mit Spiegelreduktion und periodischen
   Gittern; Lattice-FCS für `lattice-3d` (CPU, GPU); MPI in `m1pn_fast` für alle Fälle, bitgleich zu einem Rang;
   reproduzierbare Normen in der Potenziteration (dt unabhängig von der Rangzahl); MFEM-frei, MPI über InfiniBand.
 

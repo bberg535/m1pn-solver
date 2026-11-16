@@ -4,7 +4,7 @@ Gekoppeltes M1PN-Modell (PN-Momente, M1-Kegel für die vier niedrigen Momente) m
 Tensor-Bernstein-Elementen Q_p, elementbasiertem Limiting, SSPRK(4,3) und momententreuer Positivitätsprojektion am Rand.
 CPU (OpenMP, MPI) und GPU (CUDA, A100). Kein MFEM.
 
-> **Stand:** Branch `feature/combine-202611` (16.11.2026), aufbauend auf `standard-20261116`. Massenkorrektur,
+> **Stand:** Default-Branch `experiment/element-weno`, Tag `standard-20261116-ewonly` (16.11.2026). Massenkorrektur,
 > Biharmonik, NN-Filter und DLRA sind entfernt; ihr letzter Stand ist der Tag `standard-20261116`.
 
 ## Programme
