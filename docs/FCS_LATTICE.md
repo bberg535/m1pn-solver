@@ -65,4 +65,22 @@ Erster Lauf Q1 56², P7, T = 3.2 (Abweichung gegen Schotthöfer/Hauck Tab. 1 / 2
 ## Studie
 
 `scripts/element_weno/lattice_fcs_study.py` (NX, CPU, eine Aufgabe = ein Sockel): Q1 56²-448², N = 3, 7, 15, 21
-(35 auf 112², 224²), jeweils mit und ohne FCS; Kampagne `nx/tmp/lattice_fcs`. Ergebnisse folgen.
+(35 auf 112², 224²), jeweils mit und ohne FCS; Kampagne `nx/tmp/lattice_fcs` (`REPORT.md`, `results.csv`; Tabelle noch
+ohne Pruning). Abweichung gegen Schotthöfer/Hauck Tab. 1 / 2π (Masse / Absorption gesamt / Rate):
+
+| N | 448² ohne FCS | 448² mit FCS | Laufzeit ohne / mit (s) |
+|---:|---|---|---|
+| 3 | −2.24 / +4.20 / +6.36 % | −1.23 / +2.30 / +3.60 % | 252 / 1142 |
+| 7 | −0.61 / +1.16 / +1.05 % | −0.36 / +0.67 / +0.81 % | 305 / 1218 |
+| 15 | −0.22 / +0.43 / +0.40 % | −0.13 / +0.26 / +0.29 % | 754 / 1563 |
+| 21 | −0.17 / +0.34 / +0.28 % | −0.10 / +0.20 / +0.20 % | 1148 / 2006 |
+
+- FCS verkleinert Masse- und Absorptionsabweichung auf allen Gittern und für alle N um etwa den Faktor 1.7
+  (Rate 1.2-1.8), nicht um eine Größenordnung wie beim Line Source.
+- Ab N = 15 ändert sich bei festem Gitter kaum noch etwas (224²: N = 15/21/35 gleich bis 0.02 %): der Rest ist
+  Raumfehler, er fällt pro Gitterverdopplung etwa um den Faktor 3. FCS wirkt deshalb vor allem auf den Raumfehler
+  (das steile ungestoßene Feld wird nicht auf dem Gitter transportiert).
+- Kosten: die Tabelle dominierte (448²: 896 s); mit Pruning ≈ 320 s. Damit kostet FCS bei 448² etwa so viel wie der
+  Schritt N = 15 → 21 und bringt mehr (P15 mit FCS −0.13/+0.26 % gegen P21 ohne −0.17/+0.34 %); gegenüber einer
+  Gitterverfeinerung (Faktor 3, ~8x Kosten) ist es der billigere Hebel.
+- Die Abweichungen nähern sich der Auflösung der Referenz (4 Stellen, S22, andere Anfangsdichte/Einstrom).
