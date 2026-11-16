@@ -41,6 +41,10 @@ struct ElementWenoOptions {
     double positivity_fraction = 1e-3; // epsilon of report (25)
     double element_theta = .999;       // theta of report Section 6.2
     double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
+    // Study variants of the sensor at the rounding limit (docs/ELEMENT_WENO.md; CPU only, default off = bitwise the
+    // standard): soft threshold ratio -> max(0, ratio - d) / (1 - d), and a floor of the sensor denominator
+    // |u|_e -> max(|u|_e, f max_i |u_i|) with u_i the density coefficients of the element.
+    double weno_deadband = 0, weno_floor = 0;
     double viscosity_scale = 1;
     // Boundary/sensor corrections of docs/BOUNDARY_FIXES.md. All false reproduces commit 8efe517 bit for bit.
     bool vacuum_sign_limit = true;      // C2: accepted boundary mass rate may not exceed max(low-order rate, kinetic inflow)

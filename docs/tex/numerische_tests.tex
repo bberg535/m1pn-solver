@@ -32,6 +32,15 @@ Masse und der WENO-Stabilisierung nach \cite{kuzmin_hajduk_vedral_2025}; die Mom
 erster Ordnung werden elementweise gegen ein M1-Verfahren niedriger Ordnung mit Bar-States
 \cite{moujaes_2025} begrenzt. Absorption, Streuung und Quellen werden knotenweise exakt integriert
 und per Strang-Splitting angekoppelt. Zeitintegration ist SSPRK(4,3) mit $\mathrm{CFL}=0.2$.
+Mit nicht kommutierender Reaktion ist das Verfahren damit zweiter Ordnung in der Zeit (beobachtet
+2.0--2.2); der Zeitfehler liegt bei $\mathrm{CFL}=1$ zwei bis drei Größenordnungen unter dem
+Ortsfehler derselben Rechnung (2D-Lattice $Q_1/112$, $P_7$: $8\cdot10^{-5}$ relativ in der Masse gegen
+$1.9\,\%$ Ortsfehler), eine höhere Splitting-Ordnung ist daher nicht nötig.
+Der WENO-Sensor $1-\gamma_e=r_e^q$ mit $q=1$ ist in $r_e=0$ nicht differenzierbar; an glatten Extrema
+auf feinen Gittern koppelt er über die Stabilisierung Rundungsfehler zurück (glatter periodischer
+Test: $Q_4$ ab $256$ Elementen Fehler $5\cdot10^{-8}$ statt $10^{-13}$, $Q_1$ und $Q_3$ verlieren
+etwas Ordnung). Mit $q=3$ verschwindet der Effekt; wir behalten $q=1$, da er die Tests mit
+Unstetigkeiten nicht berührt.
 Materialkoeffizienten werden nodal gemittelt,
 $\sigma_i=\int\sigma\varphi_i\,dx\big/\int\varphi_i\,dx$.
 
@@ -210,6 +219,15 @@ Absorptionsrate $R(T)$ (QoI-3) zusammen.
   \label{tab:lattice:lit}
 \end{table}
 
+Zur Kontrolle der Referenz selbst haben wir eine eigene Monte-Carlo-Rechnung durchgeführt
+(Transport mit Geschwindigkeit 1, exakte Zellgeometrie, implizites Einfangen, $4\cdot10^{10}$
+Historien, statistischer Fehler $\approx10^{-5}$ relativ; validiert am ungestoßenen Anteil gegen
+dessen Strahlintegral). Sie ergibt $M(T)=2.080890$, $A=1.119098$ und $R(T)=0.731555$ (in
+Einheiten von $\rho$, also Tabelle~1 aus \cite{schotthoefer_hauck_2025} geteilt durch $2\pi$). Die
+Literaturwerte weichen davon um $-0.033\,\%$, $+0.036\,\%$ und $+0.006\,\%$ ab, also innerhalb ihrer
+vier Stellen. Die Abweichungen in Tabelle~\ref{tab:lattice} verschieben sich gegen Monte Carlo
+entsprechend um höchstens $0.04$ Prozentpunkte; die Aussagen bleiben unverändert.
+
 Ein $P_{11}$-Lauf auf $225^2$ Kontrollpunkten erreicht damit die Genauigkeit eines auf die
 Referenz trainierten neuronalen Surrogats und ist deutlich genauer als die niedrig aufgelöste
 $S_N$-Rechnung in \cite{gonzales_2026}. Zwei weitere Arbeiten untersuchen verwandte Lattice-Probleme,
@@ -319,7 +337,7 @@ geprüft ist das nicht.
 
 \subsection{Definition}
 
-Als eigene Erweiterung ohne Literaturreferenz verwenden wir $D=(0,7)^3$ mit Einheitszellen
+Als eigene Erweiterung ohne Literaturreferenz (Referenz: eigene Monte-Carlo-Rechnung, siehe unten) verwenden wir $D=(0,7)^3$ mit Einheitszellen
 $C_{ijk}=[i,i+1]\times[j,j+1]\times[k,k+1]$. Die Absorberzellen sind
 \[
   \mathcal A=\bigl\{(i,j,k)\in\{1,\dots,5\}^3:\ i+j+k\ \text{gerade}\bigr\}\setminus\{(4,2,2)\}
@@ -366,6 +384,12 @@ Masse bei $T$ ändert sich zwischen den Auflösungen aber noch um 20 bis 50\,\%
 Ortsfehler dominiert also vollständig. Für quantitative Aussagen sind Gitter mit mindestens acht
 Zellen pro Materialwürfel nötig. Der Test dient hier als Robustheits- und Bilanztest in drei
 Dimensionen.
+
+Die Monte-Carlo-Referenz (wie im 2D-Fall, $4\cdot10^{10}$ Historien) ergibt $M(T)=0.702146$,
+$A=2.497854$ und $R(T)=0.993430$ mit statistischen Fehlern um $10^{-5}$. Gegen sie liegt die Masse
+für $Q_1$ und $P_7$ auf $28^3$, $56^3$ und $112^3$ Elementen bei $-42\,\%$, $-20\,\%$ und $-8.9\,\%$;
+der Fehler halbiert sich je Verdopplung (erste Ordnung), die Rate bei $T$ liegt bereits unter
+$0.6\,\%$. Mit First-Collision-Source sinkt der Massenfehler auf $56^3$ ($P_3$) auf $-7.6\,\%$.
 
 \section{Shadow-Test (archiviert)}
 \label{sec:tests:shadow}
@@ -451,7 +475,7 @@ Offen sind:
   \item ein Strahltest mit Streuung und kinetischer Referenz anstelle des Shadow-Tests;
   \item der 1D-Plane-Source-Test gegen die analytische Lösung, für den
         \cite{schneider_leibner_2022} Fehlerkurven verschiedener Momentenmodelle liefert;
-  \item der 3D-Lattice auf feineren Gittern;
+  \item der 3D-Lattice auf feineren Gittern (Referenz liegt jetzt vor);
   \item die Wiederholung der Line Source mit dem aktuellen Stand und angepasster Filterstärke für
         $P_{11}$.
 \end{itemize}

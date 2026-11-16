@@ -247,7 +247,7 @@ Aufweitung des Strahls dominiert und ist auf diesen Gittern noch kein Konvergenz
   Ordnung). Ein quantitativer Vergleich ist nicht möglich (anderes Winkelmodell, Strahlprofil unbekannt) und wird
   nicht behauptet.
 
-## 8. Eigener 3D-Lattice (keine Literaturreferenz)
+## 8. Eigener 3D-Lattice (keine Literaturreferenz; Monte-Carlo-Referenz in LATTICE_MC.md)
 
 D = (0,7)³, Zellen C_ijk = [i,i+1]×[j,j+1]×[k,k+1]:
 

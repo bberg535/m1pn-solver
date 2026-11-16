@@ -1207,6 +1207,8 @@ Vec ElementWeno::weno_gamma(const Field &a) const {
         const double scale = norm(candidates.col(0));
         if (!(scale > 0))
             return;
+        const double denominator =
+            options.weno_floor > 0 ? std::max(scale, options.weno_floor * candidates.col(0).cwiseAbs().maxCoeff()) : scale;
         int m = 0;
         for (int d = 0; d < dimension; ++d)
             for (int side = 0; side < 2; ++side) {
@@ -1234,7 +1236,9 @@ Vec ElementWeno::weno_gamma(const Field &a) const {
         for (int l = 0; l <= m; ++l)
             star += weights[l] * candidates.col(l);
         other = candidates.col(0) - star;
-        const double ratio = std::min(1., norm(other) / scale);
+        double ratio = std::min(1., norm(other) / denominator);
+        if (options.weno_deadband > 0)
+            ratio = std::max(0., ratio - options.weno_deadband) / (1 - options.weno_deadband);
         gamma[e] = 1 - (options.weno_q == 1 ? ratio : std::pow(ratio, options.weno_q));
     });
     return gamma;
