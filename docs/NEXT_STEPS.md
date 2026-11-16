@@ -22,7 +22,10 @@ NX per Slurm (`--partition=long --constraint=nx`; Login-Knoten hat 1 Kern; NFS-Z
    `python3 tardis.py collect --campaign ...`), Konvergenz in N (7–45) und Gitter (224²–896²) gegen
    Schotthöfer/Hauck; in docs/TARDIS_RESULTS.md ergänzen. Beachten: `config.json` der Kampagnen hat `"rk":3` auch
    bei SSPRK(4,3) (Metadatenfehler, behoben in 3402f86; `time_integrator` stimmt).
-4. **Aufräumen** (offen: Bestandsaufnahme liegt vor, wartet auf Entscheidung des Nutzers; mit dem Nutzer abstimmen, nichts ungefragt löschen): Worktrees/Branches, die vollständig in
+4. **Aufräumen** (teilweise erledigt 16.11.: Worktrees gpu-a100, gpu-projection, lattice-fcs, positivity-projection,
+   element-weno-fcs, element-weno-hetero3d, element-weno-ssp43 entfernt, Branches bleiben; deren `nx/tmp` und
+   Nicht-Build-Inhalte von `tmp/` liegen in `<Haupt-Checkout>/nx/tmp/archive_worktrees_20261116/<name>/` (INDEX.txt).
+   Offen: Rohdaten element-weno-mpi, gpu-campaign bleibt. Ursprünglicher Auftrag: mit dem Nutzer abstimmen, nichts ungefragt löschen): Worktrees/Branches, die vollständig in
    standard-20261116 enthalten sind (gpu-a100, gpu-projection, gpu-campaign, lattice-fcs, element-weno-mpi,
    positivity-projection, element-weno-fcs, hetero3d, ssp43 …); ungetrackte Logs im Haupt-Checkout.
 

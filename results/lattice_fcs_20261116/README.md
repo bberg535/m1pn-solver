@@ -1,6 +1,6 @@
 # Ergebnisse: Lattice mit und ohne First-Collision-Source (NX, CPU), 16.11.2026
 
-Methode: [docs/FCS_LATTICE.md](../../docs/FCS_LATTICE.md). Kampagne `.claude/worktrees/lattice-fcs/nx/tmp/lattice_fcs`
+Methode: [docs/FCS_LATTICE.md](../../docs/FCS_LATTICE.md). Kampagne `nx/tmp/archive_worktrees_20261116/lattice-fcs/nx_tmp/lattice_fcs` im Haupt-Checkout
 (nicht versioniert; Studienskript `scripts/element_weno/lattice_fcs_study.py`), Branch `experimental/lattice-fcs`
 (`f68a994`, im Systemstand standard-20261116 enthalten). Q1, 56²–448², N = 3, 7, 15, 21 (35 auf 112², 224²), je mit und
 ohne FCS, ein Sockel (32 Kerne) je Lauf.
