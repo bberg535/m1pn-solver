@@ -8,13 +8,13 @@ L2 der Dichte; „kinetisch" enthält den PN-Abschneidefehler, „Selbstdifferen
 
 | Kampagne | fertig | Laufzeit (Summe, eine A100) | Bemerkung |
 |---|---|---|---|
-| paper | 198 / 201 | 4.2 h | Ablation ohne Limiter scheitert (Kegel verlassen, erwarteter Befund); Crossing Q1 2048² P3/P7 laufen nach (Job 160772) |
+| paper | 198 / 201 | 4.2 h | Ablation ohne Limiter scheitert (Kegel verlassen, erwarteter Befund); Crossing Q1 2048² P3/P7 verworfen (nicht nachgerechnet) |
 | fcs | 60 / 60 | 2.2 h | |
 | hetero | 61 / 61 | 0.95 h | |
 
 2048²: erster Versuch an der festen Fallback-Liste (2^16) gescheitert, behoben in `28d07a0` (keine numerische Änderung,
 Manifest-Nachtrag, altes Binary `bin/fast.pre-capacity`); zweiter Versuch am geschätzten Timeout (P7 bis T = 0.23 in
-3.6 h, P3 bis T = 0.03 in 1.2 h, Host-Fallbacks). Gescheiterte Versuche in `status_failed_{capacity,timeout}/`.
+3.6 h, P3 bis T = 0.03 in 1.2 h, Host-Fallbacks); danach verworfen. Gescheiterte Versuche in `status_failed_{capacity,timeout}/`.
 
 ## Konvergenz
 
