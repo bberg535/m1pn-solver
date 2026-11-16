@@ -11,6 +11,7 @@ struct Context;
 }
 namespace uncollided {
 struct GaussianPulse;
+struct LatticeUncollidedTable;
 }
 class ElementWenoGpu {
 public:
@@ -79,6 +80,7 @@ private:
     double *u_ = nullptr, *b1_ = nullptr, *b2_ = nullptr; // device state and stage buffers
     const uncollided::GaussianPulse *pulse_ = nullptr;    // FCS: analytic uncollided pulse
     std::vector<double> table_;
+    uncollided::LatticeUncollidedTable *lattice_ = nullptr; // FCS: lattice time table (device copy in the context)
     gpu::Counters merged_;
     double ledger_absorbed_ = 0, ledger_injected_ = 0;
     void react(double tau, double source_time, ElementWenoStats &stats);

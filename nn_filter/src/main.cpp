@@ -691,10 +691,11 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         material->source = [](const V3 &) { return 0.; };
         material->name += ", source uncollided (FCS)";
         expected_integrals = "{\"volume\":49,\"source\":0,\"sigma_a\":110,\"sigma_s\":38}";
-        const double final_time = o.final_time;
-        eo.uncollided_density = [lattice_table, final_time](double t, const std::vector<V3> &x, std::vector<double> &out) {
+        lattice_table->final_time = o.final_time;
+        eo.uncollided_lattice = lattice_table;
+        eo.uncollided_density = [lattice_table](double t, const std::vector<V3> &x, std::vector<double> &out) {
             if (lattice_table->points.empty())
-                lattice_table->build(x, final_time);
+                lattice_table->build(x, lattice_table->final_time);
             lattice_table->density(t, x, out);
         };
         eo.uncollided_points = o.degree + 1; // exact for int phi_i; the table cost scales with the point count

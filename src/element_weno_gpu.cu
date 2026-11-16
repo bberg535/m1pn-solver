@@ -1697,6 +1697,9 @@ struct ReactionView {
     double *local;  // cells x local
     double *fcs;    // nodes
     double *table;  // FCS radial table
+    const double *ltable; // lattice FCS: points x (lM + 1) time table (device)
+    int lM;
+    double ldt;
     double *ledger; // absorbed, injected
 };
 struct ReactionDevice {
@@ -1718,6 +1721,33 @@ __global__ void k_fcs_points(View v, ReactionView r, int n, double dr, double cx
         rho = fmax(val, 0.);
     }
     r.q[t] = r.fw[t] * r.fss[t] * rho;
+}
+// Lattice FCS: rho_u at the FCS points by cubic interpolation in time (same formula as LatticeUncollidedTable::value).
+__global__ void k_fcs_points_lattice(View v, ReactionView r, double time) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(v.cells) * r.P)
+        return;
+    double rho = 0;
+    if (time > 0) {
+        const double s = time / r.ldt;
+        int i = int(s);
+        if (i > r.lM - 2)
+            i = r.lM - 2; // the host table checks the range; the driver never asks beyond final_time
+        const double f = s - i, *row = r.ltable + t * std::size_t(r.lM + 1);
+        const double p1 = row[i], p2 = row[i + 1], p3 = row[i + 2], p0 = i > 0 ? row[i - 1] : 2 * p1 - p2;
+        const double val = p1 + .5 * f * (p2 - p0 + f * (2 * p0 - 5 * p1 + 4 * p2 - p3 + f * (3 * (p1 - p2) + p3 - p0)));
+        rho = fmax(val, 0.);
+    }
+    r.q[t] = r.fw[t] * r.fss[t] * rho;
+}
+__global__ void k_lattice_table(uncollided::LatticeView lv, const double *x, const double *y, std::size_t points, int M,
+                                double dt, double *table) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= points * std::size_t(M + 1))
+        return;
+    const std::size_t k = t / (M + 1);
+    const int m = int(t % (M + 1));
+    table[t] = m == 0 ? 0. : uncollided::lattice_density(lv, x[k], y[k], m * dt);
 }
 __global__ void k_fcs_element(View v, ReactionView r) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1786,6 +1816,7 @@ void reaction_setup(Context *ctx, const ReactionSetup &s) {
     } else
         r.fx = r.fy = r.fw = r.fss = r.fshape = r.fmass = nullptr, r.q = r.local = r.fcs = nullptr;
     r.table = nullptr;
+    r.ltable = nullptr, r.lM = 0, r.ldt = 0;
     r.ledger = own(dalloc<double>(2));
     ctx->reaction = rd;
 }
@@ -1806,6 +1837,40 @@ void react(Context *ctx, double *state, double tau, const double *host_table, in
         k_fcs_gather<<<blocks(v.nodes), 256>>>(v, r);
     }
     k_react<<<blocks(v.nodes), 256>>>(v, r, state, tau, fcs);
+    k_admissible<<<blocks(v.nodes), 256>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
+}
+void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, double dt, double *host_out) {
+    ReactionDevice *rd = ctx->reaction;
+    ReactionView &r = rd->r;
+    const View &v = ctx->v;
+    if (!r.P)
+        throw std::runtime_error("lattice_table: no FCS points");
+    auto own = [&](auto *p) {
+        rd->owned.push_back((void *)p);
+        return p;
+    };
+    uncollided::LatticeView lv = hv; // device copies of the arrays
+    lv.sigma_t = own(dcopy(hv.sigma_t, std::size_t(hv.nx) * hv.ny));
+    lv.phi_x = own(dcopy(hv.phi_x, std::size_t(hv.phi_n))), lv.phi_w = own(dcopy(hv.phi_w, std::size_t(hv.phi_n)));
+    lv.theta_x = own(dcopy(hv.theta_x, std::size_t(hv.theta_n)));
+    lv.theta_w = own(dcopy(hv.theta_w, std::size_t(hv.theta_n)));
+    const std::size_t points = std::size_t(v.cells) * r.P, total = points * std::size_t(M + 1);
+    double *table = own(dalloc<double>(total));
+    k_lattice_table<<<blocks(total, 128), 128>>>(lv, r.fx, r.fy, points, M, dt, table);
+    CK(cudaGetLastError());
+    if (host_out)
+        CK(cudaMemcpy(host_out, table, total * sizeof(double), cudaMemcpyDeviceToHost));
+    r.ltable = table, r.lM = M, r.ldt = dt;
+}
+void react_lattice(Context *ctx, double *state, double tau, double source_time) {
+    ReactionView &r = ctx->reaction->r;
+    const View &v = ctx->v;
+    if (!r.ltable)
+        throw std::runtime_error("react_lattice: no lattice table");
+    k_fcs_points_lattice<<<blocks(std::size_t(v.cells) * r.P), 256>>>(v, r, source_time);
+    k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256>>>(v, r);
+    k_fcs_gather<<<blocks(v.nodes), 256>>>(v, r);
+    k_react<<<blocks(v.nodes), 256>>>(v, r, state, tau, true);
     k_admissible<<<blocks(v.nodes), 256>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
 }
 Ledger ledger(Context *ctx) {

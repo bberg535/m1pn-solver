@@ -19,6 +19,7 @@
 namespace m1pn {
 namespace uncollided {
 struct GaussianPulse;
+struct LatticeUncollidedTable;
 }
 // Space-dependent isotropic reaction data (docs/ELEMENT_HETEROGENEOUS.md). sigma_a, sigma_s >= 0 in 1/length,
 // source = isotropic particle density rate q0(x) >= 0 (units of rho per time; PN coefficient q0 / sqrt(4 pi)).
@@ -96,6 +97,9 @@ struct ElementWenoOptions {
     std::function<void(double, const std::vector<V3> &, std::vector<double> &)> uncollided_density;
     // The same analytic pulse as an object (GPU path: the device evaluates its radial table, src/element_weno_gpu.cpp).
     std::shared_ptr<const uncollided::GaussianPulse> uncollided_pulse;
+    // Lattice FCS (docs/FCS_LATTICE.md): the time table of rho_u at the FCS points; the GPU path builds it on the
+    // device and fills the host copy.
+    std::shared_ptr<uncollided::LatticeUncollidedTable> uncollided_lattice;
     int uncollided_points = 0;
     // Moment-preserving positivity projection of the C6 ghost (docs/POSITIVITY_PROJECTION.md). Requires
     // fullsphere_ghost. Instead of max(0, psi_N) on the outgoing hemisphere and a cone scaling, the nodal PN

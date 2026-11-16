@@ -23,6 +23,7 @@
 // (where l_in = t or l_out = t); theta split at mu = l_in/t and mu = l_out/t. Gauss-Legendre on every piece; the
 // integrand is smooth on each piece, so the rule converges exponentially (tests/uncollided_lattice.cpp).
 #include "uncollided.hpp"
+#include "uncollided_lattice_core.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -44,101 +45,19 @@ struct CellLattice2D {
     bool prune = true;
 
     double sigma(int i, int j) const { return sigma_t[std::size_t(i) + std::size_t(nx) * j]; }
-
-    // Ray x + l d against the source cell: [l_in, l_out] (false: no hit or touch only).
-    bool hit(double x, double y, double dx, double dy, double &l_in, double &l_out) const {
-        double lo = 0, hi = 1e300;
-        const double b0[2] = {double(source_i), double(source_j)}, p[2] = {x, y}, d[2] = {dx, dy};
-        for (int a = 0; a < 2; ++a) {
-            if (std::abs(d[a]) < 1e-300) {
-                if (p[a] < b0[a] || p[a] > b0[a] + 1)
-                    return false;
-                continue;
-            }
-            double t0 = (b0[a] - p[a]) / d[a], t1 = (b0[a] + 1 - p[a]) / d[a];
-            if (t0 > t1)
-                std::swap(t0, t1);
-            lo = std::max(lo, t0), hi = std::min(hi, t1);
-        }
-        if (hi <= lo)
-            return false;
-        l_in = lo, l_out = hi;
-        return true;
+    // Plain view for lattice_density() (Gauss rules on [0, 1] from the caller).
+    LatticeView view(const std::vector<double> &px, const std::vector<double> &pw, const std::vector<double> &tx,
+                     const std::vector<double> &tw) const {
+        if (nx > 8 || ny > 8 || int(sigma_t.size()) != nx * ny)
+            throw std::runtime_error("CellLattice2D: at most 8 x 8 cells, sigma_t of size nx ny");
+        LatticeView v;
+        v.nx = nx, v.ny = ny, v.sigma_t = sigma_t.data(), v.si = source_i, v.sj = source_j, v.q0 = q0;
+        v.phi_n = int(px.size()), v.theta_n = int(tx.size());
+        v.phi_x = px.data(), v.phi_w = pw.data(), v.theta_x = tx.data(), v.theta_w = tw.data(), v.prune = prune;
+        return v;
     }
-    // Optical depth along x + l d for l in [0, length] (cell traversal; the path stays inside the lattice).
-    double depth(double x, double y, double dx, double dy, double length) const {
-        if (length <= 0)
-            return 0;
-        // Start cell: the cell entered for small l > 0.
-        auto cell = [](double p, double d, int n) {
-            double f = std::floor(p);
-            if (p == f && d < 0)
-                f -= 1;
-            return std::clamp(int(f), 0, n - 1);
-        };
-        int i = cell(x, dx, nx), j = cell(y, dy, ny);
-        const int si = dx > 0 ? 1 : -1, sj = dy > 0 ? 1 : -1;
-        const double inf = 1e300;
-        double tx = std::abs(dx) < 1e-300 ? inf : ((dx > 0 ? i + 1 : i) - x) / dx;
-        double ty = std::abs(dy) < 1e-300 ? inf : ((dy > 0 ? j + 1 : j) - y) / dy;
-        const double ddx = std::abs(dx) < 1e-300 ? inf : 1 / std::abs(dx), ddy = std::abs(dy) < 1e-300 ? inf : 1 / std::abs(dy);
-        double l = 0, T = 0;
-        for (int guard = 0; guard < 4 * (nx + ny) + 8; ++guard) {
-            const double next = std::min({tx, ty, length});
-            T += sigma(i, j) * (next - l);
-            l = next;
-            if (l >= length)
-                return T;
-            if (tx <= ty) {
-                i += si, tx += ddx;
-            } else {
-                j += sj, ty += ddy;
-            }
-            if (i < 0 || i >= nx || j < 0 || j >= ny)
-                return T; // left the lattice (cannot happen before S for x inside)
-        }
-        return T;
-    }
-    // theta integral of one ray: (l_in, l_out, T_in) at time t.
-    double theta_integral(double l_in, double l_out, double T_in, double sS, double t, const std::vector<double> &gx,
-                          const std::vector<double> &gw) const {
-        if (t <= l_in || (prune && T_in > 40))
-            return 0;
-        const double h = .5 * pi;
-        const double a1 = std::asin(std::min(1., l_in / t)), a2 = std::asin(std::min(1., l_out / t));
-        double sum = 0;
-        auto panel = [&](double lo, double hi, bool growing) {
-            for (std::size_t k = 0; k < gx.size(); ++k) {
-                const double th = lo + (hi - lo) * gx[k], mu = std::sin(th);
-                if (mu <= 0)
-                    continue;
-                const double L = (growing ? t * mu : l_out) - l_in;
-                if (L <= 0)
-                    continue;
-                const double e = std::exp(-T_in / mu);
-                const double f = sS > 0 ? e * mu / sS * -std::expm1(-sS * L / mu) : e * L;
-                sum += (hi - lo) * gw[k] * f;
-            }
-        };
-        // exp(-l/mu) has a boundary layer of width ~lo above a lower end lo ~ l/t: panels split geometrically at
-        // lo 2^k.
-        auto piece = [&](double lo0, double hi0, bool growing) {
-            if (hi0 <= lo0)
-                return;
-            for (double lo = lo0; lo < hi0;) {
-                const double hi = lo0 > 0 && 2 * lo < hi0 ? 2 * lo : hi0;
-                panel(lo, hi, growing);
-                lo = hi;
-            }
-        };
-        piece(a1, a2, true);
-        piece(a2, h, false);
-        return sum;
-    }
-    // rho_u(x, t).
+    // rho_u(x, t) (src/uncollided_lattice_core.hpp).
     double density(double x, double y, double t) const {
-        if (t <= 0)
-            return 0;
         static thread_local std::vector<double> gpx, gpw, gtx, gtw;
         static thread_local int gp = -1, gt = -1;
         if (gp != phi_order) {
@@ -149,85 +68,7 @@ struct CellLattice2D {
             auto r = gauss_legendre(theta_order, 0, 1);
             gtx = r.first, gtw = r.second, gt = theta_order;
         }
-        const double s0 = source_i, s1 = source_i + 1, r0 = source_j, r1 = source_j + 1;
-        const double sS = sigma(source_i, source_j);
-        const bool inside = x >= s0 && x <= s1 && y >= r0 && y <= r1;
-        if (prune) {
-            const double ex = std::max({s0 - x, 0., x - s1}), ey = std::max({r0 - y, 0., y - r1});
-            if (ex * ex + ey * ey >= t * t)
-                return 0; // the front has not reached S
-        }
-        // Angular window [w0, w1] (radians) of directions d that hit S.
-        double w0 = 0, w1 = 2 * pi, base = 0;
-        if (!inside) {
-            base = std::atan2(.5 * (r0 + r1) - y, .5 * (s0 + s1) - x);
-            double lo = 1e9, hi = -1e9;
-            const double cx[4] = {s0, s1, s1, s0}, cy[4] = {r0, r0, r1, r1};
-            for (int k = 0; k < 4; ++k) {
-                double a = std::atan2(cy[k] - y, cx[k] - x) - base;
-                a = std::remainder(a, 2 * pi);
-                lo = std::min(lo, a), hi = std::max(hi, a);
-            }
-            w0 = base + lo, w1 = base + hi;
-        }
-        // Breakpoints inside the window.
-        static thread_local std::vector<double> br;
-        br.clear();
-        br.push_back(w0), br.push_back(w1);
-        auto add = [&](double a) {
-            double r = std::fmod(a - w0, 2 * pi); // map into [w0, w0 + 2 pi)
-            if (r < 0)
-                r += 2 * pi;
-            a = w0 + r;
-            if (a > w0 && a < w1)
-                br.push_back(a);
-        };
-        for (int i = 0; i <= nx; ++i)
-            for (int j = 0; j <= ny; ++j) {
-                if (double(i) == x && double(j) == y)
-                    continue;
-                const bool corner_of_S = (i == source_i || i == source_i + 1) && (j == source_j || j == source_j + 1);
-                if (prune && !corner_of_S) {
-                    // Only corners strictly before the entry into S change the cells crossed on [0, l_in].
-                    const double vx = i - x, vy = j - y, r = std::hypot(vx, vy);
-                    double l_in, l_out;
-                    if (inside || !hit(x, y, vx / r, vy / r, l_in, l_out) || r >= l_in)
-                        continue;
-                }
-                add(std::atan2(j - y, i - x));
-            }
-        // Circle of radius t around x against the four edges of S.
-        auto circle = [&](double ax, double ay, double bx, double by) {
-            const double ex = bx - ax, ey = by - ay, fx = ax - x, fy = ay - y;
-            const double A = ex * ex + ey * ey, B = 2 * (fx * ex + fy * ey), C = fx * fx + fy * fy - t * t;
-            const double D = B * B - 4 * A * C;
-            if (D < 0)
-                return;
-            const double sq = std::sqrt(D);
-            for (double s : {(-B - sq) / (2 * A), (-B + sq) / (2 * A)})
-                if (s > 0 && s < 1)
-                    add(std::atan2(ay + s * ey - y, ax + s * ex - x));
-        };
-        circle(s0, r0, s1, r0), circle(s1, r0, s1, r1), circle(s1, r1, s0, r1), circle(s0, r1, s0, r0);
-        std::sort(br.begin(), br.end());
-        double sum = 0;
-        for (std::size_t b = 0; b + 1 < br.size(); ++b) {
-            const double a = br[b], c = br[b + 1];
-            if (c - a < 1e-15)
-                continue;
-            for (std::size_t k = 0; k < gpx.size(); ++k) {
-                // phi = a + (c - a) (3 s^2 - 2 s^3): at a breakpoint where l_in = t the phi integrand behaves like
-                // (t - l_in)^{3/2}; the substitution makes it smooth in s.
-                const double sk = gpx[k], phi = a + (c - a) * sk * sk * (3 - 2 * sk), jac = 6 * sk * (1 - sk);
-                const double dx = std::cos(phi), dy = std::sin(phi);
-                double l_in, l_out;
-                if (!hit(x, y, dx, dy, l_in, l_out))
-                    continue;
-                const double T_in = depth(x, y, dx, dy, l_in);
-                sum += (c - a) * gpw[k] * jac * theta_integral(l_in, l_out, T_in, sS, t, gtx, gtw);
-            }
-        }
-        return q0 / (2 * pi) * sum;
+        return lattice_density(view(gpx, gpw, gtx, gtw), x, y, t);
     }
 };
 // rho_u at fixed points on the uniform time grid t_m = m dt, m = 0..M, with cubic (Catmull-Rom) interpolation in t.
@@ -238,10 +79,13 @@ struct LatticeUncollidedTable {
     std::vector<V3> points;
     std::vector<double> table; // points x (M + 1)
     double build_seconds = 0;
+    double final_time = 0; // set by the driver; build() covers [0, final_time]
+    // Times t_m = m dt, m = 0..M, M from final_time (shared with the device build).
+    int times_for(double T) const { return int(std::ceil(T / dt)) + 2; }
     void build(const std::vector<V3> &x, double final_time) {
         const auto start = std::chrono::steady_clock::now();
         points = x;
-        M = int(std::ceil(final_time / dt)) + 2;
+        M = times_for(final_time);
         table.assign(points.size() * std::size_t(M + 1), 0.);
         parallel_for(int(points.size()), [&](int k) {
             double *row = &table[std::size_t(k) * (M + 1)];

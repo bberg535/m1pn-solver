@@ -2,6 +2,7 @@
 // Device side of the GPU time loop (src/element_weno_gpu.cu). Plain C++ (no Eigen, no CUDA headers), so the host
 // translation unit src/element_weno_gpu.cpp can include it. All fields are row-major (rows x columns) device arrays.
 #include <cstddef>
+#include "uncollided_lattice_core.hpp"
 namespace m1pn {
 namespace gpu {
 constexpr int max_local = 27; // local nodes per element (Q1/Q2 in 3D, up to Q4 in 2D)
@@ -157,6 +158,11 @@ struct Ledger {
     double absorbed = 0, injected = 0;
 };
 Ledger ledger(Context *); // cumulative (synchronous)
+// Lattice FCS (docs/FCS_LATTICE.md): rho_u at the FCS points (cells x fcs_points, the order of ReactionSetup) on
+// t_m = m dt, m = 0..M, built on the device with uncollided::lattice_density (view with host arrays; copied);
+// host_out (points x (M + 1)) receives a copy. react_lattice() then interpolates it at source_time.
+void lattice_table(Context *, const uncollided::LatticeView &host_view, int M, double dt, double *host_out);
+void react_lattice(Context *, double *state, double tau, double source_time);
 // Fallback lists (device index arrays; count from counters()).
 const int *closure_fallback_list(Context *);
 const int *limiter_fallback_list(Context *);

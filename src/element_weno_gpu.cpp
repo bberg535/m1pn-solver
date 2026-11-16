@@ -3,6 +3,7 @@
 #include "element_weno_gpu_device.hpp"
 #include "parallel.hpp"
 #include "uncollided.hpp"
+#include "uncollided_lattice.hpp"
 #include <algorithm>
 #include <random>
 #include <cstdlib>
@@ -72,8 +73,8 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     require(!s.dist_, "GPU path: serial scheme only (no MPI)");
     require(!o.periodic && !o.symmetric_residual && !o.m1_target,
             "GPU path: open mesh, standard residual, PN target");
-    require(!o.uncollided_density || (o.uncollided_pulse && s.dimension == 2),
-            "GPU path: FCS needs the analytic line-source pulse (ElementWenoOptions::uncollided_pulse, 2D)");
+    require(!o.uncollided_density || ((o.uncollided_pulse || o.uncollided_lattice) && s.dimension == 2),
+            "GPU path: FCS needs the line-source pulse or the lattice table (2D)");
     require(std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; }), "GPU path: no mirror sides");
     require(!o.projection_high_order && !o.projection_hybrid && !o.projection_diagnostics,
             "GPU path: projection_high_order/hybrid/diagnostics are not supported");
@@ -215,6 +216,7 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         std::vector<double> fx, fy, shape;
         if (o.uncollided_density) {
             pulse_ = o.uncollided_pulse.get();
+            lattice_ = o.uncollided_lattice.get();
             r.fcs_points = s.fcs_per_element_;
             fx.resize(s.fcs_points_.size()), fy.resize(s.fcs_points_.size());
             for (std::size_t k = 0; k < fx.size(); ++k)
@@ -224,6 +226,20 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
             r.fcs_sigma_s = s.fcs_sigma_s_.data(), r.fcs_shape = shape.data(), r.fcs_node_mass = s.fcs_node_mass_.data();
         }
         gpu::reaction_setup(ctx_, r);
+        if (lattice_) {
+            // Build the time table on the device and hand the host copy to the shared table object (the host FCS
+            // path then finds it built for the same points).
+            const double start = seconds();
+            uncollided::LatticeUncollidedTable &T = *lattice_;
+            const auto px = uncollided::gauss_legendre(T.lattice.phi_order, 0, 1);
+            const auto tx = uncollided::gauss_legendre(T.lattice.theta_order, 0, 1);
+            const uncollided::LatticeView view = T.lattice.view(px.first, px.second, tx.first, tx.second);
+            T.points = s.fcs_points_;
+            T.M = T.times_for(T.final_time);
+            T.table.assign(T.points.size() * std::size_t(T.M + 1), 0.);
+            gpu::lattice_table(ctx_, view, T.M, T.dt, T.table.data());
+            T.build_seconds = seconds() - start;
+        }
     }
     // Ghost projection on the device (plain full-sphere rule, unweighted); M1PN_GPU_GHOST=0 keeps it on the host.
     // Default: on the device when the boundary work (ghost pairs x rule points) is large against the volume work
@@ -1023,7 +1039,9 @@ void ElementWenoGpu::react(double tau, double source_time, ElementWenoStats &sta
         parallel_for(n, [&](int k) { table_[k + 1] = p.line(k * dr, source_time); });
         table_[0] = table_[2];
         gpu::react(ctx_, u_, tau, table_.data(), n, dr, p.centre[0], p.centre[1]);
-    } else
+    } else if (lattice_)
+        gpu::react_lattice(ctx_, u_, tau, source_time);
+    else
         gpu::react(ctx_, u_, tau, nullptr, 0, 0, 0, 0);
     closure_ready_ = false; // the fused closure of the last stage belongs to the state before the reaction
     stats.t_reaction += seconds() - start;
