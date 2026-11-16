@@ -9,7 +9,6 @@
 #include "element_weno_gpu.hpp"
 #endif
 #include "element_weno.hpp"
-#include "element_weno_dlra.hpp"
 #include "hardware.hpp"
 #include "benchmark_cases.hpp"
 #include <memory>
@@ -52,11 +51,7 @@ struct Options {
     int degree = 2;
     double weno_linear = 1e-3, weno_q = 1;
     bool m1_target = false; // element-weno: M1 instead of PN target (P1, --mirror-reduction off)
-    // element-weno: dynamical low-rank approximation of the l >= 2 moments (docs/DLRA.md)
-    std::string dlra = "off", dlra_norm = "full", sample_moments = "auto", dlra_mode = "step";
-    double dlra_tolerance = 1e-3, dlra_absolute = 0;
-    int dlra_rank = 8, dlra_min_rank = 4, dlra_max_rank = 0;
-    bool dlra_fixed = false;
+    std::string sample_moments = "auto"; // element-weno: moments written to initial/final.csv
     bool gpu = false; // element-weno: time loop on the GPU (src/element_weno_gpu.cpp, experimental)
     std::string fcs = "off"; // element-weno: first-collision source with analytic uncollided pulse (docs/FCS.md)
     bool weno = true, element_limit = true;
@@ -112,9 +107,7 @@ Options parse(int argc, char **argv) {
                    "   cases lattice-paul (2D, (0,7)^2), lattice-3d (3D, (0,7)^3), shadow-weih (3D, --inflow shadow-beam)\n"
                    "   --shadow-sigma S (sphere absorption, default 1e7) --beam-density B --material-subcells K\n"
                    "   --history-stride S (ledger rows) --skip-fields (no initial/final sample fields)\n"
-                   "   --dlra on|off (element-weno: low-rank l >= 2 moments, docs/DLRA.md) --dlra-tolerance T\n"
-                   "     --dlra-absolute-tolerance A --dlra-rank R0 --dlra-min-rank R --dlra-max-rank R --dlra-fixed-rank on|off\n"
-                   "     --dlra-norm full|high --dlra-tolerance-mode step|rate (rate: theta = T ||a|| dt) --sample-moments auto|all|low (auto: low with DLRA)\n"
+                   "   --sample-moments auto|all|low (element-weno fields: auto/all every moment, low u0..u3)\n"
                    "   --fcs off|analytic (element-weno plane-source/line-source: analytic uncollided pulse, collided\n"
                    "     part on the grid; output density = collided + uncollided; docs/FCS.md)\n"
                    "   --m1-target on|off (M1 instead of PN high-order target; needs --pn-order 1 --mirror-reduction off)\n"
@@ -302,28 +295,6 @@ Options parse(int argc, char **argv) {
             o.angular_reduction = v;
         } else if (key == "--weno-q") {
             o.weno_q = real();
-        } else if (key == "--dlra") {
-            require(v == "on" || v == "off", "--dlra must be on or off");
-            o.dlra = v;
-        } else if (key == "--dlra-tolerance") {
-            o.dlra_tolerance = real();
-        } else if (key == "--dlra-absolute-tolerance") {
-            o.dlra_absolute = real();
-        } else if (key == "--dlra-rank") {
-            o.dlra_rank = std::stoi(v);
-        } else if (key == "--dlra-min-rank") {
-            o.dlra_min_rank = std::stoi(v);
-        } else if (key == "--dlra-max-rank") {
-            o.dlra_max_rank = std::stoi(v);
-        } else if (key == "--dlra-fixed-rank") {
-            require(v == "on" || v == "off", "--dlra-fixed-rank must be on or off");
-            o.dlra_fixed = v == "on";
-        } else if (key == "--dlra-norm") {
-            require(v == "full" || v == "high", "--dlra-norm must be full or high");
-            o.dlra_norm = v;
-        } else if (key == "--dlra-tolerance-mode") {
-            require(v == "step" || v == "rate", "--dlra-tolerance-mode must be step or rate");
-            o.dlra_mode = v;
         } else if (key == "--sample-moments") {
             require(v == "auto" || v == "all" || v == "low", "--sample-moments must be auto, all or low");
             o.sample_moments = v;
@@ -744,8 +715,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     std::array<bool, 3> mirror_dir{};
     std::array<std::string, 3> mirror_reason{"", "", ""};
     double mirror_asymmetry = 0;
-    const bool dlra_on = o.dlra == "on";
-    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !dlra_on) {
+    if (o.mirror_reduction == "auto" && !o.mesh.periodic) {
         const int pd = o.degree;
         std::array<int, 3> per{1, 1, 1};
         long total = 1;
@@ -908,7 +878,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     std::unique_ptr<ElementWenoGpu> device;
     double gpu_radius_seconds = 0;
     if (o.gpu) {
-        require(!mirrored && !dlra_on, "--gpu: no mirror reduction (use --mirror-reduction off) and no DLRA");
+        require(!mirrored, "--gpu: no mirror reduction (use --mirror-reduction off)");
         device = std::make_unique<ElementWenoGpu>(scheme);
         const double r0 = seconds();
         scheme.set_spectral_radius(device->spectral_radius());
@@ -953,7 +923,6 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     auto write_samples = [&](const std::string &file, const Field &state, double time) {
         std::ofstream f(file);
         require(bool(f), "Cannot write field");
-        // DLRA: state holds the four low moments only (u0..u3 written).
         const int written = state.cols() == scheme.moments ? pn.q : 4;
         f << std::setprecision(17) << "node,x,y,z";
         for (int k = 0; k < written; ++k) f << ",u" << k;
@@ -984,7 +953,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         }
     };
     if (!o.skip_fields) {
-        const bool all = o.sample_moments == "all" || (o.sample_moments == "auto" && !dlra_on);
+        const bool all = o.sample_moments != "low";
         write_samples(o.output + "/initial.csv", all ? a : Field(a.leftCols(4)), 0.);
     }
     auto mass_of = [&](const Field &state) {
@@ -999,32 +968,6 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         return r * domain_factor;
     };
     const double initial_mass = mass_of(a);
-    // ---- DLRA: compress the initial state; `a` then holds the four low moments only -----------------------------
-    std::unique_ptr<ElementWenoDlra> dlra;
-    DlraState dlra_state;
-    DlraStats dlra_stats;
-    double compress_seconds = 0;
-    if (dlra_on) {
-        DlraOptions dop;
-        dop.tolerance = o.dlra_tolerance;
-        dop.absolute_tolerance = o.dlra_absolute;
-        dop.initial_rank = o.dlra_rank;
-        dop.min_rank = o.dlra_min_rank;
-        dop.max_rank = o.dlra_max_rank;
-        dop.fixed_rank = o.dlra_fixed;
-        dop.relative_to_high = o.dlra_norm == "high";
-        dop.per_unit_time = o.dlra_mode == "rate";
-        dlra = std::make_unique<ElementWenoDlra>(scheme, dop);
-        const double c0 = seconds();
-        dlra_state = dlra->compress(a);
-        compress_seconds = seconds() - c0;
-        a = dlra_state.low;
-    }
-    std::ofstream rank_log;
-    if (dlra_on) {
-        rank_log.open(o.output + "/dlra_rank.csv");
-        rank_log << std::setprecision(17) << "step,time,rank\n0,0," << dlra_state.rank() << "\n";
-    }
     {
         if (!o.skip_fields) {
             std::ofstream masses(o.output + "/nodal_mass.csv");
@@ -1036,11 +979,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"stabilization\":\"element-weno\",\"pn_target\":\"consistent_mass_cg_weno\""
                << ",\"basis\":\"tensor_bernstein\",\"degree\":" << o.degree
                << ",\"m1_target\":" << (o.m1_target ? "true" : "false")
-               << ",\"fcs\":" << std::quoted(o.fcs) << ",\"dlra\":" << std::quoted(o.dlra)
-               << ",\"dlra_tolerance\":" << o.dlra_tolerance << ",\"dlra_absolute_tolerance\":" << o.dlra_absolute
-               << ",\"dlra_initial_rank\":" << o.dlra_rank << ",\"dlra_min_rank\":" << o.dlra_min_rank
-               << ",\"dlra_max_rank\":" << o.dlra_max_rank << ",\"dlra_fixed_rank\":" << (o.dlra_fixed ? "true" : "false")
-               << ",\"dlra_norm\":" << std::quoted(o.dlra_norm) << ",\"dlra_tolerance_mode\":" << std::quoted(o.dlra_mode)
+               << ",\"fcs\":" << std::quoted(o.fcs)
                << ",\"weno\":" << (o.weno ? "true" : "false") << ",\"weno_linear\":" << o.weno_linear
                << ",\"weno_q\":" << o.weno_q << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
                << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength
@@ -1120,22 +1059,16 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         require(steps < o.max_steps, "Maximum step count exceeded");
         double dt = std::min(selected, o.final_time - t);
         const double start = seconds();
-        if (dlra_on) {
-            dlra_state = dlra->advance(t, dt, dlra_state, &stats, &dlra_stats);
-            a = dlra_state.low;
-        }
 #ifdef M1PN_ELEMENT_GPU
-        else if (device) {
+        if (device) {
             const double after = t + dt, next = after < o.final_time ? after : std::numeric_limits<double>::quiet_NaN();
             device->step(t, dt, next, stats);
-        }
+        } else
 #endif
-        else
             a = scheme.advance(t, dt, a, &stats);
         solver_seconds += seconds() - start;
         t = (o.final_time - (t + dt) <= 8 * std::numeric_limits<double>::epsilon() * o.final_time) ? o.final_time : t + dt;
         ++steps;
-        if (dlra_on) rank_log << steps << "," << t << "," << dlra_state.rank() << "\n";
         if (steps % 10 == 0) progress("running", t, steps);
         if (o.history_stride > 0 && steps % o.history_stride == 0) {
 #ifdef M1PN_ELEMENT_GPU
@@ -1156,11 +1089,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         min_margin = std::min(min_margin, margin(u));
     }
     if (!o.skip_fields) {
-        const bool all = o.sample_moments == "all" || (o.sample_moments == "auto" && !dlra_on);
-        if (dlra_on && all)
-            write_samples(o.output + "/final.csv", dlra->expand(dlra_state), t);
-        else
-            write_samples(o.output + "/final.csv", all ? a : Field(a.leftCols(4)), t);
+        const bool all = o.sample_moments != "low";
+        write_samples(o.output + "/final.csv", all ? a : Field(a.leftCols(4)), t);
     }
     if (dim == 3) {
         // Mid-plane slices through the box centre (density and |J|), written even with --skip-fields: the full 3D
@@ -1245,16 +1175,6 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
            << ",\"nudge_mass\":" << nudge << ",\"balance_residual\":" << balance
            << ",\"balance_relative\":" << balance / balance_scale << "}"
            << ",\"absorption_rate_final\":" << absorption_rate(a)
-           << ",\"dlra\":" << (dlra_on ? "{\"enabled\":true" : "{\"enabled\":false")
-           << ",\"low_rank_moments\":" << (dlra_on ? dlra->qh : 0) << ",\"final_rank\":" << (dlra_on ? dlra_state.rank() : 0)
-           << ",\"min_rank\":" << (dlra_on ? dlra_stats.min_rank : 0) << ",\"max_rank\":" << dlra_stats.max_rank
-           << ",\"mean_rank\":" << (dlra_stats.steps ? dlra_stats.rank_sum / dlra_stats.steps : 0.)
-           << ",\"max_relative_discard\":" << dlra_stats.max_relative_discard
-           << ",\"compress_seconds\":" << compress_seconds
-           << ",\"seconds\":{\"kl\":" << dlra_stats.t_kl << ",\"basis\":" << dlra_stats.t_basis
-           << ",\"galerkin\":" << dlra_stats.t_galerkin << ",\"truncate\":" << dlra_stats.t_truncate
-           << ",\"reaction\":" << dlra_stats.t_reaction << ",\"spatial\":" << dlra_stats.t_spatial
-           << ",\"products\":" << dlra_stats.t_products << ",\"limiter\":" << dlra_stats.t_limiter << "}}"
            << ",\"fcs\":" << std::quoted(o.fcs) << ",\"uncollided_mass_final\":" << uncollided_final * domain_factor
            << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
            << lattice_fcs_json

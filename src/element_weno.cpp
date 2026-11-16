@@ -1422,13 +1422,8 @@ Incoming ElementWeno::face_data(int side_id, const V3 &x, double time) const {
 }
 void ElementWeno::add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                                Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                               Field &bar, Vec *inflow_rate, const BoundaryExtras *extras,
-                               PositivityProjectionStats *projection) const {
+                               Field &bar, Vec *inflow_rate, PositivityProjectionStats *projection) const {
     const double ghost_start = seconds();
-    // DLRA (extras): `high` may have zero rows (the PN face load is then formed outside from the factored state), the
-    // C6 ghost trace comes from extras->ghost_psi, and the face datum loads are returned per side.
-    const bool skip_high = high.rows() == 0;
-    const bool want_datum = extras && extras->datum;
     Inflow atoms_only;
     atoms_only.atoms = inflow.atoms;
     // C6: outgoing half-range moments of the positive part of the nodal PN trace (point independent),
@@ -1442,7 +1437,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     std::vector<PositivityProjectionStats> pstats(project ? std::max(1, max_threads()) : 0);
     // projection_high_order: delta of the exterior PN state per ghost pair (zero rows: identity / C6).
     const bool high_exterior = project && options.projection_high_order && !options.projection_half_range &&
-                               !options.projection_hybrid && !skip_high;
+                               !options.projection_hybrid;
     Field delta;
     std::vector<char> has_delta;
     if (high_exterior) {
@@ -1593,13 +1588,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         }
         outgoing_moments[k] = m;
     };
-    if (ghost && extras && extras->ghost_psi) {
-        parallel_for(int(outgoing_moments.size()), [&](int k) {
-            thread_local Vec psi;
-            extras->ghost_psi(k, ghost_side_[k], ghost_node_[k], psi);
-            ghost_pair(k, psi);
-        });
-    } else if (ghost) {
+    if (ghost) {
         // PN traces in blocks of ghost_block pairs of one side (bounded memory, GEMM-sized blocks): separable
         // evaluation (SeparableTrace) or, if unavailable, the dense harmonics product.
         // At least ~4 blocks per thread, at most 32 pairs per block (GEMM width) and at least 4.
@@ -1639,8 +1628,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     const int face_rows = side_row_start_[6];
     Field G, D(face_rows, canonical_->r), L(face_rows, 4), BR(face_rows, 4), FA(face_rows, 3);
     Vec AR(face_rows), IN(face_rows);
-    if (!skip_high)
-        G.resize(face_rows, moments);
+    G.resize(face_rows, moments);
     Field K; // face rows of delta (projection_high_order)
     std::vector<char> face_delta;
     if (high_exterior) {
@@ -1735,8 +1723,6 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             }
         }
         face_datum[index] = !datum.isZero(0);
-        if (skip_high)
-            return;
         // sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum], with the exact face mass matrix;
         // the products with the dense q x q (and r x q) matrices are done per side below.
         thread_local Mat traces;
@@ -1765,7 +1751,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     // sides run in one parallel loop over blocks of rows with allocation-free coefficient products (a GEMM call per
     // small block allocated workspace and did not scale with the thread count).
     Field H;
-    if (!skip_high) {
+    {
         H.resize(face_rows, moments);
         std::array<bool, 6> datum_zero;
         datum_zero.fill(true);
@@ -1793,18 +1779,11 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     // `high` has one row per node or, in rate(), one row per boundary node (boundary_slot_). Node by node in
     // parallel; each node sums its face rows in ascending face index (the order of the former serial loop).
     const bool compact = high.rows() != nodes;
-    if (want_datum)
-        for (int s = 0; s < 6; ++s)
-            if (boundaries_[s])
-                (*extras->datum)[s] = Field::Zero(boundary_nodes_.size(), canonical_->r);
     parallel_for(int(boundary_nodes_.size()), [&](int k) {
         const int i = boundary_nodes_[k];
         for (int e = boundary_row_offsets_[k]; e < boundary_row_offsets_[k + 1]; ++e) {
             const int r = boundary_rows_[e];
-            if (!skip_high)
-                high.row(compact ? k : i) += H.row(r);
-            if (want_datum)
-                (*extras->datum)[face_row_side_[r]].row(k) += D.row(r);
+            high.row(compact ? k : i) += H.row(r);
             low_load.row(i) += L.row(r);
             bar.row(i) += BR.row(r);
             node_flux_area.row(i) += FA.row(r);
@@ -1933,7 +1912,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     Vec boundary_area = parallel_zero(nodes), boundary_inflow = parallel_zero(nodes);
     if (!faces_.empty()) {
         add_boundary(time, a, low, low_flux, boundary_high, boundary_low, flux_area, boundary_area,
-                     boundary_bar, &boundary_inflow, nullptr, &timing.projection);
+                     boundary_bar, &boundary_inflow, &timing.projection);
         if (!options.m1_target)
             for (std::size_t k = 0; k < boundary_nodes_.size(); ++k)
                 residual.row(boundary_nodes_[k]) += boundary_high.row(k);
@@ -1989,7 +1968,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     return high_rate;
 }
 // Limited low-order load of the four M1 moments (element bar states, antidiffusive element contributions, boundary
-// corrections). Shared by rate() and the DLRA Galerkin step (src/element_weno_dlra.cpp). Returns the gathered nodal
+// corrections). Used by rate(). Returns the gathered nodal
 // load in (rho, J) units, not yet divided by the lumped mass; *raw_out receives the unlimited load when requested.
 Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *stats, Field *raw_out) const {
     const Field &low = *in.low, &low_flux = *in.low_flux, &closure = *in.closure, &moment_rate = *in.moment_rate;

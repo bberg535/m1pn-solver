@@ -166,7 +166,6 @@ struct ElementWenoStats {
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
 };
-class ElementWenoDlra;
 class ElementWenoMpi;
 class ElementWenoGpu;
 // Hooks of a distributed (MPI) run, implemented by ElementWenoMpi. The scheme then lives on a slab of the global mesh
@@ -190,7 +189,6 @@ struct DistributedHooks {
     virtual double min(double local) const = 0;
 };
 class ElementWeno {
-    friend class ElementWenoDlra; // factored (low-rank) evaluation of the same operators, src/element_weno_dlra.cpp
     friend class ElementWenoMpi;
     friend class ElementWenoGpu; // device time loop, src/element_weno_gpu.cpp (experimental)
 public:
@@ -347,18 +345,9 @@ private:
     void element_origin(int element, V3 &origin) const;
     // inflow_rate (optional, nodes): kinetic mass inflow rate int phi_i (-kinetic[0]) >= 0 per boundary node.
     // `high` is indexed by node (nodes rows) or compactly by boundary_slot_ (boundary_nodes_.size() rows).
-    // DLRA hooks of add_boundary: ghost_psi(k, side, node, psi) fills the PN trace at the points of out_rules_[side]
-    // (outgoing hemisphere, plus the incoming one with the positivity projection) of ghost pair k (instead of
-    // out.harmonics * a.row(node)); datum (if set) receives per side the face datum loads
-    // sum_points w phi_n d (boundary_slot_ rows x canonical r).
-    struct BoundaryExtras {
-        std::function<void(int, int, int, Vec &)> ghost_psi;
-        std::array<Field, 6> *datum = nullptr;
-    };
     void add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                      Field &bar, Vec *inflow_rate = nullptr, const BoundaryExtras *extras = nullptr,
-                      PositivityProjectionStats *projection = nullptr) const;
+                      Field &bar, Vec *inflow_rate = nullptr, PositivityProjectionStats *projection = nullptr) const;
     // Inputs of the limited low-order part of rate() (all node-indexed except boundary_high, which has one row per
     // boundary slot and at least the four low coefficient columns).
     struct LowOrderInputs {

@@ -1,3 +1,6 @@
+> **Entfernt am 16.11.2026** (Branch `feature/combine-202611`): DLRA wird nicht mehr benötigt; Code, Tests und Skripte
+> sind aus dem Solver genommen. Letzter Stand mit DLRA: Tag `standard-20261116`. Dieses Dokument bleibt als Bericht.
+
 # Dynamische Niedrigrang-Approximation (DLRA) für Element-WENO
 
 Stand 12.11.2026, Branch `feature/element-weno-dlra` (Basis: `feature/element-weno-fcs` @ d43c0ad).

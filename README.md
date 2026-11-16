@@ -25,7 +25,7 @@
 > - dem **optimierten Randpfad und Zeitschritt** (separable Trace-Auswertung, Face-Zeilen, Thread-Skalierung, blockweises
 >   SpMM; 1.6–3.0× schneller als `bdd5d3f`, [results/positivity](results/positivity/README.md));
 > - den **Optimierungen aus dem DLRA-Zweig** (`846e6c9` schnelleres Setup/Initialisierung, `bdd5d3f` gebündelte
->   Randprodukte), **ohne DLRA**: DLRA bleibt optional und ist standardmäßig aus (`--dlra off`).
+>   Randprodukte), **ohne DLRA** (DLRA selbst ist seit 16.11.2026 entfernt, [docs/DLRA.md](docs/DLRA.md)).
 >
 > Verworfen: adaptive PN-Ordnung (Branch gelöscht; auf NX bei 54–63 % aktiven Momenten 1.2–1.4× langsamer als feste
 > Ordnung), Projektion im Hochordnungs-Randfluss (`--projection-high-order`, schlechter).
