@@ -98,6 +98,25 @@ GHS, 128², P3, ein Kern, Löserzeit (`phase_seconds`; `fcs_density` = ρ_u, `fc
 - Bei höherem P (128²): P7 6.6 s mit FCS gegen 6.5 s ohne (L1 0.099 gegen 0.819), P11 11.2 s gegen 11.1 s (L1 0.043
   gegen 0.572). FCS kostet hier netto nichts und senkt den Fehler um den Faktor 8 bzw. 13.
 
+## 4b. Nachmessung 15.11.2026 (NX, ein Sockel, 32 Threads, SSPRK(4,3))
+
+GHS Line Source, Q1, `m1pn_fast --stabilization element-weno --time-integrator ssprk43`, Gesamtzeit des Prozesses,
+relativer L1-Fehler gegen die gefaltete exakte Lösung (`scripts/line_source/analyze.py`). Rohdaten
+`nx/tmp/fcs_speed_20261115/`.
+
+| Gitter | PN | ohne FCS: L1 / Zeit | mit FCS: L1 / Zeit |
+|---|---|---|---|
+| 256² | P7 | 1.045 / 8.4 s | 0.116 / 8.7 s |
+| 256² | P11 | 0.844 / 13.6 s | 0.064 / 14.0 s |
+| 256² | P15 | 0.636 / 20.4 s | 0.035 / 20.3 s |
+| 512² | P7 | 1.110 / 41.4 s | 0.120 / 43.7 s |
+| 512² | P11 | 0.944 / 60.3 s | 0.069 / 62.6 s |
+| 512² | P15 | 0.736 / 85.4 s | 0.041 / 88.2 s |
+
+FCS kostet 0-5 % Laufzeit (Reaktion mit Stoßquelle, ρ_u 3.7 s bei 512²) und senkt den Fehler um den Faktor 9-18.
+FCS mit P7 (0.116 in 8.7 s) ist genauer als ohne FCS mit P15 (0.636 in 20.4 s). Der Fehler wird vom P_N-Fehler des
+kollidierten Anteils bestimmt und fällt mit P, nicht mit dem Gitter (512² leicht schlechter als 256²).
+
 ## 5. Grenzen und Stufe 2
 
 - Nur homogene Medien mit analytischem ψ_u. Für den Lattice (Quelle im Gebiet, Absorber) braucht ψ_u einen eigenen
