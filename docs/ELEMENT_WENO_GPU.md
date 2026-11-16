@@ -89,3 +89,23 @@ Schwellen), bei 1024² stärker als bei 512². Integrale Größen bleiben dabei 
 T = 0.32 kann daher keine Änderung einhalten, die nicht bitgleich ist (auch kein anderer Compiler-Schalter).
 
 Rohdaten und Skripte: `nx/tmp/gpu_20261115/` (nicht versioniert).
+
+## Positivitätsprojektion auf der GPU (Branch `experimental/gpu-projection`, 15.11.2026)
+
+Der Ghost (Spur an der Vollkugelregel, Identitätstest, semismooth Newton mit 4x4-LDL^T und Armijo, Warmstart pro Paar)
+läuft auf der GPU, ein Warp pro Ghost-Paar, auf einem nicht blockierenden Stream niedriger Priorität parallel zu den
+Volumenkerneln. Hüllzertifikat, augmentierte Regel und nicht konvergierte Fälle werden markiert und vom Host mit
+`project_positive_moments` gelöst (in allen Läufen hier: 0 Fälle). Der Host behält nur die Face-Terme.
+`M1PN_GPU_GHOST=0` schaltet zurück auf die Host-Projektion. Die Statistik stimmt mit dem Host überein (512²: 8883108
+Aufrufe, 5309118 Identitäten, 3945191 statt 3945159 Newton-Schritte).
+
+| Fall | Projektion auf dem Host | Projektion auf der GPU |
+|---|---|---|
+| 512², 32 Host-Threads | 13,7 s (Schleife 10,85 s) | 14,3 s (11,5 s) |
+| 512², 4 Host-Threads | 18,6 s (15,0 s) | 15,3 s (11,5 s) |
+| 1024², 32 Host-Threads | 87,5 s (82,0 s) | 90,3 s (84,7 s) |
+
+Der Ghost-Kernel braucht etwa 0,16 ms pro Stufe GPU-Zeit. Mit 32 Host-Threads lag die Host-Projektion vollständig
+neben der GPU-Arbeit, daher ist die GPU-Version dort 3-6 % langsamer. Sie lohnt sich, wenn der Host knapp ist (4
+Threads: 21 % schneller) oder wenn die GPU später durch weitere Optimierung nicht mehr der Engpass ist. Abweichung
+gegen die CPU wie zuvor auf dem Rundungsniveau des Problems (512², T = 0.32: 5,8e-5 / 4,9e-6; 1024²: 1,2e-2 / 8,6e-4).
