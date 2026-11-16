@@ -34,7 +34,7 @@ if out:
 ew = run("element_weno", *crossing, "--stabilization", "element-weno", "--degree", "2", "--elements", "4", "--dt", ".005")
 if ew:
     c = json.load(open(ew + "/config.json")); s = json.load(open(ew + "/summary.json"))
-    check(c["rk"] == 3 and c["degree"] == 2 and c["sample_points"] == 81, "element-weno uses SSPRK3 and a 9x9 sample grid")
+    check(c["rk"] == 4 and c["degree"] == 2 and c["sample_points"] == 81, "element-weno uses SSPRK(4,3) and a 9x9 sample grid")
     check(s["minimum_cone_margin"] >= 0 and s["nudged_states"] == 0, "element-weno stays in the cone without nudging")
     if standalone:
         ref = f"{root}/standalone"

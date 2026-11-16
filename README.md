@@ -1,7 +1,25 @@
 # PN-Massenkorrektur im nativen M1PN-MCL-Solver
 
-> **Aktueller Stand und Standard (14.11.2026):** Branch `feature/boundary-positivity-projection`, Tag
-> `standard-20261114`. Element-WENO-Solver (`m1pn_element_weno`, bzw. `m1pn_fast --stabilization element-weno`) mit
+> **Aktueller Stand und Standard (16.11.2026):** Branch `feature/system-202611`, Tag `standard-20261116`. Er enthält
+> den bisherigen Standard `standard-20261114` (Element-WENO mit Positivitätsprojektion am Rand, optimierter Randpfad,
+> DLRA-Speedups ohne DLRA, Details unten) und zusätzlich:
+> - **SSPRK(4,3)** als Zeitintegrator (`--ssprk3` für das frühere SSPRK3; gleiche Genauigkeit, 1,36–1,5× schneller);
+> - **MPI** für Element-WENO (Scheiben entlang der letzten Achse, bitgleich zu seriell;
+>   [docs/ELEMENT_WENO_MPI.md](docs/ELEMENT_WENO_MPI.md), aus `feature/element-weno-mpi`);
+> - den **GPU-Pfad** (`-DM1PN_ELEMENT_GPU=ON`, `m1pn_fast ... --gpu --mirror-reduction off`): Zeitschleife,
+>   Ghost-Projektion, Reaktion und FCS auf der GPU; Abweichung zur CPU auf Rundungsniveau
+>   ([docs/ELEMENT_WENO_GPU.md](docs/ELEMENT_WENO_GPU.md), [docs/TARDIS_CAMPAIGN.md](docs/TARDIS_CAMPAIGN.md));
+> - **First-Collision-Source** für Line/Plane Source ([docs/FCS.md](docs/FCS.md)) und den **Lattice** mit exakter
+>   Strahlverfolgung des ungestoßenen Anteils, CPU und GPU (`--case lattice-paul --fcs analytic`,
+>   [docs/FCS_LATTICE.md](docs/FCS_LATTICE.md));
+> - die Kampagnenskripte für tardis und NX (`scripts/element_weno/tardis_convergence.py`, `lattice_fcs_study.py`;
+>   Ergebnisse [docs/TARDIS_RESULTS.md](docs/TARDIS_RESULTS.md)).
+>
+> Nicht im Standard: AMR (`experimental/amr`, bei gleicher Genauigkeit langsamer), genäherte Masseninverse
+> (`experimental/approx-mass-inverse`, ändert das Verfahren), Schur-Löser für MPI (opt-in), Lazy-Limiter (gemessen:
+> höchstens 7–18 % bei glatten Fällen, nichts bei Lattice/Crossing; [docs/SPEEDUP_OPTIONS.md](docs/SPEEDUP_OPTIONS.md)).
+>
+> **Vorheriger Standard (14.11.2026):** Branch `feature/boundary-positivity-projection`, Tag `standard-20261114`:
 > - der **momententreuen Positivitätsprojektion am Rand** als Standard-Ghost (C6 nur noch mit `--c6-ghost`),
 >   Projektionsregel N+1, Warmstart mit Kaltstart-Retry ([docs/POSITIVITY_PROJECTION.md](docs/POSITIVITY_PROJECTION.md));
 > - dem **optimierten Randpfad und Zeitschritt** (separable Trace-Auswertung, Face-Zeilen, Thread-Skalierung, blockweises
@@ -9,8 +27,8 @@
 > - den **Optimierungen aus dem DLRA-Zweig** (`846e6c9` schnelleres Setup/Initialisierung, `bdd5d3f` gebündelte
 >   Randprodukte), **ohne DLRA**: DLRA bleibt optional und ist standardmäßig aus (`--dlra off`).
 >
-> Verworfen und nicht Teil des Standards: adaptive PN-Ordnung (Branch gelöscht; auf NX bei 54–63 % aktiven Momenten
-> 1.2–1.4× langsamer als feste Ordnung), Projektion im Hochordnungs-Randfluss (`--projection-high-order`, schlechter).
+> Verworfen: adaptive PN-Ordnung (Branch gelöscht; auf NX bei 54–63 % aktiven Momenten 1.2–1.4× langsamer als feste
+> Ordnung), Projektion im Hochordnungs-Randfluss (`--projection-high-order`, schlechter).
 
 Isoliertes Experiment im eigenen Git-Repository, Branch
 `experiment/m1pn-pn-mass-correction`. Der eingefrorene Ausgangsstand steht
@@ -62,8 +80,8 @@ Wählbar über Optionen:
 | Winkelfilter | `--filter constant --filter-strength S` oder `--filter nn` (nicht mit Element-WENO) |
 | Line Source (Garrett–Hauck) | `--case line-source --domain-length 3 --pulse-width .03 --background 1e-4 --sigma-s 1 --time 1` (nur B; Referenz `scripts/line_source/reference.py`) |
 
-Element-WENO läuft auf generierten kartesischen Gittern (konstante isotrope Streuung
-und Absorption möglich, keine Quellen) und nutzt SSPRK(4,3) (Standard seit 15.11.2026, gleiche Genauigkeit,
+Element-WENO läuft auf generierten kartesischen Gittern (konstante isotrope Streuung und Absorption, heterogene
+Fälle `lattice-paul`, `lattice-3d`, `shadow-weih` mit Material und Quelle) und nutzt SSPRK(4,3) (Standard seit 15.11.2026, gleiche Genauigkeit,
 1,36-1,5x schneller; `--ssprk3` für das frühere SSPRK3). Die Felddateien enthalten dieselben Spalten wie der Q1-Pfad, ausgewertet
 auf einem gleichmäßigen Gitter mit `elements*degree` Zellen pro Achse. Details in
 [docs/ELEMENT_WENO.md](docs/ELEMENT_WENO.md). Die bisherige `m1pn_nn_filter`

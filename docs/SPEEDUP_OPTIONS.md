@@ -44,3 +44,23 @@ GPU 23,6 s (generische Kernel).
   7-9x bzw. 2,3-2,8x (Obergrenze ohne AMR-Overhead). Die PN-Wellen (Ray-Effekte) füllen große Teile des Gebiets.
 - Adaptive Winkelordnung (Potenzial): Ordnung pro Knoten mit Abbruchschranke 1e-2 bzw. 1e-3 der Knotennorm: bei
   T = 0.32 brauchen 98-99 % der Knoten P7, Gewinn 1,0x (früh 1,1-1,3x). Lohnt sich nicht.
+
+## Lazy-Limiter: Messung der Limiter-Aktivität (16.11.2026)
+
+Frage: Lohnt es sich, Limiter und Schließung in Stufen ohne Eingriff zu überspringen? `summary.json` zählt dazu
+`rate_calls` und `unlimited_rate_calls` (Stufen, in denen kein Element und kein Randknoten begrenzt wurde; reine
+Diagnose). NX, CPU, 32 Kerne:
+
+| Fall | Stufen ohne Eingriff | begrenzte Element-Stufen | Limiter + Schließung | Obergrenze Ersparnis |
+|---|---:|---:|---:|---:|
+| Glatter Transport am Rand, Q2 128², P7 | 100 % | 0 % | 18 % | ≤ 18 % |
+| Crossing Q2 128², P15 | 80 % | 1,9 % | 9,5 % | ≤ 7,5 % |
+| Crossing Q1 256², P7 | 27 % | 30 % | 38 % | ≤ 10 % |
+| Line Source mit FCS, Q1 256², P7 | 24 % | 0,7 % | 13 % | ≤ 3 % |
+| Line Source, Q1 256², P7 | 11 % | 8 % | 22 % | ≤ 2 % |
+| Lattice Q1 224², P7 | 0 % | 9,6 % | 28 % | 0 % |
+
+Die Obergrenze setzt voraus, dass Stufen ohne Eingriff vorher kostenlos erkannt werden. A posteriori (Stufe ohne
+Limiter rechnen, Kegel prüfen, bei Verletzung wiederholen) kostet jede Fehlvorhersage eine ganze Rate und ändert das
+Verfahren (der Limiter greift an den Bars ein, nicht erst am Ergebnis); elementweise bräuchte es einen Sensor, der
+billiger ist als die Limiterprüfung selbst. Nicht umgesetzt.

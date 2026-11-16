@@ -353,7 +353,7 @@ Options parse(int argc, char **argv) {
                 "element-weno supports only the constant filter");
     }
     if (element_weno) {
-        if (!o.rk_explicit) o.rk = 3;
+        if (!o.rk_explicit) o.rk = 4; // SSPRK(4,3), as m1pn_element_weno since 2026-11-15 (--time-integrator ssprk3)
         require(o.rk == 3 || o.rk == 4, "element-weno uses SSPRK3 or SSPRK(4,3)");
         require(o.coupling == "m1pn", "element-weno has no pn-only coupling");
         require(o.degree >= 1 && o.degree <= 12, "element-weno degree must lie in [1,12]");
@@ -1073,7 +1073,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << scheme.nodes
                << ",\"spatial_dofs_full_domain\":" << long(std::llround(scheme.nodes * domain_factor))
                << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis[0]
-               << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":3"
+               << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":" << o.rk
                << ",\"time_integrator\":" << (eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\"")
                << ",\"case\":" << std::quoted(o.problem) << ",\"inflow\":" << std::quoted(o.inflow)
                << ",\"background\":" << o.background << ",\"shadow_sigma\":" << (shadow ? o.shadow_sigma : 0.)
