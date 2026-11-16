@@ -199,6 +199,9 @@ public:
     void set_distributed(const DistributedHooks *hooks, std::vector<char> owned);
     const std::vector<char> &owned() const { return owned_; }
     bool is_owned(int i) const { return owned_.empty() || owned_[i]; }
+    // MPI: an element is owned by the rank that owns its lowest node along the slab axis (local node 0).
+    bool element_owned(int e) const { return owned_.empty() || owned_[connectivity_[std::size_t(e) * local_nodes]]; }
+    int fcs_points_per_element() const { return fcs_per_element_; }
     Vec node_dt_bound; // lumped / rates per node (dt_bound is their minimum)
     ElementWeno(const Angular &, const ElementWenoOptions &, Inflow = {});
     const Angular &pn;

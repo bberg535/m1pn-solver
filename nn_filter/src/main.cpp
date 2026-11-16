@@ -10,6 +10,7 @@
 #include "element_weno_gpu.hpp"
 #endif
 #include "element_weno.hpp"
+#include "element_weno_mpi.hpp"
 #include "hardware.hpp"
 #include "benchmark_cases.hpp"
 #include <memory>
@@ -584,8 +585,20 @@ void write_checkpoint(const std::string &dir,const Spatial &fe,const Field &u,in
 // Element-based limiting with CG-WENO target on tensor Bernstein elements.
 // Writes the same field files as the Q1 path; the Bernstein solution is
 // evaluated on a uniform sample grid (nodes of Q1 with elements*degree cells).
-int run_element_weno(const Options &o, const Angular &pn, double begin) {
+int run_element_weno(const Options &o, const Angular &pn, double begin, const Runtime &world) {
     const int dim = o.mesh.dimension;
+    // MPI (docs/ELEMENT_WENO_MPI.md): slabs along the last axis with two halo element layers (ElementWenoMpi, bitwise
+    // equal to the serial run); sums over owned nodes/elements are reduced; rank 0 writes all files from the
+    // gathered state with a global scheme (`post`).
+    const int ranks = world.size, rank = world.rank;
+    const bool distributed = ranks > 1;
+#ifndef M1PN_MPI
+    require(!distributed, "element-weno with several ranks needs an MPI build");
+#endif
+    if (distributed) {
+        require(dim >= 2 && !o.mesh.periodic, "element-weno MPI: 2D/3D open meshes (slabs along the last axis)");
+        require(!o.gpu, "element-weno MPI: no --gpu (MPI+GPU is not implemented)");
+    }
     require(o.mesh.file.empty() && !o.mesh.tetrahedra && !o.mesh.single_tet,
             "element-weno needs the generated Cartesian hex mesh");
     require(o.problem != "lattice" && o.problem != "shadow" && o.source == 0 && !o.jump && o.anisotropy == 0,
@@ -761,7 +774,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     std::array<bool, 3> mirror_dir{};
     std::array<std::string, 3> mirror_reason{"", "", ""};
     double mirror_asymmetry = 0;
-    if (o.mirror_reduction == "auto" && !o.mesh.periodic) {
+    if (distributed && o.mirror_reduction == "auto")
+        mirror_reason = {"MPI", "MPI", "MPI"}; // mirror sides and slabs are not combined
+    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed) {
         const int pd = o.degree;
         std::array<int, 3> per{1, 1, 1};
         long total = 1;
@@ -886,7 +901,46 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     // ---- Angular parity reduction (1D/2D) --------------------------------------------------------------------------
     eo.reduce_angular = dim < 3 && o.angular_reduction != "off";
     require(!(o.angular_reduction == "on" && dim == 3), "--angular-reduction on needs dimension 1 or 2");
-    auto scheme_ptr = std::make_unique<ElementWeno>(pn, eo, inflow);
+    std::unique_ptr<ElementWeno> scheme_ptr;
+#ifdef M1PN_MPI
+    std::unique_ptr<ElementWenoMpi> mpi;
+    SlabPartition part;
+    if (distributed)
+        part = slab_partition(counts[dim - 1], ranks, rank, dim - 1, 2);
+#endif
+    auto build_scheme = [&]() {
+#ifdef M1PN_MPI
+        mpi.reset(); // detaches from the old scheme first
+        if (distributed) {
+            scheme_ptr = std::make_unique<ElementWeno>(pn, slab_options(eo, part), inflow);
+            mpi = std::make_unique<ElementWenoMpi>(*scheme_ptr, MPI_COMM_WORLD, part, 0);
+            return;
+        }
+#endif
+        scheme_ptr = std::make_unique<ElementWeno>(pn, eo, inflow);
+    };
+    build_scheme();
+    auto reduce_sum = [&](double v) {
+#ifdef M1PN_MPI
+        if (mpi)
+            return mpi->sum(v);
+#endif
+        return v;
+    };
+    auto reduce_min = [&](double v) {
+#ifdef M1PN_MPI
+        if (mpi)
+            return mpi->min(v);
+#endif
+        return v;
+    };
+    auto reduce_max = [&](double v) {
+#ifdef M1PN_MPI
+        if (mpi)
+            return mpi->max(v);
+#endif
+        return v;
+    };
     std::vector<Vec> initial(scheme_ptr->nodes);
     for (int i = 0; i < scheme_ptr->nodes; ++i) {
         initial[i] = initial_point(o, scheme_ptr->node_position(i), i, dim, pn);
@@ -903,16 +957,19 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
         for (int k : scheme_ptr->active) kept[k] = 1;
         for (const Vec &u : initial)
             for (int k = 0; k < pn.q; ++k) (kept[k] ? scale : dropped) = std::max(kept[k] ? scale : dropped, std::abs(u[k]));
+        scale = reduce_max(scale), dropped = reduce_max(dropped); // the decision is global
         odd_initial = scale > 0 ? dropped / scale : dropped;
         for (int k = 0; k <= 8; ++k)
             odd_inflow = std::max(odd_inflow, scheme_ptr->dropped_inflow(o.final_time * k / 8.));
+        odd_inflow = reduce_max(odd_inflow);
         const bool even = odd_initial <= 1e-13 && odd_inflow <= 1e-12;
         require(even || o.angular_reduction != "on",
                 "--angular-reduction on: initial or inflow data are not even in the unresolved directions");
         if (!even) {
-            std::cerr << "note: angular reduction off (odd data: initial " << odd_initial << ", inflow " << odd_inflow << ")\n";
+            if (rank == 0)
+                std::cerr << "note: angular reduction off (odd data: initial " << odd_initial << ", inflow " << odd_inflow << ")\n";
             eo.reduce_angular = false;
-            scheme_ptr = std::make_unique<ElementWeno>(pn, eo, inflow);
+            build_scheme();
         }
     }
     const ElementWeno &scheme = *scheme_ptr;
@@ -920,6 +977,18 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     for (int i = 0; i < scheme.nodes; ++i)
         a.row(i) = scheme.reduce(initial[i]).transpose();
     std::vector<Vec>().swap(initial);
+    // MPI: global scheme on rank 0 for the sample output, the slices and the material integrals.
+    std::unique_ptr<ElementWeno> post;
+    if (distributed && rank == 0)
+        post = std::make_unique<ElementWeno>(pn, eo, inflow);
+    const ElementWeno &out_scheme = post ? *post : scheme;
+    auto gathered = [&](const Field &f) -> Field { // owned rows of all ranks on rank 0 (global order)
+#ifdef M1PN_MPI
+        if (mpi)
+            return mpi->gather(f);
+#endif
+        return f;
+    };
 #ifdef M1PN_ELEMENT_GPU
     std::unique_ptr<ElementWenoGpu> device;
     double gpu_radius_seconds = 0;
@@ -934,7 +1003,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
 #endif
     const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.step_bound();
     require(selected <= scheme.realizability_step() * (1 + 1e-12), "Requested dt violates the element realizability bound");
-    if (selected > scheme.high_order_step())
+    if (selected > scheme.high_order_step() && rank == 0)
         std::cerr << "warning: dt exceeds the estimated high-order stability step " << scheme.high_order_step() << "\n";
     // ---- Uniform sample grid on the full box (Q1 nodes of count*degree cells per axis) -----------------------------
     std::array<int, 3> cells_axis{1, 1, 1}, points_axis{1, 1, 1};
@@ -968,7 +1037,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     auto write_samples = [&](const std::string &file, const Field &state, double time) {
         std::ofstream f(file);
         require(bool(f), "Cannot write field");
-        const int written = state.cols() == scheme.moments ? pn.q : 4;
+        const int written = state.cols() == out_scheme.moments ? pn.q : 4;
         f << std::setprecision(17) << "node,x,y,z";
         for (int k = 0; k < written; ++k) f << ",u" << k;
         if (fcs) f << ",rho_uncollided";
@@ -982,9 +1051,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
             std::array<bool, 3> flip{};
             for (int d = 0; d < dim; ++d)
                 if (mirror_dir[d] && x[d] < center[d]) x[d] = 2 * center[d] - x[d], flip[d] = true;
-            const Vec active_values = scheme.evaluate(state, x);
+            const Vec active_values = out_scheme.evaluate(state, x);
             Vec u = Vec::Zero(pn.q);
-            for (int k = 0; k < active_values.size(); ++k) u[scheme.active[k]] = active_values[k];
+            for (int k = 0; k < active_values.size(); ++k) u[out_scheme.active[k]] = active_values[k];
             for (int d = 0; d < dim; ++d)
                 if (flip[d]) u = reflect_pn(pn, u, d);
             values.row(s) = u.transpose();
@@ -999,21 +1068,25 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     };
     if (!o.skip_fields) {
         const bool all = o.sample_moments != "low";
-        write_samples(o.output + "/initial.csv", all ? a : Field(a.leftCols(4)), 0.);
+        const Field g = gathered(all ? a : Field(a.leftCols(4)));
+        if (rank == 0)
+            write_samples(o.output + "/initial.csv", g, 0.);
     }
-    auto mass_of = [&](const Field &state) {
+    auto mass_of = [&](const Field &state) { // owned nodes, reduced (all ranks call it)
         double m = 0;
-        for (int i = 0; i < scheme.nodes; ++i) m += scheme.lumped[i] * project(state.row(i).transpose())[0];
-        return m * domain_factor;
+        for (int i = 0; i < scheme.nodes; ++i)
+            if (scheme.is_owned(i)) m += scheme.lumped[i] * project(state.row(i).transpose())[0];
+        return reduce_sum(m) * domain_factor;
     };
     auto absorption_rate = [&](const Field &state) { // int sigma_a rho dx with nodal sigma_a and lumped mass
         double r = 0;
         for (int i = 0; i < scheme.nodes; ++i)
-            r += scheme.lumped[i] * (scheme.node_sigma_a[i] + o.sigma_a) * project(state.row(i).transpose())[0];
-        return r * domain_factor;
+            if (scheme.is_owned(i))
+                r += scheme.lumped[i] * (scheme.node_sigma_a[i] + o.sigma_a) * project(state.row(i).transpose())[0];
+        return reduce_sum(r) * domain_factor;
     };
     const double initial_mass = mass_of(a);
-    {
+    if (rank == 0) {
         if (!o.skip_fields) {
             std::ofstream masses(o.output + "/nodal_mass.csv");
             masses << std::setprecision(17) << "node,mass\n";
@@ -1033,10 +1106,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"reaction_model\":" << (material ? "\"nodal_average_int_sigma_phi_over_int_phi\"" : "\"constant\"")
                << ",\"material\":" << std::quoted(material ? material->name : std::string("none"))
                << ",\"material_subcells\":" << (material ? material->subcells : 0)
-               << ",\"material_integrals\":{\"volume\":" << scheme.integral_volume * domain_factor
-               << ",\"source\":" << scheme.integral_source * domain_factor
-               << ",\"sigma_a\":" << scheme.integral_sigma_a * domain_factor
-               << ",\"sigma_s\":" << scheme.integral_sigma_s * domain_factor << "}"
+               << ",\"material_integrals\":{\"volume\":" << out_scheme.integral_volume * domain_factor
+               << ",\"source\":" << out_scheme.integral_source * domain_factor
+               << ",\"sigma_a\":" << out_scheme.integral_sigma_a * domain_factor
+               << ",\"sigma_s\":" << out_scheme.integral_sigma_s * domain_factor << "}"
                << ",\"material_expected\":" << expected_integrals
                << ",\"domain_origin\":[" << full_origin[0] << "," << full_origin[1] << "," << full_origin[2] << "]"
                << ",\"domain_extent\":[" << extent[0] << "," << extent[1] << "," << extent[2] << "]"
@@ -1052,10 +1125,11 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"computed_counts\":[" << counts[0] << "," << counts[1] << "," << counts[2] << "]"
                << ",\"angular_reduction\":" << (eo.reduce_angular ? "true" : "false")
                << ",\"angular_reduction_mode\":" << std::quoted(o.angular_reduction)
-               << ",\"active_moments\":" << scheme.moments << ",\"odd_initial_fraction\":" << odd_initial
+               << ",\"active_moments\":" << out_scheme.moments << ",\"odd_initial_fraction\":" << odd_initial
                << ",\"odd_inflow_fraction\":" << odd_inflow
-               << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << scheme.nodes
-               << ",\"spatial_dofs_full_domain\":" << long(std::llround(scheme.nodes * domain_factor))
+               << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << out_scheme.nodes
+               << ",\"spatial_dofs_full_domain\":" << long(std::llround(out_scheme.nodes * domain_factor))
+               << ",\"mpi_ranks\":" << ranks << ",\"mpi_halo\":" << (distributed ? 2 : 0)
                << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis[0]
                << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":" << o.rk
                << ",\"time_integrator\":" << (eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\"")
@@ -1072,6 +1146,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                << ",\"compiler\":" << std::quoted(__VERSION__) << "\n}\n";
     }
     auto progress = [&](const char *status, double time, int count) {
+        if (rank != 0)
+            return;
         const std::string tmp = o.output + "/progress.json.tmp", dst = o.output + "/progress.json";
         std::ofstream f(tmp);
         f << std::setprecision(17) << "{\"status\":" << std::quoted(status) << ",\"time\":" << time
@@ -1085,15 +1161,25 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     int steps = 0;
     const double initialization = seconds() - begin;
     progress("running", t, steps);
-    std::ofstream history(o.output + "/history.csv");
-    history << std::setprecision(17) << "step,time,mass,absorption_rate,injected,absorbed,boundary_outflow,nudge_mass,min_margin\n";
-    auto record = [&](int step) {
+    std::ofstream history;
+    if (rank == 0) {
+        history.open(o.output + "/history.csv");
+        history << std::setprecision(17) << "step,time,mass,absorption_rate,injected,absorbed,boundary_outflow,nudge_mass,min_margin\n";
+    }
+    // Ledger: injected, absorbed and nudge_mass are per rank over owned nodes (summed here); boundary_outflow is
+    // reduced inside the scheme already.
+    auto record = [&](int step) { // all ranks (reductions); rank 0 writes
         double mm = std::numeric_limits<double>::infinity();
-        for (int i = 0; i < scheme.nodes; ++i) mm = std::min(mm, margin(project(a.row(i).transpose())));
+        for (int i = 0; i < scheme.nodes; ++i)
+            if (scheme.is_owned(i)) mm = std::min(mm, margin(project(a.row(i).transpose())));
+        mm = reduce_min(mm);
         min_margin_steps = std::min(min_margin_steps, mm);
-        history << step << "," << t << "," << mass_of(a) << "," << absorption_rate(a) << ","
-                << stats.injected * domain_factor << "," << stats.absorbed * domain_factor << ","
-                << stats.boundary_outflow * domain_factor << "," << stats.nudge_mass * domain_factor << "," << mm << "\n";
+        const double mass = mass_of(a), rate = absorption_rate(a);
+        const double inj = reduce_sum(stats.injected), absd = reduce_sum(stats.absorbed), nud = reduce_sum(stats.nudge_mass);
+        if (rank == 0)
+            history << step << "," << t << "," << mass << "," << rate << "," << inj * domain_factor << ","
+                    << absd * domain_factor << "," << stats.boundary_outflow * domain_factor << "," << nud * domain_factor
+                    << "," << mm << "\n";
     };
     record(0);
 #ifdef M1PN_ELEMENT_GPU
@@ -1129,15 +1215,21 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
 #endif
     if (o.history_stride <= 0 || steps % o.history_stride) record(steps);
     for (int i = 0; i < scheme.nodes; ++i) {
+        if (!scheme.is_owned(i))
+            continue;
         const Four u = project(a.row(i).transpose());
         min_density = std::min(min_density, u[0]);
         min_margin = std::min(min_margin, margin(u));
     }
-    if (!o.skip_fields) {
-        const bool all = o.sample_moments != "low";
-        write_samples(o.output + "/final.csv", all ? a : Field(a.leftCols(4)), t);
-    }
-    if (dim == 3) {
+    min_density = reduce_min(min_density), min_margin = reduce_min(min_margin);
+    solver_seconds = reduce_max(solver_seconds);
+    // Final state on rank 0 (global order) for the fields and the 3D slices.
+    const bool all_moments = o.sample_moments != "low";
+    const Field final_global = (!o.skip_fields || dim == 3) ? gathered(all_moments || dim == 3 ? a : Field(a.leftCols(4)))
+                                                           : Field();
+    if (!o.skip_fields && rank == 0)
+        write_samples(o.output + "/final.csv", all_moments ? final_global : Field(final_global.leftCols(4)), t);
+    if (dim == 3 && rank == 0) {
         // Mid-plane slices through the box centre (density and |J|), written even with --skip-fields: the full 3D
         // sample field is too large for P11 on fine meshes. plane = normal axis, (i, j) = in-plane sample indices.
         std::ofstream sl(o.output + "/slices.csv");
@@ -1154,9 +1246,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
                 V3 y = x;
                 for (int d = 0; d < dim; ++d)
                     if (mirror_dir[d] && y[d] < center[d]) y[d] = 2 * center[d] - y[d];
-                const Vec values = scheme.evaluate(a, y);
+                const Vec values = out_scheme.evaluate(final_global, y);
                 Vec full = Vec::Zero(pn.q);
-                for (int c = 0; c < values.size(); ++c) full[scheme.active[c]] = values[c];
+                for (int c = 0; c < values.size(); ++c) full[out_scheme.active[c]] = values[c];
                 const Four m = project(full);
                 rowsv[k] = {x[0], x[1], x[2], m[0], m.tail<3>().norm()};
             });
@@ -1167,36 +1259,51 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
     }
     progress("completed", t, steps);
     const double final_mass = mass_of(a);
-    const double injected = stats.injected * domain_factor, absorbed = stats.absorbed * domain_factor,
-                 outflow = stats.boundary_outflow * domain_factor, nudge = stats.nudge_mass * domain_factor;
+    const double injected = reduce_sum(stats.injected) * domain_factor, absorbed = reduce_sum(stats.absorbed) * domain_factor,
+                 outflow = stats.boundary_outflow * domain_factor, nudge = reduce_sum(stats.nudge_mass) * domain_factor;
     const double balance = final_mass - initial_mass + outflow + absorbed - injected - nudge;
     double uncollided_final = 0; // int rho_u(T) over the computed domain by the FCS quadrature
-    if (fcs) scheme.collided_source(t, &uncollided_final);
+    if (fcs) scheme.collided_source(t, &uncollided_final); // owned elements
+    uncollided_final = reduce_sum(uncollided_final);
     // Lattice FCS: uncollided mass, absorption rate and absorbed total (FCS quadrature, time integral of the table),
     // and the totals that compare with the kinetic reference.
     std::string lattice_fcs_json;
     if (fcs_lattice) {
         const auto &xs = scheme.fcs_points();
         const auto &ws = scheme.fcs_weights();
-        double mu = 0, ru = 0, au = 0;
+        const int P = scheme.fcs_points_per_element();
+        double mu = 0, ru = 0, au = 0, table_points = 0;
         for (std::size_t k = 0; k < xs.size(); ++k) {
+            if (!scheme.element_owned(int(k / P)))
+                continue; // MPI: owned elements only
+            table_points += 1;
             const double sa = material->sigma_a(xs[k]), r = table_value(k, t);
             mu += ws[k] * r, ru += ws[k] * sa * r;
             if (sa > 0)
                 au += ws[k] * sa * table_integral(k, t);
         }
-        mu *= domain_factor, ru *= domain_factor, au *= domain_factor;
+        mu = reduce_sum(mu) * domain_factor, ru = reduce_sum(ru) * domain_factor, au = reduce_sum(au) * domain_factor;
+        table_points = reduce_sum(table_points);
         const double rc = absorption_rate(a);
         std::ostringstream j;
         j << std::setprecision(17) << ",\"lattice_fcs\":{\"uncollided_mass_final\":" << mu
           << ",\"uncollided_absorption_rate_final\":" << ru << ",\"uncollided_absorbed\":" << au
           << ",\"total_mass_final\":" << final_mass + mu << ",\"total_absorption_rate_final\":" << rc + ru
-          << ",\"total_absorbed\":" << absorbed + au << ",\"table_points\":" << xs.size()
+          << ",\"total_absorbed\":" << absorbed + au << ",\"table_points\":" << table_points
           << ",\"table_times\":" << (lattice3d ? lattice3_table->M : lattice_table->M) + 1
-          << ",\"table_seconds\":" << (lattice3d ? lattice3_table->build_seconds : lattice_table->build_seconds) << "}";
+          << ",\"table_seconds\":" << reduce_max(lattice3d ? lattice3_table->build_seconds : lattice_table->build_seconds) << "}";
         lattice_fcs_json = j.str();
     }
     const double balance_scale = std::max({std::abs(initial_mass), injected, absorbed, std::abs(outflow), 1e-300});
+    const double absorption_final = absorption_rate(a);
+    // Diagnostics over ranks (element counts include the halo elements of every rank).
+    stats.min_gamma = reduce_min(stats.min_gamma), stats.min_limiter = reduce_min(stats.min_limiter);
+    stats.max_limited_zero_sum = reduce_max(stats.max_limited_zero_sum);
+    stats.limited_elements = long(reduce_sum(double(stats.limited_elements)));
+    stats.limited_boundary_nodes = long(reduce_sum(double(stats.limited_boundary_nodes)));
+    stats.nudged_states = long(reduce_sum(double(stats.nudged_states)));
+    if (rank != 0)
+        return 0;
     struct rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
     std::ofstream result(o.output + "/summary.json");
@@ -1220,12 +1327,13 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
            << ",\"ledger\":{\"injected\":" << injected << ",\"absorbed\":" << absorbed << ",\"boundary_outflow\":" << outflow
            << ",\"nudge_mass\":" << nudge << ",\"balance_residual\":" << balance
            << ",\"balance_relative\":" << balance / balance_scale << "}"
-           << ",\"absorption_rate_final\":" << absorption_rate(a)
+           << ",\"absorption_rate_final\":" << absorption_final
            << ",\"fcs\":" << std::quoted(o.fcs) << ",\"uncollided_mass_final\":" << uncollided_final * domain_factor
            << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
            << lattice_fcs_json
            << ",\"min_weno_gamma\":" << stats.min_gamma
-           << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << scheme.cells
+           << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << out_scheme.cells
+           << ",\"mpi_ranks\":" << ranks
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states
            << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
            << ",\"phase_seconds\":{\"closure\":" << stats.t_closure << ",\"weno\":" << stats.t_weno
@@ -1235,7 +1343,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin) {
            << ",\"finish\":" << stats.t_finish << ",\"reaction\":" << stats.t_reaction
            << ",\"fcs_density\":" << stats.t_fcs_density << ",\"fcs_quadrature\":" << stats.t_fcs_quadrature << "}}\n";
     std::cout << "Completed " << steps << " steps, P" << pn.order << ", element-weno p=" << o.degree << ", "
-              << scheme.nodes << " coefficients\n";
+              << out_scheme.nodes << " coefficients" << (distributed ? ", " + std::to_string(ranks) + " MPI ranks" : std::string()) << "\n";
     return 0;
 }
 } // namespace
@@ -1246,7 +1354,11 @@ int main(int argc, char **argv) {
     mallopt(M_TRIM_THRESHOLD, 1 << 30);
 #ifdef M1PN_MPI
     int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    // Element WENO with MPI: threaded line pipeline (MULTIPLE) and eager pipeline messages, as m1pn_element_weno
+    // (src/element_weno_main.cpp); a user value of UCX_RNDV_THRESH is kept.
+    setenv("UCX_RNDV_THRESH", "512kb", 0);
+    setenv("OMP_MAX_TASK_PRIORITY", "1", 0);
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 #endif
     Runtime world;
     try {
@@ -1276,8 +1388,7 @@ int main(int argc, char **argv) {
         }
         Angular pn(o.order, o.num.budget);
         if (o.num.stabilization == "element-weno") {
-            require(world.size == 1, "element-weno runs on a single MPI rank");
-            const int code = run_element_weno(o, pn, begin);
+            const int code = run_element_weno(o, pn, begin, world);
 #ifdef M1PN_MPI
             MPI_Finalize();
 #endif

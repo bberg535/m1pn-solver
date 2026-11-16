@@ -213,3 +213,47 @@ Rest bei 6 Prozessen: Neuaufbau des globalen Schemas auf Rang 0 für die Auswert
 Spaltenblockung (Zeilen-Kernel von `stab_local` und Linienlösungen in Spaltenblöcken von 32/64/128, bitgleich):
 durchweg langsamer (N=15: `stab_local` 2.49 → 2.65–3.28 s; N=31: Zeitschleife 43.4 → 47.5 s). Nicht übernommen.
 Der wirksame Teil von Variante 4 waren die seriellen Abschnitte in Aufbau und Auswertung (Variante 3).
+
+## MPI in `m1pn_fast` (16.11.2026, Branch `feature/combine-202611`)
+
+`m1pn_fast` (Element-WENO, Standard) läuft jetzt mit mehreren Rängen für alle Fälle, die `m1pn_fast` kennt:
+Crossing, Line Source/Plane Source (auch mit FCS), `lattice-paul` und `lattice-3d` (auch mit FCS), `shadow-weih`,
+glatte Fälle mit offenem Rand. Gleiche Zerlegung wie `m1pn_element_weno` (Scheiben entlang der letzten Achse, Halo 2,
+`ElementWenoMpi`).
+
+```bash
+# ein Knoten, ein Rang pro Sockel
+mpirun -np 2 --map-by ppr:1:package:PE=32 --bind-to core -x OMP_NUM_THREADS=32 -x OMP_PLACES=cores \
+       -x OMP_PROC_BIND=close tmp/build_cpu/m1pn_fast --case lattice-3d --dimension 3 ... --output DIR
+```
+
+Was dazu nötig war:
+- **Schema** (`src/element_weno.cpp`): Absorption/Einstrom der Reaktion und Nudge-Masse nur über eigene Knoten
+  (vorher über alle lokalen Knoten, also mit Halo doppelt; im Standalone ohne Reaktion nie aufgefallen); ungestoßene
+  FCS-Masse nur über eigene Elemente (`element_owned`: Eigentümer des untersten Knotens entlang der Achse); nach
+  jeder Reaktion Halo-Austausch (am äußeren Halo-Rand sind Material- und FCS-Knotenwerte nur aus Teilelementen
+  gemittelt). Ohne MPI ändert sich nichts (alle Knoten eigen, gleiche Reihenfolge; Bitvergleich unten).
+- **Treiber** (`nn_filter/src/main.cpp`): Masse, Absorptionsrate, Ledger, Minima, FCS-Summen über eigene
+  Knoten/Elemente und reduziert; die Winkelreduktions-Entscheidung global; Spiegelreduktion bei MPI aus (Grund
+  `MPI` in `config.json`); Rang 0 schreibt alle Dateien, Felder und 3D-Schnitte aus dem gesammelten Zustand mit einem
+  globalen Schema; `config.json`/`summary.json` mit `mpi_ranks`. FCS-Tabellen (Lattice 2D/3D) baut jeder Rang für
+  seine Punkte. `MPI_THREAD_MULTIPLE` und `UCX_RNDV_THRESH=512kb` wie `m1pn_element_weno`.
+- **Nicht kombinierbar:** `--gpu` (MPI+GPU zurückgestellt), Spiegelreduktion, periodische Gitter, 1D.
+
+**Genauigkeit** (`tests/fast_mpi_equivalence.sh`, NX, ein Knoten, 1/2/4 Ränge): Felder (`initial.csv`,
+`final.csv`, 3D-Schnitte) **bitgleich** für Crossing Q1, Crossing Q2 mit festem dt, Lattice ± FCS, Line Source mit
+FCS, Lattice 3D ± FCS, Shadow; Summen bis 1e-12 (Reduktionsreihenfolge). Mit `--dt 0` und aktiver Hochordnungsschranke
+(Q2 und höher) kann dt in den letzten Bits von der Rangzahl abhängen, weil die Normen der Potenziteration je Rang
+summiert werden (Crossing Q2 64²: dt relativ 3e-15, Dichte 1.2e-10). Bitgleich wird es mit festem `--dt`.
+
+**Seriell unverändert:** ein Rang gegen das Binary von `standard-20261116` (Job 160992): `final.csv`, Ledger und Masse
+bitgleich für Lattice ± FCS, Line Source mit FCS, Lattice 3D Q2 und Shadow.
+
+**Laufzeit** (Job 160992, ein NX-Knoten, CFL 1, ein Sockel = 1 Rang gegen 2 Ränge = ganzer Knoten): Crossing Q1 512²,
+P7, T = 0.32: 71.8 → 51.4 s (1.4×); Lattice 3D Q1 56³, P3, T = 3.2 mit FCS: 189.7 → 113.7 s (1.7×; die FCS-Tabelle
+verteilt sich mit, 171 → 99 s). Masse jeweils auf 12 Stellen gleich.
+
+**Grenze zwischen Knoten:** `m1pn_fast` linkt MFEM, und das vorhandene MFEM ist gegen die Standard-OpenMPI
+(`fabrics=none`) gebaut. Innerhalb eines Knotens läuft MPI über Shared Memory; zwischen Knoten nur über TCP
+(gut 1 GB/s). Für InfiniBand bräuchte es ein MFEM gegen die UCX-OpenMPI (`m1pn-ucx`), also eine neue MFEM-Installation
+(nicht ohne Freigabe). `m1pn_element_weno` (ohne MFEM) läuft weiterhin mit UCX über mehrere Knoten.

@@ -2319,7 +2319,8 @@ Vec ElementWeno::collided_source(double t, double *uncollided_mass, ElementWenoS
             const std::size_t at = std::size_t(e) * P + k;
             ok &= rho[at] >= 0 && std::isfinite(rho[at]);
             q[k] = fcs_weight_[at] * fcs_sigma_s_[at] * rho[at];
-            mass[e] += fcs_weight_[at] * rho[at];
+            if (element_owned(e)) // MPI: owned elements only
+                mass[e] += fcs_weight_[at] * rho[at];
             any |= rho[at] != 0;
         }
         if (!ok)
@@ -2360,7 +2361,7 @@ Field ElementWeno::react(const Field &a, double tau, ElementWenoStats *stats, do
             for (int i = 0; i < nodes; ++i) {
                 const double q0 = fcs_source[i], rho = a(i, 0) / c0;
                 out(i, 0) += c0 * q0 * tau * phi1;
-                if (stats) {
+                if (stats && is_owned(i)) { // MPI: ledger of the owned nodes only
                     stats->absorbed += lumped[i] * ((1 - decay) * rho + q0 * tau * (1 - phi1));
                     stats->injected += lumped[i] * q0 * tau;
                 }
@@ -2372,7 +2373,8 @@ Field ElementWeno::react(const Field &a, double tau, ElementWenoStats *stats, do
         if (stats && options.sigma_a > 0) { // ledger only; the state update is angular_filter() as before
             const double loss = -std::expm1(-options.sigma_a * tau);
             for (int i = 0; i < nodes; ++i)
-                stats->absorbed += lumped[i] * loss * std::sqrt(4 * pi) * a(i, 0);
+                if (is_owned(i))
+                    stats->absorbed += lumped[i] * loss * std::sqrt(4 * pi) * a(i, 0);
         }
         Field out = angular_filter(a, tau);
         return options.filter_strength == 0 && options.sigma_s == 0 && options.sigma_a == 0
@@ -2405,14 +2407,16 @@ Field ElementWeno::react(const Field &a, double tau, ElementWenoStats *stats, do
     });
     if (stats) {
         for (int i = 0; i < nodes; ++i)
-            stats->absorbed += absorbed[i], stats->injected += injected[i];
+            if (is_owned(i))
+                stats->absorbed += absorbed[i], stats->injected += injected[i];
         stats->t_reaction += seconds() - start;
     }
     return admissible_rows_public(std::move(out), stats);
 }
 namespace {
 // Nudges the stored low moments of every node into the M1 cone (rounding only).
-Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lumped) {
+// owned (MPI): only owned rows count in the statistics (all rows are nudged); empty: every row.
+Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lumped, const std::vector<char> &owned) {
     // Rounding fix only: raise the stored density coefficient by ulps until the stored row itself projects into
     // the M1 cone (coefficient level, so no set_low() round trip can move it out again).
     std::atomic<long> nudged{0};
@@ -2436,8 +2440,10 @@ Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lu
                      "State left the M1 cone beyond rounding (stored row " + std::to_string(i) + ", 4096 ulp): " +
                          describe(project(Eigen::Map<const Vec>(row, q))) + ", before nudge rho coefficient " +
                          std::to_string(before));
-        added[i] = lumped[i] * std::sqrt(4 * pi) * (row[0] - before);
-        ++nudged;
+        if (owned.empty() || owned[i]) {
+            added[i] = lumped[i] * std::sqrt(4 * pi) * (row[0] - before);
+            ++nudged;
+        }
     });
     if (stats && nudged.load()) {
         stats->nudged_states += nudged.load();
@@ -2463,7 +2469,9 @@ void combine(Field &r, const Field &x, const Field &a, double old, double fresh,
 } // namespace
 Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, ElementWenoStats *stats) const {
     // Without filter and reactions the input is used in place (no copy).
-    const Field filtered = reacts() ? react(input, .5 * dt, stats, time + .25 * dt) : Field();
+    Field filtered = reacts() ? react(input, .5 * dt, stats, time + .25 * dt) : Field();
+    if (dist_ && reacts())
+        dist_->exchange(filtered); // outer halo nodes: material/FCS node data from partial elements
     const Field &a = reacts() ? filtered : input;
     // Effective weights of the stage rates: u^{n+1} = u^n + dt (L1 + L2 + 4 L3) / 6 (boundary mass ledger).
     auto stage = [&](double t, const Field &x, double old, double fresh, double weight) {
@@ -2474,7 +2482,7 @@ Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, El
             stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
         const double combine_start = seconds();
         combine(r, x, a, old, fresh, dt, nodes);
-        Field out = admissible_rows(std::move(r), nodes, stats, lumped);
+        Field out = admissible_rows(std::move(r), nodes, stats, lumped, owned_);
         if (stats)
             stats->t_ssp_stage += seconds() - combine_start;
         return out;
@@ -2482,14 +2490,20 @@ Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, El
     const Field first = stage(time, a, 0, 1, 1. / 6);
     const Field second = stage(time + dt, first, .75, .25, 1. / 6);
     Field last = stage(time + .5 * dt, second, 1. / 3, 2. / 3, 2. / 3);
-    if (reacts())
-        return react(last, .5 * dt, stats, time + .75 * dt);
+    if (reacts()) {
+        Field out = react(last, .5 * dt, stats, time + .75 * dt);
+        if (dist_)
+            dist_->exchange(out);
+        return out;
+    }
     return last; // no copy (a conditional operator would copy the lvalue)
 }
 // SSPRK(4,3) (Kraaijevanger; Spiteri and Ruuth): four forward Euler stages of dt/2 at times t, t+dt/2, t+dt,
 // t+dt/2; u3 = 2/3 u + 1/3 (u2 + dt/2 L(u2)). Realizable for dt <= 2 dt_bound.
 Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, ElementWenoStats *stats) const {
-    const Field filtered = reacts() ? react(input, .5 * dt, stats, time + .25 * dt) : Field();
+    Field filtered = reacts() ? react(input, .5 * dt, stats, time + .25 * dt) : Field();
+    if (dist_ && reacts())
+        dist_->exchange(filtered); // outer halo nodes: material/FCS node data from partial elements
     const Field &a = reacts() ? filtered : input;
     const double half = .5 * dt;
     // Effective weights: u^{n+1} = u^n + dt (L1 + L2 + L3 + 3 L4) / 6.
@@ -2501,7 +2515,7 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
             stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
         const double combine_start = seconds();
         combine(r, x, a, old, fresh, half, nodes);
-        Field out = admissible_rows(std::move(r), nodes, stats, lumped);
+        Field out = admissible_rows(std::move(r), nodes, stats, lumped, owned_);
         if (stats)
             stats->t_ssp_stage += seconds() - combine_start;
         return out;
@@ -2510,12 +2524,16 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
     const Field second = stage(time + half, first, 0, 1, 1. / 6);
     const Field third = stage(time + dt, second, 2. / 3, 1. / 3, 1. / 6);
     Field last = stage(time + half, third, 0, 1, .5);
-    if (reacts())
-        return react(last, .5 * dt, stats, time + .75 * dt);
+    if (reacts()) {
+        Field out = react(last, .5 * dt, stats, time + .75 * dt);
+        if (dist_)
+            dist_->exchange(out);
+        return out;
+    }
     return last; // no copy (a conditional operator would copy the lvalue)
 }
 Field ElementWeno::admissible_rows_public(Field x, ElementWenoStats *stats) const {
-    return admissible_rows(std::move(x), nodes, stats, lumped);
+    return admissible_rows(std::move(x), nodes, stats, lumped, owned_);
 }
 ElementWeno::GhostEstimates ElementWeno::ghost_estimates(const Field &a, double alpha) const {
     require(options.positivity_projection && !options.projection_half_range,

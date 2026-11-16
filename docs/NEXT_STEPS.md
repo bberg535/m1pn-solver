@@ -40,10 +40,15 @@ Erledigt (16.11.2026):
 - Lattice-FCS für `lattice-3d` (CPU und GPU; docs/FCS_LATTICE.md, Abschnitt 3D; `tests/uncollided_lattice3d.cpp`).
 
 Zurückgestellt (Nutzer, 16.11.): MPI+GPU.
+- MPI in `m1pn_fast` für alle Element-WENO-Fälle inkl. Lattice-FCS 2D/3D (docs/ELEMENT_WENO_MPI.md, Abschnitt
+  `m1pn_fast`; `tests/fast_mpi_equivalence.sh`, bitgleich zu einem Rang).
+
 Offen:
-- MPI im Element-WENO-Pfad von `m1pn_fast` (bisher nur ein Rang; MPI nur in `m1pn_element_weno` für Crossing und
-  glatten Ausfluss). Voraussetzung für MPI + Lattice-FCS (Tabelle pro Rang) und für MPI+GPU in `m1pn_fast`.
 - MPI+GPU (zurückgestellt; für einen künftigen Cluster mit mehreren GPUs).
+- MPI zwischen Knoten für `m1pn_fast` nur über TCP (MFEM ist gegen die OpenMPI ohne UCX gebaut); InfiniBand bräuchte
+  eine MFEM-Installation gegen `m1pn-ucx` (Entscheidung des Nutzers).
+- Optional: reproduzierbare Summation in der Potenziteration, damit dt bei `--dt 0` nicht von der Rangzahl abhängt
+  (verschiebt dt auch seriell in den letzten Bits; Entscheidung des Nutzers).
 
 ## Block 3 — zurückgestellt (Numerik fürs Paper)
 
