@@ -109,3 +109,21 @@ Der Ghost-Kernel braucht etwa 0,16 ms pro Stufe GPU-Zeit. Mit 32 Host-Threads la
 neben der GPU-Arbeit, daher ist die GPU-Version dort 3-6 % langsamer. Sie lohnt sich, wenn der Host knapp ist (4
 Threads: 21 % schneller) oder wenn die GPU später durch weitere Optimierung nicht mehr der Engpass ist. Abweichung
 gegen die CPU wie zuvor auf dem Rundungsniveau des Problems (512², T = 0.32: 5,8e-5 / 4,9e-6; 1024²: 1,2e-2 / 8,6e-4).
+
+## Validierung des Systemstands (16.11.2026, `feature/system-202611`)
+
+Gleiches Binary, CPU gegen `--gpu` (tardis, A100), Dichte am Ende:
+
+| Fall | max rel | L2 rel |
+|---|---:|---:|
+| Crossing Q1 64², P7, T = 0.05 | 2.9e-12 | 1.0e-12 |
+| Glatter Transport am Rand, Q2 32², P7 | 8.4e-16 | 2.2e-16 |
+| Line Source mit FCS, Q1 128², P7, T = 0.02 | 1.0e-14 | 1.8e-14 |
+| Lattice 56², P7, T = 0.2 | 1.4e-15 | 4.5e-16 |
+| Lattice mit FCS 56², P7, T = 0.2 | 1.7e-10 | 6.1e-11 |
+| Lattice 56², P35, T = 0.2 | 2.2e-15 | 6.4e-16 |
+| Lattice 3D Q2 14³, P3, T = 0.1 | 3.0e-16 | 2.9e-16 |
+
+Lattice-FCS: die Tabelle entsteht auf der GPU (Rundung von sin/exp auf dem Gerät, daher 1e-10). Lattice-FCS 224²,
+P15, T = 3.2 auf der GPU: Tabelle 1.5 s (CPU ≈ 55 s), Löser 21.6 s, gesamt 27 s; Masse 2.072102 (−0.39 % gegen
+Schotthöfer/Hauck, wie der CPU-Lauf auf NX).
