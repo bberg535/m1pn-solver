@@ -1,54 +1,21 @@
-# Offene Arbeit nach standard-20261116 (Stand 16.11.2026)
+# Offene Arbeit (Stand 16.11.2026)
 
-Basis: Branch `feature/system-202611`, Tag `standard-20261116` (gepusht; Default-Branch `experiment/element-weno`
-= dieser Stand + hochgeladene Projektions-PDF). Worktree `.claude/worktrees/system`, Builds `tmp/build_cpu`
-(MFEM, MPI, OpenMP, Tests) und `tmp/build_gpu` (`-DM1PN_ELEMENT_GPU=ON`, nvcc `/sfw/cuda/12.6`). Bauen und Tests auf
-NX per Slurm (`--partition=long --constraint=nx`; Login-Knoten hat 1 Kern; NFS-Zeitstempel: geänderte Dateien vor
-`cmake --build` auf dem Knoten mit `touch` anfassen). GPU: tardis (`--constraint=ampere --gres=gpu:1`, eine A100).
+Basis: Branch `feature/combine-202611` (Worktree `.claude/worktrees/combine`), aufbauend auf Tag `standard-20261116`.
+Seit 16.11.2026 nur noch Element-WENO, ohne MFEM: Massenkorrektur, Biharmonik, NN-Filter und DLRA entfernt (letzter
+Stand mit ihnen: `standard-20261116`). Bauen: `bash scripts/build.sh` (NX, im Slurm-Job; UCX-OpenMPI), `GPU=1 bash
+scripts/build.sh tmp/build_gpu` (tardis). Cluster-Hinweise in `nx/README.md`.
 
-## Block 1 — jetzt (Reproduzierbarkeit, Aufräumen)
+## Erledigt am 16.11.2026
 
-1. ~~**GPU-Validierung ins Repo:**~~ erledigt 16.11.: `tests/gpu_validate.sh` + `tests/gpu_validate_cmp.py`, Job 160891
-   alle 7 Fälle bestanden (Schwelle 1e-8). Ursprünglicher Auftrag: `tests/gpu_validate.sh` (Slurm-Skript für tardis) nach Vorlage
-   `.claude/worktrees/system/tmp/gpuval/val.sbatch` + `cmp_final.py` (aus `gpu-campaign/nx/tmp/validate_20261115/`):
-   CPU gegen `--gpu` mit demselben Binary für Crossing, Rand Q2, Line Source+FCS, Lattice (±FCS, P35), Lattice 3D;
-   Schwellen wie in docs/ELEMENT_WENO_GPU.md (Abschnitt Validierung des Systemstands).
-2. ~~**Ergebnisse versionieren:**~~ erledigt 16.11.: `results/tardis_202611/{paper,fcs,hetero,lattice}`,
-   `results/lattice_fcs_20261116` (je README). Ursprünglicher Auftrag: aus den Kampagnen (nicht versioniert) Tabellen/Plots/Berichte nach `results/` übernehmen
-   (Muster `results/positivity`): `gpu-campaign/nx/tmp/tardis_{paper,fcs,hetero}` (REPORT.md, results.csv,
-   runtimes.md, figures/, tables.tex), `lattice-fcs/nx/tmp/lattice_fcs` (REPORT.md, results.csv). Keine Rohfelder.
-3. ~~**tardis-Lattice-Kampagne auswerten:**~~ erledigt 16.11.: docs/TARDIS_RESULTS.md, Abschnitt Lattice-Konvergenz
-   (12/18; Gitter-EOC ≈ 2, N konvergiert ab P35, Grenzwert Masse −0.02 % / Absorption +0.06 %). Ursprünglicher Auftrag: `gpu-campaign/nx/tmp/tardis_lattice` (13/18 fertig, Rest abgebrochen;
-   `python3 tardis.py collect --campaign ...`), Konvergenz in N (7–45) und Gitter (224²–896²) gegen
-   Schotthöfer/Hauck; in docs/TARDIS_RESULTS.md ergänzen. Beachten: `config.json` der Kampagnen hat `"rk":3` auch
-   bei SSPRK(4,3) (Metadatenfehler, behoben in 3402f86; `time_integrator` stimmt).
-4. **Aufräumen** (teilweise erledigt 16.11.: Worktrees gpu-a100, gpu-projection, lattice-fcs, positivity-projection,
-   element-weno-fcs, element-weno-hetero3d, element-weno-ssp43 entfernt, Branches bleiben; deren `nx/tmp` und
-   Nicht-Build-Inhalte von `tmp/` liegen in `<Haupt-Checkout>/nx/tmp/archive_worktrees_20261116/<name>/` (INDEX.txt).
-   Offen: Rohdaten element-weno-mpi, gpu-campaign bleibt. Ursprünglicher Auftrag: mit dem Nutzer abstimmen, nichts ungefragt löschen): Worktrees/Branches, die vollständig in
-   standard-20261116 enthalten sind (gpu-a100, gpu-projection, gpu-campaign, lattice-fcs, element-weno-mpi,
-   positivity-projection, element-weno-fcs, hetero3d, ssp43 …); ungetrackte Logs im Haupt-Checkout.
+- Block 1: GPU-Validierung im Repo (`tests/gpu_validate.sh`), Kampagnenergebnisse versioniert (`results/`),
+  tardis-Lattice-Kampagne ausgewertet (docs/TARDIS_RESULTS.md), Aufräumen (Worktrees, Rohdaten, alter Code).
+- Block 2: Element-WENO Default von `m1pn_fast` mit CFL 1 (CFL-Scan); GPU mit Spiegelreduktion und periodischen
+  Gittern; Lattice-FCS für `lattice-3d` (CPU, GPU); MPI in `m1pn_fast` für alle Fälle, bitgleich zu einem Rang;
+  reproduzierbare Normen in der Potenziteration (dt unabhängig von der Rangzahl); MFEM-frei, MPI über InfiniBand.
 
-## Block 2 — in Arbeit (Kombinierbarkeit), Branch `feature/combine-202611`, Worktree `.claude/worktrees/combine`
+## Offen
 
-Erledigt (16.11.2026):
-- DLRA entfernt (Nutzerentscheidung; `0cead11`, bitgleich zum Standard für alle übrigen Läufe).
-- Element-WENO ist Default von `m1pn_fast`, CFL 1.0 nach CFL-Scan (`results/cfl_scan_20261116`, `c039a16`).
-- GPU mit Spiegelreduktion und periodischen Gittern (`c039a16`; `tests/gpu_validate.sh` 24/24, ≤ 4e-10); Spiegel auf
-  der A100 1.8× (Lattice 224² P15) bis 3.0× (Line Source 512² P7).
-
-- Lattice-FCS für `lattice-3d` (CPU und GPU; docs/FCS_LATTICE.md, Abschnitt 3D; `tests/uncollided_lattice3d.cpp`).
-
-Zurückgestellt (Nutzer, 16.11.): MPI+GPU.
-- MPI in `m1pn_fast` für alle Element-WENO-Fälle inkl. Lattice-FCS 2D/3D (docs/ELEMENT_WENO_MPI.md, Abschnitt
-  `m1pn_fast`; `tests/fast_mpi_equivalence.sh`, bitgleich zu einem Rang).
-
-Offen:
 - MPI+GPU (zurückgestellt; für einen künftigen Cluster mit mehreren GPUs).
-- MPI zwischen Knoten für `m1pn_fast` nur über TCP (MFEM ist gegen die OpenMPI ohne UCX gebaut); InfiniBand bräuchte
-  eine MFEM-Installation gegen `m1pn-ucx` (Entscheidung des Nutzers).
-- Optional: reproduzierbare Summation in der Potenziteration, damit dt bei `--dt 0` nicht von der Rangzahl abhängt
-  (verschiebt dt auch seriell in den letzten Bits; Entscheidung des Nutzers).
 
 ## Block 3 — zurückgestellt (Numerik fürs Paper)
 
@@ -65,4 +32,4 @@ Offen:
 - 3D: Host-Randpfad (Face-Terme) als Engpass.
 
 Regeln: Abweichungen bis 1e-8 erlaubt, keine mathematischen Änderungen ohne Freigabe; kein Push/Merge ohne Auftrag;
-keine Spack-Installationen; MFEM-Varianten nicht ändern; Experimente auf eigenen Branches; Antworten auf Deutsch.
+keine Spack-Installationen ohne Auftrag; Experimente auf eigenen Branches; Antworten auf Deutsch.

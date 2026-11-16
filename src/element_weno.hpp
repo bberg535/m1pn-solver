@@ -48,7 +48,7 @@ struct ElementWenoOptions {
     bool fullsphere_ghost = true;       // C6: M1 ghost = incoming kinetic moments + outgoing moments of the positive PN trace
     bool scale_invariant_weno = true;   // C5: epsilon of the WENO weights is relative to the stencil scale
     bool symmetric_residual = false;    // L3 alternative: symmetric PSD residual form of s_h (changes the operator for varying gamma)
-    // Constant angular filter of nn_filter: d a_lm/dt = -sigma (l/(N+1))^4 a_lm,
+    // Constant angular filter (former nn_filter study): d a_lm/dt = -sigma (l/(N+1))^4 a_lm,
     // half a step before and after each SSPRK3 step. Zero switches it off.
     double filter_strength = 0;
     // Constant isotropic scattering and absorption (unit speed):

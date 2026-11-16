@@ -2,7 +2,7 @@
 
 Branch `feature/element-weno-heterogeneous-3d` (Basis `study/nx-element-weno-convergence-20261111` @ a62b016,
 diese wiederum auf `experiment/element-weno` @ c49290b). Stand 11.11.2026.
-Rohdaten und Tabellen: `results/element_heterogeneous_20261111/`.
+Rohdaten und Tabellen: `results/heterogeneous/nx_hetero_20261111/`.
 
 ## 0. Kurzfassung
 
@@ -163,7 +163,7 @@ für die Dichte direkt am Rand nicht untersucht. Schotthöfer/Hauck verwenden Va
 **Symmetrie:** Material und Quelle sind spiegelsymmetrisch in x um 3.5, in y nicht (Absorber [3,4]×[1,2]). Die
 automatische Reduktion halbiert daher nur in x; bei ungerader Elementzahl (Q3/35) wird nicht gespiegelt.
 
-Lokale Serie (i5-12500, 6 Threads, SSPRK(4,3), Standard-dt, `results/element_heterogeneous_20261111/lattice_local/`):
+Lokale Serie (i5-12500, 6 Threads, SSPRK(4,3), Standard-dt, `results/heterogeneous/nx_hetero_20261111/lattice_local/`):
 
 | P | Q/E | Punkte | Schritte | Löser (s) | Masse | Absorption gesamt | Absorptionsrate T | Ausfluss | Bilanz | ρ_max |
 |---|---|---:|---:|---:|---|---|---|---:|---:|---:|
@@ -222,7 +222,7 @@ Einstrahlung. Hier wurde sie nicht verändert, sondern umgangen.
 Hintergrund 10⁻⁶.
 
 Lokale Ergebnisse (Q2, T = 1.6, 6 Threads; vollständig in
-`results/element_heterogeneous_20261111/shadow_local/shadow_table.md`, Profile in `shadow_profiles.png`):
+`results/heterogeneous/nx_hetero_20261111/shadow_local/shadow_table.md`, Profile in `shadow_profiles.png`):
 
 | Kennzahl (Referenz) | P3, n=8 → 16 | P7, n=8 → 16 | P11, n=8 → 16 |
 |---|---|---|---|
@@ -334,7 +334,7 @@ python3 nx/tmp/ew_hetero_paper/study.py submit --campaign "$PWD/nx/tmp/ew_hetero
 ## 11a. Ergebnisse der nx-Kampagne `ew_hetero_paper` (12.11.2026)
 
 Profil `hetero-paper`, Git 47b8752, Binary eingefroren, 16 Packs à 4 × 16 Kerne (NUMA-gepinnt), `--cfl 0.2`.
-60 von 63 Aufgaben validiert. Bilder und Tabellen: `results/element_heterogeneous_20261111/nx_hetero_paper/`
+60 von 63 Aufgaben validiert. Bilder und Tabellen: `results/heterogeneous/nx_hetero_20261111/nx_hetero_paper/`
 (`lattice_*`, `shadow_*`, `lattice3d_*`, PNG und PDF; Tabellen `lattice.md`, `shadow.md`, `lattice3d.md`).
 
 **Lattice** (`lattice.md`, `lattice_convergence`, `lattice_density_maps`, `lattice_lineout`, `lattice_error_vs_time`):
@@ -401,7 +401,7 @@ Kernstunden. Nachlauf der drei Fehlschläge: Kampagne `ew_hetero_paper_recovery`
 
 **Entscheidung:** Der Shadow-Test wird nicht weiter als Validierung verwendet. `hetero-paper` hat damit 27 statt 63
 Aufgaben; `hetero-smoke` behält eine Shadow-Aufgabe je Stufe als Funktionstest (3D, Spiegel, Material, σ = 10⁷).
-Die Ergebnisse aus §11a bleiben unverändert in `results/element_heterogeneous_20261111/nx_hetero_paper/shadow*`.
+Die Ergebnisse aus §11a bleiben unverändert in `results/heterogeneous/nx_hetero_20261111/nx_hetero_paper/shadow*`.
 Nachlauf: `shadowB_P3_p2_E32_s1e7` abgeschlossen; `shadowB_P11_p2_E50_s1e7` (Job 159521) abgebrochen.
 
 **Begründung:**

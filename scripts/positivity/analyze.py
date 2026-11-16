@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tables and figures of the positivity-projection NX campaign (scripts/positivity/campaign.py).
 
-Usage: analyze.py --campaign DIR --output results/positivity/<name>
+Usage: analyze.py --campaign DIR --output results/boundary/positivity_20261113/<name>
 Writes summary.json, runtime.md, accuracy.md, scaling.md and fig_*.png/pdf. Missing runs are listed, never filled in.
 """
 import argparse

@@ -57,8 +57,8 @@ Periodische Sinuswelle, 1D, ohne aktiven Limiter (EOC der letzten Verfeinerung):
 Bei `q=1` skaliert `1-γ` wie `h²`; das kostet bei p=3 Ordnung. Mit `q=3` ist das
 Ergebnis identisch zu `γ=1`.
 
-Crossing-Studie, gleiche Knotenzahl, `T=0.32`, CFL 0.5. Rohdaten in
-`results/element_weno/crossing_20261109.txt`.
+Crossing-Studie, gleiche Knotenzahl, `T=0.32`, CFL 0.5 (Rohdaten bis Tag `standard-20261116` unter
+`results/element_weno/`).
 
 | Grad, Gitter | Gewicht | ρ_max | L² gegen Kinetik | Laufzeit |
 |---|---|---|---|---|
@@ -80,12 +80,9 @@ deshalb nur als Vergleich innerhalb der Tabelle aussagekräftig.
   nach SSPRK3 zusammen mit dem Filter (Strang). Erhält Dichte (Streuung) und
   M1-Kegel. Quellen, Materialsprünge und `lattice` fehlen weiterhin.
 - Line Source (Garrett–Hauck) läuft für Element-WENO exakt skaliert auf dem
-  Einheitsquadrat (`σ_s=3`, `T=1/3`, Filter ×3); Auswertung in
-  `scripts/line_source/analyze.py`.
-- Vergleich mit Variante B und Filter siehe
-  `results/element_weno/filter_comparison_20261109/REPORT.md`. Dort ist p>1 auf
-  16² und 32² schlechter als p=1; die Tabelle oben gilt nur für 96 Intervalle.
-  Feinere Gitter: `results/element_weno/large_comparison_20261109/REPORT.md`.
+  Einheitsquadrat (`σ_s=3`, `T=1/3`, Filter ×3); Referenz `scripts/line_source/reference.py`.
+- Die frühen Vergleiche mit der Massenkorrektur (Variante B) liegen nur noch in der Git-Historie (bis
+  `standard-20261116`); die Massenkorrektur ist seit 16.11.2026 entfernt.
 - Mit Gewicht 1e-3 ist der Sensor im Crossing fast wirkungslos; `ρ_max` und L²
   liegen praktisch bei `γ=1`.
 - Der Limiter ist in 41–43 % der Element-Stufen aktiv, mit Faktor bis 0.
@@ -177,8 +174,8 @@ reproduzieren.
 
 Seit 16.11.2026 ist Element-WENO der Standard von `m1pn_fast` mit SSPRK(4,3) und **CFL 1.0**
 (`dt = cfl · step_bound`, `step_bound = min(realizability_step, high_order_step)`, letzteres mit eigenem Faktor 0.9).
-Die Massenkorrektur bleibt mit `--stabilization m1pn_mass_correction` wählbar (SSPRK2, CFL 1, gelumpt).
-Scan auf NX (`results/cfl_scan_20261116`), CFL 0.1-1.0, Abweichung der Dichte gegen CFL 0.1:
+Massenkorrektur und Biharmonik sind seit 16.11.2026 entfernt (letzter Stand: Tag `standard-20261116`).
+Scan auf NX (`results/convergence/cfl_scan_20261116`), CFL 0.1-1.0, Abweichung der Dichte gegen CFL 0.1:
 
 | Fall | CFL 0.2 | CFL 0.5 | CFL 0.9 | CFL 1.0 | Zeit 0.2 → 1.0 |
 |---|---:|---:|---:|---:|---:|

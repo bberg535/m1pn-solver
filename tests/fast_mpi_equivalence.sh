@@ -26,6 +26,7 @@ OUT=${2:-$ROOT/tmp/fast_mpi_equivalence/${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}}
 mkdir -p "$OUT"
 echo "binary: $B"; echo "output: $OUT"; echo "git: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
 export OMP_PLACES=cores OMP_PROC_BIND=close
+MPIRUN=${MPIRUN:-/home/warehouse15/bberg/spack/opt/spack/linux-zen3/openmpi-5.0.10-kfdcvl5tog3tsi5rusglshnfcauemfjq/bin/mpirun}  # must match the MPI of the binary (scripts/build.sh: UCX OpenMPI)
 COMMON="--stabilization element-weno --mirror-reduction off"
 FAILED=0
 
@@ -35,10 +36,10 @@ run_case() { # tag args...
   rm -rf "$OUT/${tag}_r1" "$OUT/${tag}_r2" "$OUT/${tag}_r4"
   OMP_NUM_THREADS=32 "$B" $COMMON "$@" --threads 32 --output "$OUT/${tag}_r1" > "$OUT/${tag}_r1.log" 2>&1 \
     || { echo "  FAIL: 1 rank"; tail -3 "$OUT/${tag}_r1.log"; FAILED=$((FAILED+1)); return; }
-  mpirun -np 2 --map-by ppr:1:package:PE=32 --bind-to core -x OMP_NUM_THREADS=32 -x OMP_PLACES -x OMP_PROC_BIND \
+  "$MPIRUN" -np 2 --map-by ppr:1:package:PE=32 --bind-to core -x OMP_NUM_THREADS=32 -x OMP_PLACES -x OMP_PROC_BIND \
     "$B" $COMMON "$@" --threads 32 --output "$OUT/${tag}_r2" > "$OUT/${tag}_r2.log" 2>&1 \
     || { echo "  FAIL: 2 ranks"; tail -3 "$OUT/${tag}_r2.log"; FAILED=$((FAILED+1)); return; }
-  mpirun -np 4 --map-by ppr:2:package:PE=16 --bind-to core -x OMP_NUM_THREADS=16 -x OMP_PLACES -x OMP_PROC_BIND \
+  "$MPIRUN" -np 4 --map-by ppr:2:package:PE=16 --bind-to core -x OMP_NUM_THREADS=16 -x OMP_PLACES -x OMP_PROC_BIND \
     "$B" $COMMON "$@" --threads 16 --output "$OUT/${tag}_r4" > "$OUT/${tag}_r4.log" 2>&1 \
     || { echo "  FAIL: 4 ranks"; tail -3 "$OUT/${tag}_r4.log"; FAILED=$((FAILED+1)); return; }
   python3 - "$OUT/${tag}" <<'EOF' || FAILED=$((FAILED+1))

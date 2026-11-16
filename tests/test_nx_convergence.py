@@ -22,14 +22,15 @@ class CampaignPlan(unittest.TestCase):
             self.assertEqual([t["id"] for t in tasks], list(range(len(tasks))))
             self.assertEqual(len({t["label"] for t in tasks}), len(tasks))
             self.assertEqual(tasks, study.make_tasks(profile))
-            self.assertEqual(len(tasks), 21 if profile == "smoke" else 81)
+            self.assertEqual(len(tasks), 21 if profile == "smoke" else 79)  # 81 minus the two mass-correction baselines
 
     def test_scientific_families(self):
         tasks = study.make_tasks("paper")
         families = {t["family"] for t in tasks}
         self.assertTrue({"smooth", "smoothdt2", "boundary", "crossing",
                          "line", "time_smooth", "time_crossing",
-                         "ablation", "baseline"} <= families)
+                         "ablation"} <= families)
+        self.assertNotIn("baseline", families)  # mass correction removed 2026-11-16
         for name in ("time_smooth", "time_crossing"):
             family = [t for t in tasks if t["family"] == name]
             self.assertEqual(len(family), 5)
@@ -47,10 +48,8 @@ class CampaignPlan(unittest.TestCase):
                 self.assertEqual(opts[opts.index("--time-integrator") + 1], t["rk"])
                 self.assertEqual(opts[opts.index("--angular-reduction") + 1], "off")
                 self.assertEqual(opts[opts.index("--mirror-reduction") + 1], "off")
-                if t["family"] == "baseline":
-                    self.assertEqual(t["stabilization"], "m1pn_mass_correction")
-                    self.assertEqual(t["rk"], "ssprk3")
-                elif t["family"] != "ablation":
+                self.assertEqual(t["stabilization"], "element-weno")
+                if t["family"] != "ablation":
                     self.assertEqual(t["rk"], "ssprk43")
 
     def test_no_silent_override_and_hashes(self):
@@ -114,7 +113,7 @@ class HeterogeneousProfiles(unittest.TestCase):
             # shadow archived (12.11.2026): only the smoke profile keeps it as a functional test
             self.assertEqual("shadow" in kinds, profile == "hetero-smoke")
         # the frozen v1 matrices are unchanged by the new profiles
-        self.assertEqual(len(study.make_tasks("paper")), 81)
+        self.assertEqual(len(study.make_tasks("paper")), 79)
         self.assertEqual(len(study.make_tasks("smoke")), 21)
 
     def test_flags_and_expectations(self):
@@ -137,11 +136,10 @@ class HeterogeneousProfiles(unittest.TestCase):
             self.assertGreater(t["estimate_core_hours"], 0)
             self.assertIn(t["slot_cores"], (16, 32))
 
-    def test_path_b_tasks_carry_memory_budget(self):
-        for t in study.make_tasks("hetero-paper"):
-            opts = study.flags(t, Path("/tmp/out"), 16)
-            if t["stabilization"] == "m1pn_mass_correction":
-                self.assertEqual(opts[opts.index("--memory-mib") + 1], "49152", t["label"])
+    def test_only_element_weno_tasks(self):
+        for profile in ("paper", "hetero-paper", "hetero-smoke"):
+            for t in study.make_tasks(profile):
+                self.assertEqual(t.get("stabilization", "element-weno"), "element-weno", t["label"])
 
     def test_required_files(self):
         shadow = next(t for t in study.make_tasks("hetero-smoke") if t["kind"] == "shadow")

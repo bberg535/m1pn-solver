@@ -1,4 +1,0 @@
-[ 81%] Built target m1pn_core
-[ 90%] Building CXX object CMakeFiles/pn_mass_correction_tests.dir/tests/pn_mass_correction.cpp.o
-[100%] Linking CXX executable pn_mass_correction_tests
-[100%] Built target pn_mass_correction_tests

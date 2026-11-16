@@ -1,2 +1,0 @@
-[lws2024-05:00065] opal_ifinit: socket() failed with errno=1
-[lws2024-05:00065] pmix_ifinit: socket() failed with errno=1

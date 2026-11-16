@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI checks for m1pn_fast: defaults, element-weno, filter and biharmonic.
+"""CLI checks for m1pn_fast (element WENO only since 2026-11-16): defaults, options, constant filter.
 
 Usage: fast_cli.py M1PN_FAST [M1PN_ELEMENT_WENO]
 """
@@ -25,7 +25,7 @@ def density(path):
     return [math.sqrt(4 * math.pi) * float(r["u0"]) for r in rows], rows
 crossing = ["--case", "crossing-study", "--inflow", "crossing-study-transport", "--dimension", "2",
             "--elements", "8", "--pn-order", "3", "--time", ".02"]
-EW_DEFAULT_CFL = 1.0  # kElementWenoFastCfl in nn_filter/src/main.cpp
+EW_DEFAULT_CFL = 1.0  # kDefaultCfl in src/fast_main.cpp
 out = run("default", *crossing)
 if out:
     c = json.load(open(out + "/config.json")); s = json.load(open(out + "/summary.json"))
@@ -33,12 +33,8 @@ if out:
           and c["cfl_safety"] == EW_DEFAULT_CFL, f"default is element-weno, SSPRK(4,3), CFL {EW_DEFAULT_CFL}")
     check(s["minimum_cone_margin"] >= 0 and abs(s["ledger"]["balance_relative"]) < 1e-10,
           "default run stays in the cone with mass balance")
-mc = run("mass_correction", *crossing, "--stabilization", "m1pn_mass_correction")
-if mc:
-    c = json.load(open(mc + "/config.json")); s = json.load(open(mc + "/summary.json"))
-    check(c["rk"] == 2 and c["cfl_safety"] == 1 and c["stabilization"] == "m1pn_mass_correction"
-          and c["mass_mode"] == "lumped" and c["kv_gamma"] == 0, "mass correction keeps SSPRK2, CFL 1, lumped")
-    check(s["status"] == "completed" and s["global_Q_balance"] < 1e-12, "mass correction run completes with balance")
+run("mass_correction", *crossing, "--stabilization", "m1pn_mass_correction", expect_ok=False)
+run("biharmonic", *crossing, "--stabilization", "biharmonic-corrected", expect_ok=False)
 ew = run("element_weno", *crossing, "--stabilization", "element-weno", "--degree", "2", "--elements", "4", "--dt", ".005")
 if ew:
     c = json.load(open(ew + "/config.json")); s = json.load(open(ew + "/summary.json"))
@@ -58,10 +54,6 @@ ewf = run("element_weno_filter", *crossing, "--stabilization", "element-weno", "
 if ewf and ew:
     a, _ = density(ew); b, _ = density(ewf)
     check(max(abs(x - y) for x, y in zip(a, b)) > 1e-8, "constant filter changes the element-weno solution")
-bf = run("biharmonic_filter", *crossing, "--stabilization", "biharmonic-corrected", "--time-integrator", "ssprk3",
-         "--filter", "constant", "--filter-strength", "31.75")
-if bf:
-    check(json.load(open(bf + "/summary.json"))["status"] == "completed", "biharmonic with constant filter completes")
 run("element_weno_nn", *crossing, "--stabilization", "element-weno", "--filter", "nn", expect_ok=False)
 run("element_weno_pn_only", *crossing, "--stabilization", "element-weno", "--coupling", "pn-only", expect_ok=False)
 run("element_weno_rk2", *crossing, "--stabilization", "element-weno", "--time-integrator", "ssprk2", expect_ok=False)

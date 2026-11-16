@@ -10,13 +10,11 @@ Independent study branch; **nothing is submitted automatically**. Existing solve
 
 ## 1. Prerequisites and usage
 
-Run from the repository root on the NX login host after building both programs with the existing MFEM/MPI/Eigen environment:
+Run from the repository root on the NX login host after building (`bash scripts/build.sh tmp/build` in a Slurm job; no
+MFEM since 2026-11-16):
 
 ~~~bash
-cmake --build tmp/build --target m1pn_fast m1pn_element_weno \
-  m1pn_element_weno_tests m1pn_element_weno_fix_tests
-OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-  ctest --test-dir tmp/build -R 'element_weno' --output-on-failure
+ctest --test-dir tmp/build -R 'element_weno' --output-on-failure
 
 # Check exact task inventory without creating any files:
 python3 scripts/element_weno/nx_convergence.py prepare \
@@ -68,7 +66,6 @@ The full profile contains **81 independent tasks** (21 in smoke mode), organised
 | GHS Line Source | P3,P7; Q1,Q2; E=32,64,128 | Exact infinite-medium reference with documented rescaling: sigma_s=3, T=1/3, Gaussian width 0.01, background 9e-4 |
 | Temporal splitting | Smooth periodic with sigma_s=2,sigma_a=0.5; crossing with sigma_s=2,sigma_a=0.5, filter 0.15 | Fixed grid/PN, dt through dt/16; finest solution is **self reference** |
 | Ablation | WENO on/off and 1e-3 vs 0.2 weights; limiter on/off; SSPRK3 vs SSPRK(4,3) | No-limiter failures are valid findings, not silently excluded |
-| Baseline | `m1pn_mass_correction` coupled vs `pn-only`, SSPRK3 | **Q1 / 128 elements vs element-WENO Q2 / 64 elements:** same 129² sample points, different spatial scheme; no unimplemented pure-M1 claim |
 
 Production studies use SSPRK(4,3) **explicitly**, `--angular-reduction off` and `--mirror-reduction off` for transparent comparability (optimized variants can be compared in a separate performance campaign). Typical `--cfl .2` and the solver's current feasibility/stability step bound are used; time refinement makes a separate zero-time probe to determine a consistent sequence.
 

@@ -37,17 +37,15 @@ Einschränkungen:
 
 ## Bauen und Starten (NX)
 
-Die Standard-OpenMPI (`fabrics=none`) kann zwischen Knoten nur TCP (gut 1 GB/s). Für InfiniBand gibt es die
-Spack-Umgebung `m1pn-ucx` mit OpenMPI 5.0.10 und UCX 1.22, gebaut auf dem System-rdma-core; das MFEM-Paket ist davon
-unberührt. Element-WENO braucht kein MFEM:
+Seit 16.11.2026 braucht der Solver kein MFEM mehr; `scripts/build.sh` baut standardmäßig mit der OpenMPI der
+Spack-Umgebung `m1pn-ucx` (OpenMPI 5.0.10 mit UCX 1.22 auf dem System-rdma-core), also mit InfiniBand zwischen den
+Knoten. Die Standard-OpenMPI (`fabrics=none`) könnte zwischen Knoten nur TCP (gut 1 GB/s).
 
 ```bash
-O=/home/warehouse15/bberg/spack/opt/spack/linux-zen3/openmpi-5.0.10-kfdcvl5tog3tsi5rusglshnfcauemfjq
-cmake -S . -B tmp/build_ucx -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=$O/bin/mpic++ -DM1PN_ELEMENT_ONLY=ON
-cmake --build tmp/build_ucx -j 16
-# im Slurm-Job (Knoten exklusiv, ein Rang pro Sockel, 32 Threads):
+bash scripts/build.sh tmp/build           # im Slurm-Job (der Login-Knoten hat einen Kern)
+# Knoten exklusiv, ein Rang pro Sockel, 32 Threads:
 mpirun -np 6 --map-by ppr:1:package:PE=32 --bind-to core --mca pml ucx -x OMP_NUM_THREADS=32 \
-       -x OMP_PLACES=cores -x OMP_PROC_BIND=close tmp/build_ucx/m1pn_element_weno <Optionen> [--dump-state f]
+       -x OMP_PLACES=cores -x OMP_PROC_BIND=close tmp/build/m1pn_fast <Optionen>
 ```
 
 Vorlage: `nx/tmp/mpi_ucx4_20261114/run.sbatch` (3 Knoten, `--ntasks-per-node=2 --cpus-per-task=32`). ssh zwischen den
@@ -224,7 +222,7 @@ glatte Fälle mit offenem Rand. Gleiche Zerlegung wie `m1pn_element_weno` (Schei
 ```bash
 # ein Knoten, ein Rang pro Sockel
 mpirun -np 2 --map-by ppr:1:package:PE=32 --bind-to core -x OMP_NUM_THREADS=32 -x OMP_PLACES=cores \
-       -x OMP_PROC_BIND=close tmp/build_cpu/m1pn_fast --case lattice-3d --dimension 3 ... --output DIR
+       -x OMP_PROC_BIND=close tmp/build/m1pn_fast --case lattice-3d --dimension 3 ... --output DIR
 ```
 
 Was dazu nötig war:
@@ -233,7 +231,7 @@ Was dazu nötig war:
   FCS-Masse nur über eigene Elemente (`element_owned`: Eigentümer des untersten Knotens entlang der Achse); nach
   jeder Reaktion Halo-Austausch (am äußeren Halo-Rand sind Material- und FCS-Knotenwerte nur aus Teilelementen
   gemittelt). Ohne MPI ändert sich nichts (alle Knoten eigen, gleiche Reihenfolge; Bitvergleich unten).
-- **Treiber** (`nn_filter/src/main.cpp`): Masse, Absorptionsrate, Ledger, Minima, FCS-Summen über eigene
+- **Treiber** (`src/fast_main.cpp`, bis 16.11. `nn_filter/src/main.cpp`): Masse, Absorptionsrate, Ledger, Minima, FCS-Summen über eigene
   Knoten/Elemente und reduziert; die Winkelreduktions-Entscheidung global; Spiegelreduktion bei MPI aus (Grund
   `MPI` in `config.json`); Rang 0 schreibt alle Dateien, Felder und 3D-Schnitte aus dem gesammelten Zustand mit einem
   globalen Schema; `config.json`/`summary.json` mit `mpi_ranks`. FCS-Tabellen (Lattice 2D/3D) baut jeder Rang für
@@ -256,7 +254,8 @@ bitgleich für Lattice ± FCS, Line Source mit FCS, Lattice 3D Q2 und Shadow.
 P7, T = 0.32: 71.8 → 51.4 s (1.4×); Lattice 3D Q1 56³, P3, T = 3.2 mit FCS: 189.7 → 113.7 s (1.7×; die FCS-Tabelle
 verteilt sich mit, 171 → 99 s). Masse jeweils auf 12 Stellen gleich.
 
-**Grenze zwischen Knoten:** `m1pn_fast` linkt MFEM, und das vorhandene MFEM ist gegen die Standard-OpenMPI
-(`fabrics=none`) gebaut. Innerhalb eines Knotens läuft MPI über Shared Memory; zwischen Knoten nur über TCP
-(gut 1 GB/s). Für InfiniBand bräuchte es ein MFEM gegen die UCX-OpenMPI (`m1pn-ucx`), also eine neue MFEM-Installation
-(nicht ohne Freigabe). `m1pn_element_weno` (ohne MFEM) läuft weiterhin mit UCX über mehrere Knoten.
+**Zwischen Knoten:** Bis 16.11.2026 linkte `m1pn_fast` MFEM (gegen die OpenMPI ohne UCX gebaut), zwischen Knoten
+also nur TCP. Seit dem Entfernen von Massenkorrektur und Biharmonik ist `m1pn_fast` MFEM-frei und läuft mit der
+UCX-OpenMPI über InfiniBand wie `m1pn_element_weno`. Messung (Job 161004, Crossing Q1 512², P7, T = 0.32, CFL 1, ein
+Rang pro Sockel, `--mca pml ucx`): 1 Sockel 65.6 s, 1 Knoten (2 Ränge) 47.0 s, 2 Knoten (4 Ränge) 34.6 s; Masse auf
+15 Stellen gleich. Das MFEM-freie Binary ist bitgleich zum vorherigen MFEM-Build (Job 161001, 8 Fälle).

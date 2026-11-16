@@ -6,9 +6,9 @@ Auswertung, Plots) und ändert nur die Aufgabenmatrix, die Solver-Optionen der G
 
 ## GPU-Pfad für alle Benchmark-Typen
 
-- `m1pn_fast --gpu` (MFEM-Build mit `-DM1PN_ELEMENT_GPU=ON`): Zeitschleife auf der GPU, gleiche Fälle und Ausgaben wie
-  ohne `--gpu`. Nicht auf der GPU: periodische Gitter (1D-Glattfall, läuft auf der CPU), Spiegelreduktion (GPU-Läufe
-  mit `--mirror-reduction off`), DLRA.
+- `m1pn_fast --gpu` (Build mit `-DM1PN_ELEMENT_GPU=ON`, `GPU=1 bash scripts/build.sh`): Zeitschleife auf der GPU,
+  gleiche Fälle und Ausgaben wie ohne `--gpu`. Stand der Kampagne (15.11.): ohne periodische Gitter und
+  Spiegelreduktion; beides läuft seit 16.11.2026 auch auf der GPU (docs/ELEMENT_WENO_GPU.md).
 - Reaktion auf der GPU (exakte lokale Lösung: Material σ_a, σ_s, Quelle, konstante Streuung/Absorption, Winkelfilter,
   Bilanz), FCS-Stoßquelle auf der GPU (Radialtabelle von ρ_u vom Host, Quadratur und Sammeln auf der GPU).
 - Ghost-Projektion auf der GPU, wenn der Randaufwand groß ist (Ghost-Paare x Regelpunkte > 0.1 x Knoten x Momente;

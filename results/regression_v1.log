@@ -1,7 +1,0 @@
-RUN regression_1d_m1pn_baseline
-RUN regression_1d_m1pn
-RUN regression_2d_m1pn_baseline
-RUN regression_2d_m1pn
-RUN regression_3d_m1pn_baseline
-RUN regression_3d_m1pn
-DONE 6 runs; 0 failed

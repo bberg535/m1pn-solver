@@ -1,9 +1,0 @@
-RUN vacuum_inflow_A
-RUN affine_A
-RUN vacuum_inflow_Aex
-RUN affine_Aex
-RUN vacuum_inflow_B
-RUN affine_B
-RUN vacuum_inflow_C
-RUN affine_C
-DONE 8 runs; 4 failed

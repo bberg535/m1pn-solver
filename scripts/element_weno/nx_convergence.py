@@ -115,12 +115,6 @@ def make_hetero_tasks(profile: str) -> list[dict]:
             # same dt as the historical path-B runs (equal time step comparison)
             out.append(task("lattice", "fast", "lattice-paul", "vacuum", 2, 112, 1, pn, 3.2, kind="lattice",
                             tag="dtB", fixed_dt=LATTICE_B_DT, **lat))
-        for pn in (3, 7, 11):  # path B with the current binary (new measurement, not the historical runs)
-            row = task("lattice_B", "fast", "lattice-paul", "vacuum", 2, 112, 1, pn, 3.2, kind="lattice",
-                       tag="B_new", background=1e-10, fixed_dt=LATTICE_B_DT,
-                       stabilization="m1pn_mass_correction", rk="ssprk3")
-            row["coupling"] = "m1pn"
-            out.append(row)
     # 3D shadow, stage A (moderate, Beer-Lambert reference) and stage B (sigma = 1e7, Weih et al.).
     # Archived on 12.11.2026 (docs/ELEMENT_HETEROGENEOUS.md, section 11b): the collimated delta beam is outside what
     # P_N with N <= 11 can represent, so Beer-Lambert measures the angular model, not the scheme. Only the smoke
@@ -212,15 +206,6 @@ def make_tasks(profile: str) -> list[dict]:
         out.append(task("ablation", "fast", "crossing-study",
                         "crossing-study-transport", 2, 64, 2, 7, .32,
                         kind="ablation", tag="weno_weight_02", linear=.2))
-        # Same 129x129 sample-grid size as Q2/E64 element WENO, not same FE degree.
-        for coupling in ("m1pn", "pn-only"):
-            row = task("baseline", "fast", "crossing-study",
-                       "crossing-study-transport", 2, 128, 1, 7, .32,
-                       kind="baseline", tag=coupling)
-            row["stabilization"] = "m1pn_mass_correction"
-            row["coupling"] = coupling
-            row["rk"] = "ssprk3"
-            out.append(row)
     seen = set()
     for number, t in enumerate(out):
         if t["label"] in seen:
@@ -283,11 +268,7 @@ def hetero_flags(t: dict, output: Path, threads: int, end, dt, cfl):
         if t.get("skip_fields"):
             args.append("--skip-fields")
     else:
-        # Path B checks an internal memory budget (default too small for P11 on 112^2; ew_hetero_paper failed
-        # with "Memory budget exceeded"); 48 GiB as in the line-source campaign, below the 64 GiB per 16-core slot.
-        args += ["--coupling", t.get("coupling", "m1pn"), "--mass-mode", "lumped",
-                 "--pn-viscosity-scale", "1", "--kv-gamma", "0", "--biharmonic-gamma", "0",
-                 "--memory-mib", "49152"]
+        raise ValueError("only element-weno tasks (mass correction removed 2026-11-16)")
     return args
 
 
@@ -332,9 +313,7 @@ def flags(t: dict, output: Path, threads: int, *, end=None, dt=None, cfl=None):
                  "--element-limit", "on" if t["limiter"] else "off",
                  "--weno-linear", str(t["weno_linear"])]
     else:
-        args += ["--coupling", t.get("coupling", "m1pn"),
-                 "--mass-mode", "lumped", "--pn-viscosity-scale", "1",
-                 "--kv-gamma", "0", "--biharmonic-gamma", "0"]
+        raise ValueError("only element-weno tasks (mass correction removed 2026-11-16)")
     return args
 
 
@@ -408,18 +387,8 @@ def prepare(ns) -> int:
 
 
 def mfem_version(repo: Path) -> str:
-    """MFEM version from the build cache of the repository (MFEM_CONFIG -> config.mk), 'unknown' otherwise."""
-    for cache in (repo / "tmp/build/CMakeCache.txt",):
-        try:
-            for line in cache.read_text().splitlines():
-                if line.startswith("MFEM_CONFIG:"):
-                    for entry in Path(line.split("=", 1)[1]).read_text().splitlines():
-                        if entry.startswith("MFEM_VERSION_STRING") or entry.startswith("MFEM_VERSION "):
-                            return entry.split("=", 1)[1].strip()
-        except OSError:
-            pass
-    return "unknown"
-
+    """No MFEM since 2026-11-16 (element WENO only); kept for the manifest format."""
+    return "none"
 
 def runtime_environment() -> dict:
     """Threads, CPU affinity, NUMA nodes of the allowed CPUs and OpenMP variables of this task."""
@@ -524,9 +493,9 @@ def run(ns) -> int:
             config = load(output / "config.json")
             if summary.get("status") != "completed" or config.get("case") != t["case"]:
                 raise ValueError("solver did not complete requested case")
-            if config.get("time_integrator") != t["rk"] and t.get("stabilization") != "m1pn_mass_correction":
+            if config.get("time_integrator") != t["rk"]:
                 raise ValueError("time-integrator mismatch")
-            if int(config.get("degree", -1)) != t["degree"] and t.get("stabilization") != "m1pn_mass_correction":
+            if int(config.get("degree", -1)) != t["degree"]:
                 raise ValueError("Bernstein degree mismatch")
             if abs(float(summary["time"]) - t["time"]) > 1e-10:
                 raise ValueError("end time mismatch")

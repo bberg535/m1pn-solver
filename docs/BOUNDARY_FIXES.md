@@ -1,6 +1,9 @@
 # Randkorrekturen C1, C2, C5, C6 und Stabilisator-Regression L3
 
 Branch `fix/element-weno-boundary-c1-c6` (Basis: `experiment/element-weno` @ `8efe517` plus Audit-Harness `90e6739`).
+Hinweis (16.11.2026): Der Ordner `audit/` (Prüfprogramme, Ergebnisse) ist aus dem Arbeitsstand entfernt und liegt in der
+Git-Historie (bis Tag `standard-20261116`); die Tests `tests/element_weno_fixes.cpp` bleiben.
+
 Auslöser: Gegenbeispiele C1, C2, C5, C6 in `audit/REPORT.md`. Die WENO-/Element-MCL-Architektur ist unverändert;
 alle Änderungen sind Schalter in `ElementWenoOptions` (`src/element_weno.hpp`). **Alle Schalter `false` reproduzieren 8efe517 bitgleich**
 (`--legacy-boundary` in `m1pn_element_weno`, `AUDIT_FIX=legacy` im Audit): 29 Records der kleinen Tests und 4 Crossing-Records (64², P7) stimmen in
@@ -8,7 +11,7 @@ allen Gleitkommafeldern exakt überein (`results/fix/comparison.json`, `legacy_b
 `audit/results/*.jsonl` und die Referenzversion (Commit 8efe517) bleiben unverändert erhalten.
 
 Neue Standardwerte: `vacuum_sign_limit`, `outward_bar_rounding`, `fullsphere_ghost`, `scale_invariant_weno` = **true**; `symmetric_residual` = **false**.
-Achtung: `m1pn_fast --stabilization element-weno` (`nn_filter/src/main.cpp`) übernimmt diese Standardwerte ohne eigenen Legacy-Schalter.
+Achtung: `m1pn_fast` (`src/fast_main.cpp`) übernimmt diese Standardwerte ohne eigenen Legacy-Schalter.
 
 Reproduktion: `bash audit/run_fix.sh` (ca. 25 min, ein Kern). Tests: `tests/element_weno_fixes.cpp` (43 Checks, CMake-Ziel `m1pn_element_weno_fix_tests`),
 unverändert `tests/element_weno.cpp` (75 Checks, laufen auf dem Produktionscode mit den neuen Standardwerten: PASSED).

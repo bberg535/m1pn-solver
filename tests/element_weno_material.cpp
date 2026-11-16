@@ -1,7 +1,7 @@
 // Space-dependent reaction for element WENO (docs/ELEMENT_HETEROGENEOUS.md): exact local reaction, nodal
 // averages, realizability, ledger and global particle balance.
 #include "element_weno.hpp"
-#include "time.hpp"
+#include "element_weno.hpp"
 #include "benchmark_cases.hpp"
 #include <iostream>
 #include <memory>
@@ -38,23 +38,6 @@ std::shared_ptr<ElementWenoMaterial> blocks(double absorber, double scatter, dou
     m->source = [=](const V3 &x) { return x[1] > .5 ? source : 0.; };
     m->name = "blocks";
     return m;
-}
-// The local reaction equals the independent reaction() of path B (src/time.cpp) on the nodal coefficients.
-void reaction_matches_path_b() {
-    Angular pn(5);
-    ElementWenoOptions o;
-    o.degree = 2, o.dimension = 2, o.elements = 4, o.periodic = false;
-    o.material = blocks(10, 1, 2);
-    ElementWeno s(pn, o);
-    const Field a = random_state(s, pn, 3, false); // path B rejects states on the cone boundary
-    Field source = Field::Zero(s.nodes, pn.q);
-    source.col(0) = s.node_source / std::sqrt(4 * pi);
-    for (double tau : {1e-4, .03, 2.}) {
-        const Field mine = s.react(a, tau);
-        const Field theirs = reaction(a, source, s.node_sigma_a, s.node_sigma_s, 0., tau);
-        check(maxabs(mine - theirs) < 1e-13, "reaction equals path-B reaction(), tau=" + std::to_string(tau),
-              maxabs(mine - theirs));
-    }
 }
 void special_cases() {
     Angular pn(3);
@@ -331,7 +314,6 @@ void subnormal_rounding() {
 } // namespace
 int main() {
     try {
-        reaction_matches_path_b();
         special_cases();
         realizability_and_ledger();
         nodal_averages();

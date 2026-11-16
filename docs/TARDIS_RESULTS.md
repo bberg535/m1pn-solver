@@ -1,7 +1,7 @@
 # Konvergenzkampagne tardis (A100): Ergebnisse, Stand 16.11.2026
 
 Kampagnen unter `nx/tmp/tardis_{paper,fcs,hetero,lattice}` im Worktree `gpu-campaign` (eingefroren, `tardis.py collect`;
-je `REPORT.md`, `results.csv`, `figures/`, `runtimes.md`; versioniert in `results/tardis_202611/`). Aufbau und Effizienzschleife: [TARDIS_CAMPAIGN.md](TARDIS_CAMPAIGN.md). Fehler wie auf NX:
+je `REPORT.md`, `results.csv`, `figures/`, `runtimes.md`; versioniert in `results/convergence/tardis_202611/`). Aufbau und Effizienzschleife: [TARDIS_CAMPAIGN.md](TARDIS_CAMPAIGN.md). Fehler wie auf NX:
 L2 der Dichte; „kinetisch" enthält den PN-Abschneidefehler, „Selbstdifferenz" vergleicht mit dem nächstfeineren Gitter.
 
 ## Status
@@ -52,7 +52,7 @@ ist Q1 genauer als Q2-Q4 (Material-Unstetigkeiten). Lattice 3D (eigener Fall): B
 GPU, Q1, SSPRK(4,3), CFL 0.2, T = 3.2, ohne FCS; Binary `46141ef` (hohe PN-Ordnungen auf der GPU). 12 / 18 fertig:
 P7, P15, P21 auf 224²/448²/896²; P35 auf 224²/448²; P45 auf 448². Abgebrochen/nicht gestartet: P7 und P15 1792²,
 P21 1344², P35 896², P45 672²; P45 224² am Timeout (1800 s, T = 2.95). Versioniert in
-`results/tardis_202611/lattice/`. Referenz Schotthöfer/Hauck Tab. 1 / (2π): Masse 2.08016, Absorption 1.11950,
+`results/convergence/tardis_202611/lattice/`. Referenz Schotthöfer/Hauck Tab. 1 / (2π): Masse 2.08016, Absorption 1.11950,
 Rate 0.73164 (4 Stellen, Rundung ±0.04 % / ±0.007 % / ±0.011 %).
 
 Abweichung Masse / Absorption / Rate:
@@ -75,7 +75,7 @@ Abweichung Masse / Absorption / Rate:
   Absorption und Rate liegen knapp darüber, im Bereich der Modellunterschiede (S22 gegen PN-Grenzwert,
   Anfangsdichte, Einstrommodell). Eine genauere Aussage braucht eine eigene Referenz (Block 3 in NEXT_STEPS).
   Kontrolle: Referenz Masse + Absorption = 3.19965 statt 3.2, d. h. die Tabelle selbst ist nur auf ≈ 1e-4 konsistent.
-- **Konsistenz CPU/GPU:** gleiche Fälle auf NX (CPU, `results/lattice_fcs_20261116`, ohne FCS) stimmen auf die
+- **Konsistenz CPU/GPU:** gleiche Fälle auf NX (CPU, `results/heterogeneous/lattice_fcs_20261116`, ohne FCS) stimmen auf die
   angegebenen Stellen überein (z. B. P15 448² −0.22 % / +0.43 %, P35 224² −0.55 % / +1.06 %).
 - **Bilanz:** Massenbilanz ≤ 1.1e-10 relativ, ρ_min > 0 in allen Läufen; Masse + Absorption = 3.2 − 1.3e-5
   (Ausfluss über den Vakuumrand).

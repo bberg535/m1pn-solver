@@ -2,7 +2,7 @@
 
 Branch `feature/boundary-positivity-projection` (Basis `feature/element-weno-dlra` @ `bdd5d3f`).
 Grundlage: Notiz *Momententreue Positivitätsprojektion – Nichtnegative Winkelrekonstruktion für den M1–PN-Randzustand*
-(13.11.2026). Ergebnisse der NX-Kampagne: [results/positivity/](../results/positivity/README.md).
+(13.11.2026). Ergebnisse der NX-Kampagne: [results/boundary/positivity_20261113/](../results/boundary/positivity_20261113/README.md).
 
 ## 1. Was ersetzt wird
 
@@ -61,7 +61,7 @@ des Low-Order-Randflusses); der PN-Randfluss (LLF mit Onsager-Datum) ist unverä
 ## 2b. Varianten für U_aus (untersucht 13.11.2026)
 
 Verglichen an den **exakten kinetischen Halbraummomenten** der Randknoten (Option `--ghost-study K`, Funktion
-`ElementWeno::ghost_estimates`; [Tabelle](../results/positivity/ghost_study_20261113/README.md)):
+`ElementWeno::ghost_estimates`; [Tabelle](../results/boundary/positivity_20261113/ghost_study_20261113/README.md)):
 
 | Variante (Option) | Idee | Ergebnis |
 |---|---|---|
