@@ -41,6 +41,10 @@ struct ElementWenoOptions {
     double positivity_fraction = 1e-3; // epsilon of report (25)
     double element_theta = .999;       // theta of report Section 6.2
     double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
+    // Study variants of the sensor at the rounding limit (docs/ELEMENT_WENO.md; CPU only, default off = bitwise the
+    // standard): soft threshold ratio -> max(0, ratio - d) / (1 - d), and a floor of the sensor denominator
+    // |u|_e -> max(|u|_e, f max_i |u_i|) with u_i the density coefficients of the element.
+    double weno_deadband = 0, weno_floor = 0;
     double viscosity_scale = 1;
     // Boundary/sensor corrections of docs/BOUNDARY_FIXES.md. All false reproduces commit 8efe517 bit for bit.
     bool vacuum_sign_limit = true;      // C2: accepted boundary mass rate may not exceed max(low-order rate, kinetic inflow)
@@ -399,6 +403,11 @@ private:
     Incoming face_data(int side_id, const V3 &x, double time) const;
     void face_data_into(int side_id, const V3 &x, double time, Incoming &data) const;
     std::vector<Incoming> steady_data_; // per (face, point) when inflow.steady
+    // Uniform faces (steady inflow without exterior callbacks, all point data bitwise equal, e.g. vacuum): the
+    // low-order face terms and the PN datum load are point-independent per face node, so the point loop reduces to
+    // the face weights W_r = sum_points w_p phi_n(x_p) (row r = face_row_[f] + n). Only the summation order changes.
+    std::vector<char> face_uniform_;
+    Vec face_weight_;
     std::vector<int> boundary_nodes_sorted_;
     struct PairEntry {
         int j;

@@ -31,8 +31,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import nx_convergence as nx  # noqa: E402  (frozen next to this file inside a campaign)
 
-PROFILES = ("tardis-smoke", "tardis-paper", "tardis-fcs", "tardis-hetero", "tardis-lattice")
-HETERO = ("tardis-hetero", "tardis-lattice")
+PROFILES = ("tardis-smoke", "tardis-paper", "tardis-fcs", "tardis-hetero", "tardis-lattice", "tardis-lattice-mc")
+HETERO = ("tardis-hetero", "tardis-lattice", "tardis-lattice-mc")
 nx.HETERO_PROFILES = tuple(nx.HETERO_PROFILES) + HETERO
 # Calibration (A100, SSPRK(4,3), Q1 512^2 P7, 37 moments, 722 steps: 7.2 s): seconds per node x moment x step, plus a
 # fixed device/host overhead per stage. Estimates only (factor ~2).
@@ -158,6 +158,27 @@ def make_tardis_tasks(profile: str) -> list[dict]:
             for n in grids:
                 out.append(task("lattice", "fast", "lattice-paul", "vacuum", 2, n, 1, pn, 3.2, kind="lattice",
                                 tag="std", **lat))
+    if profile == "tardis-lattice-mc":
+        # Lattice 2D/3D against the Monte-Carlo reference (docs/LATTICE_MC.md), standard CFL 1, Q1, T = 3.2.
+        # A100 memory (80 GB): solver ~100 B per node x moment; the FCS time table holds points x (T/0.01 + 3)
+        # doubles (3D 112^3: 29 GB, 168^3: ~100 GB). Hence 3D FCS up to 112^3 (P <= 7), 2D up to 1344^2.
+        # K1, 3D: sigma_a h = 1.25 .. 0.31 (asymptotic regime?), FCS on/off, P_N part.
+        l3 = dict(background=1e-10, skip_fields=True, expect_mirror=[False, False, False], cfl=1.)
+        for n, std, fcs in [(56, [3, 7, 15], [3, 7, 15]), (112, [3, 7, 15], [3, 7]), (168, [3, 7], []), (224, [3], [])]:
+            for with_fcs, pns in ((False, std), (True, fcs)):
+                for pn in pns:
+                    t = task("lattice3d", "fast", "lattice-3d", "vacuum", 3, n, 1, pn, 3.2, kind="lattice3d",
+                             tag="fcs" if with_fcs else "std", **l3)
+                    t["fcs"] = with_fcs
+                    out.append(t)
+        # K2, 2D: high resolution in grid and N, with FCS (P21 on 896^2 also without).
+        lat = dict(background=1e-10, expect_mirror=[True, False, False], cfl=1.)
+        for n, pn, with_fcs in [(896, 15, True), (896, 21, True), (896, 21, False), (896, 35, True),
+                                (1344, 15, True), (1344, 21, True)]:
+            t = task("lattice", "fast", "lattice-paul", "vacuum", 2, n, 1, pn, 3.2, kind="lattice",
+                     tag="fcs" if with_fcs else "std", **lat)
+            t["fcs"] = with_fcs
+            out.append(t)
     seen = set()
     for number, t in enumerate(out):
         if t["label"] in seen:

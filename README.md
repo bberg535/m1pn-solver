@@ -13,6 +13,7 @@ CPU (OpenMP, MPI) und GPU (CUDA, A100). Kein MFEM.
 |---|---|
 | `m1pn_fast` (`src/fast_main.cpp`) | Standard: alle Fälle, MPI, `--gpu` |
 | `m1pn_element_weno` (`src/element_weno_main.cpp`) | Einzelstudien: glatte periodische Genauigkeit, glatter Ausfluss, Ghost-Studie |
+| `m1pn_lattice_mc` (`tools/lattice_mc.cpp`) | Monte-Carlo-Referenz für `lattice-paul` und `lattice-3d` (docs/LATTICE_MC.md) |
 
 ```bash
 m1pn_fast --case crossing-study --inflow crossing-study-transport --dimension 2 --elements 128 --degree 1 \
@@ -35,7 +36,7 @@ Ausgabe: `config.json`, `summary.json` (Bilanz, Laufzeiten), `history.csv`, `ini
 
 ```bash
 bash scripts/build.sh tmp/build                  # NX: im Slurm-Job; Eigen, OpenMP, MPI (UCX-OpenMPI, m1pn-ucx)
-GPU=1 bash scripts/build.sh tmp/build_gpu        # tardis: CUDA 12.6, sm_80
+GPU=1 bash scripts/build.sh tmp/build_gpu        # tardis: CUDA 12.6 (mit cuBLAS), sm_80
 bash scripts/test.sh tmp/build                   # ctest + MPI-Linienlöser-Test
 sbatch tests/fast_mpi_equivalence.sh             # NX: 1/2/4 Ränge bitgleich
 sbatch tests/gpu_validate.sh                     # tardis: CPU gegen GPU
@@ -62,6 +63,7 @@ sbatch tests/gpu_validate.sh                     # tardis: CPU gegen GPU
 | [docs/BOUNDARY_FIXES.md](docs/BOUNDARY_FIXES.md), [docs/POSITIVITY_PROJECTION.md](docs/POSITIVITY_PROJECTION.md) | Randbehandlung, Positivitätsprojektion |
 | [docs/ELEMENT_HETEROGENEOUS.md](docs/ELEMENT_HETEROGENEOUS.md) | Material, Lattice, 3D, Shadow |
 | [docs/FCS.md](docs/FCS.md), [docs/FCS_LATTICE.md](docs/FCS_LATTICE.md) | First-Collision-Source (Puls, Lattice 2D/3D) |
+| [docs/LATTICE_MC.md](docs/LATTICE_MC.md) | Monte-Carlo-Referenz Lattice 2D/3D, Vergleich aller Lattice-Läufe |
 | [docs/ELEMENT_WENO_MPI.md](docs/ELEMENT_WENO_MPI.md) | MPI (Scheiben, bitgleich, Start auf NX) |
 | [docs/ELEMENT_WENO_GPU.md](docs/ELEMENT_WENO_GPU.md) | GPU-Pfad (A100), Validierung |
 | [docs/TARDIS_CAMPAIGN.md](docs/TARDIS_CAMPAIGN.md), [docs/TARDIS_RESULTS.md](docs/TARDIS_RESULTS.md) | Konvergenzkampagnen |

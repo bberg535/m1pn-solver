@@ -337,3 +337,82 @@ sind in [BOUNDARY_FIXES.md](BOUNDARY_FIXES.md) mit Herleitung und Vorher/Nachher
 
 Ortsabhängige σ_a, σ_s, Quelle, exakter Reaktionsschritt, Bilanzbuch, Elementzahl pro Achse, Lattice (Paul),
 3D-Shadow, eigener 3D-Lattice und Effizienzschleife: [ELEMENT_HETEROGENEOUS.md](ELEMENT_HETEROGENEOUS.md).
+
+## Zeitordnung mit Reaktion: Strang-Splitting (Block 3, 16.11.2026)
+
+Reaktion (Absorption, Streuung, Quelle, Filter, FCS-Quelle) wird exakt integriert und als halber Schritt vor und nach
+SSPRK(4,3) angewendet (`ElementWeno::react`). Das ist Strang-Splitting, also zweite Ordnung in der Zeit, sobald die
+Reaktion nicht mit dem Transport kommutiert (Materialsprünge, Quelle); SSPRK(4,3) allein ist dritter Ordnung. Schneider
+und Leibner beanspruchen für ihr Verfahren ebenfalls nur Ordnung 2 (Strang). Eine höhere Splitting-Ordnung ist nicht
+nötig. Begründung (NX, `m1pn_fast` des Branches `feature/block3-numerics`, Default bitgleich zum Tag; Referenz CFL 1/8):
+
+| Fall | Größe | CFL 1 | CFL 1/2 | CFL 1/4 | Ortsfehler derselben Rechnung |
+|---|---|---:|---:|---:|---|
+| Lattice Q1 112², P7, T = 3.2 | Masse / Absorption / Rate | −8.4e-5 / +1.5e-4 / −6.5e-4 | −1.9e-5 / +3.3e-5 / −1.6e-4 | −3.7e-6 / +6.5e-6 / −3.1e-5 | −1.95 % / +3.6 % / +2.2 % gegen MC |
+| Lattice Q1 224², P7 | Masse / Absorption / Rate | −2.3e-5 / +4.2e-5 / −2.0e-4 | −4.4e-6 / +8.0e-6 / −4.7e-5 | −3.5e-6 / +6.4e-6 / −1.2e-5 | −0.91 % / +1.7 % / +1.3 % gegen MC |
+| Line Source + FCS Q1 256², P7, T = 1/3 | Dichte L2 relativ | 1.7e-4 | 6.7e-5 | 1.6e-5 | PN-Fehler 0.17 (P7) |
+
+Beobachtete Ordnung 2.0–2.2 (Masse und Rate im Lattice 112², Dichte im Line Source zwischen CFL 1/2 und 1/4). Der
+Zeitfehler bei CFL 1 ist 2–3 Größenordnungen kleiner als der Orts- bzw. Modellfehler derselben Rechnung und fällt bei
+Verfeinerung mit festem CFL wie h² (112² → 224²: Faktor 3.6 in der Masse), schneller als der Ortsfehler (Faktor 2.1).
+Erst ab etwa 2–3 Größenordnungen kleineren Ortsfehlern (z. B. Lattice-Masse unter 1e-4) würde die Splitting-Ordnung
+sichtbar. Rohdaten: `tmp/block3_c/dt/` im Worktree (nicht versioniert), Tabelle hier.
+
+## WENO-Sensor an der Rundungsgrenze (Block 3, 16.11.2026)
+
+**Befund.** Glatt, 1D periodisch, P3, T = 0.1, CFL 0.15 (wie tardis): Q4 auf 256 Elementen hat 4.7e-8 statt ~1e-13,
+auf 512 sogar 2.3e-7 (min γ 0.885). Diagnose mit `m1pn_weno_roundoff_study` (`tests/weno_roundoff_study.cpp`):
+
+- Auf der L²-Projektion der exakten Lösung ist γ überall 1 (1−γ < 1e-6), auch mit relativem Rauschen bis 1e-14 in
+  den Koeffizienten. Der Sensor selbst ist auf glatten Daten in Ordnung.
+- Im Lauf wächst der Koeffizientenfehler exponentiell, bevor 1−γ sichtbar wird (Q4/256: 2e-14 bei t = 0.007, 1e-11 bei
+  0.077, 8e-7 bei 0.1), am Extremum x ≈ 0.25. Unabhängig von dt (CFL 0.075 gleich), also semidiskret.
+- `--no-weno` (γ ≡ 1): kein Wachstum (1.3e-13). Ohne Limiter: Wachstum unverändert. Also eine Rückkopplung zwischen
+  Sensor und Stabilisierung, nicht Limiter oder Zeitintegration.
+
+**Mechanismus.** 1−γ = ratio^q mit ratio = ‖u−u*‖_e/‖u‖_e. Für q = 1 ist das bei ratio = 0 nicht differenzierbar
+(Norm), die Empfindlichkeit ∂γ/∂u ~ 1/‖u‖_e. Am glatten Extremum ist die skalierte Halbnorm ‖u‖_e ~ h²|u''| klein,
+die Rückkopplung über ν_e(1−γ_e) und die elementweise wechselnden γ_e (antidiffusiver Anteil −γ_e g_h) wächst daher
+mit feinerem Gitter. Ab Q4/256 übersteigt sie die Dämpfung, Rundungsfehler werden verstärkt, bis die Stabilisierung
+(1−γ ≈ 0.01) als Fehler O(ν(1−γ)) sichtbar wird. Derselbe Effekt kostet Q1 (EOC 1.83 statt 2.00) und Q3 (3.33 statt
+3.91 auf 512) Ordnung.
+
+**Varianten** (Studienoptionen `--weno-deadband`, `--weno-floor`, nur CPU, Default aus und bitgleich zum Tag geprüft):
+q = 3 (vorhandene Option `--weno-q`); weiche Schwelle ratio → max(0, ratio−d)/(1−d); Boden im Nenner
+‖u‖_e → max(‖u‖_e, f·max|u_i|). L2-Fehler (n = 32 … 512) und EOC der letzten Verfeinerung
+(`scripts/element_weno/weno_roundoff_table.py`):
+
+| Variante | Q1 n=512 (EOC) | Q2 n=512 (EOC) | Q3 n=512 (EOC) | Q4 n=128 / 256 / 512 |
+|---|---|---|---|---|
+| Standard q = 1 | 8.7e-7 (1.83) | 1.41e-9 (3.00) | 2.9e-12 (3.33) | 3.2e-12 / **4.7e-8 / 2.3e-7** |
+| ohne WENO (γ ≡ 1) | 7.4e-7 (2.00) | 1.41e-9 (3.00) | 9.8e-13 (3.91) | 5.5e-13 / 1.3e-13 / 2.6e-13 |
+| q = 3 | 7.4e-7 (2.00) | 1.41e-9 (3.00) | 9.8e-13 (3.91) | 5.5e-13 / 1.3e-13 / 2.6e-13 |
+| Schwelle d = 1e-6 | 8.7e-7 (1.83) | 1.41e-9 (3.00) | 9.8e-13 (3.91) | 5.5e-13 / 1.3e-13 / 2.6e-13 |
+| Schwelle d = 1e-4 | 8.7e-7 (1.83) | 1.41e-9 (3.00) | 9.8e-13 (3.91) | 5.5e-13 / 1.3e-13 / 2.6e-13 |
+| Schwelle d = 1e-3 | 8.3e-7 (1.88) | 1.41e-9 (3.00) | 9.8e-13 (3.91) | 5.5e-13 / 1.3e-13 / 2.6e-13 |
+| Boden f = 1e-6 | wie Standard | | | wie Standard |
+| Boden f = 1e-4 | 7.6e-7 (2.03) | 1.41e-9 (3.00) | 1.6e-12 (4.18) | 3.2e-12 / 4.7e-8 / 3.2e-13 |
+| Boden f = 1e-3 | 7.4e-7 (2.00) | 1.41e-9 (3.00) | 1.1e-12 (3.94) | 3.2e-12 / 1.7e-13 / 2.6e-13 |
+
+q = 3 ist in allen 20 Fällen identisch zu γ ≡ 1. Die Schwelle hilft nicht bei Q1, dort liegt das Sensorverhältnis
+auf glatten Daten durch die Abschneidung bei ≈ 0.006 (über d). Der Boden wirkt erst ab f ≈ 1e-3.
+
+**Gegenprobe an Unstetigkeiten** (`m1pn_fast`, CFL 1, P7; L2 der Dichte relativ zum Standard):
+
+| Fall | q = 3 | Schwelle 1e-4 | Boden 1e-3 |
+|---|---|---|---|
+| Crossing Q2 64² | 7.3e-5, ρ_max gleich | 2.5e-5 | 1e-9 (min γ 0.74 statt 0) |
+| Crossing Q4 32² | 1.2e-3, ρ_max 0.9651 statt 0.9653 | 1.1e-4 | 4.9e-6 (min γ 0.80 statt 0) |
+| Lattice Q1 112² | 1.5e-4; gegen MC −1.94/+3.61/+2.14 % statt −1.95/+3.63/+2.15 %; Limiter +19 % Stufen | 1.1e-5 | 1.4e-7 |
+| Lattice Q2 56² | 3.9e-4; −2.89/+5.37/+3.41 % statt −2.92/+5.42/+3.44 % | 1.2e-5 | 3e-11 |
+
+Kegelabstand und Laufzeit unverändert. Alle drei Varianten erhalten die Sensorwirkung an Unstetigkeiten.
+
+**Entscheidung (16.11.2026): Der Standard bleibt q = 1.** Die Studienoptionen `--weno-deadband`/`--weno-floor`
+bleiben als abgeschaltete Diagnoseschalter (Default bitgleich zum Tag, geprüft). Bewertung der Varianten: q = 3 ist die sauberste Korrektur: Die
+Sensorfunktion ist bei ratio = 0 glatt mit verschwindender Ableitung, also keine lineare Rückkopplung; volle Ordnung
+Q1–Q4; q ist ein Parameter des Verfahrens von Kuzmin/Hajduk/Vedral (dort als Wahl offen). Kosten: Limiter etwas
+häufiger aktiv, Abweichungen ≤ 1e-3 an Unstetigkeiten. Die Schwelle ist die kleinste Änderung, lässt aber Q1 bei
+EOC 1.83. Der Boden hängt von einer Skala ab und schwächt den Sensor auch an echten Strukturen (Crossing).
+Fürs Paper genügt der Satz: q = 1 verliert auf feinen Gittern an glatten Extrema Ordnung durch eine
+Rückkopplung zwischen Sensor und Stabilisierung, q = 3 beseitigt das.

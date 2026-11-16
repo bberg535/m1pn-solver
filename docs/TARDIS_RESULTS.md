@@ -84,6 +84,8 @@ Abweichung Masse / Absorption / Rate:
   1159 s von 1272 s; 0 Host-Fallbacks). Auffällig: P35 224² (463 s) ist kaum schneller als 448² (582 s), und P45 224²
   erreicht in 1800 s nicht das Ende, während P45 448² 1272 s braucht; bei 224² entfallen 385 s auf `host_boundary`
   (448²: 261 s). Ursache nicht geklärt (ggf. parallele Aufgaben im selben Job); siehe Block 4 (3D/Host-Randpfad).
+  Nachtrag 16.11.: in Einzelläufen nicht reproduziert; der Host-Randpfad ist seither beschleunigt
+  (docs/ELEMENT_WENO_GPU.md, „Host-Randpfad“).
 
 ## Effizienz: verbleibender Engpass
 

@@ -374,6 +374,41 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         pin_ghost_m_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * 4 * g.pairs));
         pin_ghost_flags_ = static_cast<int *>(gpu::host_alloc(sizeof(int) * (g.pairs + 1)));
     }
+    // Phase A on the device: the per-row trace weights M_side(n, m) and nodes, the side matrices and the node lists.
+    const char *high_env = std::getenv("M1PN_GPU_BOUNDARY_HIGH");
+    device_high_ = (high_env ? std::atoi(high_env) != 0 : true) && nb_ > 0 && face_rows > 0;
+    if (device_high_) {
+        const int nf = int(s.rules_[2 * s.faces_[0].direction + s.faces_[0].side].local.size());
+        std::vector<int> row_nodes(std::size_t(face_rows) * nf, 0);
+        std::vector<double> row_mass(std::size_t(face_rows) * nf, 0.);
+        for (std::size_t index = 0; index < s.faces_.size(); ++index) {
+            const auto &f = s.faces_[index];
+            const auto &rule = s.rules_[2 * f.direction + f.side];
+            require(int(rule.local.size()) == nf, "GPU boundary: faces with different node counts");
+            const int r0 = s.face_row_[index];
+            for (int n = 0; n < nf; ++n)
+                for (int m = 0; m < nf; ++m) {
+                    const std::size_t at = std::size_t(r0 + n) * nf + m;
+                    row_nodes[at] = s.connectivity_[std::size_t(f.element) * s.local_nodes + rule.local[m]];
+                    row_mass[at] = rule.mass(n, m);
+                }
+        }
+        gpu::BoundaryHighSetup h;
+        h.q = q, h.rows = face_rows, h.nf = nf, h.nb = nb_;
+        h.row_nodes = row_nodes.data(), h.row_mass = row_mass.data();
+        for (int side = 0; side <= 6; ++side)
+            h.side_start[side] = s.side_row_start_[side];
+        for (int side = 0; side < 6; ++side)
+            if (s.boundaries_[side]) {
+                require(s.boundary_flux_t_[side].rows() == q && s.boundary_flux_t_[side].cols() == q,
+                        "GPU boundary: flux matrix size");
+                h.flux_t[side] = s.boundary_flux_t_[side].data();
+            }
+        h.offsets = s.boundary_row_offsets_.data(), h.rows_list = s.boundary_rows_.data(), h.bnodes = d_bnodes_;
+        gpu::boundary_high_setup(ctx_, h);
+        pin_db_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(face_rows) * q));
+        pin_low4_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(nb_) * 4));
+    }
 }
 ElementWenoGpu::~ElementWenoGpu() {
     gpu::host_free(pin_fetch_);
@@ -382,6 +417,8 @@ ElementWenoGpu::~ElementWenoGpu() {
     gpu::host_free(pin_load_up_);
     if (pin_ghost_m_)
         gpu::host_free(pin_ghost_m_), gpu::host_free(pin_ghost_flags_);
+    if (pin_db_)
+        gpu::host_free(pin_db_), gpu::host_free(pin_low4_);
     gpu::destroy(ctx_);
 }
 // Phase A of add_boundary: the PN face load sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum] per
@@ -678,6 +715,48 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
         thread_local std::vector<Four> memo_moments, memo_state;
         memo_valid.assign(nf, 0);
         memo_moments.resize(nf), memo_state.resize(nf);
+        // Bar state of face node n (exterior from the data plus the ghost); as ElementWeno::add_boundary.
+        auto bar_state = [&](int n, int i, const Four &ui, const Incoming &data) {
+            Four state;
+            Four ext = data.moments;
+            if (ghost)
+                ext += outgoing_[ghost_id[n]];
+            bool in_cone = exact::cone(ext);
+            for (int k = 0; ghost && k < 64 && !in_cone; ++k) {
+                ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
+                in_cone = exact::cone(ext);
+            }
+            cone_require(in_cone, "M1 exterior state outside cone");
+            Four own = Four::Zero();
+            for (int d = 0; d < dimension; ++d)
+                own += b.n[d] * Four(low_flux(i, 4 * d), low_flux(i, 4 * d + 1), low_flux(i, 4 * d + 2),
+                                     low_flux(i, 4 * d + 3));
+            const Four outer = Levermore(ext).flux(b.n);
+            state = .5 * (ui + own) + .5 * (ext - outer);
+            if (options.outward_bar_rounding && !exact::cone(state)) {
+                const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
+                if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
+                    state[0] = norm_up(state);
+            }
+            return state;
+        };
+        if (!s.face_uniform_.empty() && s.face_uniform_[index]) { // uniform face (steady): point-independent terms
+            const Incoming &data = s.steady_data_[std::size_t(index) * rule.weights.size()];
+            for (int n = 0; n < nf; ++n) {
+                const double weight = s.face_weight_[r0 + n];
+                if (weight == 0)
+                    continue;
+                const int i = global[n];
+                const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
+                IN_[r0 + n] = weight * std::max(0., -data.kinetic[0]);
+                const Four state = bar_state(n, i, ui, data);
+                AR_[r0 + n] = weight;
+                bar_row.row(n) = weight * state.transpose();
+                for (int d = 0; d < dimension; ++d)
+                    fa_row(n, d) = weight * b.n[d];
+                load_row.row(n) = weight * (state - ui).transpose();
+            }
+        } else
         for (int point = 0; point < rule.weights.size(); ++point) {
             const Incoming &data = s.inflow.steady ? s.steady_data_[std::size_t(index) * rule.weights.size() + point]
                                                    : (*fd)[std::size_t(index) * face_points_ + point];
@@ -692,26 +771,7 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
                 if (memo_valid[n] && (memo_moments[n].array() == data.moments.array()).all())
                     state = memo_state[n];
                 else {
-                    Four ext = data.moments;
-                    if (ghost)
-                        ext += outgoing_[ghost_id[n]];
-                    bool in_cone = exact::cone(ext);
-                    for (int k = 0; ghost && k < 64 && !in_cone; ++k) {
-                        ext[0] = std::nextafter(ext[0], std::numeric_limits<double>::infinity());
-                        in_cone = exact::cone(ext);
-                    }
-                    cone_require(in_cone, "M1 exterior state outside cone");
-                    Four own = Four::Zero();
-                    for (int d = 0; d < dimension; ++d)
-                        own += b.n[d] * Four(low_flux(i, 4 * d), low_flux(i, 4 * d + 1), low_flux(i, 4 * d + 2),
-                                             low_flux(i, 4 * d + 3));
-                    const Four outer = Levermore(ext).flux(b.n);
-                    state = .5 * (ui + own) + .5 * (ext - outer);
-                    if (options.outward_bar_rounding && !exact::cone(state)) {
-                        const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
-                        if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
-                            state[0] = norm_up(state);
-                    }
+                    state = bar_state(n, i, ui, data);
                     memo_valid[n] = 1, memo_moments[n] = data.moments, memo_state[n] = state;
                 }
                 AR_[r0 + n] += weight;
@@ -1055,8 +1115,23 @@ void ElementWenoGpu::stage(double time, const double *x, double *out, double *u,
         gpu::synchronize();
     }
     unpack();
-    // Host phase A: PN boundary load rows, added before the mass solve.
-    {
+    // Phase A: PN boundary load rows, added before the mass solve (device, or host with M1PN_GPU_BOUNDARY_HIGH=0).
+    if (device_high_) {
+        const double t0 = seconds();
+        bool datum = false;
+        for (int side = 0; side < 6; ++side)
+            datum |= s_.boundaries_[side] && !datum_zero_[buffer][side];
+        if (datum) { // row-major copy of the datum rows (time-dependent inflow only)
+            const Field &DB = DB_[buffer];
+            const int rows = int(DB.rows());
+            parallel_for(rows, [&](int r) {
+                for (int c = 0; c < q; ++c)
+                    pin_db_[std::size_t(r) * q + c] = DB(r, c);
+            });
+        }
+        gpu::boundary_high(ctx_, x, out, datum ? pin_db_ : nullptr, pin_low4_);
+        t_boundary_high += seconds() - t0;
+    } else {
         const double t0 = seconds();
         boundary_high(buffer);
         std::copy_n(boundary_high_.data(), std::size_t(nb_) * q, pin_high_);
@@ -1084,6 +1159,11 @@ void ElementWenoGpu::stage(double time, const double *x, double *out, double *u,
         gpu::wait(ctx_, 1);
         t_wait += seconds() - t0;
     }
+    if (device_high_) // l <= 1 columns of the node sums (all that the boundary corrections read)
+        parallel_for(nb_, [&](int k) {
+            for (int c = 0; c < 4; ++c)
+                boundary_high_(k, c) = pin_low4_[std::size_t(k) * 4 + c];
+        });
     const gpu::Counters c = gpu::snapshot(ctx_);
     if (c.error)
         check_error();

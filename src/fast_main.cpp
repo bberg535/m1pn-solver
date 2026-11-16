@@ -53,7 +53,7 @@ struct Options {
     double final_time = .01, dt = 0, cfl = kDefaultCfl, sigma_a = 0, sigma_s = 0;
     double pulse_width = .07, background = .001;
     int degree = 2;
-    double weno_linear = 1e-3, weno_q = 1;
+    double weno_linear = 1e-3, weno_q = 1, weno_deadband = 0, weno_floor = 0;
     bool m1_target = false;               // M1 instead of PN target (P1, --mirror-reduction off)
     std::string sample_moments = "auto";  // moments written to initial/final.csv
     bool gpu = false;                     // time loop on the GPU (src/element_weno_gpu.cpp)
@@ -78,7 +78,7 @@ Options parse(int argc, char **argv) {
                    " --inflow vacuum|isotropic|time-dependent|beam|crossing|matching|smooth-transport|crossing-transport|\n"
                    "   crossing-three-transport|crossing-study-transport|crossing-3d-transport|shadow-beam\n"
                    " --pulse-width W --background B --sigma-a A --sigma-s S --memory-mib M --threads T --max-steps K\n"
-                   " --weno on|off --weno-linear W --weno-q Q --element-limit on|off --filter off|constant --filter-strength S\n"
+                   " --weno on|off --weno-linear W --weno-q Q --weno-deadband D --weno-floor F (study, CPU) --element-limit on|off --filter off|constant --filter-strength S\n"
                    " --angular-reduction auto|on|off (1D/2D: drop PN moments odd in the unresolved directions)\n"
                    " --mirror-reduction auto|off (half/quarter/octant domain for mirror-symmetric cases)\n"
                    " --shadow-sigma S --beam-density B --material-subcells K --history-stride S --skip-fields\n"
@@ -189,6 +189,10 @@ Options parse(int argc, char **argv) {
             o.angular_reduction = v;
         } else if (key == "--weno-q")
             o.weno_q = real();
+        else if (key == "--weno-deadband")
+            o.weno_deadband = real();
+        else if (key == "--weno-floor")
+            o.weno_floor = real();
         else if (key == "--sample-moments") {
             require(v == "auto" || v == "all" || v == "low", "--sample-moments must be auto, all or low");
             o.sample_moments = v;
@@ -207,6 +211,8 @@ Options parse(int argc, char **argv) {
     require(o.filter_strength >= 0, "Negative filter strength");
     require(o.degree >= 1 && o.degree <= 12, "degree must lie in [1,12]");
     require(o.weno_linear > 0 && o.weno_linear < .5 && o.weno_q >= 1, "Invalid WENO weights");
+    require(o.weno_deadband >= 0 && o.weno_deadband < 1 && o.weno_floor >= 0, "Invalid --weno-deadband/--weno-floor");
+    require(!o.gpu || (o.weno_deadband == 0 && o.weno_floor == 0), "--weno-deadband/--weno-floor: CPU only");
     require(o.final_time >= 0 && o.dt >= 0 && o.cfl > 0 && o.cfl <= 1 && o.threads > 0 && o.max_steps > 0,
             "Invalid time/thread configuration");
     require(o.sigma_a >= 0 && o.sigma_s >= 0, "Invalid reaction coefficients");
@@ -545,6 +551,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         };
     }
     eo.weno_q = o.weno_q;
+    eo.weno_deadband = o.weno_deadband, eo.weno_floor = o.weno_floor;
     eo.filter_strength = o.filter_mode == "constant" ? o.filter_strength : 0.;
     eo.sigma_s = o.sigma_s;
     eo.sigma_a = o.sigma_a;
@@ -886,7 +893,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                << ",\"m1_target\":" << (o.m1_target ? "true" : "false")
                << ",\"fcs\":" << std::quoted(o.fcs)
                << ",\"weno\":" << (o.weno ? "true" : "false") << ",\"weno_linear\":" << o.weno_linear
-               << ",\"weno_q\":" << o.weno_q << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
+               << ",\"weno_q\":" << o.weno_q << ",\"weno_deadband\":" << o.weno_deadband
+               << ",\"weno_floor\":" << o.weno_floor << ",\"element_limit\":" << (o.element_limit ? "true" : "false")
                << ",\"filter_mode\":" << std::quoted(o.filter_mode) << ",\"filter_constant\":" << o.filter_strength
                << ",\"sigma_s\":" << o.sigma_s << ",\"sigma_a\":" << o.sigma_a
                << ",\"reaction_integration\":\"exact_exponential_half_steps_around_ssprk\""

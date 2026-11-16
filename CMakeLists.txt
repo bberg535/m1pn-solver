@@ -39,7 +39,7 @@ if(M1PN_ELEMENT_GPU)
   add_library(m1pn_element_gpu STATIC src/element_weno_gpu.cu)
   set_target_properties(m1pn_element_gpu PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
   target_compile_options(m1pn_element_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo>)
-  target_link_libraries(m1pn_element_gpu PUBLIC CUDA::cudart)
+  target_link_libraries(m1pn_element_gpu PUBLIC CUDA::cudart CUDA::cublas)
   target_sources(m1pn_element PRIVATE src/element_weno_gpu.cpp)
   target_link_libraries(m1pn_element PUBLIC m1pn_element_gpu)
   target_compile_definitions(m1pn_element PUBLIC M1PN_ELEMENT_GPU)
@@ -55,6 +55,13 @@ add_executable(m1pn_element_weno_time_study tests/element_weno_time_study.cpp)
 target_link_libraries(m1pn_element_weno_time_study PRIVATE m1pn_element)
 add_executable(m1pn_positivity_projection_bench tests/positivity_projection_bench.cpp)
 target_link_libraries(m1pn_positivity_projection_bench PRIVATE m1pn_element)
+# Monte-Carlo reference for lattice-paul and lattice-3d (docs/LATTICE_MC.md); independent of the solver, it only shares
+# the material predicates (src/benchmark_cases.hpp) and, for its validation, the uncollided analytics.
+add_executable(m1pn_lattice_mc tools/lattice_mc.cpp)
+target_link_libraries(m1pn_lattice_mc PRIVATE m1pn_element)
+# Study of the WENO activation at the rounding limit (smooth periodic case; docs/ELEMENT_WENO.md). Not a ctest.
+add_executable(m1pn_weno_roundoff_study tests/weno_roundoff_study.cpp)
+target_link_libraries(m1pn_weno_roundoff_study PRIVATE m1pn_element)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -82,6 +89,9 @@ if(BUILD_TESTING)
     add_test(NAME fast_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/fast_cli.py
              $<TARGET_FILE:m1pn_fast> $<TARGET_FILE:m1pn_element_weno>)
     set_tests_properties(fast_cli PROPERTIES TIMEOUT 600)
+    add_test(NAME lattice_mc COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/lattice_mc_check.py
+             $<TARGET_FILE:m1pn_lattice_mc>)
+    set_tests_properties(lattice_mc PROPERTIES TIMEOUT 300)
     add_test(NAME campaign_scripts COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nx_convergence.py
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/scripts/element_weno)
   endif()

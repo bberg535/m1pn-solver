@@ -140,3 +140,5 @@ Reaktion nutzt denselben Interpolationskern wie in 2D. CPU gegen GPU (`tests/gpu
 Ungestoßene Masse bei T: 0.4230 / 0.4299 / 0.4325. Bilanz des gestoßenen Anteils ≤ 5e-12. Beide Varianten sind auf
 diesen Gittern noch nicht konvergiert (eine Quellzelle hat bei 14³ nur 2³ Elemente); die FCS-Summen ändern sich je
 Verdopplung um etwa die Hälfte weniger als ohne FCS. `lattice-3d` ist ein eigener Fall ohne Literaturreferenz.
+Seit 16.11.2026 gibt es eine eigene Monte-Carlo-Referenz für beide Lattice-Fälle; Abweichungen dagegen in
+[LATTICE_MC.md](LATTICE_MC.md) (3D mit FCS, P3: 28³ −15.9 %, 56³ −7.6 % in der Masse).

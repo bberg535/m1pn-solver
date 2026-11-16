@@ -15,7 +15,7 @@ Der Zustand bleibt während der ganzen Zeitschleife auf der GPU. Pro Stufe:
 | WENO-Gewichte | GPU | ein Thread pro Element |
 | Gradienten `M^-1 C_d a` | GPU | Konvektion im Vorwärtssweep, gebänderte LDL^T in natürlicher Ordnung |
 | Stabilisierung (gesammelt) | GPU | 2D Q1: Streifen-Kernel, 3x3-Fenster in Registern |
-| PN-Randlast (Teil A) | Host | nur Randknoten; Datum-Anteil `D B_datum` vorab für die nächste Stufe |
+| PN-Randlast (Teil A) | GPU (seit 16.11.2026, Block 4) | Spurkernel, cuBLAS-DGEMM je Seite, Knotensumme; Datum-Anteil `D B_datum` vom Host; `M1PN_GPU_BOUNDARY_HIGH=0`: Host |
 | Massenlösung, Fluss der Momente | GPU | |
 | Limiter | GPU | ein Thread pro (Element, Knoten), Elementsummen per Warp-Shuffle in Host-Reihenfolge |
 | Ghost (Positivitätsprojektion), Face-Zustände (Teil B) | Host | überlappt mit der GPU-Arbeit |
@@ -173,3 +173,51 @@ Laufzeit auf der A100 (Job 160905, CFL 0.2, Löserzeit voll → Spiegel, Masse j
 Weniger als Faktor 4, weil das Viertelgebiet die GPU schlechter auslastet und der Host-Randpfad nicht mitschrumpft.
 
 `lattice-3d` ist absichtlich asymmetrisch (Zelle (4,2,2) frei, (3,3,1) Absorber) und wird nicht gespiegelt.
+
+## Host-Randpfad (Block 4, 16.11.2026, Branch `feature/block4-host-boundary`)
+
+**Befund** (tardis, A100, `results/performance/host_boundary_20261116/`): In 3D und bei hoher PN-Ordnung lag fast die
+ganze Löserzeit im Host-Randpfad, die GPU wartete. Lattice 3D Q1 56³, T = 1: P7 30.5 s Löserzeit, davon Phase B
+(Face-Terme) 22.7 s und Phase A (PN-Randlast) 7.1 s; P15 163 s, davon 64 s bzw. 97 s. 2D-Lattice P35 224²: Phase A
+24.4 von 25.6 s.
+
+**Phase B (Face-Terme niedriger Ordnung), CPU und GPU-Host.** Die Face-Regel hat `p + N + 3` Gauß-Punkte je
+Richtung (für die exakte Face-Masse des PN-Terms; Q1/P15 in 3D: 361 Punkte je Face). Die Face-Terme niedriger
+Ordnung liefen über alle Punkte × Face-Knoten, mit je einem `Incoming`-Datensatz pro Punkt. Bei stationärem Einstrom
+ohne Rückruf-Zustand, dessen Daten auf einem Face an allen Punkten bitgleich sind (Vakuum, isotrop), hängen alle
+Summanden je Face-Knoten nicht vom Punkt ab; die Schleife reduziert sich auf die Face-Gewichte
+W = Σ_Punkte w_p φ_n(x_p) (`face_uniform_`, `face_weight_` in `ElementWeno`, einmal beim Aufbau geprüft). Gilt für
+`ElementWeno::add_boundary` (CPU, MPI) und `ElementWenoGpu::boundary_low`. Ortsabhängiger Einstrom (Strahlen,
+Crossing) bleibt auf dem alten Pfad (bitgleich).
+
+**Phase A (PN-Randlast) auf der GPU** (`gpu::boundary_high`): H_r = Σ_m M_side(n,m) x_node(f,m) · B_side − DB_r mit
+einem Spurkernel, einem cuBLAS-DGEMM je Randseite (B_side = (A_n − llf_homogeneous)ᵀ, q × q) und der Summe der
+Zeilen je Randknoten in fester Reihenfolge (wie auf dem Host); die ersten vier Spalten der Knotensummen (l ≤ 1) gehen
+asynchron zurück für die Randkorrekturen. Der Datumsanteil wird bei zeitabhängigem Einstrom je Stufe hochgeladen.
+cuBLAS ist Teil von CUDA 12.6 (keine Installation). Deterministisch (feste Konfiguration, ein Stream).
+
+**Ergebnis** (Löserzeit, T = 1):
+
+| Fall | vorher | nur Phase B | Phase A + B | Faktor |
+|---|---:|---:|---:|---:|
+| Lattice 3D 56³, P7 | 30.5 s | 2.0 s | 2.0 s | 15 |
+| Lattice 3D 56³, P15 | 163.0 s | 13.2 s | 13.1 s | 12 |
+| Lattice 2D 224², P35 | 25.6 s | 18.6 s | 18.6 s | 1.4 |
+
+Phase B allein beschleunigt auch die Host-Phase A um etwa den Faktor 10 (vermutlich, weil die Punktdaten den Cache
+und die Speicherbandbreite nicht mehr belegen); Phase A auf der GPU bringt danach in diesen Fällen wenig, entlastet
+aber den Host. Auf der CPU (NX) halbiert Phase B die Randphase im 3D-Lattice (56³ P7 1.1 → 0.5 s).
+
+**Abweichungen.** Nur Summationsreihenfolge: 3D-Lattice 3e-16, Lattice 2D 112² 5e-14, Line Source + FCS 2e-12 gegen
+`standard-20261116-ewonly`; Crossing (ortsabhängiger Einstrom) bitgleich; `tests/gpu_validate.sh` alle Fälle PASS
+(1e-16 … 4e-10). Ausnahme: 2D-Lattice ohne FCS bei hoher PN-Ordnung (P35 224², T = 1) verstärkt jede
+Rundungsänderung auf 1e-4 (alter Stand gegen nur Phase B 2.4e-4, gegen Phase A + B 6.9e-5), wie schon CPU gegen GPU
+(Abschnitt „Abweichung“). MPI 1/2/4 Ränge bleiben bitgleich (`tests/fast_mpi_equivalence.sh`).
+
+**Nächster Engpass:** die Ghost-Projektion auf der GPU (`k_ghost`, P15 56³ ≈ 51 von ≈ 70 ms GPU-Zeit je Stufe,
+`nsys_lattice3d_P15_E56.txt`); die Rechnung ist jetzt GPU-gebunden. Nebenbefund: Mit `--fcs analytic` in 3D wertet
+die Ausgabe die exakte ungestoßene Dichte an allen Ausgabeknoten aus (≈ 5 ms je Punkt; 56³: 12 min nach 30 s Löser);
+Kampagnen mit `skip_fields` sind davon nicht betroffen.
+
+Die frühere Auffälligkeit der tardis-Lattice-Kampagne (P35 224² kaum schneller als 448²) tritt in Einzelläufen nicht
+auf (T = 1: 25.6 s gegen 174.7 s); sie kam vermutlich von parallelen Aufgaben im damaligen Job.
