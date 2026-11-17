@@ -232,7 +232,7 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     g.weno = o.weno, g.stabilize = o.stabilize, g.limit = o.limit, g.outward_bar_rounding = o.outward_bar_rounding;
     g.scale_invariant_weno = o.scale_invariant_weno;
     g.weno_q = o.weno_q, g.weno_r = o.weno_r, g.weno_epsilon = o.weno_epsilon, g.weno_linear = o.weno_linear;
-    g.positivity_fraction = o.positivity_fraction, g.element_theta = o.element_theta;
+    g.element_theta = o.element_theta;
     ctx_ = gpu::create(g);
     nb_ = int(s.boundary_nodes_.size());
     d_bnodes_ = gpu::device_ints(ctx_, 3, std::max(1, nb_));
@@ -945,21 +945,6 @@ void ElementWenoGpu::limiter_fallback(ElementWenoStats &stats) {
         limited = contribution;
         double factor = 1;
         if (options.limit) {
-            double pos = 0, neg = 0;
-            std::vector<double> clipped(n);
-            for (int i = 0; i < n; ++i) {
-                const double fmin = -2 * total_viscosity[i] * (1 - options.positivity_fraction) * ubar[i][0];
-                clipped[i] = std::max(contribution[i][0], fmin);
-                (clipped[i] > 0 ? pos : neg) += clipped[i];
-            }
-            for (int i = 0; i < n; ++i) {
-                double value = clipped[i];
-                if (value > 0 && pos + neg > 0)
-                    value *= -neg / pos;
-                else if (value < 0 && pos + neg < 0)
-                    value *= -pos / neg;
-                limited[i][0] = value;
-            }
             for (int i = 0; i < n; ++i) {
                 const Four g = limited[i] / (2 * total_viscosity[i]);
                 if (exact::cone(ubar[i] + g))

@@ -4,7 +4,7 @@
 // Space: tensor-product Bernstein Q_p on a uniform Cartesian mesh of [0,1]^d.
 // Target: PN Galerkin with consistent mass and the CG-WENO term of
 // Kuzmin, Hajduk, Vedral (arXiv:2509.04673v2), equations (6)-(7).
-// Limiter: Section 6 of holo_m1_pn (clip and scale, then one element factor).
+// Limiter: one element factor against the M1 cone (Section 6.2 of holo_m1_pn; without the clip-and-scale stage).
 // See docs/ELEMENT_WENO.md for the formulas and the choices made here.
 #include "boundary.hpp"
 #include "m1.hpp"
@@ -38,7 +38,6 @@ struct ElementWenoOptions {
     bool stabilize = true; // false drops s_h^e altogether
     bool weno = true;      // false fixes gamma_e = 1
     bool limit = true;     // false applies the raw contributions
-    double positivity_fraction = 1e-3; // epsilon of report (25)
     double element_theta = .999;       // theta of report Section 6.2
     double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
     // Study variants of the sensor at the rounding limit (docs/ELEMENT_WENO.md; CPU only, default off = bitwise the

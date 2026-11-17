@@ -66,7 +66,7 @@ struct View {
     const int *pair_j;
     const double *pair_d, *pair_m, *pair_c, *pair_ct, *total_viscosity, *lumped;
     bool weno, stabilize, limit, outward_bar_rounding, scale_invariant_weno;
-    double weno_q, weno_r, weno_epsilon, weno_linear, positivity_fraction, element_theta;
+    double weno_q, weno_r, weno_epsilon, weno_linear, element_theta;
     int fallback_capacity;
     // Work arrays.
     double *density; // nodes: copy of column 0 of the stage input (closure kernel), read by the WENO kernel
@@ -78,7 +78,7 @@ struct View {
     int flux_width;
     bool flux_in_shared; // ELL table staged in shared memory (fits the default 48 KiB); else read from global
     int *closure_list, *limiter_list, *segment_list;
-    double *seg_ubar, *seg_lim; // cells x 4 local: bar states and clipped contributions of queued elements
+    double *seg_ubar, *seg_lim; // cells x 4 local: bar states and contributions of queued elements
     DeviceCounters *counters;
 };
 struct Context {
@@ -949,22 +949,6 @@ template <int N> __device__ __forceinline__ void limit_element(const View &v, in
         raw = fmax(raw, fabs(sum[r]));
     double factor = 1;
     if (v.limit) {
-        double pos = 0, neg = 0, clipped[NA];
-#pragma unroll
-        for (int i = 0; i < n; ++i) {
-            const double fmin_ = -2 * v.total_viscosity[i] * (1 - v.positivity_fraction) * ubar[i][0];
-            clipped[i] = fmax(contribution[i][0], fmin_);
-            (clipped[i] > 0 ? pos : neg) += clipped[i];
-        }
-#pragma unroll
-        for (int i = 0; i < n; ++i) {
-            double value = clipped[i];
-            if (value > 0 && pos + neg > 0)
-                value *= -neg / pos;
-            else if (value < 0 && pos + neg < 0)
-                value *= -pos / neg;
-            contribution[i][0] = value; // contribution now holds `limited`
-        }
         bool need = false;
 #pragma unroll
         for (int i = 0; i < n; ++i) {
@@ -1097,19 +1081,6 @@ template <int N, int NG> __global__ void __launch_bounds__(256) k_limiter_group(
     double lim[4] = {fi[0], fi[1], fi[2], fi[3]};
     int need = 0;
     if (v.limit) {
-        const double clipped = fmax(fi[0], -2 * tv * (1 - v.positivity_fraction) * ub[0]);
-        double pos = 0, neg = 0;
-#pragma unroll
-        for (int k = 0; k < N; ++k) {
-            const double ck = __shfl_sync(FULL, clipped, base + k);
-            (ck > 0 ? pos : neg) += ck;
-        }
-        double value = clipped;
-        if (value > 0 && pos + neg > 0)
-            value *= -neg / pos;
-        else if (value < 0 && pos + neg < 0)
-            value *= -pos / neg;
-        lim[0] = value;
         if (valid && !flag) {
             double tt[4];
             for (int r = 0; r < 4; ++r)
@@ -2150,7 +2121,7 @@ Context *create(const Setup &s) {
     v.weno = s.weno, v.stabilize = s.stabilize, v.limit = s.limit, v.outward_bar_rounding = s.outward_bar_rounding;
     v.scale_invariant_weno = s.scale_invariant_weno;
     v.weno_q = s.weno_q, v.weno_r = s.weno_r, v.weno_epsilon = s.weno_epsilon, v.weno_linear = s.weno_linear;
-    v.positivity_fraction = s.positivity_fraction, v.element_theta = s.element_theta;
+    v.element_theta = s.element_theta;
     v.fallback_capacity = s.fallback_capacity;
     const std::size_t N = s.nodes, Q = s.q;
     Buffers &b = ctx->b;

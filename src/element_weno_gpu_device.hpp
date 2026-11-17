@@ -49,7 +49,7 @@ struct Setup {
     // Options.
     bool weno = true, stabilize = true, limit = true, outward_bar_rounding = true, scale_invariant_weno = true;
     double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
-    double positivity_fraction = 1e-3, element_theta = .999;
+    double element_theta = .999;
     int fallback_capacity = 1 << 16;
 };
 // Device work arrays and counters; created by create(), freed by destroy().

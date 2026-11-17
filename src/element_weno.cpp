@@ -230,7 +230,6 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     }
     require(o.elements_per_axis[0] == 0 || o.elements_per_axis[0] == o.elements,
             "elements_per_axis[0] must equal elements");
-    require(o.positivity_fraction > 0 && o.positivity_fraction < 1, "epsilon must lie in (0,1)");
     require(o.element_theta > 0 && o.element_theta < 1, "theta must lie in (0,1)");
     require(o.filter_strength >= 0 && std::isfinite(o.filter_strength), "Invalid filter strength");
     require(o.sigma_s >= 0 && o.sigma_a >= 0 && std::isfinite(o.sigma_s) && std::isfinite(o.sigma_a),
@@ -2047,10 +2046,8 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
         const int *map = &connectivity_[e * local_nodes];
         thread_local std::vector<Four> ubar, contribution, limited;
         thread_local std::vector<double> copies;
-        thread_local Vec clipped;
         ubar.resize(local_nodes);
         contribution.resize(local_nodes);
-        clipped.resize(local_nodes);
         // Element copies per local node: u (4), F^L (12), G (12), projected high-order rate (4).
         copies.resize(std::size_t(32) * local_nodes);
         for (int l = 0; l < local_nodes; ++l) {
@@ -2110,22 +2107,8 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
         raw_sum[e] = sum.cwiseAbs().maxCoeff();
         limited = contribution;
         if (options.limit) {
-            // Step 1: clip and scale the zeroth moment.
-            double pos = 0, neg = 0;
-            for (int i = 0; i < local_nodes; ++i) {
-                const double fmin = -2 * total_viscosity[i] * (1 - options.positivity_fraction) * ubar[i][0];
-                clipped[i] = std::max(contribution[i][0], fmin);
-                (clipped[i] > 0 ? pos : neg) += clipped[i];
-            }
-            for (int i = 0; i < local_nodes; ++i) {
-                double value = clipped[i];
-                if (value > 0 && pos + neg > 0)
-                    value *= -neg / pos;
-                else if (value < 0 && pos + neg < 0)
-                    value *= -pos / neg;
-                limited[i][0] = value;
-            }
-            // Step 2: one element factor against the M1 cone.
+            // One element factor against the M1 cone (the former clip-and-scale stage of the density was removed on
+            // 2026-11-17: the cone condition rho >= |J| is sharper and binds first, docs/ELEMENT_WENO.md).
             double factor = 1;
             for (int i = 0; i < local_nodes; ++i) {
                 const Four g = limited[i] / (2 * total_viscosity[i]);
