@@ -1,6 +1,6 @@
 // m1pn_fast: the standard M1PN program, element WENO on tensor Bernstein elements (docs/ELEMENT_WENO.md), without
 // MFEM. Cases on generated Cartesian hex meshes (crossing, line/plane source with optional first-collision source,
-// lattice-paul, lattice-3d, shadow-weih, smooth and beam test cases), MPI slabs (docs/ELEMENT_WENO_MPI.md), GPU time
+// lattice-paul, lattice-3d, shadow-weih, kobayashi, smooth and beam test cases), MPI slabs (docs/ELEMENT_WENO_MPI.md), GPU time
 // loop with --gpu (docs/ELEMENT_WENO_GPU.md). The former MFEM paths (mass correction, biharmonic, NN filter) were
 // removed on 2026-11-16; last state with them: tag standard-20261116.
 #include "angular.hpp"
@@ -8,6 +8,7 @@
 #include "uncollided.hpp"
 #include "uncollided_lattice.hpp"
 #include "uncollided_lattice3d.hpp"
+#include "uncollided_box3d.hpp"
 #ifdef M1PN_ELEMENT_GPU
 #include "element_weno_gpu.hpp"
 #endif
@@ -75,7 +76,8 @@ Options parse(int argc, char **argv) {
                    " --time T --dt DT --cfl C (default 1) --time-integrator ssprk43|ssprk3 (default ssprk43)\n"
                    " --case smooth|stress|isotropic|vacuum|pure-beam|beam|crossing|plane-source|line-source|\n"
                    "   smooth-beam|vacuum-beam|oblique-beam|crossing-three|crossing-study|crossing-3d|\n"
-                   "   lattice-paul (2D, (0,7)^2)|lattice-3d (3D, (0,7)^3)|shadow-weih (3D, --inflow shadow-beam)\n"
+                   "   lattice-paul (2D, (0,7)^2)|lattice-3d (3D, (0,7)^3)|shadow-weih (3D, --inflow shadow-beam)|\n"
+                   "   kobayashi-1i|1ii|2i|2ii (3D, cm, --elements n per 200 cm, n divisible by 20; docs/KOBAYASHI.md)\n"
                    " --inflow vacuum|isotropic|time-dependent|beam|crossing|matching|smooth-transport|crossing-transport|\n"
                    "   crossing-three-transport|crossing-study-transport|crossing-3d-transport|shadow-beam\n"
                    " --pulse-width W --plane-width W --background B --sigma-a A --sigma-s S --memory-mib M --threads T --max-steps K\n"
@@ -362,7 +364,7 @@ Vec initial_point(const Options &o, const V3 &x, int i, int dimension, const Ang
         }
         else if (o.problem == "shadow" || o.problem == "lattice" || o.problem == "lattice-paul")
             a[0] = (o.problem=="lattice-paul"?o.background:.01) / std::sqrt(4 * pi);
-        else if (o.problem == "lattice-3d" || o.problem == "shadow-weih")
+        else if (o.problem == "lattice-3d" || o.problem == "shadow-weih" || o.problem.rfind("kobayashi-", 0) == 0)
             a[0] = o.background / std::sqrt(4 * pi); // isotropic background, no initial beam
         else
             throw std::runtime_error("Unknown case: " + o.problem);
@@ -413,7 +415,16 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     std::string expected_integrals = "null";
     const bool lattice2d = o.problem == "lattice-paul", lattice3d = o.problem == "lattice-3d",
                shadow = o.problem == "shadow-weih";
-    if (lattice2d || lattice3d || shadow)
+    // Kobayashi benchmarks (docs/KOBAYASHI.md): problem 1 or 2, case i (pure absorber) or ii (scattering ratio 1/2), on
+    // the full mirrored box in cm; the mirror reduction computes the benchmark octant with its reflecting faces.
+    int kobayashi_problem = 0;
+    bool kobayashi_scattering = false;
+    if (o.problem.rfind("kobayashi-", 0) == 0) {
+        const std::string v = o.problem.substr(10);
+        require(v == "1i" || v == "1ii" || v == "2i" || v == "2ii", "Unknown Kobayashi case (kobayashi-1i|1ii|2i|2ii)");
+        kobayashi_problem = v[0] - '0', kobayashi_scattering = v.size() == 3;
+    }
+    if (lattice2d || lattice3d || shadow || kobayashi_problem)
         require(o.sigma_s == 0 && o.sigma_a == 0, "This case owns its material coefficients");
     if (lattice2d) {
         require(dim == 2 && o.mesh.elements % 7 == 0, "lattice-paul is 2D with elements divisible by 7");
@@ -455,6 +466,29 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         e << std::setprecision(17) << "{\"volume\":0.375,\"source\":0,\"sigma_a\":" << sigma * 4 * pi / 3 * std::pow(.1, 3)
           << ",\"sigma_s\":0}";
         expected_integrals = e.str();
+    }
+    if (kobayashi_problem) {
+        require(dim == 3 && o.mesh.elements % 20 == 0, "kobayashi is 3D with elements divisible by 20 (h divides 10 cm)");
+        require(o.inflow == "vacuum", "kobayashi uses vacuum inflow (reflecting faces by the mirror reduction)");
+        const auto half = uncollided::kobayashi::box_half(kobayashi_problem);
+        const double hk = 200. / o.mesh.elements; // cm
+        for (int d = 0; d < 3; ++d)
+            counts[d] = int(std::lround(2 * half[d] / hk)), origin[d] = -half[d];
+        length_x = 2 * half[0];
+        material = std::make_shared<ElementWenoMaterial>();
+        const int kp = kobayashi_problem;
+        const double ratio = kobayashi_scattering ? .5 : 0.;
+        using uncollided::kobayashi::Region;
+        material->sigma_a = [kp, ratio](const V3 &x) {
+            return (1 - ratio) * uncollided::kobayashi::sigma_t(uncollided::kobayashi::region(kp, x));
+        };
+        material->sigma_s = [kp, ratio](const V3 &x) {
+            return ratio * uncollided::kobayashi::sigma_t(uncollided::kobayashi::region(kp, x));
+        };
+        material->source = [kp](const V3 &x) {
+            return uncollided::kobayashi::region(kp, x) == Region::source ? 1. : 0.;
+        };
+        material->name = "kobayashi-" + std::to_string(kp) + (kobayashi_scattering ? "ii" : "i");
     }
     if (material)
         material->subcells = o.material_subcells > 0 ? o.material_subcells : (shadow ? 4 : 1);
@@ -530,6 +564,29 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         sample_uncollided = [lattice_table](double t, const std::vector<V3> &x, std::vector<double> &out) {
             out.resize(x.size());
             parallel_for(int(x.size()), [&](int k) { out[k] = lattice_table->lattice.density(x[k][0], x[k][1], t); });
+        };
+    } else if (fcs && kobayashi_problem) {
+        // Kobayashi: the whole source is uncollided; the benchmark is steady, so the collided part gets the steady
+        // uncollided density (t -> infinity, src/uncollided_box3d.hpp) from t = 0 on: same steady state, no time table.
+        auto box = std::make_shared<const uncollided::Box3dGeometry>(uncollided::kobayashi::geometry(kobayashi_problem));
+        material->source = [](const V3 &) { return 0.; };
+        material->name += ", source uncollided (FCS, steady)";
+        auto cache = std::make_shared<std::pair<std::vector<V3>, std::vector<double>>>();
+        eo.uncollided_density = [box, cache](double, const std::vector<V3> &x, std::vector<double> &out) {
+            const bool same = cache->first.size() == x.size() &&
+                              (x.empty() || ((cache->first.front() - x.front()).norm() == 0 &&
+                                             (cache->first.back() - x.back()).norm() == 0));
+            if (!same) {
+                cache->first = x;
+                cache->second.resize(x.size());
+                parallel_for(int(x.size()), [&](int k) { cache->second[k] = box->density(x[k]); });
+            }
+            out = cache->second;
+        };
+        eo.uncollided_points = o.degree + 1;
+        sample_uncollided = [box](double, const std::vector<V3> &x, std::vector<double> &out) {
+            out.resize(x.size());
+            parallel_for(int(x.size()), [&](int k) { out[k] = box->density(x[k]); });
         };
     } else if (fcs) {
         require(o.problem == "line-source" || o.problem == "plane-source", "--fcs analytic needs line-source or plane-source");
@@ -1058,6 +1115,23 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                    << rowsv[k][1] << "," << rowsv[k][2] << "," << rowsv[k][3] << "," << rowsv[k][4] << "\n";
         }
     }
+    if (kobayashi_problem && rank == 0) {
+        // Benchmark detector points (octant, cm): collided density of the final state (Bernstein evaluation) plus the
+        // steady uncollided density at the point itself (with FCS); without FCS the grid carries everything.
+        const auto box = uncollided::kobayashi::geometry(kobayashi_problem);
+        std::ofstream df(o.output + "/detectors.csv");
+        df << std::setprecision(17) << "line,x,y,z,rho_grid,rho_uncollided,rho\n";
+        for (const auto &d : uncollided::kobayashi::detectors(kobayashi_problem)) {
+            V3 y(d.x, d.y, d.z);
+            for (int k = 0; k < dim; ++k)
+                if (mirror_dir[k] && y[k] < center[k]) y[k] = 2 * center[k] - y[k];
+            const Vec values = out_scheme.evaluate(final_global, y);
+            Vec full = Vec::Zero(pn.q);
+            for (int c = 0; c < values.size(); ++c) full[out_scheme.active[c]] = values[c];
+            const double grid = project(full)[0], unc = fcs ? box.density(V3(d.x, d.y, d.z)) : 0.;
+            df << d.line << "," << d.x << "," << d.y << "," << d.z << "," << grid << "," << unc << "," << grid + unc << "\n";
+        }
+    }
     progress("completed", t, steps);
     const double final_mass = mass_of(a);
     const double injected = reduce_sum(stats.injected) * domain_factor, absorbed = reduce_sum(stats.absorbed) * domain_factor,
@@ -1130,7 +1204,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
            << ",\"balance_relative\":" << balance / balance_scale << "}"
            << ",\"absorption_rate_final\":" << absorption_final
            << ",\"fcs\":" << std::quoted(o.fcs) << ",\"uncollided_mass_final\":" << uncollided_final * domain_factor
-           << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
+           << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice && !kobayashi_problem ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
            << lattice_fcs_json
            << ",\"min_weno_gamma\":" << stats.min_gamma
            << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << out_scheme.cells

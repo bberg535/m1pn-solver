@@ -80,6 +80,7 @@ if(BUILD_TESTING)
   m1pn_test(element_weno_fcs tests/element_weno_fcs.cpp 1 300)
   m1pn_test(uncollided_lattice tests/uncollided_lattice.cpp 2 300)
   m1pn_test(uncollided_lattice3d tests/uncollided_lattice3d.cpp 2 300)
+  m1pn_test(kobayashi_uncollided tests/kobayashi_uncollided.cpp 1 60)
   m1pn_test(positivity_projection tests/positivity_projection.cpp 1 300)
   if(ENABLE_MPI)
     # Run with mpirun (not in ctest): mpirun -np 4 m1pn_element_weno_mpi_tests
