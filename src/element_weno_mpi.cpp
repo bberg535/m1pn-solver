@@ -1191,7 +1191,11 @@ void ElementWenoMpi::solve_axis_static(Field &b, int fillers, const std::functio
     for (int c = 0; c < C; ++c)
         ready[c].store(0), done[c].store(0);
     std::atomic<int> filler_next{0};
+    // Workers call this in their wait loops (possibly for minutes while a neighbour rank is busy): increment only while
+    // fillers remain, otherwise the counter overflows int after 2^31 calls, turns negative and runs filler(i < 0).
     auto run_filler = [&]() {
+        if (filler_next.load(std::memory_order_relaxed) >= fillers)
+            return false;
         const int i = filler_next.fetch_add(1);
         if (i >= fillers)
             return false;

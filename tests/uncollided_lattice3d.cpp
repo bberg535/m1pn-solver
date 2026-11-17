@@ -1,6 +1,6 @@
 // Tests of the 3D lattice uncollided density (src/uncollided_lattice3d*.hpp, docs/FCS_LATTICE.md section 3D).
-//   m1pn_uncollided_lattice3d_tests          quick checks (ctest)
-//   m1pn_uncollided_lattice3d_tests --full   adds the volume-integral comparison with absorbers, the quadrature study
+//   uncollided_lattice3d_tests               quick checks (ctest)
+//   uncollided_lattice3d_tests --full        adds the volume-integral comparison with absorbers, the quadrature study
 //                                            and the balance check (minutes, threads)
 #include "benchmark_cases.hpp"
 #include "uncollided_lattice3d.hpp"
