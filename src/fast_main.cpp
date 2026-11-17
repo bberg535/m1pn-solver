@@ -52,6 +52,7 @@ struct Options {
     std::string thread_policy = "OpenMP maximum";
     double final_time = .01, dt = 0, cfl = kDefaultCfl, sigma_a = 0, sigma_s = 0;
     double pulse_width = .07, background = .001;
+    double plane_width = .05; // plane-source Gaussian width (peak one); default exp(-200 (x - 1/2)^2)
     int degree = 2;
     double weno_linear = 1e-3, weno_q = 1, weno_deadband = 0, weno_floor = 0;
     bool m1_target = false;               // M1 instead of PN target (P1, --mirror-reduction off)
@@ -77,7 +78,7 @@ Options parse(int argc, char **argv) {
                    "   lattice-paul (2D, (0,7)^2)|lattice-3d (3D, (0,7)^3)|shadow-weih (3D, --inflow shadow-beam)\n"
                    " --inflow vacuum|isotropic|time-dependent|beam|crossing|matching|smooth-transport|crossing-transport|\n"
                    "   crossing-three-transport|crossing-study-transport|crossing-3d-transport|shadow-beam\n"
-                   " --pulse-width W --background B --sigma-a A --sigma-s S --memory-mib M --threads T --max-steps K\n"
+                   " --pulse-width W --plane-width W --background B --sigma-a A --sigma-s S --memory-mib M --threads T --max-steps K\n"
                    " --weno on|off --weno-linear W --weno-q Q --weno-deadband D --weno-floor F (study, CPU) --element-limit on|off --filter off|constant --filter-strength S\n"
                    " --angular-reduction auto|on|off (1D/2D: drop PN moments odd in the unresolved directions)\n"
                    " --mirror-reduction auto|off (half/quarter/octant domain for mirror-symmetric cases)\n"
@@ -160,6 +161,8 @@ Options parse(int argc, char **argv) {
             o.max_steps = integer();
         else if (key == "--pulse-width")
             o.pulse_width = real();
+        else if (key == "--plane-width")
+            o.plane_width = real();
         else if (key == "--background")
             o.background = real();
         else if (key == "--threads") {
@@ -216,7 +219,7 @@ Options parse(int argc, char **argv) {
     require(o.final_time >= 0 && o.dt >= 0 && o.cfl > 0 && o.cfl <= 1 && o.threads > 0 && o.max_steps > 0,
             "Invalid time/thread configuration");
     require(o.sigma_a >= 0 && o.sigma_s >= 0, "Invalid reaction coefficients");
-    require(o.pulse_width > 0 && o.background >= 0, "Invalid pulse width/background");
+    require(o.pulse_width > 0 && o.plane_width > 0 && o.background >= 0, "Invalid pulse width/background");
     if (o.problem == "line-source")
         require(o.mesh.dimension == 2 && o.inflow == "vacuum", "line-source is 2D with vacuum inflow");
     return o;
@@ -348,7 +351,9 @@ Vec initial_point(const Options &o, const V3 &x, int i, int dimension, const Ang
             a += pulse(x-V3(.5,.32,z)) * harmonics(pn.order, V3::UnitY());
             a += pulse(x-V3(.68,.5,z)) * harmonics(pn.order, -V3::UnitX());
         } else if (o.problem == "plane-source")
-            a[0] = std::exp(-200 * (x[0] - .5) * (x[0] - .5)) / std::sqrt(4 * pi);
+            a[0] = (o.plane_width == .05 ? std::exp(-200 * (x[0] - .5) * (x[0] - .5))
+                                         : std::exp(-(x[0] - .5) * (x[0] - .5) / (2 * o.plane_width * o.plane_width))) /
+                   std::sqrt(4 * pi);
         else if (o.problem == "line-source") {
             // Garrett-Hauck line source: unit-mass Gaussian of width W plus floor B.
             const double r2 = (x[0] - .5) * (x[0] - .5) + (x[1] - .5) * (x[1] - .5);
@@ -535,8 +540,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             pulse.dimension = 2, pulse.width = o.pulse_width, pulse.mass = 1, pulse.centre = V3(.5, .5, 0);
         } else {
             require(dim == 1, "--fcs analytic plane-source is 1D");
-            // initial_point(): rho_0 = exp(-200 (x - 1/2)^2), i.e. width 1/20 and peak one.
-            pulse.dimension = 1, pulse.width = .05, pulse.mass = std::sqrt(2 * pi) * .05, pulse.centre = V3(.5, 0, 0);
+            // initial_point(): rho_0 = exp(-(x - 1/2)^2 / (2 w^2)), peak one (default w = 1/20).
+            pulse.dimension = 1, pulse.width = o.plane_width, pulse.mass = std::sqrt(2 * pi) * o.plane_width,
+            pulse.centre = V3(.5, 0, 0);
         }
         // The analytic pulse assumes an infinite medium: its support (t + 6 width, Gaussian tail < 1e-8) must stay
         // inside the box.
