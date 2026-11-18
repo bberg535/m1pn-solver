@@ -254,7 +254,8 @@ Options parse(int argc, char **argv) {
     require(o.weno_linear > 0 && o.weno_linear < .5 && o.weno_q >= 1, "Invalid WENO weights");
     require(o.weno_deadband >= 0 && o.weno_deadband < 1 && o.weno_floor >= 0, "Invalid --weno-deadband/--weno-floor");
     require(!o.gpu || (o.weno_deadband == 0 && o.weno_floor == 0), "--weno-deadband/--weno-floor: CPU only");
-    require(o.final_time >= 0 && o.dt >= 0 && o.cfl > 0 && o.cfl <= 1 && o.threads > 0 && o.max_steps > 0,
+    // EXPERIMENT (experiment/break-dt): CFL up to 2; above 1 the step is capped at the realizability bound.
+    require(o.final_time >= 0 && o.dt >= 0 && o.cfl > 0 && o.cfl <= 2 && o.threads > 0 && o.max_steps > 0,
             "Invalid time/thread configuration");
     require(o.sigma_a >= 0 && o.sigma_s >= 0, "Invalid reaction coefficients");
     require(o.pulse_width > 0 && o.plane_width > 0 && o.background >= 0, "Invalid pulse width/background");
@@ -1013,7 +1014,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
 #endif
     require(o.dt_bound == "both" || o.dt_bound == "high-order", "--dt-bound both|high-order");
     const bool high_order_only = o.dt_bound == "high-order";
-    const double selected = o.dt > 0 ? o.dt : o.cfl * (high_order_only ? scheme.high_order_step() : scheme.step_bound());
+    double selected = o.dt > 0 ? o.dt : o.cfl * (high_order_only ? scheme.high_order_step() : scheme.step_bound());
+    if (o.dt <= 0 && o.cfl > 1 && !high_order_only) // experiment: CFL > 1 relative to the high-order estimate only
+        selected = std::min(selected, scheme.realizability_step());
     require(high_order_only || selected <= scheme.realizability_step() * (1 + 1e-12),
             "Requested dt violates the element realizability bound");
     if (high_order_only && rank == 0)
