@@ -1297,7 +1297,14 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
            << ",\"stab_local\":" << stats.t_stab_local << ",\"residual\":" << stats.t_residual
            << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass << ",\"limiter\":" << stats.t_limiter
            << ",\"finish\":" << stats.t_finish << ",\"reaction\":" << stats.t_reaction
-           << ",\"fcs_density\":" << stats.t_fcs_density << ",\"fcs_quadrature\":" << stats.t_fcs_quadrature << "}}\n";
+           << ",\"fcs_density\":" << stats.t_fcs_density << ",\"fcs_quadrature\":" << stats.t_fcs_quadrature << "}"
+           << ",\"projection\":{\"calls\":" << stats.projection.calls << ",\"identities\":" << stats.projection.identities
+           << ",\"augmented\":" << stats.projection.augmented << ",\"diracs\":" << stats.projection.diracs
+           << ",\"certificates\":" << stats.projection.certificates << ",\"failures\":" << stats.projection.failures
+           << ",\"iterations\":" << stats.projection.iterations << ",\"backtracks\":" << stats.projection.backtracks
+           << ",\"max_iterations\":" << stats.projection.max_iterations
+           << ",\"trace_thread_seconds\":" << stats.projection.product_seconds
+           << ",\"solve_thread_seconds\":" << stats.projection.reduce_seconds << "}}\n";
     std::cout << "Completed " << steps << " steps, P" << pn.order << ", element-weno p=" << o.degree << ", "
               << out_scheme.nodes << " coefficients" << (distributed ? ", " + std::to_string(ranks) + " MPI ranks" : std::string()) << "\n";
     return 0;

@@ -57,6 +57,7 @@ struct View {
     const int *klass;                 // cells: size class of an element (nullptr: one class, uniform mesh)
     int classes;
     bool structured;
+    const int *strip_elem[2];         // broken 2D Q1: element line left/right of a node line (see GpuSetup)
     const double *class_viscosity;    // classes (nullptr: viscosity)
     const double *ext_list;           // graded WENO extensions (ext_count x local x local)
     const int *ext_index;             // cells x 2 dimension (nullptr: extension[d][side])
@@ -791,7 +792,8 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
         for (int qy = 0; qy < 2; ++qy)
 #pragma unroll
             for (int qx = 0; qx < 2; ++qx) {
-                const int ex = ix - 1 + qx, ey = y - 1 + qy;
+                const int ex = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+                const int ey = v.strip_elem[1] ? v.strip_elem[1][2 * y + qy] : y - 1 + qy;
                 if (ex < 0 || ex >= cx || ey < 0 || ey >= cy)
                     continue;
                 const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
@@ -2070,6 +2072,8 @@ Context *create(const Setup &s) {
     v.klass = s.element_class ? own(dcopy(s.element_class, std::size_t(s.cells))) : nullptr;
     v.classes = s.classes;
     v.structured = s.structured;
+    for (int d = 0; d < 2; ++d)
+        v.strip_elem[d] = s.strip_elem[d] ? own(dcopy(s.strip_elem[d], 2 * std::size_t(s.nodes_per_axis[d]))) : nullptr;
     v.class_viscosity = s.class_viscosity ? own(dcopy(s.class_viscosity, C)) : nullptr;
     v.ext_index = s.ext_index ? own(dcopy(s.ext_index, std::size_t(s.cells) * 2 * s.dimension)) : nullptr;
     v.ext_list = s.ext_index ? own(dcopy(s.ext_list, std::size_t(s.ext_count) * n * n)) : nullptr;
@@ -2402,7 +2406,8 @@ void gradients(Context *ctx, const double *state) {
 }
 void stabilization(Context *ctx, const double *state, double *out, bool want_low, double constant_gamma) {
     const View &v = ctx->v;
-    if (v.dimension == 2 && v.degree == 1 && !v.periodic && v.classes <= max_strip_classes && v.structured) {
+    if (v.dimension == 2 && v.degree == 1 && !v.periodic && v.classes <= max_strip_classes &&
+        (v.structured || (v.strip_elem[0] && v.strip_elem[1]))) {
         static const int sy = [] {
             const char *e = std::getenv("M1PN_GPU_STRIP");
             return e ? std::atoi(e) : 16;

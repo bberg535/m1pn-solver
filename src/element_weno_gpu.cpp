@@ -104,6 +104,21 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     std::array<std::vector<double>, 3> class_convection;
     g.classes = classes;
     g.structured = !s.broken_;
+    std::array<std::vector<int>, 2> strip_elem;
+    if (s.broken_ && s.dimension == 2 && s.degree == 1 && !s.options.periodic) {
+        const int npx = s.nodes_per_axis[0];
+        for (int d = 0; d < 2; ++d)
+            strip_elem[d].assign(2 * std::size_t(s.nodes_per_axis[d]), -1);
+        for (int e = 0; e < s.cells; ++e) {
+            const int corner = s.connectivity_[std::size_t(e) * s.local_nodes]; // local node 0 = (0, 0)
+            const int line[2] = {corner % npx, corner / npx}, id[2] = {e % s.count[0], e / s.count[0]};
+            for (int d = 0; d < 2; ++d) {
+                strip_elem[d][2 * line[d] + 1] = id[d]; // right of its first node line
+                strip_elem[d][2 * (line[d] + 1)] = id[d]; // left of its second
+            }
+        }
+        g.strip_elem[0] = strip_elem[0].data(), g.strip_elem[1] = strip_elem[1].data();
+    }
     if (s.graded_) {
         for (const auto &c : s.classes_) {
             class_stiffness.insert(class_stiffness.end(), c.stiffness_rows.begin(), c.stiffness_rows.end());
@@ -762,13 +777,20 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
                 at.col(j - begin) = a_h_.row(s.ghost_node_[list[j]]).transpose();
             if (s.ghost_sigma_.size())
                 at = s.ghost_sigma_.asDiagonal() * at;
+            const double t0 = seconds();
             if (s.separable_[side])
                 s.separable_[side]->evaluate(at, traces);
             else
                 traces.noalias() = s.out_rules_[side].harmonics * at;
+            const double t1 = seconds();
             for (int j = begin; j < end; ++j) {
                 psi = traces.col(j - begin);
                 ghost_pair(list[j], psi);
+            }
+            const double t2 = seconds();
+            if (project) { // diagnostics (thread seconds): trace products vs projections
+                PositivityProjectionStats &ps = pstats[omp_thread()];
+                ps.product_seconds += t1 - t0, ps.reduce_seconds += t2 - t1;
             }
         });
     }
