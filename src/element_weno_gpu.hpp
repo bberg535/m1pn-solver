@@ -45,12 +45,18 @@ public:
     int fallback_capacity_ = 1 << 16;
     long ghost_flagged = 0; // ghost pairs solved by the host (device projection flagged them)
     double t_wait_ghost = 0;
+    double t_ghost = 0; // host phase B: ghost moments (part of t_boundary)
 
 private:
     const ElementWeno &s_;
     gpu::Context *ctx_ = nullptr;
     int nb_ = 0;                       // boundary nodes (boundary_nodes_ order = boundary slot)
     int *d_bnodes_ = nullptr;          // device copy of boundary_nodes_
+    // Boundary nodes whose full PN row the host reads (ghost pairs, block interfaces, host phase A); the nodes only on
+    // broken lines need the low moments alone. nf_ == nb_ and d_fnodes_ == d_bnodes_ when every row is needed.
+    int nf_ = 0;
+    int *d_fnodes_ = nullptr;
+    std::vector<int> full_nodes_;
     // Host buffers: node-indexed fields valid on the boundary rows only, compact boundary arrays.
     Field a_h_, low_h_, low_flux_h_, closure_h_;
     Field boundary_low_, flux_area_, boundary_bar_;

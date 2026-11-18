@@ -1266,6 +1266,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
 #ifdef M1PN_ELEMENT_GPU
                << (device ? ",\"gpu_timing\":{\"spectral_radius\":" + std::to_string(gpu_radius_seconds) +
                                 ",\"host_boundary\":" + std::to_string(device->t_boundary) +
+                                ",\"host_ghost\":" + std::to_string(device->t_ghost) +
+                                ",\"host_fallback\":" + std::to_string(device->t_fallback) +
                                 ",\"host_boundary_high\":" + std::to_string(device->t_boundary_high) +
                                 ",\"host_face_data\":" + std::to_string(device->t_face_data) +
                                 ",\"host_correction\":" + std::to_string(device->t_correction) +

@@ -3278,9 +3278,10 @@ int ElementWeno::node_near(const V3 &x, const V3 &probe) const {
     return best;
 }
 void ElementWeno::for_each_interface_node(const std::function<void(int, int, int)> &visit) const {
-    for (const auto &f : faces_) {
+    for (std::size_t i = 0; i < faces_.size(); ++i) {
+        const auto &f = faces_[i];
         const int side_id = 2 * f.direction + f.side;
-        if (!options.interface_side[side_id])
+        if (!options.interface_side[side_id] || face_break_[i]) // broken lines are internal, not block interfaces
             continue;
         for (int l : rules_[side_id].local)
             visit(side_id, f.element, connectivity_[f.element * local_nodes + l]);

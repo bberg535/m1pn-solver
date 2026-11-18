@@ -420,6 +420,28 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     device_high_ = (high_env ? std::atoi(high_env) != 0 : true) && nb_ > 0 && face_rows > 0 && !interfaces_;
     require(!s.broken_ || interfaces_ || device_high_, "GPU path: broken lines need the device face load (phase A)");
     require(!nodal_interfaces_ || device_high_, "GPU path: conforming interfaces need the device face load (phase A)");
+    {
+        std::vector<char> full(s.nodes, 0);
+        const bool all = !device_high_ || interfaces_ || !s.broken_;
+        for (std::size_t index = 0; index < s.faces_.size() && !all; ++index)
+            if (!s.face_break_[index]) {
+                const auto &f = s.faces_[index];
+                for (int l : s.rules_[2 * f.direction + f.side].local)
+                    full[s.connectivity_[f.element * s.local_nodes + l]] = 1;
+            }
+        full_nodes_.clear();
+        for (int k = 0; k < nb_; ++k)
+            if (all || full[s.boundary_nodes_[k]])
+                full_nodes_.push_back(s.boundary_nodes_[k]);
+        nf_ = int(full_nodes_.size());
+        if (nf_ == nb_)
+            d_fnodes_ = d_bnodes_;
+        else {
+            d_fnodes_ = gpu::device_ints(ctx_, 5, std::max(1, nf_));
+            if (nf_)
+                gpu::upload(d_fnodes_, full_nodes_.data(), sizeof(int) * nf_);
+        }
+    }
     if (device_high_) {
         const int nf = int(s.rules_[2 * s.faces_[0].direction + s.faces_[0].side].local.size());
         // Broken lines: each row also carries the partner nodes with negative weights (M_face (u - u_partner)).
@@ -754,6 +776,7 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
         for (const auto &ps : pstats)
             projection->merge(ps);
     const double ghost_end = seconds();
+    t_ghost += ghost_end - ghost_start;
     if (projection)
         projection->seconds += ghost_end - ghost_start;
     parallel_for(int(s.faces_.size()), [&](int index) {
@@ -1133,14 +1156,15 @@ int ElementWenoGpu::stage_begin(double time, const double *x, double *out, doubl
            *fc = ff + std::size_t(nb_) * 12;
     auto unpack = [&]() {
         parallel_for(nb_, [&](int k) {
-            std::copy_n(fx + std::size_t(k) * q, q, &a_h_.coeffRef(bn[k], 0));
+            if (k < nf_)
+                std::copy_n(fx + std::size_t(k) * q, q, &a_h_.coeffRef(full_nodes_[k], 0));
             std::copy_n(fl + std::size_t(k) * 4, 4, &low_h_.coeffRef(bn[k], 0));
             std::copy_n(ff + std::size_t(k) * 12, 12, &low_flux_h_.coeffRef(bn[k], 0));
             std::copy_n(fc + std::size_t(k) * 12, 12, &closure_h_.coeffRef(bn[k], 0));
         });
     };
     auto fetch = [&]() {
-        gpu::gather_async(ctx_, x, q, d_bnodes_, nb_, fx, 0);
+        gpu::gather_async(ctx_, x, q, d_fnodes_, nf_, fx, 0);
         gpu::gather_async(ctx_, b.low, 4, d_bnodes_, nb_, fl, 1, s_.nodes);
         gpu::gather_async(ctx_, b.low_flux, 12, d_bnodes_, nb_, ff, 2, s_.nodes);
         gpu::gather_async(ctx_, b.closure, 12, d_bnodes_, nb_, fc, 3, s_.nodes);
@@ -1222,8 +1246,8 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
             parallel_for(int(s_.faces_.size()), [&](int index) {
                 const auto &f = s_.faces_[index];
                 const int side_id = 2 * f.direction + f.side;
-                if (!s_.nodal_interface(side_id))
-                    return;
+                if (!s_.nodal_interface(side_id) || (s_.broken_ && s_.face_break_[index]))
+                    return; // broken lines: partner term on the device (phase A partner rows), datum stays zero
                 const int nf = int(s_.rules_[side_id].local.size()), r0 = s_.face_row_[index];
                 thread_local Field rows, db;
                 rows.resize(nf, q);
