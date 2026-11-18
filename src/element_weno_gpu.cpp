@@ -1,4 +1,5 @@
 #include "element_weno_gpu.hpp"
+#include <iostream>
 #include "base_bar.hpp"
 #include "element_weno_gpu_device.hpp"
 #include "parallel.hpp"
@@ -380,8 +381,12 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
             T.points = s.fcs_points_;
             T.M = T.times_for(T.final_time);
             T.table.assign(T.points.size() * std::size_t(T.M + 1), 0.);
+            const double assigned = seconds();
             gpu::lattice_table(ctx_, view, T.M, T.dt, T.table.data());
             T.build_seconds = seconds() - start;
+            if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e))
+                std::cerr << "gpu: lattice table host alloc " << assigned - start << " s, device build + copy "
+                          << seconds() - assigned << " s (" << T.table.size() * 8e-9 << " GB)\n";
         }
     }
     // Ghost projection on the device (plain full-sphere rule, unweighted); M1PN_GPU_GHOST=0 keeps it on the host.

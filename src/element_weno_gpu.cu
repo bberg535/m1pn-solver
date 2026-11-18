@@ -5,6 +5,7 @@
 // Levermore states, the stable base bar) are flagged and recomputed by the host with the original code.
 #include "element_weno_gpu_device.hpp"
 #include <cuda_runtime.h>
+#include <chrono>
 #include <cublas_v2.h>
 #include <algorithm>
 #include <cmath>
@@ -1962,6 +1963,12 @@ void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, doubl
     double *table = own(dalloc<double>(total));
     k_lattice_table<<<blocks(total, 128), 128>>>(lv, r.fx, r.fy, points, M, dt, table);
     CK(cudaGetLastError());
+    if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        CK(cudaDeviceSynchronize());
+        std::fprintf(stderr, "gpu: lattice table kernel %.3f s\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     if (host_out)
         CK(cudaMemcpy(host_out, table, total * sizeof(double), cudaMemcpyDeviceToHost));
     r.ltable = table, r.lM = M, r.ldt = dt;
