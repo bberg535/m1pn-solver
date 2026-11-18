@@ -430,6 +430,17 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     // gathered state with a global scheme (`post`).
     const int ranks = world.size, rank = world.rank;
     const bool distributed = ranks > 1;
+    // Initialization phases (wall seconds since the previous mark) to stderr and summary.json ("init_phases").
+    double init_last = begin;
+    std::string init_phases;
+    auto init_mark = [&](const char *what) {
+        const double now = seconds();
+        if (rank == 0)
+            std::cerr << "init: " << what << " " << now - init_last << " s\n";
+        init_phases += std::string(init_phases.empty() ? "" : ",") + "\"" + what + "\":" + std::to_string(now - init_last);
+        init_last = now;
+    };
+    init_mark("angular basis and options");
 #ifndef M1PN_MPI
     require(!distributed, "element-weno with several ranks needs an MPI build");
 #endif
@@ -727,6 +738,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     V3 extent = V3::Zero(), center = V3::Zero();
     for (int d = 0; d < dim; ++d) extent[d] = h * counts[d], center[d] = origin[d] + .5 * extent[d];
     const Inflow inflow = make_inflow(o, dim);
+    init_mark("case and material");
     // ---- Mirror reduction per direction about the box centre ----------------------------------------------------
     // Exact for mirror-symmetric problems (tests/element_weno.cpp, mirror_quarter). Required per direction d:
     // even element count, open mesh, initial data symmetric at every node of the full grid (reflected PN moments),
@@ -892,6 +904,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     const bool mirrored = mirror_dir[0] || mirror_dir[1] || mirror_dir[2];
     double domain_factor = 1; // full mass / computed mass
     for (int d = 0; d < dim; ++d) if (mirror_dir[d]) domain_factor *= 2;
+    init_mark("mirror check");
     // ---- Angular parity reduction (1D/2D) --------------------------------------------------------------------------
     eo.reduce_angular = dim < 3 && o.angular_reduction != "off";
     require(!(o.angular_reduction == "on" && dim == 3), "--angular-reduction on needs dimension 1 or 2");
@@ -914,6 +927,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         scheme_ptr = std::make_unique<ElementWeno>(pn, eo, inflow);
     };
     build_scheme();
+    init_mark("scheme");
     auto reduce_sum = [&](double v) {
 #ifdef M1PN_MPI
         if (mpi)
@@ -988,8 +1002,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     double gpu_radius_seconds = 0;
     if (o.gpu) {
         device = std::make_unique<ElementWenoGpu>(scheme);
+        init_mark("gpu setup");
         const double r0 = seconds();
         scheme.set_spectral_radius(device->spectral_radius());
+        init_mark("gpu spectral radius");
         gpu_radius_seconds = seconds() - r0;
     }
 #else
@@ -1005,6 +1021,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                   << scheme.realizability_step() << " (ratio " << selected / scheme.realizability_step() << ")\n";
     if (selected > scheme.high_order_step() && rank == 0)
         std::cerr << "warning: dt exceeds the estimated high-order stability step " << scheme.high_order_step() << "\n";
+    init_mark("dt");
     // ---- Uniform sample grid on the full box (Q1 nodes of count*degree cells per axis) -----------------------------
     std::array<int, 3> cells_axis{1, 1, 1}, points_axis{1, 1, 1};
     long samples = 1;
@@ -1184,6 +1201,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     double t = 0, solver_seconds = 0, min_density = std::numeric_limits<double>::infinity(), min_margin = min_density;
     double min_margin_steps = min_density;
     int steps = 0;
+    init_mark("samples, initial output");
     const double initialization = seconds() - begin;
     progress("running", t, steps);
     std::ofstream history;
@@ -1365,7 +1383,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                           : std::string())
 #endif
            
-           << ",\"initialization_seconds\":" << initialization << ",\"peak_rss_kib_rank0\":" << usage.ru_maxrss
+           << ",\"initialization_seconds\":" << initialization << ",\"init_phases\":{" << init_phases << "}"
+           << ",\"peak_rss_kib_rank0\":" << usage.ru_maxrss
            << ",\"minimum_coefficient_density\":" << min_density << ",\"minimum_cone_margin\":" << min_margin
            << ",\"minimum_cone_margin_recorded_steps\":" << min_margin_steps
            << ",\"final_density_mass\":" << final_mass << ",\"initial_density_mass\":" << initial_mass

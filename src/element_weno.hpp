@@ -432,6 +432,11 @@ private:
     mutable Field split_term_;
     mutable Vec split_area_;
     std::vector<int> split_nodes_; // nodes on broken-line faces
+    // split_breaks: broken-line faces, per split node its face rows (CSR, ascending face index), and persistent
+    // work arrays of split_second_step (only the rows/nodes of the broken lines are written and read).
+    std::vector<int> split_faces_, split_row_offsets_, split_rows_;
+    mutable Field split_ylow_, split_yflux_, split_L_, split_BR_, split_FA_;
+    mutable Vec split_AR_, split_IN_;
     void apply_split_breaks(const Field &x, Field &r, double tau, ElementWenoStats *stats) const;
     // Core of apply_split_breaks for split node k (split_nodes_ order): u[k] the stage state, rate[k] the low-order
     // rate of step 1 (load / m) on input, the rate of the two-step update (z - u) / tau on output. term/area: T and

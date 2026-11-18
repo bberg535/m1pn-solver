@@ -3145,8 +3145,36 @@ void ElementWeno::apply_split_breaks(const Field &x, Field &r, double tau, Eleme
 void ElementWeno::split_second_step(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term,
                                     const Vec &area, double tau, ElementWenoStats *stats) const {
     const int K = int(split_nodes_.size());
+    if (split_row_offsets_.empty()) { // first call: broken-line faces and the per-node row lists (CSR)
+        auto &self = const_cast<ElementWeno &>(*this);
+        std::vector<int> slot(nodes, -1);
+        for (int k = 0; k < K; ++k)
+            slot[split_nodes_[k]] = k;
+        std::vector<std::vector<int>> rows(K);
+        for (std::size_t index = 0; index < faces_.size(); ++index) {
+            if (!face_break_[index])
+                continue;
+            self.split_faces_.push_back(int(index));
+            const auto &f = faces_[index];
+            const auto &rule = rules_[2 * f.direction + f.side];
+            for (std::size_t n = 0; n < rule.local.size(); ++n) {
+                const int i = connectivity_[f.element * local_nodes + rule.local[n]];
+                require(slot[i] >= 0, "split_breaks: broken-line face node without split slot");
+                rows[slot[i]].push_back(face_row_[index] + int(n));
+            }
+        }
+        self.split_row_offsets_.assign(1, 0);
+        for (int k = 0; k < K; ++k) {
+            self.split_rows_.insert(self.split_rows_.end(), rows[k].begin(), rows[k].end());
+            self.split_row_offsets_.push_back(int(self.split_rows_.size()));
+        }
+        const int face_rows = side_row_start_[6];
+        split_ylow_ = Field::Zero(nodes, 4), split_yflux_ = Field::Zero(nodes, 12);
+        split_L_ = Field::Zero(face_rows, 4), split_BR_ = Field::Zero(face_rows, 4), split_FA_ = Field::Zero(face_rows, 3);
+        split_AR_ = Vec::Zero(face_rows), split_IN_ = Vec::Zero(face_rows);
+    }
     // Step-1 states y (and their Levermore fluxes) at all broken-line nodes; partners are broken-line nodes too.
-    Field ylow = Field::Zero(nodes, 4), yflux = Field::Zero(nodes, 12);
+    Field &ylow = split_ylow_, &yflux = split_yflux_;
     std::vector<Four> y_of(K);
     parallel_for(K, [&](int k) {
         const int i = split_nodes_[k];
@@ -3163,38 +3191,35 @@ void ElementWeno::split_second_step(const std::vector<Four> &u, std::vector<Four
                 yflux(i, 4 * d + c) = fl[c];
         }
     });
-    // Bar states of the broken-line faces with the step-1 states (rows as in add_boundary), summed per node.
-    const int face_rows = side_row_start_[6];
-    Field L = Field::Zero(face_rows, 4), BR = Field::Zero(face_rows, 4), FA = Field::Zero(face_rows, 3);
-    Vec AR = Vec::Zero(face_rows), IN = Vec::Zero(face_rows);
-    parallel_for(int(faces_.size()), [&](int index) {
-        if (face_break_[index])
-            broken_face_low(index, ylow, yflux, L, BR, FA, AR, IN);
-    });
-    Field bstar = Field::Zero(nodes, 4);
-    Vec astar = Vec::Zero(nodes);
-    for (std::size_t index = 0; index < faces_.size(); ++index) { // serial: fixed summation order
-        if (!face_break_[index])
-            continue;
+    // Bar states of the broken-line faces with the step-1 states (rows as in add_boundary): rows zeroed, then filled.
+    parallel_for(int(split_faces_.size()), [&](int m) {
+        const int index = split_faces_[m];
         const auto &f = faces_[index];
-        const auto &rule = rules_[2 * f.direction + f.side];
-        const int r0 = face_row_[index];
-        for (std::size_t n = 0; n < rule.local.size(); ++n) {
-            const int i = connectivity_[f.element * local_nodes + rule.local[n]];
-            bstar.row(i) += BR.row(r0 + n);
-            astar[i] += AR[r0 + n];
+        const int nf = int(rules_[2 * f.direction + f.side].local.size()), r0 = face_row_[index];
+        split_L_.middleRows(r0, nf).setZero(), split_BR_.middleRows(r0, nf).setZero();
+        split_FA_.middleRows(r0, nf).setZero(), split_AR_.segment(r0, nf).setZero(), split_IN_.segment(r0, nf).setZero();
+        broken_face_low(index, ylow, yflux, split_L_, split_BR_, split_FA_, split_AR_, split_IN_);
+    });
+    // Per node: sum of its rows in ascending face index (fixed order, parallel over the nodes).
+    std::vector<Four> bstar(K, Four::Zero());
+    std::vector<double> astar(K, 0.);
+    parallel_for(K, [&](int k) {
+        for (int e = split_row_offsets_[k]; e < split_row_offsets_[k + 1]; ++e) {
+            const int r = split_rows_[e];
+            bstar[k] += Four(split_BR_.row(r).transpose());
+            astar[k] += split_AR_[r];
         }
-    }
+    });
     std::vector<double> theta_of(K, 1.), defect(K, 0.);
     parallel_for(K, [&](int k) {
         const int i = split_nodes_[k];
         const double A = area[i];
-        if (!(A > 0) || !(astar[i] > 0)) {
+        if (!(A > 0) || !(astar[k] > 0)) {
             rate[k] = (y_of[k] - u[k]) / tau;
             return;
         }
         const Four &y = y_of[k];
-        Four bbar = Four(bstar.row(i).transpose()) / astar[i];
+        Four bbar = bstar[k] / astar[k];
         nudge_into_cone(bbar, "split bar");
         const Four c = Four(term.row(i).transpose()) - A * (bbar - y);
         const Four g = c / A;
