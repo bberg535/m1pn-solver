@@ -54,6 +54,11 @@ struct View {
     double viscosity, s0, s1; // sqrt(4 pi), sqrt(4 pi / 3)
     const int *connectivity, *neighbors, *node_offsets, *node_entries;
     const double *stiffness_rows, *convection_t_rows[3], *seminorm, *extension[3][2];
+    const int *klass;                 // cells: size class of an element (nullptr: one class, uniform mesh)
+    int classes;
+    const double *class_viscosity;    // classes (nullptr: viscosity)
+    const double *ext_list;           // graded WENO extensions (ext_count x local x local)
+    const int *ext_index;             // cells x 2 dimension (nullptr: extension[d][side])
     const double *convection_band[3], *lower[3], *invdiag[3];
     int mirror_index[3];                       // -1: no mirror side in d
     const double *dlower[3], *dinvdiag[3];     // Dirichlet factor of the 1D mass (mirror directions)
@@ -366,6 +371,11 @@ __device__ __forceinline__ void closure_node(const View &v, const double *a, int
         }
     }
 }
+// Size class of element e and its stabilization viscosity (graded meshes; class 0 and `viscosity` otherwise).
+__device__ __forceinline__ int klass_of(const View &v, int e) { return v.klass ? v.klass[e] : 0; }
+__device__ __forceinline__ double viscosity_of(const View &v, int c) {
+    return v.class_viscosity ? v.class_viscosity[c] : v.viscosity;
+}
 template <int N> __device__ __forceinline__ double weno_element(const View &v, int e) {
     constexpr int NA = N > 0 ? N : max_local;
     const int n = N > 0 ? N : v.local;
@@ -402,7 +412,8 @@ template <int N> __device__ __forceinline__ double weno_element(const View &v, i
                 other[l] = v.density[next >= 0 ? v.connectivity[next * n + l]
                                                : v.connectivity[e * n + v.reflected[d][l]]];
             ++m;
-            const double *X = v.extension[d][side];
+            const double *X = v.ext_index ? v.ext_list + std::size_t(v.ext_index[e * 2 * v.dimension + 2 * d + side]) * n * n
+                                          : v.extension[d][side];
             for (int r = 0; r < n; ++r) {
                 double s = 0;
                 for (int c = 0; c < n; ++c)
@@ -720,15 +731,17 @@ __global__ void k_stabilization(View v, const double *a, double *result, bool wa
     for (int k = v.node_offsets[i]; k < v.node_offsets[i + 1]; ++k) {
         const int entry = v.node_entries[k], e = entry / n, l = entry % n;
         const int *map = v.connectivity + std::size_t(e) * n;
-        const double *K = v.stiffness_rows + std::size_t(l) * n;
+        const int kc = klass_of(v, e);
+        const double nu = viscosity_of(v, kc);
+        const double *K = v.stiffness_rows + std::size_t(kc) * n * n + std::size_t(l) * n;
         double term = 0;
         for (int m = 0; m < n; ++m)
-            term += (v.viscosity * K[m]) * a[std::size_t(map[m]) * q + c];
+            term += (nu * K[m]) * a[std::size_t(map[m]) * q + c];
         const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
-        const double weight = -v.viscosity * g;
+        const double weight = -nu * g;
         if (weight != 0)
             for (int d = 0; d < v.dimension; ++d) {
-                const double *Ct = v.convection_t_rows[d] + std::size_t(l) * n;
+                const double *Ct = v.convection_t_rows[d] + std::size_t(kc) * n * n + std::size_t(l) * n;
                 const double *G = v.gradient[d];
                 for (int m = 0; m < n; ++m)
                     term += (weight * Ct[m]) * G[std::size_t(map[m]) * q + c];
@@ -742,7 +755,10 @@ __global__ void k_stabilization(View v, const double *a, double *result, bool wa
     }
     result[t] = out;
 }
-__constant__ double cK[16], cKv[16], cC0[16], cC1[16]; // 2D Q1 element tables (stiffness rows, C_d^T rows)
+constexpr int max_strip_classes = 64; // graded 2D Q1: size classes held in constant memory for the strip kernel
+// 2D Q1 element tables per size class c at 16 c: stiffness rows, nu K, C_d^T rows; cNu[c]: viscosity.
+__constant__ double cK[16 * max_strip_classes], cKv[16 * max_strip_classes], cC0[16 * max_strip_classes],
+    cC1[16 * max_strip_classes], cNu[max_strip_classes];
 // 2D Q1: the gathered residual of node i only involves its 3 x 3 neighbourhood. One thread per (x, component) walks a
 // strip of SY rows in y with a sliding 3 x 3 window of a, g_0, g_1 in registers (9 loads per output); the four elements
 // around a node are visited as quadrants with compile-time local indices.
@@ -778,8 +794,9 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
                 if (ex < 0 || ex >= cx || ey < 0 || ey >= cy)
                     continue;
                 const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
+                const int kc = 16 * klass_of(v, e);
                 const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
-                const double weight = -v.viscosity * g;
+                const double weight = -cNu[kc / 16] * g;
                 // nu K a + weight (C_0^T g_0 + C_1^T g_1), nu K prescaled (cKv)
                 double stiff = 0, conv = 0;
 #pragma unroll
@@ -787,8 +804,9 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
 #pragma unroll
                     for (int mx = 0; mx < 2; ++mx) {
                         const int m = mx + 2 * my;
-                        stiff += cKv[4 * l + m] * W[0][qy + my][qx + mx];
-                        conv += cC0[4 * l + m] * W[1][qy + my][qx + mx] + cC1[4 * l + m] * W[2][qy + my][qx + mx];
+                        stiff += cKv[kc + 4 * l + m] * W[0][qy + my][qx + mx];
+                        conv += cC0[kc + 4 * l + m] * W[1][qy + my][qx + mx] +
+                                cC1[kc + 4 * l + m] * W[2][qy + my][qx + mx];
                     }
                 const double term = stiff + weight * conv;
                 if (want_low && c < 4) {
@@ -873,6 +891,9 @@ template <int N> __device__ __forceinline__ void limit_element(const View &v, in
     const int n = N > 0 ? N : v.local, dim = v.dimension;
     const int *map = v.connectivity + std::size_t(e) * n;
     const std::size_t NN = v.nodes;
+    const int kc = klass_of(v, e);
+    const std::size_t po = std::size_t(kc) * n * (n - 1); // pair table offset of the class
+    const double *tvis = v.total_viscosity + std::size_t(kc) * n;
     double ubar[NA][4], contribution[NA][4];
     bool uncertain = false;
     long long nudged = 0;
@@ -887,7 +908,7 @@ template <int N> __device__ __forceinline__ void limit_element(const View &v, in
         double weighted[4] = {0, 0, 0, 0}, fi[4] = {0, 0, 0, 0};
 #pragma unroll
         for (int k = 0; k < n - 1; ++k) {
-            const int pk = i * (n - 1) + k;
+            const std::size_t pk = po + i * (n - 1) + k;
             const int j = N > 0 ? (k < i ? k : k + 1) : v.pair_j[pk]; // pair table order: all j != i ascending
             const double dij = v.pair_d[pk];
             const int nj = map[j];
@@ -927,7 +948,7 @@ template <int N> __device__ __forceinline__ void limit_element(const View &v, in
             for (int r = 0; r < 4; ++r)
                 fi[r] -= v.stab_low[std::size_t(4 * i + r) * v.cells + e];
         for (int r = 0; r < 4; ++r) {
-            ubar[i][r] = weighted[r] / v.total_viscosity[i];
+            ubar[i][r] = weighted[r] / tvis[i];
             contribution[i][r] = fi[r];
         }
         if (nudge(ubar[i], v.counters, uncertain))
@@ -954,7 +975,7 @@ template <int N> __device__ __forceinline__ void limit_element(const View &v, in
         for (int i = 0; i < n; ++i) {
             double t[4];
             for (int r = 0; r < 4; ++r)
-                t[r] = ubar[i][r] + contribution[i][r] / (2 * v.total_viscosity[i]);
+                t[r] = ubar[i][r] + contribution[i][r] / (2 * tvis[i]);
             need |= !cone(t, uncertain);
         }
         if (uncertain) {
@@ -988,7 +1009,7 @@ template <int N> __device__ __forceinline__ void limit_element(const View &v, in
     for (int i = 0; i < n; ++i) {
         const int ni = map[i];
         for (int r = 0; r < 4; ++r) {
-            const double lo = 2 * v.total_viscosity[i] * (ubar[i][r] - v.low[r * NN + ni]);
+            const double lo = 2 * tvis[i] * (ubar[i][r] - v.low[r * NN + ni]);
             v.element_limited[std::size_t(4 * i + r) * v.cells + e] = lo + contribution[i][r];
         }
     }
@@ -1018,7 +1039,9 @@ template <int N, int NG> __global__ void __launch_bounds__(256) k_limiter_group(
     const std::size_t NN = v.nodes;
     double ub[4] = {0, 0, 0, 0}, fi[4] = {0, 0, 0, 0}, ui[4] = {0, 0, 0, 0};
     bool bad = false, uncertain = false;
-    const double tv = i < N ? v.total_viscosity[i] : 1.;
+    const int kc = e < v.cells ? klass_of(v, e) : 0;
+    const std::size_t po = std::size_t(kc) * N * (N - 1);
+    const double tv = i < N ? v.total_viscosity[std::size_t(kc) * N + i] : 1.;
     if (valid) {
         const int *map = v.connectivity + std::size_t(e) * N;
         const int ni = map[i];
@@ -1029,7 +1052,8 @@ template <int N, int NG> __global__ void __launch_bounds__(256) k_limiter_group(
             Fi[r] = v.low_flux[r * NN + ni], Gi[r] = v.closure[r * NN + ni];
         double weighted[4] = {0, 0, 0, 0};
         for (int k = 0; k < N - 1; ++k) {
-            const int pk = i * (N - 1) + k, j = k < i ? k : k + 1, nj = map[j];
+            const std::size_t pk = po + i * (N - 1) + k;
+            const int j = k < i ? k : k + 1, nj = map[j];
             const double dij = v.pair_d[pk];
             double uj[4], fd[4] = {0, 0, 0, 0}, ct[4] = {0, 0, 0, 0};
             for (int r = 0; r < 4; ++r)
@@ -1133,6 +1157,7 @@ template <int N> __global__ void k_limiter_segment(View v) {
         return;
     const int e = v.segment_list[idx], n = N > 0 ? N : v.local;
     const int *map = v.connectivity + std::size_t(e) * n;
+    const double *tvis = v.total_viscosity + std::size_t(klass_of(v, e)) * n;
     double ubar[NA][4], lim[NA][4];
     for (int i = 0; i < n; ++i)
         for (int r = 0; r < 4; ++r) {
@@ -1144,7 +1169,7 @@ template <int N> __global__ void k_limiter_segment(View v) {
     for (int i = 0; i < n; ++i) {
         double g[4], t[4];
         for (int r = 0; r < 4; ++r) {
-            g[r] = lim[i][r] / (2 * v.total_viscosity[i]);
+            g[r] = lim[i][r] / (2 * tvis[i]);
             t[r] = ubar[i][r] + g[r];
         }
         if (cone(t, uncertain))
@@ -1168,7 +1193,7 @@ template <int N> __global__ void k_limiter_segment(View v) {
         sum = fmax(sum, fabs(after[r]));
     for (int i = 0; i < n; ++i) {
         for (int r = 0; r < 4; ++r) {
-            const double lo = 2 * v.total_viscosity[i] * (ubar[i][r] - v.low[std::size_t(r) * v.nodes + map[i]]);
+            const double lo = 2 * tvis[i] * (ubar[i][r] - v.low[std::size_t(r) * v.nodes + map[i]]);
             v.element_limited[std::size_t(4 * i + r) * v.cells + e] = lo + lim[i][r];
         }
     }
@@ -2040,10 +2065,16 @@ Context *create(const Setup &s) {
     v.neighbors = own(dcopy(s.neighbors, std::size_t(s.cells) * 2 * s.dimension));
     v.node_offsets = own(dcopy(s.node_offsets, std::size_t(s.nodes) + 1));
     v.node_entries = own(dcopy(s.node_entries, std::size_t(ne)));
-    v.stiffness_rows = own(dcopy(s.stiffness_rows, std::size_t(n) * n));
+    const std::size_t C = std::size_t(s.classes);
+    v.klass = s.element_class ? own(dcopy(s.element_class, std::size_t(s.cells))) : nullptr;
+    v.classes = s.classes;
+    v.class_viscosity = s.class_viscosity ? own(dcopy(s.class_viscosity, C)) : nullptr;
+    v.ext_index = s.ext_index ? own(dcopy(s.ext_index, std::size_t(s.cells) * 2 * s.dimension)) : nullptr;
+    v.ext_list = s.ext_index ? own(dcopy(s.ext_list, std::size_t(s.ext_count) * n * n)) : nullptr;
+    v.stiffness_rows = own(dcopy(s.stiffness_rows, C * n * n));
     v.seminorm = own(dcopy(s.seminorm, std::size_t(n) * n));
     for (int d = 0; d < 3; ++d) {
-        v.convection_t_rows[d] = d < s.dimension ? own(dcopy(s.convection_t_rows[d], std::size_t(n) * n)) : nullptr;
+        v.convection_t_rows[d] = d < s.dimension ? own(dcopy(s.convection_t_rows[d], C * n * n)) : nullptr;
         for (int side = 0; side < 2; ++side)
             v.extension[d][side] = d < s.dimension ? own(dcopy(s.extension[d][side], std::size_t(n) * n)) : nullptr;
         if (d < s.dimension) {
@@ -2101,22 +2132,27 @@ Context *create(const Setup &s) {
         v.ell_val = own(dcopy(ev.data(), ev.size()));
         v.ell_idx = own(dcopy(ei.data(), ei.size()));
     }
-    const std::size_t pairs = std::size_t(n) * (n - 1);
+    const std::size_t pairs = C * n * (n - 1);
     v.pair_j = own(dcopy(s.pair_j, pairs));
     v.pair_d = own(dcopy(s.pair_d, pairs));
     v.pair_m = own(dcopy(s.pair_m, pairs));
     v.pair_c = own(dcopy(s.pair_c, 3 * pairs));
     v.pair_ct = own(dcopy(s.pair_ct, 3 * pairs));
-    v.total_viscosity = own(dcopy(s.total_viscosity, std::size_t(n)));
+    v.total_viscosity = own(dcopy(s.total_viscosity, C * n));
     v.lumped = own(dcopy(s.lumped, std::size_t(s.nodes)));
-    if (s.dimension == 2 && s.degree == 1) {
-        CK(cudaMemcpyToSymbol(cK, s.stiffness_rows, 16 * sizeof(double)));
-        double kv[16];
-        for (int k = 0; k < 16; ++k)
-            kv[k] = s.viscosity * s.stiffness_rows[k];
-        CK(cudaMemcpyToSymbol(cKv, kv, 16 * sizeof(double)));
-        CK(cudaMemcpyToSymbol(cC0, s.convection_t_rows[0], 16 * sizeof(double)));
-        CK(cudaMemcpyToSymbol(cC1, s.convection_t_rows[1], 16 * sizeof(double)));
+    if (s.dimension == 2 && s.degree == 1 && s.classes <= max_strip_classes) {
+        const std::size_t m = 16 * C;
+        std::vector<double> kv(m), nu(C);
+        for (std::size_t c = 0; c < C; ++c) {
+            nu[c] = s.class_viscosity ? s.class_viscosity[c] : s.viscosity;
+            for (int k = 0; k < 16; ++k)
+                kv[16 * c + k] = nu[c] * s.stiffness_rows[16 * c + k];
+        }
+        CK(cudaMemcpyToSymbol(cK, s.stiffness_rows, m * sizeof(double)));
+        CK(cudaMemcpyToSymbol(cKv, kv.data(), m * sizeof(double)));
+        CK(cudaMemcpyToSymbol(cC0, s.convection_t_rows[0], m * sizeof(double)));
+        CK(cudaMemcpyToSymbol(cC1, s.convection_t_rows[1], m * sizeof(double)));
+        CK(cudaMemcpyToSymbol(cNu, nu.data(), C * sizeof(double)));
     }
     v.weno = s.weno, v.stabilize = s.stabilize, v.limit = s.limit, v.outward_bar_rounding = s.outward_bar_rounding;
     v.scale_invariant_weno = s.scale_invariant_weno;
@@ -2354,7 +2390,7 @@ void gradients(Context *ctx, const double *state) {
 }
 void stabilization(Context *ctx, const double *state, double *out, bool want_low, double constant_gamma) {
     const View &v = ctx->v;
-    if (v.dimension == 2 && v.degree == 1 && !v.periodic) { // the strip kernel assumes the open grid
+    if (v.dimension == 2 && v.degree == 1 && !v.periodic && v.classes <= max_strip_classes) { // open grid only
         static const int sy = [] {
             const char *e = std::getenv("M1PN_GPU_STRIP");
             return e ? std::atoi(e) : 16;
@@ -2368,6 +2404,8 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
             k_stabilization_strip<64><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
         else
             k_stabilization_strip<32><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+    } else if (v.klass) { // graded: the element kernels stage one class in shared memory; per node instead
+        k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, state, out, want_low, constant_gamma);
     } else {
         double *local_out = device_doubles(ctx, 7, std::size_t(v.cells) * v.local * v.q);
         const unsigned g = blocks(std::size_t(v.cells) * v.q, 128);

@@ -81,6 +81,17 @@ pair lattice3d_q2_14_P3 1e-8 - --case lattice-3d --dimension 3 --inflow vacuum -
 pair latticefcs3d_q1_28_P3 1e-8 --fcs-integrals --case lattice-3d --dimension 3 --inflow vacuum --background 1e-10 \
      --elements 28 --degree 1 --pn-order 3 --time 0.5 --fcs analytic
 
+# Graded meshes (--cells-per-unit, docs/GRADED_MESH.md): size classes on the device, strip kernel (Q1) and the per
+# node stabilization (Q2), class pair tables in the limiter, WENO extensions per width ratio, scaled boundary faces.
+GR="--cells-per-unit 6,8,12,16,12,8,6"
+pair graded_lattice_q1_P7     1e-8 - $LAT --elements 56 --pn-order 7 --time 0.2 $GR
+pair graded_latticefcs_q1_P7  1e-8 --fcs-integrals $LAT --elements 56 --pn-order 7 --time 0.2 --fcs analytic $GR
+pair graded_lattice_q2_P7     1e-8 - --case lattice-paul --dimension 2 --inflow vacuum --background 1e-10 --degree 2 \
+     --elements 28 --pn-order 7 --time 0.2 --cells-per-unit 3,4,6,8,6,4,3
+pair graded_linefcs_q1_P7     1e-8 - --case line-source --dimension 2 --inflow vacuum --pulse-width .01 \
+     --background .0009 --sigma-s 3 --time 0.02 --elements 128 --degree 1 --pn-order 7 --fcs analytic \
+     --cells-per-unit 16,32,64,32,16
+
 # Periodic meshes (cyclic line solve on the device): smooth transport with exact periodic data.
 PER="--case smooth --periodic --pn-order 7 --time .1"
 pair periodic_1d_q3_32       1e-8 - $PER --dimension 1 --elements 32 --degree 3

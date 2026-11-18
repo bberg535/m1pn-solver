@@ -510,8 +510,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     if (!o.cells_per_unit.empty()) {
         // Graded mesh: every axis of the box is split into equal segments, one per entry, with the given element
         // counts (for the lattices: unit segments, so material and source boundaries stay on element boundaries).
-        require(dim <= 2 && !distributed && !o.gpu && !o.mesh.periodic,
-                "--cells-per-unit: 1D/2D, serial CPU, open mesh (docs/GRADED_MESH.md)");
+        require(dim <= 2 && !distributed && !o.mesh.periodic && (!o.gpu || dim == 2),
+                "--cells-per-unit: 1D/2D (GPU: 2D), serial, open mesh (docs/GRADED_MESH.md)");
         const std::array<int, 3> uniform_counts = counts; // the loop overwrites counts[d]; extents use the originals
         for (int d = 0; d < dim; ++d) {
             const double extent_d = length_x / uniform_counts[0] * uniform_counts[d];

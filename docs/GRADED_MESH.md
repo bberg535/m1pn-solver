@@ -66,3 +66,17 @@ konstanter Liste unsichtbar). Kontrolle in v4: Verfeinern nur der Außenzelle l�
 
 GB erreicht U896 (alle QoIs und Feld) in 37 % der Zeit, GA erreicht U560 in 56 %. Kosten je Element und Schritt
 abgestuft ~1,2 µs gegen 0,8 µs gleichmäßig (Klassenzugriff; Optimierungspotential).
+
+## Stufe C: GPU (18.11.2026, Branch `feature/graded-gpu`)
+
+Geräteseite: Klassen-Tabellen gestapelt (Steifigkeits- und C_dᵀ-Zeilen, Paartabelle, Zeilensummen der
+Graph-Viskosität, Viskosität je Klasse), Elementklasse je Element, WENO-Erweiterungen je (Element, Achse, Seite).
+2D-Q1-Streifenkern mit Klassentabellen im Konstantspeicher (bis 64 Klassen), sonst der knotenweise Kern; Limiter
+(Gruppen-, Element- und Segmentkern, Host-Rückfall) mit den Klassenpaaren. Host-Randpfad: Flächenskalierung in
+row_mass, G, Datum, Phase-B-Gewichten und Quadraturpunkten mit den Elementbreiten. Gleichmäßige Gitter laufen mit
+einer Klasse über die bisherigen Daten.
+
+Abnahme (`nx/tmp/graded_gpu`): `tests/gpu_validate.sh` alle Fälle PASS, darunter vier abgestufte (Lattice Q1/Q2, mit
+FCS, Line Source mit FCS; CPU gegen GPU 9e-15 bis 3e-10). Gleichmäßig bitgleich zum GPU-Binary von 4cf885d für Lattice
+Q1 (mit/ohne FCS) und Line Source; Lattice Q2 ist schon mit dem alten Binary von Lauf zu Lauf nicht bitgleich (6 Läufe:
+3 verschiedene Ergebnisse, Abweichung ~1e-12; offener Punkt unabhängig von dieser Stufe).

@@ -70,7 +70,6 @@ std::vector<double> row_major(const Mat &m) {
 } // namespace
 
 ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
-    require(!s.graded_, "GPU time loop: graded meshes are not supported yet (docs/GRADED_MESH.md)");
     const ElementWenoOptions &o = s.options;
     require(!s.dist_, "GPU path: serial scheme only (no MPI)");
     require(!o.symmetric_residual && !o.m1_target, "GPU path: standard residual, PN target");
@@ -93,16 +92,42 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     g.neighbors = s.neighbors_.data();
     g.node_offsets = s.node_offsets_.data();
     g.node_entries = s.node_entries_.data();
-    g.stiffness_rows = s.stiffness_rows_.data();
+    // Element tables: one class (the members) on a uniform mesh, the stacked size classes on a graded one.
+    const int classes = s.graded_ ? int(s.classes_.size()) : 1;
+    std::vector<double> class_stiffness, class_viscosity, ext_list;
+    std::array<std::vector<double>, 3> class_convection;
+    g.classes = classes;
+    if (s.graded_) {
+        for (const auto &c : s.classes_) {
+            class_stiffness.insert(class_stiffness.end(), c.stiffness_rows.begin(), c.stiffness_rows.end());
+            class_viscosity.push_back(c.viscosity);
+            for (int d = 0; d < s.dimension; ++d)
+                class_convection[d].insert(class_convection[d].end(), c.convection_t_rows[d].begin(),
+                                           c.convection_t_rows[d].end());
+        }
+        for (const Mat &X : s.extension_list_) {
+            const std::vector<double> r = row_major(X);
+            ext_list.insert(ext_list.end(), r.begin(), r.end());
+        }
+        g.element_class = s.element_class_.data();
+        g.class_viscosity = class_viscosity.data();
+        g.ext_count = int(s.extension_list_.size());
+        g.ext_list = ext_list.data();
+        g.ext_index = s.extension_index_.data();
+        g.stiffness_rows = class_stiffness.data();
+    } else
+        g.stiffness_rows = s.stiffness_rows_.data();
     const std::vector<double> semi = row_major(s.seminorm_);
     g.seminorm = semi.data();
     std::array<std::array<std::vector<double>, 2>, 3> ext;
     std::array<std::vector<double>, 3> band, lower, diagonal, dlower, ddiagonal, tail;
     g.periodic = o.periodic;
     for (int d = 0; d < s.dimension; ++d) {
-        g.convection_t_rows[d] = s.convection_t_rows_[d].data();
+        g.convection_t_rows[d] = s.graded_ ? class_convection[d].data() : s.convection_t_rows_[d].data();
         for (int side = 0; side < 2; ++side) {
-            ext[d][side] = row_major(s.extension_[d][side]);
+            // graded: ext_index selects from ext_list; the uniform slot only needs n x n readable values
+            ext[d][side] = s.graded_ ? std::vector<double>(ext_list.begin(), ext_list.begin() + n * n)
+                                     : row_major(s.extension_[d][side]);
             g.extension[d][side] = ext[d][side].data();
         }
         // Banded 1D convection rows.
@@ -218,17 +243,25 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         g.comp_odd = comp_odd.data();
         g.node_mirror = node_mirror.data();
     }
-    const std::size_t pairs = s.pair_table_.size();
+    std::vector<ElementWeno::PairEntry> stacked_pairs;
+    std::vector<double> stacked_total;
+    if (s.graded_)
+        for (const auto &c : s.classes_) {
+            stacked_pairs.insert(stacked_pairs.end(), c.pairs.begin(), c.pairs.end());
+            stacked_total.insert(stacked_total.end(), c.total_viscosity.data(), c.total_viscosity.data() + n);
+        }
+    const std::vector<ElementWeno::PairEntry> &pair_source = s.graded_ ? stacked_pairs : s.pair_table_;
+    const std::size_t pairs = pair_source.size();
     std::vector<int> pj(pairs);
     std::vector<double> pd(pairs), pm(pairs), pc(3 * pairs), pct(3 * pairs);
     for (std::size_t k = 0; k < pairs; ++k) {
-        const auto &pe = s.pair_table_[k];
+        const auto &pe = pair_source[k];
         pj[k] = pe.j, pd[k] = pe.d, pm[k] = pe.m;
         for (int d = 0; d < 3; ++d)
             pc[3 * k + d] = pe.c[d], pct[3 * k + d] = pe.ct[d];
     }
     g.pair_j = pj.data(), g.pair_d = pd.data(), g.pair_m = pm.data(), g.pair_c = pc.data(), g.pair_ct = pct.data();
-    g.total_viscosity = s.total_viscosity_.data();
+    g.total_viscosity = s.graded_ ? stacked_total.data() : s.total_viscosity_.data();
     g.lumped = s.lumped.data();
     g.weno = o.weno, g.stabilize = o.stabilize, g.limit = o.limit, g.outward_bar_rounding = o.outward_bar_rounding;
     g.scale_invariant_weno = o.scale_invariant_weno;
@@ -391,7 +424,7 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
                 for (int m = 0; m < nf; ++m) {
                     const std::size_t at = std::size_t(r0 + n) * nf + m;
                     row_nodes[at] = s.connectivity_[std::size_t(f.element) * s.local_nodes + rule.local[m]];
-                    row_mass[at] = rule.mass(n, m);
+                    row_mass[at] = s.face_scale_[index] * rule.mass(n, m); // graded: area of this face
                 }
         }
         gpu::BoundaryHighSetup h;
@@ -457,7 +490,7 @@ void ElementWenoGpu::prepare_face_data(double time) {
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
             for (int d = 0; d < s.dimension; ++d)
-                x[d] += s.h * rule.points(point, d);
+                x[d] += s.width(f.element, d) * rule.points(point, d);
             s.face_data_into(side_id, x, time, buffer[std::size_t(index) * face_points_ + point]);
         }
     });
@@ -481,7 +514,7 @@ void ElementWenoGpu::fill_datum(int k) {
             const Incoming &data = s.inflow.steady ? s.steady_data_[std::size_t(index) * rule.weights.size() + point]
                                                    : face_data_[k][std::size_t(index) * face_points_ + point];
             for (int n = 0; n < nf; ++n) {
-                const double weight = rule.weights[point] * rule.shape(n, point);
+                const double weight = s.face_scale_[index] * rule.weights[point] * rule.shape(n, point);
                 if (weight == 0)
                     continue;
                 datum.row(n).noalias() += weight * data.d.transpose();
@@ -519,6 +552,8 @@ void ElementWenoGpu::boundary_high(int buffer) {
         for (int n = 0; n < nf; ++n)
             traces.row(n) = a_h_.row(s.connectivity_[f.element * s.local_nodes + rule.local[n]]);
         G_.middleRows(r0, nf).noalias() = rule.mass * traces;
+        if (s.graded_)
+            G_.middleRows(r0, nf) *= s.face_scale_[index];
     });
     constexpr int rows_per_task = 16;
     std::vector<std::array<int, 3>> tasks;
@@ -762,7 +797,7 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
             const Incoming &data = s.inflow.steady ? s.steady_data_[std::size_t(index) * rule.weights.size() + point]
                                                    : (*fd)[std::size_t(index) * face_points_ + point];
             for (int n = 0; n < nf; ++n) {
-                const double weight = rule.weights[point] * rule.shape(n, point);
+                const double weight = s.face_scale_[index] * rule.weights[point] * rule.shape(n, point);
                 if (weight == 0)
                     continue;
                 const int i = global[n];
@@ -883,9 +918,10 @@ void ElementWenoGpu::limiter_fallback(ElementWenoStats &stats) {
     gpu::gather_device(ctx_, b.moment_rate, 4, d_nodes, m, mr.data(), s_.nodes);
     const int *d_elements = gpu::limiter_fallback_list(ctx_);
     gpu::gather_device(ctx_, b.stab_low, 4 * n, d_elements, count, stab.data(), s_.cells);
-    const Vec &total_viscosity = s_.total_viscosity_;
     using Quad = Eigen::Map<const Four>;
     for (int k = 0; k < count; ++k) {
+        const Vec &total_viscosity = s_.graded_ ? s_.klass(elements[k]).total_viscosity : s_.total_viscosity_;
+        const std::vector<ElementWeno::PairEntry> &pair_table = s_.graded_ ? s_.klass(elements[k]).pairs : s_.pair_table_;
         std::vector<double> copies(std::size_t(32) * n);
         for (int l = 0; l < n; ++l) {
             const std::size_t r = std::size_t(k) * n + l;
@@ -901,7 +937,7 @@ void ElementWenoGpu::limiter_fallback(ElementWenoStats &stats) {
             const double *ci = &copies[std::size_t(32) * i];
             const Four ui = Quad(ci), qi = Quad(ci + 28);
             Four weighted = Four::Zero(), fi = Four::Zero();
-            const auto *pairs = &s_.pair_table_[std::size_t(i) * (n - 1)];
+            const auto *pairs = &pair_table[std::size_t(i) * (n - 1)];
             for (int kk = 0; kk < n - 1; ++kk) {
                 const auto &pe = pairs[kk];
                 const int j = pe.j;

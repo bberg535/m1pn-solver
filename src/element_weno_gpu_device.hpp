@@ -17,8 +17,18 @@ struct Setup {
     const int *neighbors = nullptr;    // cells x 2 dimension (-1: none)
     const int *node_offsets = nullptr; // nodes + 1
     const int *node_entries = nullptr; // cells * local, entry = e * local + l
-    const double *stiffness_rows = nullptr;      // local x local
-    const double *convection_t_rows[3] = {};     // local x local each
+    // Graded meshes (docs/GRADED_MESH.md): `classes` size classes; the per-class tables below are stacked (class c
+    // at offset c * size), element_class[e] selects one (null: one class, the uniform mesh), class_viscosity[c] the
+    // stabilization viscosity (null: `viscosity`). WENO extensions per (element, axis, side): ext_list (ext_count x
+    // local x local) indexed by ext_index[e * 2 dimension + 2 d + side] (null: extension[d][side]).
+    int classes = 1;
+    const int *element_class = nullptr;
+    const double *class_viscosity = nullptr;
+    int ext_count = 0;
+    const double *ext_list = nullptr;
+    const int *ext_index = nullptr;
+    const double *stiffness_rows = nullptr;      // classes x local x local
+    const double *convection_t_rows[3] = {};     // classes x local x local each
     const double *seminorm = nullptr;            // local x local, row-major
     const double *extension[3][2] = {};          // local x local, row-major
     // Banded 1D operators per axis (bandwidth = degree): convection rows (n x (2p+1), entry k-p..k+p, row-major),
@@ -41,10 +51,10 @@ struct Setup {
     const int *flux_outer[3] = {}, *flux_inner[3] = {};
     const double *flux_value[3] = {};
     int flux_nnz[3] = {0, 0, 0};
-    // Limiter pair table: local x (local - 1) entries of (j, d, m, c[3], ct[3]).
+    // Limiter pair table: classes x local x (local - 1) entries of (j, d, m, c[3], ct[3]).
     const int *pair_j = nullptr;
     const double *pair_d = nullptr, *pair_m = nullptr, *pair_c = nullptr, *pair_ct = nullptr; // c, ct: 3 per entry
-    const double *total_viscosity = nullptr; // local
+    const double *total_viscosity = nullptr; // classes x local
     const double *lumped = nullptr;          // nodes
     // Options.
     bool weno = true, stabilize = true, limit = true, outward_bar_rounding = true, scale_invariant_weno = true;
