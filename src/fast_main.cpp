@@ -686,15 +686,15 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     // inflow data symmetric: density(Rx, t, R w) = density(x, t, w) and atoms(Rx, t) = R atoms(x, t) on all faces.
     std::array<bool, 3> mirror_dir{};
     std::array<std::string, 3> mirror_reason{"", "", ""};
+    const std::array<std::vector<double>, 3> full_planes = eo.planes; // graded: planes of the full box (samples)
     double mirror_asymmetry = 0;
     if (distributed && o.mirror_reduction == "auto")
         mirror_reason = {"MPI", "MPI", "MPI"}; // mirror sides and slabs are not combined
-    if (!o.cells_per_unit.empty())
-        mirror_reason = {"graded mesh", "graded mesh", "graded mesh"};
-    if (o.break_every > 0 || o.break_units)
-        mirror_reason = {"broken lines", "broken lines", "broken lines"};
-    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed && o.cells_per_unit.empty() &&
-        o.break_every == 0 && !o.break_units) {
+    // Graded meshes and unit broken lines (docs/STATIC_HP_BLOCKS.md, "Spiegelreduktion"): additionally the planes and
+    // the broken lines must be symmetric about the centre, and no broken line may lie on the mirror plane.
+    if (o.break_every > 0)
+        mirror_reason = {"broken lines (--break-every)", "broken lines (--break-every)", "broken lines (--break-every)"};
+    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed && o.break_every == 0) {
         const int pd = o.degree;
         std::array<int, 3> per{1, 1, 1};
         long total = 1;
@@ -744,6 +744,21 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         for (int d = 0; d < dim; ++d) {
             auto reflect = [&](V3 x) { x[d] = 2 * center[d] - x[d]; return x; };
             if (counts[d] % 2) { mirror_reason[d] = "odd element count"; continue; }
+            if (!eo.planes[d].empty()) {
+                const auto &P = eo.planes[d];
+                const double c = P[counts[d] / 2], tol = 1e-12 * std::max(1., std::abs(c));
+                bool even = true;
+                for (int k = 0; k <= counts[d]; ++k)
+                    even = even && std::abs(P[k] + P[counts[d] - k] - 2 * c) <= tol;
+                if (!even || std::abs(c - center[d]) > tol) { mirror_reason[d] = "graded planes not symmetric"; continue; }
+            }
+            if (!eo.breaks[d].empty()) {
+                const auto &K = eo.breaks[d];
+                bool even = !std::binary_search(K.begin(), K.end(), counts[d] / 2);
+                for (int k : K)
+                    even = even && std::binary_search(K.begin(), K.end(), counts[d] - k);
+                if (!even) { mirror_reason[d] = "broken lines not symmetric or on the mirror plane"; continue; }
+            }
             double asym = 0, scale = 0;
             for (long i = 0; i < total; ++i) {
                 const V3 x = node_x(i);
@@ -804,8 +819,21 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         }
         for (int d = 0; d < dim; ++d)
             if (mirror_dir[d]) {
-                counts[d] /= 2;
+                const int half = counts[d] / 2;
+                counts[d] = half;
                 origin[d] = center[d];
+                if (!eo.planes[d].empty()) { // graded: the upper half of the planes, starting exactly at the origin
+                    std::vector<double> P(eo.planes[d].begin() + half, eo.planes[d].end());
+                    origin[d] = P.front();
+                    eo.planes[d] = std::move(P);
+                }
+                if (!eo.breaks[d].empty()) { // broken lines of the upper half, renumbered
+                    std::vector<int> K;
+                    for (int k : eo.breaks[d])
+                        if (k > half)
+                            K.push_back(k - half);
+                    eo.breaks[d] = std::move(K);
+                }
                 eo.mirror[2 * d] = true;
             }
         eo.origin = origin;
@@ -939,9 +967,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     // Graded mesh: the samples are the Q1 nodes of the element planes subdivided by the degree, with trapezoid
     // weights (the uniform branch is unchanged).
     std::array<std::vector<double>, 3> axis_coord;
-    if (!eo.planes[0].empty())
+    if (!full_planes[0].empty())
         for (int d = 0; d < dim; ++d) {
-            const auto &P = eo.planes[d];
+            const auto &P = full_planes[d];
             for (std::size_t i = 0; i + 1 < P.size(); ++i)
                 for (int k = 0; k < o.degree; ++k)
                     axis_coord[d].push_back(P[i] + (P[i + 1] - P[i]) * k / o.degree);
@@ -986,7 +1014,13 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             V3 x = where[s];
             std::array<bool, 3> flip{};
             for (int d = 0; d < dim; ++d)
-                if (mirror_dir[d] && x[d] < center[d]) x[d] = 2 * center[d] - x[d], flip[d] = true;
+                if (mirror_dir[d] && x[d] < center[d]) {
+                    x[d] = 2 * center[d] - x[d], flip[d] = true;
+                    // Broken lines: on a line the value is two-sided and evaluate() takes the upper element; the
+                    // reflected point must take the lower one to match the full mesh (one ulp, only broken meshes).
+                    if (!eo.breaks[d].empty())
+                        x[d] = std::nextafter(x[d], -std::numeric_limits<double>::infinity());
+                }
             const Vec active_values = out_scheme.evaluate(state, x);
             Vec u = Vec::Zero(pn.q);
             for (int k = 0; k < active_values.size(); ++k) u[out_scheme.active[k]] = active_values[k];
@@ -1267,6 +1301,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                << (device ? ",\"gpu_timing\":{\"spectral_radius\":" + std::to_string(gpu_radius_seconds) +
                                 ",\"host_boundary\":" + std::to_string(device->t_boundary) +
                                 ",\"host_ghost\":" + std::to_string(device->t_ghost) +
+                                ",\"diag_device\":" + std::to_string(device->t_diag_device) +
                                 ",\"host_fallback\":" + std::to_string(device->t_fallback) +
                                 ",\"host_boundary_high\":" + std::to_string(device->t_boundary_high) +
                                 ",\"host_face_data\":" + std::to_string(device->t_face_data) +

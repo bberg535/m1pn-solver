@@ -169,6 +169,18 @@ void ghost_setup(Context *, const GhostSetup &);
 // flag count and the flagged pair list into pinned host memory.
 void ghost(Context *, const double *state, double *pinned_moments, int *pinned_flags);
 GhostStats ghost_stats(Context *); // cumulative (synchronous)
+// Ghost traces on the device, projections on the host (docs/STATIC_HP_BLOCKS.md): per side s the trace matrix
+// harmonics_s (points_s x q, column-major, ghost filter applied) times the stage input rows of the side's ghost nodes.
+struct GhostTraceSetup {
+    int q = 0;
+    int count[6] = {}, points[6] = {};
+    const int *nodes[6] = {};        // ghost nodes of side s, in ElementWeno::ghost_by_side_ order (host)
+    const double *harmonics[6] = {}; // points_s x q, column-major (host)
+};
+void ghost_traces_setup(Context *, const GhostTraceSetup &);
+// On the aux stream after the work queued so far on the default stream: the traces psi (points_s per ghost node,
+// sides in order 0..5, nodes in setup order) of `state` into pinned host memory; completion is event 2.
+void ghost_traces(Context *, const double *state, double *pinned_out);
 // Exact local reaction (ElementWeno::react): per node rho' = e^{-sa tau} rho + q0 tau phi1(-sa tau),
 // a_k' = e^{-tau (sa + ss + f_k)} a_k (k >= 1), q0 = source + FCS collision source; then the admissible-row nudge.
 struct ReactionSetup {

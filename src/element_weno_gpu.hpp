@@ -46,6 +46,7 @@ public:
     long ghost_flagged = 0; // ghost pairs solved by the host (device projection flagged them)
     double t_wait_ghost = 0;
     double t_ghost = 0; // host phase B: ghost moments (part of t_boundary)
+    double t_diag_device = 0; // M1PN_GPU_DIAG_SERIAL=1: device work overlapped by phase B
 
 private:
     const ElementWeno &s_;
@@ -74,6 +75,10 @@ private:
     int face_points_ = 0, last_face_ = -1;
     bool closure_ready_ = false;
     bool device_ghost_ = false; // positivity projection of the ghost on the device
+    // Ghost traces on the device, projections on the host (docs/STATIC_HP_BLOCKS.md; experiment, M1PN_GPU_GHOST_TRACES=1).
+    bool trace_ghost_ = false;
+    double *pin_traces_ = nullptr;
+    std::array<std::size_t, 6> trace_offset_{};
     // Phase A (PN face load) on the device (gpu::boundary_high); M1PN_GPU_BOUNDARY_HIGH=0 keeps it on the host.
     bool device_high_ = false;
     double *pin_db_ = nullptr, *pin_low4_ = nullptr; // datum rows (row-major) up, l <= 1 node sums down

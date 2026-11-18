@@ -242,10 +242,11 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     h = o.length / elements;
     graded_ = std::any_of(o.planes.begin(), o.planes.end(), [](const auto &v) { return !v.empty(); });
     if (graded_) {
-        require(!o.periodic && std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; }) &&
-                    std::none_of(o.cut.begin(), o.cut.end(), [](bool c) { return c; }) &&
+        // Mirror sides (docs/STATIC_HP_BLOCKS.md, "Spiegelreduktion"): the mirrored neighbour has the own width
+        // (extension with width ratio 1), the 1D masses and their Dirichlet factors are assembled from the widths.
+        require(!o.periodic && std::none_of(o.cut.begin(), o.cut.end(), [](bool c) { return c; }) &&
                     o.element_offset == std::array<int, 3>{0, 0, 0},
-                "Graded mesh: serial, open, without mirror sides (docs/GRADED_MESH.md)");
+                "Graded mesh: serial, open (docs/GRADED_MESH.md)");
         require(!o.symmetric_residual, "Graded mesh: the symmetric residual form is not supported");
         double smallest = std::numeric_limits<double>::infinity();
         for (int d = 0; d < dimension; ++d) {
@@ -263,10 +264,10 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     }
     broken_ = std::any_of(o.breaks.begin(), o.breaks.end(), [](const auto &v) { return !v.empty(); });
     if (broken_) {
-        require(!o.periodic && std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; }) &&
-                    std::none_of(o.cut.begin(), o.cut.end(), [](bool c) { return c; }) &&
+        // Mirror sides allowed (the mirror plane is a domain end, never a broken line: 0 < k < count).
+        require(!o.periodic && std::none_of(o.cut.begin(), o.cut.end(), [](bool c) { return c; }) &&
                     o.element_offset == std::array<int, 3>{0, 0, 0},
-                "Broken lines: serial, open mesh without mirror sides");
+                "Broken lines: serial, open mesh");
         for (int d = 0; d < 3; ++d) {
             const auto &k = o.breaks[d];
             require(d < dimension || k.empty(), "Broken lines beyond the dimension");
@@ -609,9 +610,10 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             for (int d = 0; d < dimension; ++d)
                 for (int side = 0; side < 2; ++side) {
                     const int next = neighbors_[e * 2 * dimension + 2 * d + side];
-                    if (next < 0)
+                    if (next == -1)
                         continue;
-                    const double r = axis_width_[d][id[d] + (side ? 1 : -1)] / axis_width_[d][id[d]];
+                    // -2: mirror side, the neighbour is this element reflected (same width, ratio 1)
+                    const double r = next == -2 ? 1. : axis_width_[d][id[d] + (side ? 1 : -1)] / axis_width_[d][id[d]];
                     const std::array<double, 3> key{double(d), double(side), r};
                     auto it = ext_of.find(key);
                     if (it == ext_of.end()) {

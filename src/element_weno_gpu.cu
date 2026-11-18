@@ -103,6 +103,7 @@ struct Context {
     cudaStream_t aux = nullptr; // non-blocking stream of the ghost kernel (overlaps the volume kernels)
     struct ReactionDevice *reaction = nullptr;
     struct BoundaryHighDevice *bhigh = nullptr;
+    struct GhostTraceDevice *gtrace = nullptr;
     int flux_nnz[3] = {0, 0, 0};
     DeviceCounters *pinned_counters = nullptr;
 };
@@ -2259,6 +2260,81 @@ void boundary_high_setup(Context *ctx, const BoundaryHighSetup &s) {
     cublas_check(cublasSetStream(d->handle, 0), "set stream"); // legacy default stream, as all kernels here
     ctx->bhigh = d;
 }
+// ---------------------------------------------------------------------------------------------------------------
+// Ghost traces (GhostTraceSetup): gather the ghost rows of a side (q x count, column-major = the row-major state rows)
+// and one DGEMM per side, T_s = H_s A_s, on the aux stream with its own cuBLAS handle.
+struct GhostTraceDevice {
+    int q = 0, count[6] = {}, points[6] = {};
+    int *nodes[6] = {};
+    double *H[6] = {};
+    double *A = nullptr, *T = nullptr; // max_count x q gather buffer, all traces
+    std::size_t offset[6] = {}, total = 0;
+    cublasHandle_t handle = nullptr;
+};
+__global__ void k_gather_ghost_rows(int q, int count, const int *nodes, const double *state, double *A) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(count) * q)
+        return;
+    const int j = int(t / q), c = int(t % q);
+    A[t] = state[std::size_t(nodes[j]) * q + c];
+}
+void ghost_traces_setup(Context *ctx, const GhostTraceSetup &s) {
+    auto *d = new GhostTraceDevice;
+    d->q = s.q;
+    int max_count = 0;
+    for (int side = 0; side < 6; ++side) {
+        d->count[side] = s.count[side], d->points[side] = s.points[side];
+        d->offset[side] = d->total;
+        if (!s.count[side])
+            continue;
+        d->nodes[side] = dcopy(s.nodes[side], std::size_t(s.count[side]));
+        d->H[side] = dcopy(s.harmonics[side], std::size_t(s.points[side]) * s.q);
+        d->total += std::size_t(s.points[side]) * s.count[side];
+        max_count = std::max(max_count, s.count[side]);
+    }
+    CK(cudaMalloc(&d->A, sizeof(double) * std::max<std::size_t>(1, std::size_t(max_count) * s.q)));
+    CK(cudaMalloc(&d->T, sizeof(double) * std::max<std::size_t>(1, d->total)));
+    if (!ctx->aux) {
+        int least = 0, greatest = 0;
+        CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CK(cudaStreamCreateWithPriority(&ctx->aux, cudaStreamNonBlocking, least));
+    }
+    cublas_check(cublasCreate(&d->handle), "create (ghost traces)");
+    cublas_check(cublasSetStream(d->handle, ctx->aux), "set stream (ghost traces)");
+    ctx->gtrace = d;
+}
+void ghost_traces(Context *ctx, const double *state, double *pinned_out) {
+    GhostTraceDevice *d = ctx->gtrace;
+    cudaStream_t st = ctx->aux;
+    CK(cudaEventRecord(ctx->events[3], 0));
+    CK(cudaStreamWaitEvent(st, ctx->events[3], 0));
+    const double one = 1, zero = 0;
+    for (int side = 0; side < 6; ++side) {
+        const int n = d->count[side], p = d->points[side];
+        if (!n)
+            continue;
+        // The gather buffer is reused per side: the DGEMM of the previous side is ordered before it on the stream.
+        k_gather_ghost_rows<<<blocks(std::size_t(n) * d->q), 256, 0, st>>>(d->q, n, d->nodes[side], state, d->A);
+        cublas_check(cublasDgemm(d->handle, CUBLAS_OP_N, CUBLAS_OP_N, p, n, d->q, &one, d->H[side], p, d->A, d->q,
+                                 &zero, d->T + d->offset[side], p),
+                     "dgemm (ghost traces)");
+    }
+    CK(cudaGetLastError());
+    CK(cudaMemcpyAsync(pinned_out, d->T, d->total * sizeof(double), cudaMemcpyDeviceToHost, st));
+    CK(cudaEventRecord(ctx->events[2], st));
+}
+void destroy_ghost_traces(Context *ctx) {
+    GhostTraceDevice *d = ctx->gtrace;
+    if (!d)
+        return;
+    for (int side = 0; side < 6; ++side)
+        cudaFree(d->nodes[side]), cudaFree(d->H[side]);
+    cudaFree(d->A), cudaFree(d->T);
+    if (d->handle)
+        cublasDestroy(d->handle);
+    delete d;
+    ctx->gtrace = nullptr;
+}
 void destroy_boundary_high(Context *ctx) {
     BoundaryHighDevice *d = ctx->bhigh;
     if (!d)
@@ -2319,6 +2395,7 @@ void destroy(Context *ctx) {
     if (ctx->aux)
         cudaStreamDestroy(ctx->aux);
     destroy_boundary_high(ctx);
+    destroy_ghost_traces(ctx);
     if (ctx->ghost) {
         for (void *p : ctx->ghost->owned)
             cudaFree(p);

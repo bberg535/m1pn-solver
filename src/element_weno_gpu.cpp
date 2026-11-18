@@ -430,6 +430,38 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         pin_ghost_m_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * 4 * g.pairs));
         pin_ghost_flags_ = static_cast<int *>(gpu::host_alloc(sizeof(int) * (g.pairs + 1)));
     }
+    // Ghost traces on the device (host projection path only): psi = harmonics (ghost filter applied) x stage input rows,
+    // computed on the aux stream while the device runs the volume kernels; the host projections read them in phase B.
+    {
+        const char *tenv = std::getenv("M1PN_GPU_GHOST_TRACES");
+        // Default off (docs/STATIC_HP_BLOCKS.md): no speed-up once the device is the bottleneck, and the validation
+        // case graded_lattice_q1_P7 deviates by 4e-7 from the CPU with it (cause not yet understood).
+        trace_ghost_ = (tenv ? std::atoi(tenv) != 0 : false) && o.fullsphere_ghost && !device_ghost_ &&
+                       !s.ghost_node_.empty() && !interfaces_;
+    }
+    if (trace_ghost_) {
+        gpu::GhostTraceSetup g;
+        g.q = s.moments;
+        std::array<std::vector<int>, 6> nodes;
+        std::array<Mat, 6> harmonics;
+        std::size_t total = 0;
+        for (int side = 0; side < 6; ++side) {
+            trace_offset_[side] = total;
+            const std::vector<int> &list = s.ghost_by_side_[side];
+            if (list.empty())
+                continue;
+            for (int k : list)
+                nodes[side].push_back(s.ghost_node_[k]);
+            harmonics[side] = s.out_rules_[side].harmonics; // points x q, column-major
+            if (s.ghost_sigma_.size())
+                harmonics[side] = harmonics[side] * s.ghost_sigma_.asDiagonal();
+            g.count[side] = int(list.size()), g.points[side] = int(harmonics[side].rows());
+            g.nodes[side] = nodes[side].data(), g.harmonics[side] = harmonics[side].data();
+            total += std::size_t(g.points[side]) * g.count[side];
+        }
+        gpu::ghost_traces_setup(ctx_, g);
+        pin_traces_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::max<std::size_t>(1, total)));
+    }
     // Phase A on the device: the per-row trace weights M_side(n, m) and nodes, the side matrices and the node lists.
     const char *high_env = std::getenv("M1PN_GPU_BOUNDARY_HIGH");
     device_high_ = (high_env ? std::atoi(high_env) != 0 : true) && nb_ > 0 && face_rows > 0 && !interfaces_;
@@ -507,6 +539,8 @@ ElementWenoGpu::~ElementWenoGpu() {
     gpu::host_free(pin_load_up_);
     if (pin_ghost_m_)
         gpu::host_free(pin_ghost_m_), gpu::host_free(pin_ghost_flags_);
+    if (pin_traces_)
+        gpu::host_free(pin_traces_);
     if (pin_db_)
         gpu::host_free(pin_db_), gpu::host_free(pin_low4_);
     gpu::destroy(ctx_);
@@ -767,9 +801,26 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
         for (int side = 0; side < 6; ++side)
             for (int begin = 0; begin < int(s.ghost_by_side_[side].size()); begin += ghost_block)
                 tasks.push_back({side, begin, std::min<int>(begin + ghost_block, s.ghost_by_side_[side].size())});
+        if (trace_ghost_) {
+            const double t0 = seconds();
+            gpu::wait(ctx_, 2);
+            t_wait_ghost += seconds() - t0;
+        }
         parallel_for(int(tasks.size()), [&](int t) {
             const auto [side, begin, end] = tasks[t];
             const std::vector<int> &list = s.ghost_by_side_[side];
+            if (trace_ghost_) { // traces from the device: column j of side `side` (points_s doubles each)
+                const int points = int(s.out_rules_[side].harmonics.rows());
+                thread_local Vec psi_d;
+                const double t1 = seconds();
+                for (int j = begin; j < end; ++j) {
+                    psi_d = Eigen::Map<const Vec>(pin_traces_ + trace_offset_[side] + std::size_t(j) * points, points);
+                    ghost_pair(list[j], psi_d);
+                }
+                if (project)
+                    pstats[omp_thread()].reduce_seconds += seconds() - t1;
+                return;
+            }
             thread_local Mat at, traces;
             thread_local Vec psi;
             at.resize(s.moments, end - begin);
@@ -1199,6 +1250,8 @@ int ElementWenoGpu::stage_begin(double time, const double *x, double *out, doubl
     gpu::record(ctx_, 0);
     if (device_ghost_) // concurrent with the volume kernels below (aux stream, after the closure)
         gpu::ghost(ctx_, x, pin_ghost_m_, pin_ghost_flags_);
+    else if (trace_ghost_) // ghost traces of the stage input, same overlap (aux stream)
+        gpu::ghost_traces(ctx_, x, pin_traces_);
     gpu::weno_gamma(ctx_, x);
     gpu::gradients(ctx_, x);
     gpu::stabilization(ctx_, x, out, true, -1);
@@ -1300,6 +1353,17 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
     gpu::gather_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_, 5);
     gpu::record(ctx_, 1);
     gpu::combine_pn(ctx_, out, x, u, old, fresh, tau); // PN rows: independent of the boundary corrections
+    // Diagnostics (M1PN_GPU_DIAG_SERIAL=1, timing only, same results): wait for the device before phase B, so that
+    // t_diag_device is the device work that phase B normally overlaps.
+    static const bool diag_serial = [] {
+        const char *e = std::getenv("M1PN_GPU_DIAG_SERIAL");
+        return e && std::atoi(e) != 0;
+    }();
+    if (diag_serial) {
+        const double t0 = seconds();
+        gpu::synchronize();
+        t_diag_device += seconds() - t0;
+    }
     // Host phase B (overlaps the device work above): ghost moments and low-order face terms.
     if (!interfaces_) {
         const double t0 = seconds();
