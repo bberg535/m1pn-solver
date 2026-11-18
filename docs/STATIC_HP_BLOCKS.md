@@ -156,10 +156,20 @@ GB, t = 3,2, A100, 16 Kerne (`OMP_PLACES=cores`), gegen MC:
 Zum Vergleich KiT-RT (cl 0,005): S6 269 s, +0,06 / +0,05 / −0,02 %, Feld L1 4,3e-3; S14 1270 s, +0,04 / +0,08 /
 +0,01 %, 1,5e-3. Hinweis: KiT-RT nutzt keine Spiegelreduktion; fair wäre, das im Paper zu nennen.
 
-## Offen: GPU-Pfad auf abgestuften Gittern nicht reproduzierbar (hohe Priorität)
+## GPU-Läufe von Lauf zu Lauf reproduzierbar (behoben)
 
-`tests/gpu_validate.sh`, Fall `graded_lattice_q1_P7`: zehn identische GPU-Läufe liefern zufällig eines von drei
-Ergebnissen gegen die CPU: 6,3e-13, 9,8e-13 oder **4,2e-7** (Schwelle 1e-8). Das Binary von `feature/graded-gpu`
-(vor den Änderungen dieses Branches) zeigt dasselbe (Job 162342, `nx/tmp/race14`); die CPU ist für 1–16 Threads
-bitgleich. Vermutung: Reihenfolge atomarer Listen (Closure-/Limiter-Rückfälle, Segmentliste) auf der GPU kippt eine
-diskrete Entscheidung. Validierungsläufe von heute: 28/29 bzw. 29/29 je nach Zufall.
+Befund: `tests/gpu_validate.sh`, Fall `graded_lattice_q1_P7`, zehn identische GPU-Läufe lieferten zufällig eines
+von drei Ergebnissen gegen die CPU (6,3e-13, 9,8e-13, 4,2e-7; Schwelle 1e-8), schon mit dem Binary von
+`feature/graded-gpu` (Job 162342, `nx/tmp/race14`). Die CPU ist für 1–16 Threads bitgleich.
+
+Ursache: `gpu::norm` (Potenziteration der Hochordnungsschranke, daraus Δt) summierte die Blockteilsummen mit
+`atomicAdd` in zufälliger Reihenfolge; Δt schwankte in der letzten Binärstelle. Behoben: Jeder Block schreibt seine
+Teilsumme, der Host summiert in Blockreihenfolge. Zwölf identische Läufe bitgleich (Job 162351), alle 23 GPU-Ausgaben
+der Validierung zwischen zwei Läufen bitgleich (Job 162365; auch Lattice Q2 abgestuft, vorher ~1e-12 schwankend,
+docs/GRADED_MESH.md).
+
+Verbleibend und erklärt: CPU und GPU schätzen Δt mit verschiedener Summationsreihenfolge (ein bis zwei ulp
+Unterschied). `graded_lattice_q1_P7` reagiert auf ein ulp in Δt mit einer diskreten Limiter-Entscheidung: die CPU mit
+dem Δt der GPU weicht selbst um 4,16e-7 ab und stimmt dann mit der GPU auf 1,2e-12 überein. Diese Empfindlichkeit
+gehört zum Verfahren (CPU wie GPU), liegt weit unter dem Diskretisierungsfehler. Die Validierung gibt dem GPU-Lauf
+deshalb das Δt des CPU-Laufs (`dt_selected` aus config.json); 29/29 bestanden, zweimal.

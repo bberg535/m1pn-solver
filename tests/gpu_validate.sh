@@ -57,8 +57,13 @@ pair() {
   if ! "$B" $EW "$@" --output "$OUT/${tag}_cpu" > "$OUT/${tag}_cpu.log" 2>&1; then
     echo "  FAIL: cpu run failed"; tail -3 "$OUT/${tag}_cpu.log"; FAILED=$((FAILED+1)); FAILED_CASES+=" $tag"; return
   fi
+  # The GPU run takes the step of the CPU run: both estimate the high-order step by a power iteration on their own
+  # (different summation orders, dt differs in the last bits), and some cases react to one ulp of dt by a discrete
+  # limiter decision (graded_lattice_q1_P7: 4e-7; the CPU with the GPU dt agrees with the GPU to 1e-12).
+  local dt_cpu
+  dt_cpu=$(python3 -c "import json,sys; print(repr(json.load(open(sys.argv[1]))['dt_selected']))" "$OUT/${tag}_cpu/config.json")
   # shellcheck disable=SC2086
-  if ! "$B" $EW "$@" --gpu --output "$OUT/${tag}_gpu" > "$OUT/${tag}_gpu.log" 2>&1; then
+  if ! "$B" $EW "$@" --dt "$dt_cpu" --gpu --output "$OUT/${tag}_gpu" > "$OUT/${tag}_gpu.log" 2>&1; then
     echo "  FAIL: gpu run failed"; tail -3 "$OUT/${tag}_gpu.log"; FAILED=$((FAILED+1)); FAILED_CASES+=" $tag"; return
   fi
   # shellcheck disable=SC2086

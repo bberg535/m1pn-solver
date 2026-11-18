@@ -1331,8 +1331,8 @@ __global__ void k_sumsq(const double *f, std::size_t count, double *out) {
             part[threadIdx.x] += part[threadIdx.x + w];
         __syncthreads();
     }
-    if (threadIdx.x == 0)
-        atomicAdd(out, part[0]);
+    if (threadIdx.x == 0) // one partial per block, summed on the host in block order (deterministic; an atomicAdd made
+        out[blockIdx.x] = part[0]; // the power-iteration norm, hence dt, vary in the last bit from run to run)
 }
 __global__ void k_divide(double *dst, const double *src, std::size_t count, double divisor) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2188,7 +2188,7 @@ Context *create(const Setup &s) {
     v.seg_ubar = own(dalloc<double>(std::size_t(s.cells) * 4 * n));
     v.seg_lim = own(dalloc<double>(std::size_t(s.cells) * 4 * n));
     v.counters = own(dalloc<DeviceCounters>(1));
-    ctx->norm_accumulator = own(dalloc<double>(1));
+    ctx->norm_accumulator = own(dalloc<double>(1024)); // per-block partials of norm() (at most 1024 blocks)
     for (auto &e : ctx->events)
         CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     CK(cudaMallocHost(&ctx->pinned_counters, sizeof(DeviceCounters)));
@@ -2586,11 +2586,14 @@ void finish_stage(Context *ctx, double *r, const double *x, const double *a, dou
     k_admissible<<<blocks(v.nodes), 256>>>(v, r, closure_next, false, x, a, old, fresh, tau);
 }
 double norm(Context *ctx, const double *field) {
-    CK(cudaMemset(ctx->norm_accumulator, 0, sizeof(double)));
     const std::size_t count = std::size_t(ctx->v.nodes) * ctx->v.q;
-    k_sumsq<<<std::min<unsigned>(blocks(count), 1024), 256>>>(field, count, ctx->norm_accumulator);
+    const unsigned grid = std::max(1u, std::min<unsigned>(blocks(count), 1024));
+    k_sumsq<<<grid, 256>>>(field, count, ctx->norm_accumulator);
+    double partial[1024];
+    CK(cudaMemcpy(partial, ctx->norm_accumulator, grid * sizeof(double), cudaMemcpyDeviceToHost));
     double s = 0;
-    CK(cudaMemcpy(&s, ctx->norm_accumulator, sizeof(double), cudaMemcpyDeviceToHost));
+    for (unsigned b = 0; b < grid; ++b)
+        s += partial[b];
     return std::sqrt(s);
 }
 void divide(Context *ctx, double *dst, const double *src, double divisor) {
