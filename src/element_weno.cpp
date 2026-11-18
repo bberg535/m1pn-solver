@@ -1,6 +1,7 @@
 #include "element_weno.hpp"
 #include "base_bar.hpp"
 #include "parallel.hpp"
+#include <iostream>
 #include <algorithm>
 #include <atomic>
 #include <string>
@@ -217,6 +218,15 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     : pn(angular), options(o), inflow(std::move(in)), degree(o.degree), dimension(o.dimension),
       elements(o.elements) {
     require(degree >= 1 && degree <= 12, "Element WENO supports Bernstein degrees 1 to 12");
+    // Constructor phases to stderr with M1PN_CTOR_TIMING=1 (diagnostics only).
+    const bool ctor_timing = [] { const char *e = std::getenv("M1PN_CTOR_TIMING"); return e && std::atoi(e); }();
+    double ctor_last = seconds();
+    auto ctor_mark = [&](const char *what) {
+        const double now = seconds();
+        if (ctor_timing)
+            std::cerr << "ctor: " << what << " " << now - ctor_last << " s\n";
+        ctor_last = now;
+    };
     require(!o.m1_target || (angular.order == 1 && !o.periodic &&
                              std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; })),
             "The M1 target needs P1, an open mesh and no mirror sides");
@@ -435,6 +445,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             extension_[d][side] = tensor(f, p);
         }
     }
+    ctor_mark("before connectivity");
     // Connectivity and von Neumann neighbors.
     connectivity_.resize(cells * local_nodes);
     neighbors_.assign(cells * 2 * dimension, -1);
@@ -514,6 +525,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 pe.ct[d] = d < dimension ? convection_[d](j, i) : 0.;
             }
         }
+    ctor_mark("before graded classes");
     // Graded mesh: element data per size class (docs/GRADED_MESH.md). With widths w: M = (prod w) M^, C_d =
     // (prod_{k != d} w_k) C^_d, K_d = (prod_{k != d} w_k / w_d) K^_d; d_ij from the scaled c_ij as above.
     // Stabilization with one viscosity per axis, nu_d = scale w_d / 2p (the uniform nu = scale h / 2p on cubes):
@@ -633,6 +645,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
         }
     }
+    ctor_mark("before lumped and 1D masses");
     // Lumped masses, one-dimensional consistent mass factor, boundary rules.
     lumped = Vec::Zero(nodes);
     if (graded_) {
@@ -761,6 +774,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             if ((i / stride(d)) % nodes_per_axis[d] == removed)
                 mirror_nodes_[d].push_back(i);
     }
+    ctor_mark("before nodal reaction data");
     // Nodal reaction data: positive averages int c phi_i / int phi_i by composite Gauss quadrature.
     node_sigma_a = node_sigma_s = node_source = Vec::Zero(nodes);
     if (o.material) {
@@ -895,6 +909,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         const auto [fx, fw] = unit_gauss(p + pn.order + 3);
         const int nfp = dimension == 1 ? 1 : (dimension == 2 ? fx.size() : fx.size() * fx.size());
         const int nfn = dimension == 1 ? 1 : (dimension == 2 ? one : one * one);
+        ctor_mark("before boundary rules");
         for (int d = 0; d < dimension; ++d)
             for (int side = 0; side < 2; ++side) {
                 FaceRule &rule = rules_[2 * d + side];
@@ -934,6 +949,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
                 rule.mass = rule.shape * rule.weights.asDiagonal() * rule.shape.transpose();
             }
+        ctor_mark("before face scales");
         face_scale_.assign(faces_.size(), 1.);
         if (graded_)
             for (std::size_t f = 0; f < faces_.size(); ++f)
@@ -979,6 +995,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         // Face rows (add_boundary): the rows of face f are face_row_[f] + n, n < nf; the faces of one side are
         // contiguous (rows side_row_start_[s] ..), in ascending face index. boundary_rows_ lists, per boundary slot,
         // the rows of its node in ascending face index (the order of the former serial reduction).
+        ctor_mark("before face rows");
         face_row_.assign(faces_.size(), 0);
         side_row_start_.fill(0);
         {
@@ -1015,6 +1032,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             for (const auto &list : per_slot)
                 boundary_rows_.insert(boundary_rows_.end(), list.begin(), list.end());
         }
+        ctor_mark("before projection warm");
         if (options.positivity_projection)
             projection_warm_.assign(ghost_node_.size(), PositivityProjectionWarm{});
         if (options.ghost_filter > 0) {
@@ -1024,9 +1042,13 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 ghost_sigma_[c] = l <= 1 ? 1. : std::exp(-options.ghost_filter * std::pow(l / (angular.order + 1.), 4));
             }
         }
+        ctor_mark("before canonical C1");
         canonical_ = std::make_unique<CanonicalC1>(pn);
-        for (int d = 0; d < dimension; ++d)
-            for (int side = 0; side < 2; ++side) {
+        ctor_mark("before per-side out rules/separable/facets");
+        // The sides are independent (each writes only its own slots): built in parallel, the same data as serially.
+        parallel_for(2 * dimension, [&](int side_id) {
+            {
+                const int d = side_id / 2, side = side_id % 2;
                 V3 normal = V3::Zero();
                 normal[d] = side ? 1 : -1;
                 boundaries_[2 * d + side] = std::make_unique<Boundary>(pn, *canonical_, normal, false, false);
@@ -1107,7 +1129,9 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
                 out_harmonics_[2 * d + side] = out.harmonics;
             }
+        });
     }
+    ctor_mark("before rates");
     // Forward Euler bound of report (19), including the boundary bar states.
     Vec rates = Vec::Zero(nodes);
     const Vec sum = viscosity_ij_.rowwise().sum();
@@ -1147,6 +1171,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int entry = 0; entry < cells * local_nodes; ++entry)
             node_entries_[fill[connectivity_[entry]]++] = entry;
     }
+    ctor_mark("before inflow data");
     // A constant inflow density gives the same angular data at every boundary
     // point of one normal; evaluate that part once instead of per point and stage.
     if (!o.periodic && inflow.density && inflow.constant_density) {
@@ -1204,6 +1229,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         boundary_nodes_sorted_ = boundary_nodes_;
         std::sort(boundary_nodes_sorted_.begin(), boundary_nodes_sorted_.end());
     }
+    ctor_mark("tail (inflow data, ghosts)");
 }
 
 int ElementWeno::stride(int direction) const {
