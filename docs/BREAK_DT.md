@@ -46,7 +46,30 @@ Ergebnis: Der Gewinn der Trennebenen kommt fast ganz aus dem feinen Zentrum (Lin
 Linien 1, 6 bringen nichts (bitgleich zu „keine“ in den Kennzahlen). c) löst das Problem nicht: Die Genauigkeit
 braucht die Trennebenen genau dort, wo die feine Seite die Schranke senkt.
 
-## a) Lokale Teilschritte (nicht begonnen)
+## d) Verbreiterte Zellen an den Trennebenen (`--break-widen w`)
+
+Gitterwahl statt Mathematik: Auf abgestuften Gittern werden die w Zellen auf jeder Seite einer Trennebene zu einer
+Zelle verschmolzen (Breite w·h normal zur Linie, tangential unverändert). Die einseitige Knotenmasse wächst, die
+Kopplung nur wenig.
+
+Schranken (CPU, 8,16,32,32,32,16,8, P3): w = 2: Realisierbarkeit 0,0154, Hochordnung 0,0123, Δt 0,0123 (ohne
+Trennebenen 0,0122) — die Strafe ist vollständig weg.
+
+Genauigkeit gegen MC (GB, A100, Spiegel, Job 162477):
+
+| Gitter | Schritte | P35 Zeit | P35 Masse/Absorption/Rate % | P35 Feld L1 | P21 Zeit | P21 Absorption % | P21 Feld L1 |
+|---|---|---|---|---|---|---|---|
+| ohne Trennebenen | 1052 | 122 s | −0,046 / +0,079 / +0,076 | 8,6e-4 | 61 s | +0,127 | 1,2e-3 |
+| Trennebenen, w = 2 | 1051 | 125 s | −0,049 / +0,068 / +0,067 | 1,2e-3 | 61 s | +0,114 | 1,6e-3 |
+| Trennebenen, w = 3 | 1051 | 121 s | −0,080 / +0,097 / +0,087 | 2,0e-3 | 59 s | +0,137 | 2,2e-3 |
+| Trennebenen, w = 1 | 1623 | 185 s | −0,026 / +0,042 / +0,050 | 7,7e-4 | 89 s | +0,096 | 1,1e-3 |
+
+Ergebnis: Die gröberen Zellen liegen genau dort, wo die Lösung am steilsten ist; w = 2 behält nur einen kleinen Teil
+des Absorptionsgewinns und verschlechtert das Feld (L1 schlechter als ganz ohne Trennebenen). Kein Gewinn.
+Nebenbefund: CPU gegen GPU auf diesem Gitter (w = 2, P7, gleiches Δt) 1,0e-7 max / 1,8e-8 L2, über der Schwelle
+1e-8; nicht untersucht (einzelne Limiter-Entscheidung oder GPU-Pfad mit verschmolzenen Zellen neben Trennebenen).
+
+## a) Lokale Teilschritte (nicht begonnen; nach b, c, d der verbleibende Weg)
 
 Nur die Knoten der Trennebenen (bzw. die Elemente daneben) mit 2 Teilschritten, Kopplung über Flussregister,
 Theorem 3.1 je Teilschritt. Großer Umbau (SSPRK(4,3)-Stufen, GPU-Pipeline), Ausgang offen. Nach c) der einzige

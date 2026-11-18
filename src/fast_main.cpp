@@ -50,6 +50,9 @@ struct Options {
     std::string dt_bound = "both";
     // EXPERIMENT: with --break-units on, only these unit lines (coordinates, both axes) are broken; empty: all.
     std::vector<int> break_at;
+    // EXPERIMENT: graded mesh with broken unit lines: the element on each side of a broken line gets `break_widen`
+    // times the width (that many cells merged), so the one-sided lumped mass of the line nodes grows.
+    int break_widen = 1;
     bool break_units = false; // broken lines on the unit lines of the box (lattices: the material lines)
     std::vector<int> cells_per_unit; // graded mesh: elements per unit interval of each axis (docs/GRADED_MESH.md)
     bool skip_fields = false;
@@ -161,6 +164,8 @@ Options parse(int argc, char **argv) {
             o.dt = real();
         else if (key == "--dt-bound")
             o.dt_bound = v; // both | high-order (experiment)
+        else if (key == "--break-widen") // experiment: merge that many cells next to each broken line
+            o.break_widen = std::stoi(v);
         else if (key == "--break-at") { // experiment: comma list of unit lines
             std::stringstream list(v);
             std::string item;
@@ -540,6 +545,22 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             for (std::size_t u = 0; u < o.cells_per_unit.size(); ++u)
                 for (int k = 1; k <= o.cells_per_unit[u]; ++k)
                     P.push_back(origin[d] + segment * (double(u) + double(k) / o.cells_per_unit[u]));
+            if (o.break_widen > 1 && o.break_units)
+                for (std::size_t u = 0; u + 1 < o.cells_per_unit.size(); ++u) {
+                    if (!o.break_at.empty() &&
+                        std::find(o.break_at.begin(), o.break_at.end(), int(u) + 1) == o.break_at.end())
+                        continue;
+                    const double line = origin[d] + segment * double(u + 1);
+                    const auto at = std::find_if(P.begin(), P.end(), [&](double p) { return std::abs(p - line) < 1e-12; });
+                    require(at != P.end(), "--break-widen: unit line not a plane");
+                    const long k = at - P.begin();
+                    // drop the planes k - 1 .. k - (w - 1) and k + 1 .. k + (w - 1)
+                    std::vector<double> Q;
+                    for (long m = 0; m < long(P.size()); ++m)
+                        if (m == k || std::abs(m - k) >= o.break_widen)
+                            Q.push_back(P[m]);
+                    P = std::move(Q);
+                }
             counts[d] = int(P.size()) - 1;
         }
         eo.elements = counts[0];
@@ -556,12 +577,19 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             if (o.break_every > 0)
                 for (int k = o.break_every; k < counts[d]; k += o.break_every)
                     eo.breaks[d].push_back(k);
-            else if (!o.cells_per_unit.empty()) // graded: the segment lines (experiment: only those in --break-at)
-                for (std::size_t u = 0, k = 0; u + 1 < o.cells_per_unit.size(); ++u) {
-                    k += o.cells_per_unit[u];
-                    if (o.break_at.empty() || std::find(o.break_at.begin(), o.break_at.end(), int(u) + 1) != o.break_at.end())
-                        eo.breaks[d].push_back(int(k));
+            else if (!o.cells_per_unit.empty()) { // graded: the segment lines (experiment: only those in --break-at)
+                const auto &P = eo.planes[d];
+                const double segment = (P.back() - P.front()) / double(o.cells_per_unit.size());
+                for (std::size_t u = 0; u + 1 < o.cells_per_unit.size(); ++u) {
+                    if (!o.break_at.empty() &&
+                        std::find(o.break_at.begin(), o.break_at.end(), int(u) + 1) == o.break_at.end())
+                        continue;
+                    const double line = P.front() + segment * double(u + 1);
+                    const auto at = std::find_if(P.begin(), P.end(), [&](double p) { return std::abs(p - line) < 1e-12; });
+                    require(at != P.end(), "--break-units: unit line not a plane");
+                    eo.breaks[d].push_back(int(at - P.begin()));
                 }
+            }
             else { // uniform: element lines at the integer coordinates of the box
                 const double hd = length_x / counts[0];
                 for (int k = 1; k < counts[d]; ++k) {
