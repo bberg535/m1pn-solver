@@ -1114,14 +1114,24 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     for (int e = 0; e < cells; ++e)
         for (int l = 0; l < local_nodes; ++l)
             rates[connectivity_[e * local_nodes + l]] += 2 * (graded_ ? klass(e).total_viscosity[l] : sum[l]);
+    const bool split = options.split_breaks && broken_;
+    require(!options.split_breaks || (broken_ && !o.periodic), "split_breaks: broken lines, open mesh, serial");
+    Vec break_rates = Vec::Zero(nodes); // split_breaks: the broken-line face weights A_i (second convex step)
     for (std::size_t fi = 0; fi < faces_.size(); ++fi) {
         const auto &f = faces_[fi];
         const auto &rule = rules_[2 * f.direction + f.side];
         for (std::size_t n = 0; n < rule.local.size(); ++n)
-            rates[connectivity_[f.element * local_nodes + rule.local[n]]] +=
+            (split && face_break_[fi] ? break_rates : rates)[connectivity_[f.element * local_nodes + rule.local[n]]] +=
                 face_scale_[fi] * (rule.shape.row(n).transpose().array() * rule.weights.array()).sum();
     }
     node_dt_bound = lumped.array() / rates.array();
+    if (split) { // both convex steps: tau (sum 2 tv + A_dom) <= m and tau A_break <= m
+        for (int i = 0; i < nodes; ++i)
+            if (break_rates[i] > 0) {
+                node_dt_bound[i] = std::min(node_dt_bound[i], lumped[i] / break_rates[i]);
+                split_nodes_.push_back(i);
+            }
+    }
     dt_bound = node_dt_bound.minCoeff();
     total_viscosity_ = viscosity_ij_.rowwise().sum();
     if (!graded_)
@@ -1722,7 +1732,8 @@ Incoming ElementWeno::face_data(int side_id, const V3 &x, double time) const {
 }
 void ElementWeno::add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                                Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                               Field &bar, Vec *inflow_rate, PositivityProjectionStats *projection) const {
+                               Field &bar, Vec *inflow_rate, PositivityProjectionStats *projection,
+                               BreakAggregates *breaks) const {
     const double ghost_start = seconds();
     Inflow atoms_only;
     atoms_only.atoms = inflow.atoms;
@@ -2224,7 +2235,18 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         const int i = boundary_nodes_[k];
         for (int e = boundary_row_offsets_[k]; e < boundary_row_offsets_[k + 1]; ++e) {
             const int r = boundary_rows_[e];
-            high.row(compact ? k : i) += H.row(r);
+            high.row(compact ? k : i) += H.row(r); // the PN load keeps all rows (the high-order part is not split)
+            if (breaks && r >= break_row_start_[face_row_side_[r]]) {
+                // split_breaks: low-order sums of the broken-line rows apart (second convex step of the stage)
+                // project() of the row (the local flag `project` hides the function here)
+                const double s0 = std::sqrt(4 * pi), s1 = std::sqrt(4 * pi / 3);
+                breaks->high4.row(i) += Four(s0 * H(r, 0), s1 * H(r, 3), s1 * H(r, 1), s1 * H(r, 2)).transpose();
+                breaks->low.row(i) += L.row(r);
+                breaks->bar.row(i) += BR.row(r);
+                breaks->flux_area.row(i) += FA.row(r);
+                breaks->area[i] += AR[r];
+                continue;
+            }
             low_load.row(i) += L.row(r);
             bar.row(i) += BR.row(r);
             node_flux_area.row(i) += FA.row(r);
@@ -2443,9 +2465,16 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     Field boundary_high = parallel_zero(boundary_nodes_.size(), q), boundary_low = parallel_zero(nodes, 4);
     Field flux_area = parallel_zero(nodes, 3), boundary_bar = parallel_zero(nodes, 4);
     Vec boundary_area = parallel_zero(nodes), boundary_inflow = parallel_zero(nodes);
+    const bool split = options.split_breaks && broken_;
+    BreakAggregates breaks;
+    if (split) {
+        breaks.high4 = parallel_zero(nodes, 4), breaks.low = parallel_zero(nodes, 4);
+        breaks.bar = parallel_zero(nodes, 4), breaks.flux_area = parallel_zero(nodes, 3);
+        breaks.area = parallel_zero(nodes);
+    }
     if (!faces_.empty()) {
         add_boundary(time, a, low, low_flux, boundary_high, boundary_low, flux_area, boundary_area,
-                     boundary_bar, &boundary_inflow, &timing.projection);
+                     boundary_bar, &boundary_inflow, &timing.projection, split ? &breaks : nullptr);
         if (!options.m1_target)
             for (std::size_t k = 0; k < boundary_nodes_.size(); ++k)
                 residual.row(boundary_nodes_[k]) += boundary_high.row(k);
@@ -2468,7 +2497,8 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     Field raw_load;
     {
         const LowOrderInputs inputs{&low, &low_flux, &closure, &moment_rate, &stabilization_low, &boundary_high,
-                                    &boundary_low, &flux_area, &boundary_bar, &boundary_area, &boundary_inflow, &gamma};
+                                    &boundary_low, &flux_area, &boundary_bar, &boundary_area, &boundary_inflow, &gamma,
+                                    split ? &breaks.high4 : nullptr};
         const long before = stats ? stats->limited_elements + stats->limited_boundary_nodes : 0;
         load = limited_low_load(inputs, stats, debug ? &raw_load : nullptr);
         if (stats) {
@@ -2477,6 +2507,19 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
         }
     }
     clock = seconds();
+    if (split) { // unsplit broken-line face term T = P b^H - (int phi n) . G (the low part sum w (state - u) cancels)
+        split_term_ = Field::Zero(nodes, 4);
+        split_area_ = breaks.area;
+        parallel_for(int(split_nodes_.size()), [&](int k) {
+            const int i = split_nodes_[k];
+            Four t = Four(breaks.high4.row(i).transpose());
+            for (int d = 0; d < dimension; ++d)
+                t -= breaks.flux_area(i, d) * block(closure, i, d);
+            if (options.m1_target)
+                t = Four(breaks.low.row(i).transpose()); // low-order face term only (theta = 0 in the unsplit scheme)
+            split_term_.row(i) = t.transpose();
+        });
+    }
     parallel_for(nodes, [&](int i) {
         set_low(Eigen::Map<Vec>(&high_rate.coeffRef(i, 0), q), Four(load.row(i).transpose()) / lumped[i]);
     });
@@ -2639,6 +2682,8 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
                 return;
             Four correction = project(boundary_high.row(boundary_slot_[i]).transpose()) -
                               Four(boundary_low(i, 0), boundary_low(i, 1), boundary_low(i, 2), boundary_low(i, 3));
+            if (in.break_high4) // split_breaks: the domain part only (the broken-line rows go to the second step)
+                correction -= Four(in.break_high4->row(i).transpose());
             for (int d = 0; d < dimension; ++d)
                 correction -= flux_area(i, d) * block(closure, i, d);
             Four bar(boundary_bar(i, 0), boundary_bar(i, 1), boundary_bar(i, 2), boundary_bar(i, 3));
@@ -3033,6 +3078,7 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
     // Effective weights: u^{n+1} = u^n + dt (L1 + L2 + L3 + 3 L4) / 6.
     auto stage = [&](double t, const Field &x, double old, double fresh, double weight) {
         Field r = rate(t, x, stats);
+        apply_split_breaks(x, r, half, stats); // split_breaks only (experiment)
         if (dist_)
             dist_->exchange(r); // halo rows of the stage = the owners' values (deterministic, no garbage)
         if (stats)
@@ -3060,6 +3106,7 @@ Field ElementWeno::ssprk43_stage(double t, double dt, const Field &x, const Fiel
                                  double weight, ElementWenoStats *stats) const {
     require(!dist_, "ssprk43_stage: serial schemes only");
     Field r = rate(t, x, stats);
+    apply_split_breaks(x, r, .5 * dt, stats); // split_breaks only (experiment)
     if (stats)
         stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
     const double combine_start = seconds();
@@ -3068,6 +3115,90 @@ Field ElementWeno::ssprk43_stage(double t, double dt, const Field &x, const Fiel
     if (stats)
         stats->t_ssp_stage += seconds() - combine_start;
     return out;
+}
+// split_breaks (docs/BREAK_DT.md): the forward Euler stage x + tau r of the broken-line nodes as two convex steps.
+// r holds load/m for the element and domain-boundary terms only (rate() with split_breaks); split_term_ the unsplit
+// broken-line face term T, split_area_ its area A. Step 1: y = u + tau r (convex for tau sum 2 tv <= m); step 2:
+// z = y + tau A/m (Bbar(y) + theta g - y), Bbar(y) the nodal LLF bar states with the partner's y, g = c / A,
+// c = T - A (Bbar(y) - y). theta = 1 reproduces u + tau (E + T)/m exactly; theta < 1 keeps z in the cone. The rate
+// rows of these nodes become (z - u)/tau, so combine() and the SSP stage weights are unchanged.
+void ElementWeno::apply_split_breaks(const Field &x, Field &r, double tau, ElementWenoStats *stats) const {
+    if (!(options.split_breaks && broken_) || split_nodes_.empty())
+        return;
+    require(options.ssprk43, "split_breaks: SSPRK(4,3) only");
+    const int K = int(split_nodes_.size());
+    Field ylow = Field::Zero(nodes, 4), yflux = Field::Zero(nodes, 12);
+    std::vector<Four> u_of(K), y_of(K);
+    parallel_for(K, [&](int k) {
+        const int i = split_nodes_[k];
+        const Four u = project(x.row(i).transpose()), rl = project(r.row(i).transpose());
+        Four y = u + tau * rl;
+        nudge_into_cone(y, "split step 1"); // convex by the dt bound; only rounding is fixed here
+        u_of[k] = u, y_of[k] = y;
+        ylow.row(i) = y.transpose();
+        const Levermore closure_state(y);
+        for (int d = 0; d < dimension; ++d) {
+            V3 n = V3::Zero();
+            n[d] = 1;
+            const Four fl = closure_state.flux(n);
+            for (int c = 0; c < 4; ++c)
+                yflux(i, 4 * d + c) = fl[c];
+        }
+    });
+    // Bar states of the broken-line faces with the step-1 states (rows as in add_boundary), summed per node.
+    const int face_rows = side_row_start_[6];
+    Field L = Field::Zero(face_rows, 4), BR = Field::Zero(face_rows, 4), FA = Field::Zero(face_rows, 3);
+    Vec AR = Vec::Zero(face_rows), IN = Vec::Zero(face_rows);
+    parallel_for(int(faces_.size()), [&](int index) {
+        if (face_break_[index])
+            broken_face_low(index, ylow, yflux, L, BR, FA, AR, IN);
+    });
+    Field bstar = Field::Zero(nodes, 4);
+    Vec astar = Vec::Zero(nodes);
+    for (std::size_t index = 0; index < faces_.size(); ++index) { // serial: fixed summation order
+        if (!face_break_[index])
+            continue;
+        const auto &f = faces_[index];
+        const auto &rule = rules_[2 * f.direction + f.side];
+        const int r0 = face_row_[index];
+        for (std::size_t n = 0; n < rule.local.size(); ++n) {
+            const int i = connectivity_[f.element * local_nodes + rule.local[n]];
+            bstar.row(i) += BR.row(r0 + n);
+            astar[i] += AR[r0 + n];
+        }
+    }
+    std::vector<double> theta_of(K, 1.), defect(K, 0.);
+    parallel_for(K, [&](int k) {
+        const int i = split_nodes_[k];
+        const double A = split_area_[i];
+        if (!(A > 0) || !(astar[i] > 0))
+            return;
+        const Four &y = y_of[k];
+        Four bbar = Four(bstar.row(i).transpose()) / astar[i];
+        nudge_into_cone(bbar, "split bar");
+        const Four c = Four(split_term_.row(i).transpose()) - A * (bbar - y);
+        const Four g = c / A;
+        double theta = 1;
+        if (options.limit && !exact::cone(bbar + g))
+            theta = options.element_theta * segment(bbar, g);
+        const Four z = y + (tau * A / lumped[i]) * (bbar + theta * g - y);
+        theta_of[k] = theta;
+        defect[k] = tau * (theta - 1) * c[0];
+        set_low(Eigen::Map<Vec>(&r.coeffRef(i, 0), r.cols()), (z - u_of[k]) / tau);
+    });
+    // Mirror planes: odd moments of the rate vanish there (as at the end of rate()).
+    for (int d = 0; d < dimension; ++d)
+        if (mirror_index_[d] >= 0)
+            for (int i : mirror_nodes_[d])
+                for (int c = 0; c < r.cols(); ++c)
+                    if (reflect_odd_[d][c])
+                        r(i, c) = 0;
+    if (stats)
+        for (int k = 0; k < K; ++k) {
+            stats->split_limited += theta_of[k] < 1;
+            stats->min_split_theta = std::min(stats->min_split_theta, theta_of[k]);
+            stats->split_mass += defect[k];
+        }
 }
 Field ElementWeno::admissible_rows_public(Field x, ElementWenoStats *stats) const {
     return admissible_rows(std::move(x), nodes, stats, lumped, owned_);

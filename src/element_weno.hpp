@@ -113,6 +113,12 @@ struct ElementWenoOptions {
     // interface term (.5 (A_n - I)(u - v), v = the trace of the element across, limiter bar state with its moments).
     // On the lattice: the material lines, so no node averages absorber and scatterer data. Serial, open mesh.
     std::array<std::vector<int>, 3> breaks;
+    // EXPERIMENT (experiment/break-dt, docs/BREAK_DT.md, "a) Geteilter Schritt"): each forward Euler stage first
+    // applies the element and domain-boundary terms (y = u + tau/m (E + B_dom)), then the broken-line face terms as
+    // a second convex step from y: z = y + tau A/m (bar(y) + theta c/A - y) with c = T - (Bbar(y) - A y), T the
+    // unsplit face term at u. theta = 1 gives exactly the unsplit stage; theta < 1 only where the cone needs it.
+    // dt_bound then uses min(m / (sum 2 tv + A_dom), m / A_break) per node. Serial CPU only.
+    bool split_breaks = false;
     std::function<void(int, const V3 &, Vec &)> interface_trace;
     // Non-conforming interfaces: interface_split(side, face centre, face width) = number of neighbour elements along
     // each tangential axis of this face (> 1: the face rule is applied on that many sub-faces per axis, so the face
@@ -174,6 +180,10 @@ struct ElementWenoStats {
     long rate_calls = 0, unlimited_rate_calls = 0;
     // C1/C2 counters: outward-rounded base bars; boundary nodes whose correction was reduced by the sign condition.
     long outward_bars = 0, sign_limited_nodes = 0;
+    // split_breaks: broken-line nodes whose face correction was reduced (theta < 1), and the mass that this limiting
+    // removed or added (sum m_i (z - unsplit)[0], tau included; not part of the ledger otherwise).
+    long split_limited = 0;
+    double split_mass = 0, min_split_theta = 1;
     double min_sign_factor = 1;
     // Wall seconds per phase of rate(), accumulated over all calls. t_stabilization = t_gradient_solve +
     // t_stab_local. The gradient is a line operator and s_h is gathered node by node, so t_gradient_local,
@@ -399,17 +409,30 @@ private:
     void element_origin(int element, V3 &origin) const;
     // inflow_rate (optional, nodes): kinetic mass inflow rate int phi_i (-kinetic[0]) >= 0 per boundary node.
     // `high` is indexed by node (nodes rows) or compactly by boundary_slot_ (boundary_nodes_.size() rows).
+    // split_breaks: the broken-line face rows summed per node apart from the domain-boundary rows.
+    struct BreakAggregates {
+        Field high4, low, bar, flux_area; // nodes x 4, 4, 4, 3 (projected PN face load, sum w (state - u), sum w state)
+        Vec area;
+    };
     void add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                      Field &bar, Vec *inflow_rate = nullptr, PositivityProjectionStats *projection = nullptr) const;
+                      Field &bar, Vec *inflow_rate = nullptr, PositivityProjectionStats *projection = nullptr,
+                      BreakAggregates *breaks = nullptr) const;
     // Inputs of the limited low-order part of rate() (all node-indexed except boundary_high, which has one row per
     // boundary slot and at least the four low coefficient columns).
     struct LowOrderInputs {
         const Field *low, *low_flux, *closure, *moment_rate, *stabilization_low, *boundary_high;
         const Field *boundary_low, *flux_area, *boundary_bar;
         const Vec *boundary_area, *boundary_inflow, *gamma;
+        const Field *break_high4 = nullptr; // split_breaks: projected PN load of the broken-line rows (subtracted)
     };
     Field limited_low_load(const LowOrderInputs &, ElementWenoStats *, Field *raw_out) const;
+    // split_breaks: per node the unsplit broken-line face term T (4 moments) and its area A from the last rate();
+    // apply_split_breaks turns the rate rows of the broken-line nodes into the two-step update (see split_breaks).
+    mutable Field split_term_;
+    mutable Vec split_area_;
+    std::vector<int> split_nodes_; // nodes on broken-line faces
+    void apply_split_breaks(const Field &x, Field &r, double tau, ElementWenoStats *stats) const;
     std::array<Sparse, 3> mass_1d_; // assembled 1D consistent masses (h m1) per axis
     // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state. With the positivity
     // projection the incoming hemisphere follows as rows [outgoing, points) (full sphere); the C6 sums only use the

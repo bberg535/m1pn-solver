@@ -69,7 +69,37 @@ des Absorptionsgewinns und verschlechtert das Feld (L1 schlechter als ganz ohne 
 Nebenbefund: CPU gegen GPU auf diesem Gitter (w = 2, P7, gleiches Δt) 1,0e-7 max / 1,8e-8 L2, über der Schwelle
 1e-8; nicht untersucht (einzelne Limiter-Entscheidung oder GPU-Pfad mit verschmolzenen Zellen neben Trennebenen).
 
-## a) Lokale Teilschritte (nicht begonnen; nach b, c, d der verbleibende Weg)
+## a) Geteilter Schritt an den Trennebenen (`--split-breaks on`, CPU-Prototyp)
+
+Statt echter lokaler Teilschritte (Zwischenzustände der Nachbarn, Flussregister, SSPRK-Stufen; mehrere Tage) eine
+Umformung jedes Vorwärts-Euler-Teilschritts τ = Δt/2 der SSPRK(4,3)-Stufen an den Trennebenenknoten:
+
+1. **Element- und Randschritt:** y = u + τ/m (E + B_Rand). E = Σ_e [2 tv (ū^e − u) + θ_e f^e] hat schon die konvexe
+   Form (ū^e im Kegel, der Randfluss steckt in ū^e), also realisierbar für τ (Σ 2 tv + A_Rand) ≤ m.
+2. **Trennebenenschritt:** z = y + τA/m (B̄(y) + θ g − y) mit B̄(y) dem knotenweisen LLF-Barzustand aus y und dem
+   y des Partners (`broken_face_low`), g = c/A, c = T − A (B̄(y) − y), T = P b^H − Σ_d (∫φ n_d) G_d der unbegrenzte
+   Flächenterm des ungeteilten Schritts. θ = 1 ergibt **genau** u + τ (E + T)/m, also den ungeteilten Schritt;
+   θ < 1 nur dort, wo z sonst den Kegel verließe (wie der Randlimiter). Realisierbar für τ A ≤ m.
+
+Schranke: Δt ≤ 2 min_i min(m_i / (Σ 2 tv_i + A_Rand,i), m_i / A_TE,i) (`node_dt_bound`); die Rate der
+Trennebenenknoten wird (z − u)/τ, `combine` und die SSP-Gewichte bleiben. Masse bleibt erhalten bis auf den
+Begrenzungsanteil τ(θ − 1)c₀ (Statistik `split_mass`). Code: `ElementWenoOptions::split_breaks`,
+`apply_split_breaks`, getrennte Summen der Trennebenenzeilen in `add_boundary` (`BreakAggregates`).
+
+Prüfung (CPU, lattice-paul FCS, 8,16,32,32,32,16,8, P7, Trennebenen, Spiegel, t = 1,6):
+
+| Lauf | Δt | Schritte | gegen ungeteilt: Integrale | Feld | Massenbilanz |
+|---|---|---|---|---|---|
+| ohne Option | 0,00789 | 203 | bitgleich zum Stand vor dem Umbau | | 4e-14 |
+| geteilt, altes Δt | 0,00789 | 203 | 4e-9 / 4e-8 / 6e-10 | 3e-8 | 3e-8 |
+| geteilt, neues Δt | 0,01203 | 133 | 7e-6 / 5e-5 / 2e-4 | 5e-4 | 5e-8 |
+
+θ < 1 tritt auch beim alten Δt oft auf (65 554 Knotenstufen, min θ 0,0025), aber nur in fast leeren Bereichen
+(Wirkung 1e-8). Beim neuen Δt Abweichung 2e-4 in der Rate — Zeitfehler oder Teilungsfehler; entscheidet der
+Vergleich gegen MC (GB P21, NX, Job 162520): ERGEBNIS_FOLGT. Der CPU-Prototyp ist pro Schritt noch ~45 % teurer
+(volle Felder je Stufe, serielle Summen); GPU-Pfad noch nicht umgesetzt.
+
+## Echte lokale Teilschritte (nicht begonnen)
 
 Nur die Knoten der Trennebenen (bzw. die Elemente daneben) mit 2 Teilschritten, Kopplung über Flussregister,
 Theorem 3.1 je Teilschritt. Großer Umbau (SSPRK(4,3)-Stufen, GPU-Pipeline), Ausgang offen. Nach c) der einzige

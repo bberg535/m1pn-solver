@@ -53,6 +53,7 @@ struct Options {
     // EXPERIMENT: graded mesh with broken unit lines: the element on each side of a broken line gets `break_widen`
     // times the width (that many cells merged), so the one-sided lumped mass of the line nodes grows.
     int break_widen = 1;
+    bool split_breaks = false; // EXPERIMENT: two convex steps per stage at broken-line nodes (docs/BREAK_DT.md)
     bool break_units = false; // broken lines on the unit lines of the box (lattices: the material lines)
     std::vector<int> cells_per_unit; // graded mesh: elements per unit interval of each axis (docs/GRADED_MESH.md)
     bool skip_fields = false;
@@ -164,6 +165,8 @@ Options parse(int argc, char **argv) {
             o.dt = real();
         else if (key == "--dt-bound")
             o.dt_bound = v; // both | high-order (experiment)
+        else if (key == "--split-breaks") // experiment: on|off
+            o.split_breaks = v == "on";
         else if (key == "--break-widen") // experiment: merge that many cells next to each broken line
             o.break_widen = std::stoi(v);
         else if (key == "--break-at") { // experiment: comma list of unit lines
@@ -601,6 +604,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         }
     }
     eo.periodic = o.mesh.periodic;
+    eo.split_breaks = o.split_breaks;
+    require(!o.split_breaks || !o.gpu, "--split-breaks: CPU only (experiment)");
     eo.weno = o.weno;
     eo.limit = o.element_limit;
     eo.weno_linear = o.weno_linear;
@@ -1376,6 +1381,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
            << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << out_scheme.cells
            << ",\"mpi_ranks\":" << ranks
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states
+           << ",\"split_limited\":" << stats.split_limited << ",\"split_mass\":" << stats.split_mass
+           << ",\"min_split_theta\":" << stats.min_split_theta
            << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
            << ",\"phase_seconds\":{\"closure\":" << stats.t_closure << ",\"weno\":" << stats.t_weno
            << ",\"stabilization\":" << stats.t_stabilization << ",\"gradient_solve\":" << stats.t_gradient_solve
