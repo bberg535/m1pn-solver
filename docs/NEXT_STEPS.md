@@ -48,3 +48,13 @@ scripts/build.sh tmp/build_gpu` (tardis). Cluster-Hinweise in `nx/README.md`.
 
 Regeln: Abweichungen bis 1e-8 erlaubt, keine mathematischen Änderungen ohne Freigabe; kein Push/Merge ohne Auftrag;
 keine Spack-Installationen ohne Auftrag; Experimente auf eigenen Branches; Antworten auf Deutsch.
+
+## Paper-Optimierung 18.11.2026 (Branch `feature/multiblock`, docs/STATIC_HP_BLOCKS.md)
+
+- Erledigt: Trennebenen im GPU-Pfad, Streifenkern mit Trennebenen, Spiegelreduktion auf abgestuften Gittern und mit
+  Trennebenen, deterministische GPU-Norm (Läufe bitgleich reproduzierbar), Validierung mit CPU-Δt (29/29).
+  lattice-paul GB P35 mit Trennebenen: 543 → 187 s (A100, 16 Kerne, `OMP_PLACES=cores`), −0,026 / +0,042 / +0,050 %.
+- Offen (Entscheidung Nutzer, Mathematik): Trennebenen kosten 1,54× Schritte (Realisierbarkeitsschranke an
+  einseitigen Knoten); Optionen lokale Teilschritte / nachträgliche Prüfung / Trennebenen nur grob.
+- Offen: Ordnungskarten (`m1pn_blocks`) auf der GPU langsam (ein Stream für alle Blöcke); GPU ist jetzt der Engpass
+  (Massenlösung nahe Speicherbandbreite); Ghost-Spuren auf der GPU als Experiment (`M1PN_GPU_GHOST_TRACES=1`).
