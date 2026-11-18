@@ -96,8 +96,41 @@ Prüfung (CPU, lattice-paul FCS, 8,16,32,32,32,16,8, P7, Trennebenen, Spiegel, t
 
 θ < 1 tritt auch beim alten Δt oft auf (65 554 Knotenstufen, min θ 0,0025), aber nur in fast leeren Bereichen
 (Wirkung 1e-8). Beim neuen Δt Abweichung 2e-4 in der Rate — Zeitfehler oder Teilungsfehler; entscheidet der
-Vergleich gegen MC (GB P21, NX, Job 162520): ERGEBNIS_FOLGT. Der CPU-Prototyp ist pro Schritt noch ~45 % teurer
-(volle Felder je Stufe, serielle Summen); GPU-Pfad noch nicht umgesetzt.
+Vergleich gegen MC.
+
+**GPU:** Der Kernel `k_boundary_rows_add` liefert zusätzlich die l ≤ 1-Summen nur der Trennebenenzeilen (Zeilenflag
+`row_break`); der Host summiert in Phase B die Trennebenenzeilen getrennt, rechnet in `boundary_correction` nur
+den Randanteil und danach den zweiten Schritt auf `load_b_` mit derselben Funktion wie die CPU
+(`ElementWeno::split_second_step`). (Erster Versuch falsch: die l ≤ 1-Koeffizientensummen nicht nach (ρ, J)
+projiziert; −0,5 % Absorption. Behoben.)
+
+Ergebnisse gegen MC (lattice-paul, Spiegel in x, t = 3,2):
+
+| Lauf | Gerät | Zeit | Schritte | Masse/Absorption/Rate % | Feld L1 | Median |
+|---|---|---|---|---|---|---|
+| GB P21, Trennebenen, ungeteilt | CPU NX 32 Thr. | 674 s | 1623 | −0,055 / +0,096 / +0,133 | 1,1e-3 | 2,6e-3 |
+| GB P21, Trennebenen, geteilt | CPU NX 32 Thr. | 582 s | 1059 | −0,055 / +0,096 / +0,132 | 1,1e-3 | 2,6e-3 |
+| GB P35, ohne Trennebenen | A100 | 122 s | 1052 | −0,046 / +0,079 / +0,076 | 8,6e-4 | 2,8e-3 |
+| GB P35, Trennebenen, ungeteilt | A100 | 185 s | 1623 | −0,026 / +0,042 / +0,050 | 7,7e-4 | 2,2e-3 |
+| **GB P35, Trennebenen, geteilt** | A100 | **131 s** | 1059 | **−0,026 / +0,042 / +0,049** | **7,7e-4** | 2,2e-3 |
+| GB P21, Trennebenen, ungeteilt | A100 | 89 s | 1623 | −0,055 / +0,096 / +0,133 | 1,1e-3 | 2,6e-3 |
+| **GB P21, Trennebenen, geteilt** | A100 | **64 s** | 1059 | −0,055 / +0,096 / +0,132 | 1,1e-3 | 2,6e-3 |
+
+(Jobs 162520, 162541.) Die Trennebenen behalten ihren vollen Genauigkeitsgewinn, die Schrittzahl ist die des
+Gitters ohne Trennebenen; Massenbilanz 7e-8 (`split_mass` 1,4e-7). Host-Zusatzzeit des zweiten Schritts ~10 s
+(`host_correction`), überlappt nicht mit der GPU.
+
+Offen/Einschränkungen:
+- Der zweite Schritt begrenzt oft (θ < 1 in ~6 % der Knotenstufen, min θ ~1e-3): sein Ziel y + T/A verlässt an
+  steilen Stellen den Kegel. Die Wirkung auf Integrale, Bilanz und MC-Fehler ist vernachlässigbar, aber die diskreten
+  θ-Entscheidungen machen den Lauf empfindlich gegen Rundung: CPU gegen GPU bei gleichem Δt 2,7e-7 max / 2,9e-8 L2
+  in der Dichte (Integrale 7e-9), ungeteilt 1e-12. Eine glattere Variante (nur den Hochordnungsanteil begrenzen)
+  verliert ohne Zusatzmaßnahme die Erhaltung.
+- Zeitgenauigkeit an den Trennebenen: formal ist jede SSP-Stufe exakt der ungeteilte Euler-Schritt, solange θ = 1;
+  bei θ < 1 ist der Fehler lokal erster Ordnung. Nicht gesondert gemessen (Abweichung beim größeren Δt von gleicher
+  Größe wie der reine Zeitfehler ohne Trennebenen).
+- 3D: CPU-Code dimensionsunabhängig; abgestufte Gitter und Trennebenen auf der GPU sind derzeit nur 2D.
+- CPU-Prototyp ~45 % teurer je Schritt (volle Felder je Stufe, serielle Summen) — für die GPU unerheblich.
 
 ## Echte lokale Teilschritte (nicht begonnen)
 

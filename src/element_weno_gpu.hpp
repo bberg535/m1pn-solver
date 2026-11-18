@@ -82,6 +82,12 @@ private:
     // Phase A (PN face load) on the device (gpu::boundary_high); M1PN_GPU_BOUNDARY_HIGH=0 keeps it on the host.
     bool device_high_ = false;
     double *pin_db_ = nullptr, *pin_low4_ = nullptr; // datum rows (row-major) up, l <= 1 node sums down
+    // split_breaks (experiment, docs/BREAK_DT.md): l <= 1 sums of the broken-line rows (pinned, per boundary slot) and
+    // the low-order broken-line sums of phase B (node-indexed), the unsplit term T and area A per node.
+    bool split_ = false;
+    double *pin_low4b_ = nullptr;
+    Field brk_low_, brk_bar_, brk_fa_, brk_high4_, split_term_h_;
+    Vec brk_area_;
     double *pin_ghost_m_ = nullptr;
     int *pin_ghost_flags_ = nullptr;
     long ghost_flagged_merged = 0;

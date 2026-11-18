@@ -605,7 +605,6 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     }
     eo.periodic = o.mesh.periodic;
     eo.split_breaks = o.split_breaks;
-    require(!o.split_breaks || !o.gpu, "--split-breaks: CPU only (experiment)");
     eo.weno = o.weno;
     eo.limit = o.element_limit;
     eo.weno_linear = o.weno_linear;

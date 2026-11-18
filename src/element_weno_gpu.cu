@@ -2200,7 +2200,8 @@ struct BoundaryHighDevice {
     BoundaryHighSetup s;
     int *row_nodes = nullptr, *offsets = nullptr, *rows_list = nullptr;
     double *row_mass = nullptr, *flux_t[6] = {}, *iface_t[6] = {}, *G = nullptr, *H = nullptr, *db = nullptr,
-           *low4 = nullptr;
+           *low4 = nullptr, *low4b = nullptr;
+    int *row_break = nullptr;
     cublasHandle_t handle = nullptr;
 };
 namespace {
@@ -2225,7 +2226,7 @@ __global__ void k_sub(double *a, const double *b, std::size_t n) {
         a[t] -= b[t];
 }
 __global__ void k_boundary_rows_add(int q, int nb, const int *offsets, const int *rows_list, const int *bnodes,
-                                    const double *H, double *out, double *low4) {
+                                    const double *H, double *out, double *low4, const int *row_break, double *low4b) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= std::size_t(nb) * q)
         return;
@@ -2234,8 +2235,16 @@ __global__ void k_boundary_rows_add(int q, int nb, const int *offsets, const int
     for (int e = offsets[k]; e < offsets[k + 1]; ++e)
         sum += H[std::size_t(rows_list[e]) * q + c];
     out[std::size_t(bnodes[k]) * q + c] += sum;
-    if (c < 4)
+    if (c < 4) {
         low4[std::size_t(k) * 4 + c] = sum;
+        if (row_break) { // split_breaks: the broken-line rows apart
+            double part = 0;
+            for (int e = offsets[k]; e < offsets[k + 1]; ++e)
+                if (row_break[rows_list[e]])
+                    part += H[std::size_t(rows_list[e]) * q + c];
+            low4b[std::size_t(k) * 4 + c] = part;
+        }
+    }
 }
 } // namespace
 void boundary_high_setup(Context *ctx, const BoundaryHighSetup &s) {
@@ -2256,6 +2265,10 @@ void boundary_high_setup(Context *ctx, const BoundaryHighSetup &s) {
     d->H = dalloc<double>(rq);
     d->db = dalloc<double>(rq);
     d->low4 = dalloc<double>(std::size_t(std::max(1, s.nb)) * 4);
+    if (s.row_break) {
+        d->row_break = dcopy(s.row_break, std::size_t(std::max(1, s.rows)));
+        d->low4b = dalloc<double>(std::size_t(std::max(1, s.nb)) * 4);
+    }
     cublas_check(cublasCreate(&d->handle), "create");
     cublas_check(cublasSetStream(d->handle, 0), "set stream"); // legacy default stream, as all kernels here
     ctx->bhigh = d;
@@ -2340,7 +2353,7 @@ void destroy_boundary_high(Context *ctx) {
     if (!d)
         return;
     for (void *p : {(void *)d->row_nodes, (void *)d->offsets, (void *)d->rows_list, (void *)d->row_mass, (void *)d->G,
-                    (void *)d->H, (void *)d->db, (void *)d->low4})
+                    (void *)d->H, (void *)d->db, (void *)d->low4, (void *)d->low4b, (void *)d->row_break})
         cudaFree(p);
     for (double *p : d->iface_t)
         cudaFree(p);
@@ -2351,7 +2364,8 @@ void destroy_boundary_high(Context *ctx) {
     delete d;
     ctx->bhigh = nullptr;
 }
-void boundary_high(Context *ctx, const double *state, double *out, const double *pinned_db, double *pinned_low4) {
+void boundary_high(Context *ctx, const double *state, double *out, const double *pinned_db, double *pinned_low4,
+                   double *pinned_low4_break) {
     BoundaryHighDevice *d = ctx->bhigh;
     const BoundaryHighSetup &s = d->s;
     if (s.rows == 0 || s.nb == 0)
@@ -2378,8 +2392,11 @@ void boundary_high(Context *ctx, const double *state, double *out, const double 
         k_sub<<<blocks(rq), 256>>>(d->H, d->db, rq);
     }
     k_boundary_rows_add<<<blocks(std::size_t(s.nb) * s.q), 256>>>(s.q, s.nb, d->offsets, d->rows_list, s.bnodes, d->H,
-                                                                   out, d->low4);
+                                                                   out, d->low4, d->row_break, d->low4b);
     CK(cudaMemcpyAsync(pinned_low4, d->low4, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost, 0));
+    if (pinned_low4_break && d->low4b)
+        CK(cudaMemcpyAsync(pinned_low4_break, d->low4b, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost,
+                           0));
 }
 void destroy(Context *ctx) {
     if (!ctx)

@@ -228,10 +228,13 @@ struct BoundaryHighSetup {
     const int *offsets = nullptr;      // nb + 1
     const int *rows_list = nullptr;    // boundary_rows_
     const int *bnodes = nullptr;       // device: boundary node of slot k
+    const int *row_break = nullptr;    // split_breaks (experiment): rows x {0, 1}, 1 = broken-line row; null: none
 };
 void boundary_high_setup(Context *, const BoundaryHighSetup &);
 // pinned_db: rows x q row-major datum part (null: zero datum). pinned_low4: nb x 4 out (async, stream order).
-void boundary_high(Context *, const double *state, double *out, const double *pinned_db, double *pinned_low4);
+// pinned_low4_break (split_breaks): nb x 4 out, the l <= 1 sums of the broken-line rows only.
+void boundary_high(Context *, const double *state, double *out, const double *pinned_db, double *pinned_low4,
+                   double *pinned_low4_break = nullptr);
 // Device scratch for uploading small index/row lists.
 int *device_ints(Context *, int slot, int count);
 double *device_doubles(Context *, int slot, std::size_t count);

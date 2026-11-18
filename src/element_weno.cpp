@@ -3127,14 +3127,32 @@ void ElementWeno::apply_split_breaks(const Field &x, Field &r, double tau, Eleme
         return;
     require(options.ssprk43, "split_breaks: SSPRK(4,3) only");
     const int K = int(split_nodes_.size());
-    Field ylow = Field::Zero(nodes, 4), yflux = Field::Zero(nodes, 12);
-    std::vector<Four> u_of(K), y_of(K);
+    std::vector<Four> u(K), rate(K);
     parallel_for(K, [&](int k) {
         const int i = split_nodes_[k];
-        const Four u = project(x.row(i).transpose()), rl = project(r.row(i).transpose());
-        Four y = u + tau * rl;
+        u[k] = project(x.row(i).transpose()), rate[k] = project(r.row(i).transpose());
+    });
+    split_second_step(u, rate, split_term_, split_area_, tau, stats);
+    parallel_for(K, [&](int k) { set_low(Eigen::Map<Vec>(&r.coeffRef(split_nodes_[k], 0), r.cols()), rate[k]); });
+    // Mirror planes: odd moments of the rate vanish there (as at the end of rate()).
+    for (int d = 0; d < dimension; ++d)
+        if (mirror_index_[d] >= 0)
+            for (int i : mirror_nodes_[d])
+                for (int c = 0; c < r.cols(); ++c)
+                    if (reflect_odd_[d][c])
+                        r(i, c) = 0;
+}
+void ElementWeno::split_second_step(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term,
+                                    const Vec &area, double tau, ElementWenoStats *stats) const {
+    const int K = int(split_nodes_.size());
+    // Step-1 states y (and their Levermore fluxes) at all broken-line nodes; partners are broken-line nodes too.
+    Field ylow = Field::Zero(nodes, 4), yflux = Field::Zero(nodes, 12);
+    std::vector<Four> y_of(K);
+    parallel_for(K, [&](int k) {
+        const int i = split_nodes_[k];
+        Four y = u[k] + tau * rate[k];
         nudge_into_cone(y, "split step 1"); // convex by the dt bound; only rounding is fixed here
-        u_of[k] = u, y_of[k] = y;
+        y_of[k] = y;
         ylow.row(i) = y.transpose();
         const Levermore closure_state(y);
         for (int d = 0; d < dimension; ++d) {
@@ -3170,13 +3188,15 @@ void ElementWeno::apply_split_breaks(const Field &x, Field &r, double tau, Eleme
     std::vector<double> theta_of(K, 1.), defect(K, 0.);
     parallel_for(K, [&](int k) {
         const int i = split_nodes_[k];
-        const double A = split_area_[i];
-        if (!(A > 0) || !(astar[i] > 0))
+        const double A = area[i];
+        if (!(A > 0) || !(astar[i] > 0)) {
+            rate[k] = (y_of[k] - u[k]) / tau;
             return;
+        }
         const Four &y = y_of[k];
         Four bbar = Four(bstar.row(i).transpose()) / astar[i];
         nudge_into_cone(bbar, "split bar");
-        const Four c = Four(split_term_.row(i).transpose()) - A * (bbar - y);
+        const Four c = Four(term.row(i).transpose()) - A * (bbar - y);
         const Four g = c / A;
         double theta = 1;
         if (options.limit && !exact::cone(bbar + g))
@@ -3184,15 +3204,8 @@ void ElementWeno::apply_split_breaks(const Field &x, Field &r, double tau, Eleme
         const Four z = y + (tau * A / lumped[i]) * (bbar + theta * g - y);
         theta_of[k] = theta;
         defect[k] = tau * (theta - 1) * c[0];
-        set_low(Eigen::Map<Vec>(&r.coeffRef(i, 0), r.cols()), (z - u_of[k]) / tau);
+        rate[k] = (z - u[k]) / tau;
     });
-    // Mirror planes: odd moments of the rate vanish there (as at the end of rate()).
-    for (int d = 0; d < dimension; ++d)
-        if (mirror_index_[d] >= 0)
-            for (int i : mirror_nodes_[d])
-                for (int c = 0; c < r.cols(); ++c)
-                    if (reflect_odd_[d][c])
-                        r(i, c) = 0;
     if (stats)
         for (int k = 0; k < K; ++k) {
             stats->split_limited += theta_of[k] < 1;

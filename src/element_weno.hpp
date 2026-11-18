@@ -433,6 +433,11 @@ private:
     mutable Vec split_area_;
     std::vector<int> split_nodes_; // nodes on broken-line faces
     void apply_split_breaks(const Field &x, Field &r, double tau, ElementWenoStats *stats) const;
+    // Core of apply_split_breaks for split node k (split_nodes_ order): u[k] the stage state, rate[k] the low-order
+    // rate of step 1 (load / m) on input, the rate of the two-step update (z - u) / tau on output. term/area: T and
+    // A per node (node-indexed). Used by the CPU stage and the GPU host phase.
+    void split_second_step(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term, const Vec &area,
+                           double tau, ElementWenoStats *stats) const;
     std::array<Sparse, 3> mass_1d_; // assembled 1D consistent masses (h m1) per axis
     // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state. With the positivity
     // projection the incoming hemisphere follows as rows [outgoing, points) (full sphere); the C6 sums only use the

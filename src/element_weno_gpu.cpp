@@ -527,6 +527,18 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
                 }
             }
         h.offsets = s.boundary_row_offsets_.data(), h.rows_list = s.boundary_rows_.data(), h.bnodes = d_bnodes_;
+        split_ = s.options.split_breaks && s.broken_;
+        std::vector<int> row_break;
+        if (split_) {
+            row_break.assign(std::max(1, face_rows), 0);
+            for (int r = 0; r < face_rows; ++r)
+                row_break[r] = r >= s.break_row_start_[s.face_row_side_[r]];
+            h.row_break = row_break.data();
+            pin_low4b_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(nb_) * 4));
+            brk_low_ = Field::Zero(s.nodes, 4), brk_bar_ = Field::Zero(s.nodes, 4), brk_fa_ = Field::Zero(s.nodes, 3);
+            brk_high4_ = Field::Zero(s.nodes, 4), split_term_h_ = Field::Zero(s.nodes, 4);
+            brk_area_ = Vec::Zero(s.nodes);
+        }
         gpu::boundary_high_setup(ctx_, h);
         pin_db_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(face_rows) * q));
         pin_low4_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(nb_) * 4));
@@ -543,6 +555,8 @@ ElementWenoGpu::~ElementWenoGpu() {
         gpu::host_free(pin_traces_);
     if (pin_db_)
         gpu::host_free(pin_db_), gpu::host_free(pin_low4_);
+    if (pin_low4b_)
+        gpu::host_free(pin_low4b_);
     gpu::destroy(ctx_);
 }
 // Phase A of add_boundary: the PN face load sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum] per
@@ -954,8 +968,17 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
         boundary_bar_.row(i).setZero();
         boundary_area_[i] = 0;
         boundary_inflow_[i] = 0;
+        if (split_)
+            brk_low_.row(i).setZero(), brk_bar_.row(i).setZero(), brk_fa_.row(i).setZero(), brk_area_[i] = 0;
         for (int e = s.boundary_row_offsets_[k]; e < s.boundary_row_offsets_[k + 1]; ++e) {
             const int r = s.boundary_rows_[e];
+            if (split_ && r >= s.break_row_start_[s.face_row_side_[r]]) { // split_breaks: broken-line rows apart
+                brk_low_.row(i) += L_.row(r);
+                brk_bar_.row(i) += BR_.row(r);
+                brk_fa_.row(i) += FA_.row(r);
+                brk_area_[i] += AR_[r];
+                continue;
+            }
             boundary_low_.row(i) += L_.row(r);
             boundary_bar_.row(i) += BR_.row(r);
             flux_area_.row(i) += FA_.row(r);
@@ -1158,6 +1181,8 @@ void ElementWenoGpu::boundary_correction(ElementWenoStats &stats) {
         const int slot = s_.boundary_slot_[i];
         Four correction = project(boundary_high_.row(slot).transpose()) -
                           Four(boundary_low_(i, 0), boundary_low_(i, 1), boundary_low_(i, 2), boundary_low_(i, 3));
+        if (split_) // split_breaks: the domain part only (the broken-line rows go to the second step)
+            correction -= Four(brk_high4_.row(i).transpose());
         for (int d = 0; d < dimension; ++d)
             correction -= flux_area_(i, d) * block(closure, i, d);
         Four bar(boundary_bar_(i, 0), boundary_bar_(i, 1), boundary_bar_(i, 2), boundary_bar_(i, 3));
@@ -1188,6 +1213,7 @@ void ElementWenoGpu::boundary_correction(ElementWenoStats &stats) {
         const Four base = boundary_area_[i] * (bar - ui);
         load_b_.row(slot) += (base + theta * correction).transpose();
         double m = base[0] + theta * correction[0];
+        // (split_breaks: a pure broken-line node has boundary_area_ = 0 and is skipped above.)
         for (int d = 0; d < dimension; ++d)
             m -= flux_area_(i, d) * low_flux(i, 4 * d);
         node_mass[k] = m;
@@ -1334,7 +1360,7 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
             });
             datum = true;
         }
-        gpu::boundary_high(ctx_, x, out, datum ? pin_db_ : nullptr, pin_low4_);
+        gpu::boundary_high(ctx_, x, out, datum ? pin_db_ : nullptr, pin_low4_, split_ ? pin_low4b_ : nullptr);
         t_boundary_high += seconds() - t0;
     } else {
         const double t0 = seconds();
@@ -1379,6 +1405,10 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
         parallel_for(nb_, [&](int k) {
             for (int c = 0; c < 4; ++c)
                 boundary_high_(k, c) = pin_low4_[std::size_t(k) * 4 + c];
+            if (split_) { // projected (rho, J) of the broken-line rows' l <= 1 coefficient sums
+                const double *b = pin_low4b_ + std::size_t(k) * 4;
+                brk_high4_.row(s_.boundary_nodes_[k]) = project(Vec(Eigen::Map<const Vec>(b, 4))).transpose();
+            }
         });
     const gpu::Counters c = gpu::snapshot(ctx_);
     if (c.error)
@@ -1394,6 +1424,29 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
         const double t0 = seconds();
         std::copy_n(pin_load_, std::size_t(nb_) * 4, load_b_.data());
         boundary_correction(stats);
+        if (split_) { // split_breaks: the broken-line face terms as the second convex step (ElementWeno::split_second_step)
+            const auto &nodes = s_.split_nodes_;
+            const int K = int(nodes.size());
+            std::vector<Four> u(K), rate(K);
+            const int dimension = s_.dimension;
+            parallel_for(K, [&](int k) {
+                const int i = nodes[k], slot = s_.boundary_slot_[i];
+                Four t = Four(brk_high4_.row(i).transpose());
+                for (int d = 0; d < dimension; ++d)
+                    t -= brk_fa_(i, d) * Four(closure_h_(i, 4 * d), closure_h_(i, 4 * d + 1), closure_h_(i, 4 * d + 2),
+                                              closure_h_(i, 4 * d + 3));
+                if (s_.options.m1_target)
+                    t = Four(brk_low_.row(i).transpose());
+                split_term_h_.row(i) = t.transpose();
+                u[k] = Four(low_h_(i, 0), low_h_(i, 1), low_h_(i, 2), low_h_(i, 3));
+                rate[k] = Four(load_b_.row(slot).transpose()) / s_.lumped[i];
+            });
+            s_.split_second_step(u, rate, split_term_h_, brk_area_, tau, &stats);
+            parallel_for(K, [&](int k) {
+                const int i = nodes[k];
+                load_b_.row(s_.boundary_slot_[i]) = (s_.lumped[i] * rate[k]).transpose();
+            });
+        }
         std::copy_n(load_b_.data(), std::size_t(nb_) * 4, pin_load_up_);
         gpu::scatter_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_up_, false, 6);
         t_correction += seconds() - t0;
