@@ -141,3 +141,33 @@ einem Umbau zu prüfen wäre: nur der Tiefordnungsschritt der Trennebenenknoten 
 eingefrorenen Nachbarzuständen (jeder Teilschritt konvex, also realisierbar); die Masse bliebe aber nur mit einem
 Flussregister (Ausgleich auf der Partnerseite) erhalten, und die Kopplung an den Limiter (Hochordnungsanteil gegen
 Tiefordnungszustand) ist zu klären. Entscheidung des Nutzers.
+
+## Weitere Optimierungen (19.11.2026)
+
+- **CFL > 1** (`--cfl` bis 2, oberhalb von 1 bei der Realisierbarkeitsschranke gedeckelt; Job 162548, GB P35 geteilt,
+  Spiegel): CFL 1,1 stabil und gleich genau (121 s statt 131 s, −0,026 / +0,042 / +0,048 %); CFL 1,2 instabil (Rate
+  +13,9 %, 3058 s), 1,35 Abbruch. Die Hochordnungsschranke hat also nur ~10 % Reserve; Standard bleibt CFL 1.
+- **Initialisierung** (Zeitmarken `init:` im Log, `init_phases` in summary.json; Konstruktor mit `M1PN_CTOR_TIMING=1`):
+  Randseiten parallel aufgebaut (P35: 7,7 → 2,5 s, bitgleich). Verbleibend GB P35 ~20 s: FCS-Tabelle 7,6 s (Kernel,
+  wächst mit der Endzeit; Panels hängen von t ab, ohne Änderung der Quadratur nicht billiger), Spektralradius 3,3 s,
+  Löseraufbau 4 s.
+- **Zweiter Teilungsschritt:** dauerhafte Arbeitsfelder, Liste der Trennebenenflächen, parallele CSR-Summen (bitgleich).
+
+## Endläufe für das Paper (Job 162569, `nx/tmp/final9`, A100, 16 Kerne, Spiegel in x, FCS ohne Filter)
+
+| Lauf | Schritte | Zeit | Masse/Absorption/Rate % | Feld L1 | Median |
+|---|---|---|---|---|---|
+| U896 P21 | 1623 | 187 s | −0,070 / +0,124 / +0,153 | 1,2e-3 | 0,28 % |
+| GB P21 | 1052 | 61 s | −0,071 / +0,127 / +0,153 | 1,2e-3 | 0,31 % |
+| GB P21 Trennebenen | 1623 | 89 s | −0,055 / +0,096 / +0,133 | 1,1e-3 | 0,26 % |
+| GB P21 Trennebenen geteilt | 1059 | 64 s | −0,055 / +0,096 / +0,132 | 1,1e-3 | 0,26 % |
+| U896 P35 | 1623 | 385 s | −0,044 / +0,075 / +0,074 | 8,4e-4 | 0,25 % |
+| GB P35 | 1052 | 119 s | −0,046 / +0,079 / +0,076 | 8,6e-4 | 0,28 % |
+| GB P35 Trennebenen | 1623 | 183 s | −0,026 / +0,042 / +0,050 | 7,7e-4 | 0,22 % |
+| GB P35 Trennebenen geteilt | 1059 | 127 s | −0,026 / +0,042 / +0,049 | 7,7e-4 | 0,22 % |
+
+KiT-RT (gleiche A100, abgestuftes Dreiecksgitter cl 0,005, 683 854 Zellen, Logs in `external/kitrt_runs`): S6 269 s,
++0,054 / +0,048 / −0,020 %, L1 4,3e-3, Median 2,5 %; S14 1270 s, +0,039 / +0,080 / +0,011 %, 1,5e-3, 1,1 %.
+Paper (`05_papers/m1pn_3d/M1PN_Paper_Rewrite.tex`): Abschnitt 6.3 „Time step at broken lines“ (Proposition 6.2) und
+Absatz „Graded mesh, broken lines and comparison with S_N“ mit Tabelle 8; Backup der vorherigen Fassung
+`M1PN_Paper_Rewrite_backup_2026-11-18_timestep_pre.tex`.
