@@ -45,6 +45,11 @@ struct Options {
     double shadow_sigma = 1e7, beam_density = 1;
     int material_subcells = 0, history_stride = 0;
     int break_every = 0; // broken lines at every k-th element line of each axis (docs/STATIC_HP_BLOCKS.md)
+    // EXPERIMENT (experiment/break-dt, docs/BREAK_DT.md): "high-order" selects dt = cfl * high_order_step and drops
+    // the a-priori realizability bound (Theorem 3.1 then no longer guarantees the stage states).
+    std::string dt_bound = "both";
+    // EXPERIMENT: with --break-units on, only these unit lines (coordinates, both axes) are broken; empty: all.
+    std::vector<int> break_at;
     bool break_units = false; // broken lines on the unit lines of the box (lattices: the material lines)
     std::vector<int> cells_per_unit; // graded mesh: elements per unit interval of each axis (docs/GRADED_MESH.md)
     bool skip_fields = false;
@@ -154,6 +159,14 @@ Options parse(int argc, char **argv) {
             o.final_time = real();
         else if (key == "--dt")
             o.dt = real();
+        else if (key == "--dt-bound")
+            o.dt_bound = v; // both | high-order (experiment)
+        else if (key == "--break-at") { // experiment: comma list of unit lines
+            std::stringstream list(v);
+            std::string item;
+            while (std::getline(list, item, ','))
+                o.break_at.push_back(std::stoi(item));
+        }
         else if (key == "--break-units")
             o.break_units = v == "on";
         else if (key == "--break-every")
@@ -543,9 +556,12 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             if (o.break_every > 0)
                 for (int k = o.break_every; k < counts[d]; k += o.break_every)
                     eo.breaks[d].push_back(k);
-            else if (!o.cells_per_unit.empty()) // graded: the segment lines
-                for (std::size_t u = 0, k = 0; u + 1 < o.cells_per_unit.size(); ++u)
-                    eo.breaks[d].push_back(int(k += o.cells_per_unit[u]));
+            else if (!o.cells_per_unit.empty()) // graded: the segment lines (experiment: only those in --break-at)
+                for (std::size_t u = 0, k = 0; u + 1 < o.cells_per_unit.size(); ++u) {
+                    k += o.cells_per_unit[u];
+                    if (o.break_at.empty() || std::find(o.break_at.begin(), o.break_at.end(), int(u) + 1) != o.break_at.end())
+                        eo.breaks[d].push_back(int(k));
+                }
             else { // uniform: element lines at the integer coordinates of the box
                 const double hd = length_x / counts[0];
                 for (int k = 1; k < counts[d]; ++k) {
@@ -947,8 +963,14 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
 #else
     require(!o.gpu, "--gpu: built without M1PN_ELEMENT_GPU");
 #endif
-    const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.step_bound();
-    require(selected <= scheme.realizability_step() * (1 + 1e-12), "Requested dt violates the element realizability bound");
+    require(o.dt_bound == "both" || o.dt_bound == "high-order", "--dt-bound both|high-order");
+    const bool high_order_only = o.dt_bound == "high-order";
+    const double selected = o.dt > 0 ? o.dt : o.cfl * (high_order_only ? scheme.high_order_step() : scheme.step_bound());
+    require(high_order_only || selected <= scheme.realizability_step() * (1 + 1e-12),
+            "Requested dt violates the element realizability bound");
+    if (high_order_only && rank == 0)
+        std::cerr << "EXPERIMENT --dt-bound high-order: dt " << selected << ", realizability step "
+                  << scheme.realizability_step() << " (ratio " << selected / scheme.realizability_step() << ")\n";
     if (selected > scheme.high_order_step() && rank == 0)
         std::cerr << "warning: dt exceeds the estimated high-order stability step " << scheme.high_order_step() << "\n";
     // ---- Uniform sample grid on the full box (Q1 nodes of count*degree cells per axis) -----------------------------
