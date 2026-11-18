@@ -80,3 +80,13 @@ Abnahme (`nx/tmp/graded_gpu`): `tests/gpu_validate.sh` alle Fälle PASS, darunte
 FCS, Line Source mit FCS; CPU gegen GPU 9e-15 bis 3e-10). Gleichmäßig bitgleich zum GPU-Binary von 4cf885d für Lattice
 Q1 (mit/ohne FCS) und Line Source; Lattice Q2 ist schon mit dem alten Binary von Lauf zu Lauf nicht bitgleich (6 Läufe:
 3 verschiedene Ergebnisse, Abweichung ~1e-12; offener Punkt unabhängig von dieser Stufe).
+
+Laufzeit A100 (`nx/tmp/graded_gpu/perf`, lattice-paul FCS, t = 3,2):
+
+| Lauf | Zeit | Masse/Absorption/Rate % | Feld L1 | Median |
+|---|---|---|---|---|
+| U896 P21 | 351 s | −0,070 / +0,124 / +0,153 | 1,2e-3 | 0,28 % |
+| GB P21 | 109 s | −0,071 / +0,127 / +0,153 | 1,2e-3 | 0,31 % |
+| GA P21 | 47 s | −0,106 / +0,173 / +0,183 | 1,7e-3 | 0,49 % |
+| U896 P11 + Filter | 136 s | −0,110 / +0,199 / +0,223 | 1,6e-3 | 0,46 % |
+| GB P11 + Filter | 49 s | −0,112 / +0,202 / +0,225 | 1,6e-3 | 0,48 % |
