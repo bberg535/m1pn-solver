@@ -44,6 +44,7 @@ struct Options {
     std::string mirror_reduction = "auto";
     double shadow_sigma = 1e7, beam_density = 1;
     int material_subcells = 0, history_stride = 0;
+    std::vector<int> cells_per_unit; // graded mesh: elements per unit interval of each axis (docs/GRADED_MESH.md)
     bool skip_fields = false;
     double filter_strength = 0;
     Mesh mesh;
@@ -85,6 +86,8 @@ Options parse(int argc, char **argv) {
                    " --angular-reduction auto|on|off (1D/2D: drop PN moments odd in the unresolved directions)\n"
                    " --mirror-reduction auto|off (half/quarter/octant domain for mirror-symmetric cases)\n"
                    " --shadow-sigma S --beam-density B --material-subcells K --history-stride S --skip-fields\n"
+                   " --cells-per-unit n0,n1,... (graded mesh, 1D/2D, serial CPU: every axis is split into as many equal\n"
+                   "   segments as entries, entry k = elements in segment k; e.g. lattice: 7 unit segments)\n"
                    " --sample-moments auto|all|low --fcs off|analytic --m1-target on|off --gpu --output DIR\n"
                    " compatibility: --stabilization element-weno, --model r2, --mesh-type hex are accepted\n"
                    "threads: physical cores of one NUMA node unless --threads or OMP_NUM_THREADS is set\n";
@@ -181,6 +184,12 @@ Options parse(int argc, char **argv) {
         } else if (key == "--beam-density") {
             o.beam_density = std::stod(v);
             require(o.beam_density >= 0 && std::isfinite(o.beam_density), "Invalid --beam-density");
+        } else if (key == "--cells-per-unit") {
+            std::stringstream list(v);
+            for (std::string item; std::getline(list, item, ',');) {
+                o.cells_per_unit.push_back(std::stoi(item));
+                require(o.cells_per_unit.back() >= 1, "Invalid --cells-per-unit");
+            }
         } else if (key == "--material-subcells") {
             o.material_subcells = std::stoi(v);
             require(o.material_subcells >= 0, "Invalid --material-subcells");
@@ -498,6 +507,26 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     eo.elements = counts[0];
     eo.elements_per_axis = {counts[0], dim > 1 ? counts[1] : 0, dim > 2 ? counts[2] : 0};
     eo.origin = origin;
+    if (!o.cells_per_unit.empty()) {
+        // Graded mesh: every axis of the box is split into equal segments, one per entry, with the given element
+        // counts (for the lattices: unit segments, so material and source boundaries stay on element boundaries).
+        require(dim <= 2 && !distributed && !o.gpu && !o.mesh.periodic,
+                "--cells-per-unit: 1D/2D, serial CPU, open mesh (docs/GRADED_MESH.md)");
+        const std::array<int, 3> uniform_counts = counts; // the loop overwrites counts[d]; extents use the originals
+        for (int d = 0; d < dim; ++d) {
+            const double extent_d = length_x / uniform_counts[0] * uniform_counts[d];
+            const double segment = extent_d / double(o.cells_per_unit.size());
+            auto &P = eo.planes[d];
+            P.assign(1, origin[d]);
+            for (std::size_t u = 0; u < o.cells_per_unit.size(); ++u)
+                for (int k = 1; k <= o.cells_per_unit[u]; ++k)
+                    P.push_back(origin[d] + segment * (double(u) + double(k) / o.cells_per_unit[u]));
+            counts[d] = int(P.size()) - 1;
+        }
+        eo.elements = counts[0];
+        eo.elements_per_axis = {counts[0], dim > 1 ? counts[1] : 0, dim > 2 ? counts[2] : 0};
+        eo.length = length_x;
+    }
     eo.length = length_x;
     eo.material = material;
     eo.periodic = o.mesh.periodic;
@@ -633,7 +662,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     double mirror_asymmetry = 0;
     if (distributed && o.mirror_reduction == "auto")
         mirror_reason = {"MPI", "MPI", "MPI"}; // mirror sides and slabs are not combined
-    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed) {
+    if (!o.cells_per_unit.empty())
+        mirror_reason = {"graded mesh", "graded mesh", "graded mesh"};
+    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed && o.cells_per_unit.empty()) {
         const int pd = o.degree;
         std::array<int, 3> per{1, 1, 1};
         long total = 1;
@@ -875,6 +906,18 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     for (int d = 0; d < dim; ++d) if (mirror_dir[d]) full_origin[d] = center[d] - .5 * extent[d];
     std::vector<V3> where(samples);
     Vec sample_mass(samples);
+    // Graded mesh: the samples are the Q1 nodes of the element planes subdivided by the degree, with trapezoid
+    // weights (the uniform branch is unchanged).
+    std::array<std::vector<double>, 3> axis_coord;
+    if (!eo.planes[0].empty())
+        for (int d = 0; d < dim; ++d) {
+            const auto &P = eo.planes[d];
+            for (std::size_t i = 0; i + 1 < P.size(); ++i)
+                for (int k = 0; k < o.degree; ++k)
+                    axis_coord[d].push_back(P[i] + (P[i + 1] - P[i]) * k / o.degree);
+            axis_coord[d].push_back(P.back());
+            require(int(axis_coord[d].size()) == points_axis[d], "graded sample grid");
+        }
     for (long s = 0; s < samples; ++s) {
         V3 x = V3::Zero();
         double m = 1;
@@ -882,6 +925,12 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         for (int d = 0; d < dim; ++d) {
             const int index = int(k % points_axis[d]);
             k /= points_axis[d];
+            if (!axis_coord[d].empty()) {
+                const auto &c = axis_coord[d];
+                x[d] = c[index];
+                m *= .5 * ((index + 1 < int(c.size()) ? c[index + 1] : c[index]) - (index > 0 ? c[index - 1] : c[index]));
+                continue;
+            }
             x[d] = full_origin[d] + hs * index;
             const bool edge = !o.mesh.periodic && (index == 0 || index == cells_axis[d]);
             m *= (edge ? .5 : 1.) * hs;
@@ -971,7 +1020,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                << ",\"material_expected\":" << expected_integrals
                << ",\"domain_origin\":[" << full_origin[0] << "," << full_origin[1] << "," << full_origin[2] << "]"
                << ",\"domain_extent\":[" << extent[0] << "," << extent[1] << "," << extent[2] << "]"
-               << ",\"cell_size\":" << h
+               << ",\"cell_size\":" << h << ",\"graded\":" << (o.cells_per_unit.empty() ? "false" : "true")
                << ",\"pn_order\":" << pn.order << ",\"Q\":" << pn.q << ",\"dimension\":" << dim
                << ",\"mirror_reduction\":" << (mirrored ? "true" : "false")
                << ",\"mirror_directions\":[" << mirror_dir[0] << "," << mirror_dir[1] << "," << mirror_dir[2] << "]"

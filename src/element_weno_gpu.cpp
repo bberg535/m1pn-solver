@@ -70,6 +70,7 @@ std::vector<double> row_major(const Mat &m) {
 } // namespace
 
 ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
+    require(!s.graded_, "GPU time loop: graded meshes are not supported yet (docs/GRADED_MESH.md)");
     const ElementWenoOptions &o = s.options;
     require(!s.dist_, "GPU path: serial scheme only (no MPI)");
     require(!o.symmetric_residual && !o.m1_target, "GPU path: standard residual, PN target");

@@ -8,6 +8,7 @@
 #include <sstream>
 #include <random>
 #ifdef _OPENMP
+#include <map>
 #include <omp.h>
 #endif
 #include <Eigen/Eigenvalues>
@@ -239,6 +240,27 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     const int p = degree, one = p + 1;
     require(o.length > 0 && std::isfinite(o.length), "Invalid element WENO domain length");
     h = o.length / elements;
+    graded_ = std::any_of(o.planes.begin(), o.planes.end(), [](const auto &v) { return !v.empty(); });
+    if (graded_) {
+        require(!o.periodic && std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; }) &&
+                    std::none_of(o.cut.begin(), o.cut.end(), [](bool c) { return c; }) &&
+                    o.element_offset == std::array<int, 3>{0, 0, 0},
+                "Graded mesh: serial, open, without mirror sides (docs/GRADED_MESH.md)");
+        require(!o.symmetric_residual, "Graded mesh: the symmetric residual form is not supported");
+        double smallest = std::numeric_limits<double>::infinity();
+        for (int d = 0; d < dimension; ++d) {
+            const auto &P = o.planes[d];
+            require(int(P.size()) == count[d] + 1, "Graded mesh: planes per axis must be count + 1");
+            require(P.front() == o.origin[d], "Graded mesh: the first plane is the origin");
+            axis_width_[d].resize(count[d]);
+            for (int i = 0; i < count[d]; ++i) {
+                axis_width_[d][i] = P[i + 1] - P[i];
+                require(axis_width_[d][i] > 0 && std::isfinite(axis_width_[d][i]), "Graded mesh: planes must increase");
+                smallest = std::min(smallest, axis_width_[d][i]);
+            }
+        }
+        h = smallest; // reporting only; every geometric quantity uses width() / volume()
+    }
     nodes = cells = local_nodes = 1;
     for (int d = 0; d < dimension; ++d) {
         nodes_per_axis[d] = count[d] * p + (o.periodic ? 0 : 1);
@@ -456,12 +478,136 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 pe.ct[d] = d < dimension ? convection_[d](j, i) : 0.;
             }
         }
+    // Graded mesh: element data per size class (docs/GRADED_MESH.md). With widths w: M = (prod w) M^, C_d =
+    // (prod_{k != d} w_k) C^_d, K_d = (prod_{k != d} w_k / w_d) K^_d; d_ij from the scaled c_ij as above.
+    // Stabilization with one viscosity per axis, nu_d = scale w_d / 2p (the uniform nu = scale h / 2p on cubes):
+    // nu_d (K_d a - gamma C_d^T g_d) is stored as nu (f_d K_d, f_d C_d^T) with nu = scale w_min / 2p, f_d = w_d / w_min.
+    // A single nu ~ w_max would make the stiffness of a stretched element w_max / w_min times too strong and cut the
+    // high-order step by that ratio.
+    if (graded_) {
+        std::array<std::vector<double>, 3> distinct;
+        for (int d = 0; d < dimension; ++d) {
+            distinct[d] = axis_width_[d];
+            std::sort(distinct[d].begin(), distinct[d].end());
+            distinct[d].erase(std::unique(distinct[d].begin(), distinct[d].end()), distinct[d].end());
+        }
+        std::map<std::array<int, 3>, int> index_of;
+        element_class_.resize(cells);
+        for (int e = 0; e < cells; ++e) {
+            std::array<int, 3> key{0, 0, 0}, id{e % count[0], (e / count[0]) % count[1], e / (count[0] * count[1])};
+            for (int d = 0; d < dimension; ++d)
+                key[d] = int(std::lower_bound(distinct[d].begin(), distinct[d].end(), axis_width_[d][id[d]]) -
+                             distinct[d].begin());
+            auto it = index_of.find(key);
+            if (it == index_of.end()) {
+                it = index_of.emplace(key, int(classes_.size())).first;
+                ElementClass c;
+                for (int d = 0; d < dimension; ++d)
+                    c.width[d] = distinct[d][key[d]];
+                std::vector<Mat> base(dimension, m1);
+                double vol = 1, wmin = std::numeric_limits<double>::infinity();
+                for (int d = 0; d < dimension; ++d)
+                    vol *= c.width[d], wmin = std::min(wmin, c.width[d]);
+                c.viscosity = o.viscosity_scale * wmin / (2. * p);
+                c.mass = vol * tensor(base, p);
+                c.stiffness = Mat::Zero(local_nodes, local_nodes);
+                for (int d = 0; d < 3; ++d)
+                    c.convection[d] = Mat::Zero(local_nodes, local_nodes);
+                for (int d = 0; d < dimension; ++d) {
+                    auto fc = base, fk = base;
+                    fc[d] = c1;
+                    fk[d] = k1;
+                    const double side_area = vol / c.width[d];
+                    c.convection[d] = side_area * tensor(fc, p);
+                    c.stiffness += (c.width[d] / wmin) * (side_area / c.width[d]) * tensor(fk, p);
+                }
+                c.viscosity_ij = Mat::Zero(local_nodes, local_nodes);
+                for (int i = 0; i < local_nodes; ++i)
+                    for (int j = 0; j < local_nodes; ++j) {
+                        if (i == j)
+                            continue;
+                        V3 cij = V3::Zero(), cji = V3::Zero();
+                        for (int d = 0; d < dimension; ++d)
+                            cij[d] = c.convection[d](i, j), cji[d] = c.convection[d](j, i);
+                        double value_ij = std::max(cij.norm(), cji.norm());
+                        while (value_ij > 0 && (!exact::cone(Four(value_ij, cij[0], cij[1], cij[2])) ||
+                                                !exact::cone(Four(value_ij, cji[0], cji[1], cji[2]))))
+                            value_ij = std::nextafter(value_ij, std::numeric_limits<double>::infinity());
+                        c.viscosity_ij(i, j) = value_ij;
+                    }
+                c.viscosity_ij = c.viscosity_ij.cwiseMax(Mat(c.viscosity_ij.transpose()));
+                c.pairs.resize(std::size_t(local_nodes) * (local_nodes - 1));
+                for (int i = 0, k = 0; i < local_nodes; ++i)
+                    for (int j = 0; j < local_nodes; ++j) {
+                        if (j == i)
+                            continue;
+                        PairEntry &pe = c.pairs[k++];
+                        pe.j = j, pe.d = c.viscosity_ij(i, j), pe.m = c.mass(i, j);
+                        for (int d = 0; d < 3; ++d) {
+                            pe.c[d] = d < dimension ? c.convection[d](i, j) : 0.;
+                            pe.ct[d] = d < dimension ? c.convection[d](j, i) : 0.;
+                        }
+                    }
+                c.total_viscosity = c.viscosity_ij.rowwise().sum();
+                c.mass_row = c.mass.rowwise().sum();
+                c.stiffness_rows.resize(std::size_t(local_nodes) * local_nodes);
+                for (int d = 0; d < dimension; ++d)
+                    c.convection_t_rows[d].resize(std::size_t(local_nodes) * local_nodes);
+                for (int l = 0; l < local_nodes; ++l)
+                    for (int m = 0; m < local_nodes; ++m) {
+                        c.stiffness_rows[std::size_t(l) * local_nodes + m] = c.stiffness(l, m);
+                        for (int d = 0; d < dimension; ++d)
+                            c.convection_t_rows[d][std::size_t(l) * local_nodes + m] =
+                                (c.width[d] / wmin) * c.convection[d](m, l);
+                    }
+                classes_.push_back(std::move(c));
+            }
+            element_class_[e] = it->second;
+        }
+        // WENO extension of a neighbour of width r w onto this element (width w), per axis, side and ratio r:
+        // the neighbour's polynomial at reference s of this element is at t = s / r + 1 (low side) or (s - 1) / r.
+        Eigen::LDLT<Mat> m1_ldlt(m1);
+        std::map<std::array<double, 3>, int> ext_of; // (axis, side, ratio)
+        extension_index_.assign(std::size_t(cells) * 2 * dimension, -1);
+        for (int e = 0; e < cells; ++e) {
+            std::array<int, 3> id{e % count[0], (e / count[0]) % count[1], e / (count[0] * count[1])};
+            for (int d = 0; d < dimension; ++d)
+                for (int side = 0; side < 2; ++side) {
+                    const int next = neighbors_[e * 2 * dimension + 2 * d + side];
+                    if (next < 0)
+                        continue;
+                    const double r = axis_width_[d][id[d] + (side ? 1 : -1)] / axis_width_[d][id[d]];
+                    const std::array<double, 3> key{double(d), double(side), r};
+                    auto it = ext_of.find(key);
+                    if (it == ext_of.end()) {
+                        Mat load = Mat::Zero(one, one);
+                        for (int q = 0; q < xq.size(); ++q) {
+                            const double t = side ? (xq[q] - 1) / r : xq[q] / r + 1;
+                            for (int i = 0; i < one; ++i)
+                                for (int j = 0; j < one; ++j)
+                                    load(i, j) += wq[q] * bernstein(i, p, 0, xq[q]) * bernstein(j, p, 0, t);
+                        }
+                        std::vector<Mat> f(dimension, Mat::Identity(one, one));
+                        f[d] = m1_ldlt.solve(load);
+                        it = ext_of.emplace(key, int(extension_list_.size())).first;
+                        extension_list_.push_back(tensor(f, p));
+                    }
+                    extension_index_[std::size_t(e) * 2 * dimension + 2 * d + side] = it->second;
+                }
+        }
+    }
     // Lumped masses, one-dimensional consistent mass factor, boundary rules.
     lumped = Vec::Zero(nodes);
-    const Vec row = mass_.rowwise().sum();
-    for (int e = 0; e < cells; ++e)
-        for (int l = 0; l < local_nodes; ++l)
-            lumped[connectivity_[e * local_nodes + l]] += row[l];
+    if (graded_) {
+        for (int e = 0; e < cells; ++e)
+            for (int l = 0; l < local_nodes; ++l)
+                lumped[connectivity_[e * local_nodes + l]] += klass(e).mass_row[l];
+    } else {
+        const Vec row = mass_.rowwise().sum();
+        for (int e = 0; e < cells; ++e)
+            for (int l = 0; l < local_nodes; ++l)
+                lumped[connectivity_[e * local_nodes + l]] += row[l];
+    }
     // Assembled one-dimensional mass and convection matrices per axis (they differ only in the element count).
     std::array<Eigen::SparseMatrix<double>, 3> m1d;
     for (int d = 0; d < dimension; ++d) {
@@ -473,7 +619,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                     int a = e * p + i, b = e * p + j;
                     if (o.periodic)
                         a %= n1, b %= n1;
-                    triplets.emplace_back(a, b, h * m1(i, j));
+                    triplets.emplace_back(a, b, (graded_ ? axis_width_[d][e] : h) * m1(i, j));
                     m1_reference_ = m1;
                     entries.emplace_back(a, b, c1(i, j));
                 }
@@ -495,6 +641,16 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             for (int d = 0; d < dimension; ++d)
                 convection_t_rows_[d][std::size_t(l) * local_nodes + m] = convection_[d](m, l);
         }
+    if (!graded_) { // the single class of the uniform mesh: copies of the members above (bitwise the old data)
+        ElementClass c;
+        c.width = V3(h, dimension > 1 ? h : 1., dimension > 2 ? h : 1.);
+        c.viscosity = viscosity;
+        c.mass = mass_, c.stiffness = stiffness_, c.viscosity_ij = viscosity_ij_, c.convection = convection_;
+        c.pairs = pair_table_;
+        c.mass_row = mass_.rowwise().sum();
+        c.stiffness_rows = stiffness_rows_, c.convection_t_rows = convection_t_rows_;
+        classes_.assign(1, std::move(c)); // total_viscosity is set with total_viscosity_ below
+    }
     for (int d = 0; d < dimension; ++d) {
         flux_t_[d] = Mat(restrict_square(Mat(pn.A[d]), "A_d").transpose()).sparseView();
         flux_t_[d].makeCompressed();
@@ -587,7 +743,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         int points = 1;
         for (int d = 0; d < dimension; ++d)
             points *= per;
-        const double volume = std::pow(h, dimension);
+        const double uniform_volume = std::pow(h, dimension);
         // Element by element in parallel into per-element buffers, then gathered in element order (deterministic,
         // independent of the thread count).
         std::vector<double> local(std::size_t(cells) * local_nodes * 4, 0.), element_integrals(std::size_t(cells) * 4, 0.);
@@ -597,11 +753,11 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             double *loc = &local[std::size_t(e) * local_nodes * 4], *ints = &element_integrals[std::size_t(e) * 4];
             for (int point = 0; point < points; ++point) {
                 V3 x = origin;
-                double w = volume;
+                double w = graded_ ? this->volume(e) : uniform_volume;
                 std::array<int, 3> idx{0, 0, 0};
                 for (int d = 0, k = point; d < dimension; ++d, k /= per) {
                     idx[d] = k % per;
-                    x[d] += h * x1[idx[d]];
+                    x[d] += width(e, d) * x1[idx[d]];
                     w *= w1[idx[d]];
                 }
                 const double ca = mat.sigma_a ? mat.sigma_a(x) : 0., cs = mat.sigma_s ? mat.sigma_s(x) : 0.,
@@ -648,7 +804,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         fcs_shape_.resize(local_nodes, points);
         std::vector<double> wref(points);
         for (int k = 0; k < points; ++k) {
-            double w = std::pow(h, dimension);
+            double w = graded_ ? 1. : std::pow(h, dimension); // graded: times volume(e) per element
             std::array<int, 3> idx{0, 0, 0};
             for (int d = 0, r = k; d < dimension; ++d, r /= per)
                 idx[d] = r % per, w *= gw[idx[d]];
@@ -668,21 +824,34 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             element_origin(e, origin);
             for (int k = 0; k < points; ++k) {
                 V3 x = origin;
-                for (int d = 0, r = k; d < dimension; ++d, r /= per)
-                    x[d] += h * gx[r % per];
+                if (graded_)
+                    for (int d = 0, r = k; d < dimension; ++d, r /= per)
+                        x[d] += width(e, d) * gx[r % per];
+                else
+                    for (int d = 0, r = k; d < dimension; ++d, r /= per)
+                        x[d] += h * gx[r % per];
                 const std::size_t at = std::size_t(e) * points + k;
                 fcs_points_[at] = x;
-                fcs_weight_[at] = wref[k];
+                if (graded_)
+                    fcs_weight_[at] = wref[k] * this->volume(e);
+                else
+                    fcs_weight_[at] = wref[k];
                 const double ss = (o.material && o.material->sigma_s ? o.material->sigma_s(x) : 0.) + o.sigma_s;
                 require(ss >= 0 && std::isfinite(ss), "FCS: sigma_s must be finite and nonnegative");
                 fcs_sigma_s_[at] = ss;
             }
         });
         fcs_node_mass_ = Vec::Zero(nodes);
-        for (int e = 0; e < cells; ++e)
-            for (int l = 0; l < local_nodes; ++l)
-                for (int k = 0; k < points; ++k)
-                    fcs_node_mass_[connectivity_[e * local_nodes + l]] += wref[k] * fcs_shape_(l, k);
+        if (graded_)
+            for (int e = 0; e < cells; ++e)
+                for (int l = 0; l < local_nodes; ++l)
+                    for (int k = 0; k < points; ++k)
+                        fcs_node_mass_[connectivity_[e * local_nodes + l]] += wref[k] * this->volume(e) * fcs_shape_(l, k);
+        else
+            for (int e = 0; e < cells; ++e)
+                for (int l = 0; l < local_nodes; ++l)
+                    for (int k = 0; k < points; ++k)
+                        fcs_node_mass_[connectivity_[e * local_nodes + l]] += wref[k] * fcs_shape_(l, k);
     }
     if (!o.periodic) {
         const auto [fx, fw] = unit_gauss(p + pn.order + 3);
@@ -716,7 +885,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                         a /= fx.size();
                     }
                     rule.points.row(q) = ref.transpose();
-                    rule.weights[q] = weight * area;
+                    rule.weights[q] = weight * (graded_ ? 1. : area); // graded: times face_scale_ per face
                     for (int n = 0; n < nfn; ++n) {
                         int x = rule.local[n];
                         double value_n = 1;
@@ -727,6 +896,12 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
                 rule.mass = rule.shape * rule.weights.asDiagonal() * rule.shape.transpose();
             }
+        face_scale_.assign(faces_.size(), 1.);
+        if (graded_)
+            for (std::size_t f = 0; f < faces_.size(); ++f)
+                for (int d = 0; d < dimension; ++d)
+                    if (d != faces_[f].direction)
+                        face_scale_[f] *= width(faces_[f].element, d);
         boundary_slot_.assign(nodes, -1);
         ghost_of_face_.reserve(faces_.size() * nfn);
         std::array<std::vector<int>, 6> ghost_slot;
@@ -873,16 +1048,19 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     const Vec sum = viscosity_ij_.rowwise().sum();
     for (int e = 0; e < cells; ++e)
         for (int l = 0; l < local_nodes; ++l)
-            rates[connectivity_[e * local_nodes + l]] += 2 * sum[l];
-    for (const auto &f : faces_) {
+            rates[connectivity_[e * local_nodes + l]] += 2 * (graded_ ? klass(e).total_viscosity[l] : sum[l]);
+    for (std::size_t fi = 0; fi < faces_.size(); ++fi) {
+        const auto &f = faces_[fi];
         const auto &rule = rules_[2 * f.direction + f.side];
         for (std::size_t n = 0; n < rule.local.size(); ++n)
             rates[connectivity_[f.element * local_nodes + rule.local[n]]] +=
-                (rule.shape.row(n).transpose().array() * rule.weights.array()).sum();
+                face_scale_[fi] * (rule.shape.row(n).transpose().array() * rule.weights.array()).sum();
     }
     node_dt_bound = lumped.array() / rates.array();
     dt_bound = node_dt_bound.minCoeff();
     total_viscosity_ = viscosity_ij_.rowwise().sum();
+    if (!graded_)
+        classes_[0].total_viscosity = total_viscosity_;
     node_offsets_.assign(nodes + 1, 0);
     for (int entry = 0; entry < cells * local_nodes; ++entry)
         ++node_offsets_[connectivity_[entry] + 1];
@@ -916,7 +1094,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             for (std::size_t point = 0; point < points; ++point) {
                 V3 x = origin;
                 for (int d = 0; d < dimension; ++d)
-                    x[d] += h * rule.points(point, d);
+                    x[d] += width(f.element, d) * rule.points(point, d);
                 steady_data_[index * points + point] = face_data(side_id, x, 0.);
             }
         });
@@ -941,7 +1119,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                         if (weight != 0)
                             w += weight;
                     }
-                    face_weight_[face_row_[index] + n] = w;
+                    face_weight_[face_row_[index] + n] = face_scale_[index] * w;
                 }
             });
         }
@@ -961,6 +1139,13 @@ int ElementWeno::stride(int direction) const {
 void ElementWeno::element_origin(int element, V3 &origin) const {
     origin = V3::Zero();
     int x = element;
+    if (graded_) {
+        for (int d = 0; d < dimension; ++d) {
+            origin[d] = options.planes[d][x % count[d]];
+            x /= count[d];
+        }
+        return;
+    }
     for (int d = 0; d < dimension; ++d) {
         origin[d] = options.origin[d] + (options.element_offset[d] + x % count[d]) * h;
         x /= count[d];
@@ -969,6 +1154,14 @@ void ElementWeno::element_origin(int element, V3 &origin) const {
 V3 ElementWeno::node_position(int node) const {
     V3 x = V3::Zero();
     int value = node;
+    if (graded_) {
+        for (int d = 0; d < dimension; ++d) {
+            const int i = value % nodes_per_axis[d], e = std::min(i / degree, count[d] - 1);
+            x[d] = options.planes[d][e] + axis_width_[d][e] * double(i - e * degree) / degree;
+            value /= nodes_per_axis[d];
+        }
+        return x;
+    }
     for (int d = 0; d < dimension; ++d) {
         x[d] = options.origin[d] + (options.element_offset[d] * degree + value % nodes_per_axis[d]) * h / degree;
         value /= nodes_per_axis[d];
@@ -1241,7 +1434,9 @@ Vec ElementWeno::weno_gamma(const Field &a) const {
                     continue;
                 for (int l = 0; l < n; ++l) // -2: mirror side, the neighbour is this element reflected in d
                     other[l] = density[next >= 0 ? connectivity_[next * n + l] : connectivity_[e * n + reflected_local_[d][l]]];
-                candidates.col(++m).noalias() = extension_[d][side] * other;
+                const Mat &ext = graded_ ? extension_list_[extension_index_[std::size_t(e) * 2 * dimension + 2 * d + side]]
+                                         : extension_[d][side];
+                candidates.col(++m).noalias() = ext * other;
             }
         Eigen::Matrix<double, Eigen::Dynamic, 1, 0, 7, 1> smoothness(m + 1), weights(m + 1);
         smoothness[0] = power(scale);
@@ -1297,7 +1492,8 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, const st
                     ae.row(l) = a.row(connectivity_[e * local_nodes + l]);
                     ge.row(l) = gradient[d].row(connectivity_[e * local_nodes + l]);
                 }
-                const Mat res = (convection_[d] * ae - mass_ * ge) * (viscosity * gamma[e]);
+                const ElementClass &C = klass(e);
+                const Mat res = (C.convection[d] * ae - C.mass * ge) * (C.viscosity * gamma[e]);
                 for (int l = 0; l < local_nodes; ++l)
                     for (int c = 0; c < q; ++c) weighted(e, l * q + c) = res(l, c);
             });
@@ -1308,7 +1504,8 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, const st
             Mat ae(local_nodes, q);
             for (int l = 0; l < local_nodes; ++l)
                 ae.row(l) = a.row(connectivity_[e * local_nodes + l]);
-            Mat r = stiffness_ * ae;
+            const ElementClass &C = klass(e);
+            Mat r = C.stiffness * ae;
             Mat second = Mat::Zero(local_nodes, q);
             for (int d = 0; d < dimension; ++d) {
                 Mat g(local_nodes, q), ye(local_nodes, q);
@@ -1316,10 +1513,10 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, const st
                     g.row(l) = gradient[d].row(connectivity_[e * local_nodes + l]);
                     ye.row(l) = y[d].row(connectivity_[e * local_nodes + l]);
                 }
-                r.noalias() -= gamma[e] * convection_[d].transpose() * g;
-                second.noalias() += convection_[d].transpose() * ye;
+                r.noalias() -= gamma[e] * C.convection[d].transpose() * g;
+                second.noalias() += C.convection[d].transpose() * ye;
             }
-            r = viscosity * r - second;
+            r = C.viscosity * r - second;
             for (int l = 0; l < local_nodes; ++l)
                 for (int c = 0; c < q; ++c) sym(e, l * q + c) = r(l, c);
         });
@@ -1336,13 +1533,14 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, const st
         std::fill_n(out, std::size_t(local_nodes) * q, 0.);
         for (int l = 0; l < local_nodes; ++l)
             rows[l] = a.data() + std::size_t(map[l]) * q;
-        apply_rows(local_nodes, local_nodes, q, stiffness_rows_.data(), viscosity, rows.data(), out);
-        const double weight = -viscosity * gamma[e];
+        const ElementClass &C = klass(e);
+        apply_rows(local_nodes, local_nodes, q, C.stiffness_rows.data(), C.viscosity, rows.data(), out);
+        const double weight = -C.viscosity * gamma[e];
         if (weight != 0)
             for (int d = 0; d < dimension; ++d) {
                 for (int l = 0; l < local_nodes; ++l)
                     rows[l] = gradient[d].data() + std::size_t(map[l]) * q;
-                apply_rows(local_nodes, local_nodes, q, convection_t_rows_[d].data(), weight, rows.data(), out);
+                apply_rows(local_nodes, local_nodes, q, C.convection_t_rows[d].data(), weight, rows.data(), out);
             }
     });
     lap(timing.t_stab_local);
@@ -1379,13 +1577,14 @@ Field ElementWeno::stabilization_residual(const Field &a, const Vec &gamma, cons
                 std::fill_n(term.data(), q, 0.);
                 for (int m = 0; m < n; ++m)
                     rows[m] = a.data() + std::size_t(map[m]) * q;
-                apply_rows(1, n, q, &stiffness_rows_[std::size_t(l) * n], viscosity, rows.data(), term.data());
-                const double weight = -viscosity * gamma[e];
+                const ElementClass &C = klass(e);
+                apply_rows(1, n, q, &C.stiffness_rows[std::size_t(l) * n], C.viscosity, rows.data(), term.data());
+                const double weight = -C.viscosity * gamma[e];
                 if (weight != 0)
                     for (int d = 0; d < dimension; ++d) {
                         for (int m = 0; m < n; ++m)
                             rows[m] = gradient[d].data() + std::size_t(map[m]) * q;
-                        apply_rows(1, n, q, &convection_t_rows_[d][std::size_t(l) * n], weight, rows.data(), term.data());
+                        apply_rows(1, n, q, &C.convection_t_rows[d][std::size_t(l) * n], weight, rows.data(), term.data());
                     }
                 if (low)
                     Eigen::Map<Four>(&low->coeffRef(e, 4 * l)) = project(Eigen::Map<const Vec>(term.data(), q));
@@ -1745,14 +1944,14 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
             for (int d = 0; d < dimension; ++d)
-                x[d] += h * rule.points(point, d);
+                x[d] += width(f.element, d) * rule.points(point, d);
             thread_local Incoming fresh;
             if (!inflow.steady)
                 face_data_into(side_id, x, time, fresh);
             const Incoming &data = inflow.steady ? steady_data_[std::size_t(index) * rule.weights.size() + point]
                                                  : fresh;
             for (int n = 0; n < nf; ++n) {
-                const double weight = rule.weights[point] * rule.shape(n, point);
+                const double weight = face_scale_[index] * rule.weights[point] * rule.shape(n, point);
                 if (weight == 0)
                     continue;
                 const int i = global[n];
@@ -1782,6 +1981,8 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         for (int n = 0; n < nf; ++n)
             traces.row(n) = a.row(global[n]);
         G.middleRows(r0, nf).noalias() = rule.mass * traces;
+        if (graded_)
+            G.middleRows(r0, nf) *= face_scale_[index];
         if (high_exterior) {
             bool any = false;
             for (int n = 0; n < nf; ++n)
@@ -1790,8 +1991,11 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                     any = true;
                 } else
                     traces.row(n).setZero();
-            if (any)
+            if (any) {
                 K.middleRows(r0, nf).noalias() = rule.mass * traces;
+                if (graded_)
+                    K.middleRows(r0, nf) *= face_scale_[index];
+            }
             else
                 K.middleRows(r0, nf).setZero();
         }
@@ -2058,12 +2262,12 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
             std::copy_n(&moment_rate.coeffRef(map[l], 0), 4, c + 28);
         }
         using Quad = Eigen::Map<const Four>;
-        const Vec &total_viscosity = total_viscosity_;
+        const Vec &total_viscosity = graded_ ? klass(e).total_viscosity : total_viscosity_;
         for (int i = 0; i < local_nodes; ++i) {
             const double *ci = &copies[std::size_t(32) * i];
             const Four ui = Quad(ci), qi = Quad(ci + 28);
             Four weighted = Four::Zero(), fi = Four::Zero();
-            const PairEntry *pairs = &pair_table_[std::size_t(i) * (local_nodes - 1)];
+            const PairEntry *pairs = &(graded_ ? klass(e).pairs : pair_table_)[std::size_t(i) * (local_nodes - 1)];
             for (int k = 0; k < local_nodes - 1; ++k) {
                 const PairEntry &pe = pairs[k];
                 const int j = pe.j;
@@ -2681,8 +2885,8 @@ double ElementWeno::dropped_inflow(double time) const {
         element_origin(f.element, origin);
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
-            for (int d = 0; d < dimension; ++d)
-                x[d] += h * rule.points(point, d);
+            for (int dd = 0; dd < dimension; ++dd)
+                x[dd] += width(f.element, dd) * rule.points(point, dd);
             const Vec d = b.data(inflow, x, time).d;
             if (d.isZero(0)) // vacuum: nothing dropped or kept (skips a dense q x r product per point)
                 continue;
@@ -2704,19 +2908,19 @@ Field ElementWeno::project_l2(const std::function<Vec(const V3 &)> &f) const {
     int points = 1;
     for (int d = 0; d < dimension; ++d)
         points *= xq.size();
-    const double volume = std::pow(h, dimension);
+    const double uniform_volume = std::pow(h, dimension);
     for (int e = 0; e < cells; ++e) {
         V3 origin;
         element_origin(e, origin);
         for (int p = 0; p < points; ++p) {
             V3 x = origin;
-            double w = volume;
+            double w = graded_ ? volume(e) : uniform_volume;
             Vec ref(dimension);
             int value = p;
             for (int d = 0; d < dimension; ++d, value /= xq.size()) {
                 ref[d] = xq[value % xq.size()];
                 w *= wq[value % xq.size()];
-                x[d] += h * ref[d];
+                x[d] += width(e, d) * ref[d];
             }
             const Vec state = reduce(f(x));
             for (int l = 0; l < local_nodes; ++l) {
@@ -2734,9 +2938,17 @@ Vec ElementWeno::evaluate(const Field &a, const V3 &x) const {
     int element = 0, scale = 1;
     Vec ref(dimension);
     for (int d = 0; d < dimension; ++d) {
-        double s = (x[d] - options.origin[d]) / h - options.element_offset[d];
-        int id = std::min(count[d] - 1, std::max(0, int(std::floor(s))));
-        ref[d] = s - id;
+        int id;
+        if (graded_) {
+            const auto &P = options.planes[d];
+            id = int(std::upper_bound(P.begin(), P.end(), x[d]) - P.begin()) - 1;
+            id = std::min(count[d] - 1, std::max(0, id));
+            ref[d] = (x[d] - P[id]) / axis_width_[d][id];
+        } else {
+            double s = (x[d] - options.origin[d]) / h - options.element_offset[d];
+            id = std::min(count[d] - 1, std::max(0, int(std::floor(s))));
+            ref[d] = s - id;
+        }
         element += id * scale;
         scale *= count[d];
     }
@@ -2759,7 +2971,7 @@ double ElementWeno::l2_density_error(const Field &a, const std::function<double(
     int points = 1;
     for (int d = 0; d < dimension; ++d)
         points *= xq.size();
-    const double volume = std::pow(h, dimension);
+    const double uniform_volume = std::pow(h, dimension);
     // The point terms in parallel, summed afterwards in the serial (element, point) order: same result for every
     // thread count.
     std::vector<double> terms(std::size_t(cells) * points);
@@ -2768,10 +2980,10 @@ double ElementWeno::l2_density_error(const Field &a, const std::function<double(
         element_origin(e, origin);
         for (int p = 0; p < points; ++p) {
             V3 x = origin;
-            double w = volume;
+            double w = graded_ ? volume(e) : uniform_volume;
             int value = p;
             for (int d = 0; d < dimension; ++d, value /= xq.size()) {
-                x[d] += h * xq[value % xq.size()];
+                x[d] += width(e, d) * xq[value % xq.size()];
                 w *= wq[value % xq.size()];
             }
             const double difference = project(evaluate(a, x))[0] - exact_density(x);

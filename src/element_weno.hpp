@@ -77,6 +77,10 @@ struct ElementWenoOptions {
     // box is origin + [0, h count[0]] x [0, h count[1]] x [0, h count[2]] (e.g. 150 x 50 x 50 for the shadow
     // test). Non-cubic cells are not supported.
     std::array<int, 3> elements_per_axis{0, 0, 0};
+    // Graded tensor mesh (docs/GRADED_MESH.md): element boundaries per axis (count + 1 increasing coordinates,
+    // absolute). Empty: the uniform mesh above (bitwise unchanged). Serial CPU only for now (no MPI, GPU, mirror
+    // sides, periodic meshes); elements are boxes with the widths of their axis intervals.
+    std::array<std::vector<double>, 3> planes;
     // Space-dependent reaction (adds to the constant sigma_s, sigma_a above, which must then be zero).
     std::shared_ptr<const ElementWenoMaterial> material;
     // Mirror sides, index 2 * direction + side (side 0 = low end): specular reflection instead of a physical
@@ -412,6 +416,43 @@ private:
         int j;
         double d, m, c[3], ct[3];
     };
+    // Element data per size class (docs/GRADED_MESH.md): one class on the uniform mesh (copies of the members
+    // above), one per occurring width triple on a graded mesh. element_class_ is empty on the uniform mesh.
+    struct ElementClass {
+        V3 width = V3::Ones();
+        double viscosity = 0;
+        Mat mass, stiffness, viscosity_ij;
+        std::array<Mat, 3> convection;
+        std::vector<PairEntry> pairs;
+        Vec total_viscosity, mass_row;
+        std::vector<double> stiffness_rows;              // sum_d f_d K_d (graded: f_d = w_d / w_min, else 1)
+        std::array<std::vector<double>, 3> convection_t_rows; // f_d C_d^T, stabilization only
+    };
+    std::vector<ElementClass> classes_;
+    std::vector<int> element_class_;
+    const ElementClass &klass(int e) const { return element_class_.empty() ? classes_[0] : classes_[element_class_[e]]; }
+    bool graded_ = false;
+    // Graded mesh: element widths per axis (global element index along the axis); per (element, 2d + side) the index
+    // of the WENO extension matrix in extension_list_ (-1: none).
+    std::array<std::vector<double>, 3> axis_width_;
+    std::vector<Mat> extension_list_;
+    std::vector<int> extension_index_;
+    std::vector<double> face_scale_; // per boundary face: physical area / rule area (1 on the uniform mesh)
+    // Width of element e along axis d (h on the uniform mesh) and its volume (h^d on the uniform mesh).
+    double width(int e, int d) const {
+        if (!graded_)
+            return h;
+        int id = e;
+        for (int k = 0; k < d; ++k)
+            id /= count[k];
+        return axis_width_[d][id % count[d]];
+    }
+    double volume(int e) const {
+        double v = 1;
+        for (int d = 0; d < dimension; ++d)
+            v *= width(e, d);
+        return v; // only used on graded meshes (the uniform branches keep std::pow(h, d))
+    }
     std::vector<PairEntry> pair_table_; // limiter pairs (i, j != i), row-major in i // ascending, for the deterministic parallel boundary corrections
     Field gather_load(const Field &local, double scale = 1.) const;
     // M^-1 C_d a along the grid lines of direction d, and the element loads of s_h for given gradients.
