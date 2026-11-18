@@ -13,6 +13,7 @@ CPU (OpenMP, MPI) und GPU (CUDA, A100). Kein MFEM.
 |---|---|
 | `m1pn_fast` (`src/fast_main.cpp`) | Standard: alle Fälle, MPI, `--gpu` |
 | `m1pn_element_weno` (`src/element_weno_main.cpp`) | Einzelstudien: glatte periodische Genauigkeit, glatter Ausfluss, Ghost-Studie |
+| `m1pn_adaptive_pn` (`src/adaptive_pn_main.cpp`) | Periodischer CPU-Prototyp für lokale Winkelordnung und Vergleiche mit festem N. [Versuch und Ergebnisse](docs/ADAPTIVE_PN_PROTOTYPE.md) |
 | `m1pn_lattice_mc` (`tools/lattice_mc.cpp`) | Monte-Carlo-Referenz für `lattice-paul` und `lattice-3d` (docs/LATTICE_MC.md) |
 
 ```bash
