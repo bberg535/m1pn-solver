@@ -40,6 +40,7 @@ ElementWenoOptions slab_options(const ElementWenoOptions &g, const SlabPartition
 ElementWenoMpi::ElementWenoMpi(ElementWeno &scheme, MPI_Comm comm, const SlabPartition &part, int chunks)
     : s_(scheme), comm_(comm), part_(part), chunks_(chunks) {
     require(!scheme.graded_, "MPI: graded meshes are not supported yet (docs/GRADED_MESH.md)");
+    require(!scheme.broken_, "MPI: broken lines are not supported yet (docs/STATIC_HP_BLOCKS.md)");
     if (const char *env = std::getenv("M1PN_MPI_CHUNKS"))
         chunks_ = std::atoi(env);
     const int D = part.axis, r = part.rank, P = part.ranks, E = part.elements;

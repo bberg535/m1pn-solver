@@ -22,6 +22,7 @@ struct Setup {
     // stabilization viscosity (null: `viscosity`). WENO extensions per (element, axis, side): ext_list (ext_count x
     // local x local) indexed by ext_index[e * 2 dimension + 2 d + side] (null: extension[d][side]).
     int classes = 1;
+    bool structured = true; // node grid = element grid (false with broken lines: no 3 x 3 node strip kernel)
     const int *element_class = nullptr;
     const double *class_viscosity = nullptr;
     int ext_count = 0;
@@ -204,6 +205,10 @@ struct BoundaryHighSetup {
     const double *row_mass = nullptr;  // rows x nf: M_side(n, m)
     int side_start[7] = {};            // rows of side s: side_start[s] .. side_start[s + 1]
     const double *flux_t[6] = {};      // q x q column-major (Eigen) boundary_flux_t_, null for sides without boundary
+    // Broken lines: rows break_start[s] .. side_start[s + 1] of side s belong to broken-line faces; their row weights
+    // (nf = twice the face nodes) give M_face (u - u_partner), multiplied by iface_t[s] = .5 (A_n - I)^T.
+    int break_start[6] = {};
+    const double *iface_t[6] = {};
     const int *offsets = nullptr;      // nb + 1
     const int *rows_list = nullptr;    // boundary_rows_
     const int *bnodes = nullptr;       // device: boundary node of slot k

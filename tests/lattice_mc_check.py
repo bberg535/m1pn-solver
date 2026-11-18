@@ -38,7 +38,16 @@ def main():
                 rhs = src["injected"][k] + bg["injected"][k]
                 if abs(lhs - rhs) > 1e-12 * max(1., rhs):
                     failures.append(f"{case}: balance at t={a['times'][k]}: {lhs} vs {rhs}")
-            if case == "lattice-paul":
+            if case == "lattice-paul":  # pixel field: sum over pixels x area = mass at the final time
+                env = dict(os.environ, OMP_NUM_THREADS="2")
+                out = os.path.join(tmp, "field.json")
+                subprocess.run([binary, "--case", case, "--histories", "1e5", "--batches", "10", "--field-pixels", "14",
+                                "--field-output", os.path.join(tmp, "field.csv"), "--output", out],
+                               check=True, env=env, stdout=subprocess.DEVNULL)
+                with open(out) as f:
+                    fd = json.load(f)
+                if abs(fd["field"]["mass"] - fd["total"]["mass"][-1]) > 1e-12 * fd["total"]["mass"][-1]:
+                    failures.append(f"field mass {fd['field']['mass']} vs mass {fd['total']['mass'][-1]}")
                 for q, ref in LITERATURE.items():
                     m, s = tot[q][-1], tot[q + "_stderr"][-1]
                     if abs(m - ref) > 5 * s:

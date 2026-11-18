@@ -29,6 +29,14 @@ public:
     void step(double time, double dt, double next, ElementWenoStats &stats);
     Field state();
     Field end(ElementWenoStats &stats);
+    // Multi-block lockstep (src/blocks_main.cpp, SSPRK(4,3) only): stage s = 0..3 of the step from `time` in two
+    // halves; the driver runs lockstep_begin on all blocks before any lockstep_end (interface traces of all blocks are
+    // then on the host: host_state() rows of the boundary nodes, zero elsewhere). lockstep_react = the Strang half
+    // step of step(). Same arithmetic as step().
+    void lockstep_react(double tau, double source_time, ElementWenoStats &stats) { react(tau, source_time, stats); }
+    void lockstep_begin(int s, double time, double dt);
+    void lockstep_end(int s, double time, double dt, ElementWenoStats &stats);
+    const Field &host_state() const { return a_h_; }
     // Spectral radius of high_order_step() (same power iteration, on the device).
     double spectral_radius();
     // Host-side profile.
@@ -91,6 +99,13 @@ private:
     void react(double tau, double source_time, ElementWenoStats &stats);
     void stage(double time, const double *x, double *out, double *u, double old, double fresh, double tau,
                double weight, double dt, ElementWenoStats &stats, double next_time);
+    int stage_begin(double time, const double *x, double *out, double next_time);
+    void stage_end(int buffer, double time, const double *x, double *out, double *u, double old, double fresh,
+                   double tau, double weight, double dt, ElementWenoStats &stats);
+    bool interfaces_ = false; // multi-block interface sides: host face work by ElementWeno::add_boundary
+    bool nodal_interfaces_ = false; // conforming interface sides: partner term as face datum, regular pipeline
+    bool nodal_db_zeroed_ = false;
+    int lockstep_buffer_ = 0;
     void closure_fallback(const double *x);
     void limiter_fallback(ElementWenoStats &stats);
     void boundary_correction(ElementWenoStats &stats);

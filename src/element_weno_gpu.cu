@@ -56,6 +56,7 @@ struct View {
     const double *stiffness_rows, *convection_t_rows[3], *seminorm, *extension[3][2];
     const int *klass;                 // cells: size class of an element (nullptr: one class, uniform mesh)
     int classes;
+    bool structured;
     const double *class_viscosity;    // classes (nullptr: viscosity)
     const double *ext_list;           // graded WENO extensions (ext_count x local x local)
     const int *ext_index;             // cells x 2 dimension (nullptr: extension[d][side])
@@ -2068,6 +2069,7 @@ Context *create(const Setup &s) {
     const std::size_t C = std::size_t(s.classes);
     v.klass = s.element_class ? own(dcopy(s.element_class, std::size_t(s.cells))) : nullptr;
     v.classes = s.classes;
+    v.structured = s.structured;
     v.class_viscosity = s.class_viscosity ? own(dcopy(s.class_viscosity, C)) : nullptr;
     v.ext_index = s.ext_index ? own(dcopy(s.ext_index, std::size_t(s.cells) * 2 * s.dimension)) : nullptr;
     v.ext_list = s.ext_index ? own(dcopy(s.ext_list, std::size_t(s.ext_count) * n * n)) : nullptr;
@@ -2192,7 +2194,8 @@ Context *create(const Setup &s) {
 struct BoundaryHighDevice {
     BoundaryHighSetup s;
     int *row_nodes = nullptr, *offsets = nullptr, *rows_list = nullptr;
-    double *row_mass = nullptr, *flux_t[6] = {}, *G = nullptr, *H = nullptr, *db = nullptr, *low4 = nullptr;
+    double *row_mass = nullptr, *flux_t[6] = {}, *iface_t[6] = {}, *G = nullptr, *H = nullptr, *db = nullptr,
+           *low4 = nullptr;
     cublasHandle_t handle = nullptr;
 };
 namespace {
@@ -2238,9 +2241,12 @@ void boundary_high_setup(Context *ctx, const BoundaryHighSetup &s) {
     d->row_mass = dcopy(s.row_mass, rn);
     d->offsets = dcopy(s.offsets, std::size_t(s.nb) + 1);
     d->rows_list = dcopy(s.rows_list, std::size_t(std::max(1, s.offsets[s.nb])));
-    for (int side = 0; side < 6; ++side)
+    for (int side = 0; side < 6; ++side) {
         if (s.flux_t[side])
             d->flux_t[side] = dcopy(s.flux_t[side], std::size_t(s.q) * s.q);
+        if (s.iface_t[side])
+            d->iface_t[side] = dcopy(s.iface_t[side], std::size_t(s.q) * s.q);
+    }
     d->G = dalloc<double>(rq);
     d->H = dalloc<double>(rq);
     d->db = dalloc<double>(rq);
@@ -2255,6 +2261,8 @@ void destroy_boundary_high(Context *ctx) {
         return;
     for (void *p : {(void *)d->row_nodes, (void *)d->offsets, (void *)d->rows_list, (void *)d->row_mass, (void *)d->G,
                     (void *)d->H, (void *)d->db, (void *)d->low4})
+        cudaFree(p);
+    for (double *p : d->iface_t)
         cudaFree(p);
     for (double *p : d->flux_t)
         cudaFree(p);
@@ -2273,13 +2281,17 @@ void boundary_high(Context *ctx, const double *state, double *out, const double 
     CK(cudaMemsetAsync(d->H, 0, rq * sizeof(double), 0));
     const double one = 1, zero = 0;
     for (int side = 0; side < 6; ++side) {
-        const int r0 = s.side_start[side], n = s.side_start[side + 1] - r0;
-        if (!d->flux_t[side] || n <= 0)
-            continue;
+        const int r0 = s.side_start[side], r1 = d->iface_t[side] ? s.break_start[side] : s.side_start[side + 1];
         // Row-major G (rows x q) is column-major G^T (q x rows): H^T = B^T G^T with B = flux_t (column-major q x q).
-        cublas_check(cublasDgemm(d->handle, CUBLAS_OP_T, CUBLAS_OP_N, s.q, n, s.q, &one, d->flux_t[side], s.q,
-                                 d->G + std::size_t(r0) * s.q, s.q, &zero, d->H + std::size_t(r0) * s.q, s.q),
-                     "dgemm");
+        if (d->flux_t[side] && r1 > r0)
+            cublas_check(cublasDgemm(d->handle, CUBLAS_OP_T, CUBLAS_OP_N, s.q, r1 - r0, s.q, &one, d->flux_t[side], s.q,
+                                     d->G + std::size_t(r0) * s.q, s.q, &zero, d->H + std::size_t(r0) * s.q, s.q),
+                         "dgemm");
+        const int r2 = s.side_start[side + 1];
+        if (d->iface_t[side] && r2 > r1) // broken-line rows: G holds M_face (u - u_partner)
+            cublas_check(cublasDgemm(d->handle, CUBLAS_OP_T, CUBLAS_OP_N, s.q, r2 - r1, s.q, &one, d->iface_t[side], s.q,
+                                     d->G + std::size_t(r1) * s.q, s.q, &zero, d->H + std::size_t(r1) * s.q, s.q),
+                         "dgemm");
     }
     if (pinned_db) {
         CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, 0));
@@ -2390,7 +2402,7 @@ void gradients(Context *ctx, const double *state) {
 }
 void stabilization(Context *ctx, const double *state, double *out, bool want_low, double constant_gamma) {
     const View &v = ctx->v;
-    if (v.dimension == 2 && v.degree == 1 && !v.periodic && v.classes <= max_strip_classes) { // open grid only
+    if (v.dimension == 2 && v.degree == 1 && !v.periodic && v.classes <= max_strip_classes && v.structured) {
         static const int sy = [] {
             const char *e = std::getenv("M1PN_GPU_STRIP");
             return e ? std::atoi(e) : 16;
@@ -2404,7 +2416,7 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
             k_stabilization_strip<64><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
         else
             k_stabilization_strip<32><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
-    } else if (v.klass) { // graded: the element kernels stage one class in shared memory; per node instead
+    } else if (v.klass || !v.structured) { // graded / broken: per node (connectivity) instead of the element kernels
         k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, state, out, want_low, constant_gamma);
     } else {
         double *local_out = device_doubles(ctx, 7, std::size_t(v.cells) * v.local * v.q);

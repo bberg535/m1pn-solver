@@ -44,6 +44,8 @@ struct Options {
     std::string mirror_reduction = "auto";
     double shadow_sigma = 1e7, beam_density = 1;
     int material_subcells = 0, history_stride = 0;
+    int break_every = 0; // broken lines at every k-th element line of each axis (docs/STATIC_HP_BLOCKS.md)
+    bool break_units = false; // broken lines on the unit lines of the box (lattices: the material lines)
     std::vector<int> cells_per_unit; // graded mesh: elements per unit interval of each axis (docs/GRADED_MESH.md)
     bool skip_fields = false;
     double filter_strength = 0;
@@ -152,6 +154,10 @@ Options parse(int argc, char **argv) {
             o.final_time = real();
         else if (key == "--dt")
             o.dt = real();
+        else if (key == "--break-units")
+            o.break_units = v == "on";
+        else if (key == "--break-every")
+            o.break_every = integer();
         else if (key == "--cfl")
             o.cfl = real();
         else if (key == "--sigma-a")
@@ -529,6 +535,27 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     }
     eo.length = length_x;
     eo.material = material;
+    if (o.break_every > 0 || o.break_units) {
+        require(!distributed && !o.mesh.periodic && !(o.break_every > 0 && o.break_units),
+                "--break-every / --break-units: serial, open mesh, one of the two (docs/STATIC_HP_BLOCKS.md)");
+        require(o.break_units || o.cells_per_unit.empty(), "--break-every needs a uniform mesh (graded: --break-units)");
+        for (int d = 0; d < dim; ++d) {
+            if (o.break_every > 0)
+                for (int k = o.break_every; k < counts[d]; k += o.break_every)
+                    eo.breaks[d].push_back(k);
+            else if (!o.cells_per_unit.empty()) // graded: the segment lines
+                for (std::size_t u = 0, k = 0; u + 1 < o.cells_per_unit.size(); ++u)
+                    eo.breaks[d].push_back(int(k += o.cells_per_unit[u]));
+            else { // uniform: element lines at the integer coordinates of the box
+                const double hd = length_x / counts[0];
+                for (int k = 1; k < counts[d]; ++k) {
+                    const double xk = origin[d] + k * hd;
+                    if (std::abs(xk - std::round(xk)) < 1e-9 * std::max(1., std::abs(xk)))
+                        eo.breaks[d].push_back(k);
+                }
+            }
+        }
+    }
     eo.periodic = o.mesh.periodic;
     eo.weno = o.weno;
     eo.limit = o.element_limit;
@@ -664,7 +691,10 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         mirror_reason = {"MPI", "MPI", "MPI"}; // mirror sides and slabs are not combined
     if (!o.cells_per_unit.empty())
         mirror_reason = {"graded mesh", "graded mesh", "graded mesh"};
-    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed && o.cells_per_unit.empty()) {
+    if (o.break_every > 0 || o.break_units)
+        mirror_reason = {"broken lines", "broken lines", "broken lines"};
+    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed && o.cells_per_unit.empty() &&
+        o.break_every == 0 && !o.break_units) {
         const int pd = o.degree;
         std::array<int, 3> per{1, 1, 1};
         long total = 1;

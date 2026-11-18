@@ -103,6 +103,28 @@ struct ElementWenoOptions {
     // int sigma_s rho_u phi_i / int phi_i by Gauss quadrature (uncollided_points per element and direction,
     // 0: degree + 3), evaluated at the midpoint of each Strang half step (second order in time).
     std::function<void(double, const std::vector<V3> &, std::vector<double> &)> uncollided_density;
+    // Multi-block coupling (docs/STATIC_HP_BLOCKS.md): faces of an interface side couple to a neighbouring block
+    // instead of the kinetic inflow. interface_trace(side, x, v) returns the neighbour's PN coefficients at x in this
+    // scheme's active layout (degrees above the neighbour's order zero). Face term .5 (A_n - I)(u - v) (Rusanov),
+    // limiter bar state with the neighbour's moments as exterior; no C6 ghost on these faces.
+    std::array<bool, 6> interface_side{};
+    // Broken lines (docs/STATIC_HP_BLOCKS.md, "Trennebenen"): per axis the element lines k (0 < k < count) at which
+    // the nodes are doubled. Each side keeps its own continuous space; the faces on a broken line couple by the
+    // interface term (.5 (A_n - I)(u - v), v = the trace of the element across, limiter bar state with its moments).
+    // On the lattice: the material lines, so no node averages absorber and scatterer data. Serial, open mesh.
+    std::array<std::vector<int>, 3> breaks;
+    std::function<void(int, const V3 &, Vec &)> interface_trace;
+    // Non-conforming interfaces: interface_split(side, face centre, face width) = number of neighbour elements along
+    // each tangential axis of this face (> 1: the face rule is applied on that many sub-faces per axis, so the face
+    // integrals of the piecewise-polynomial neighbour trace stay exact). Null or 1: one rule per face.
+    std::function<int(int, const V3 &, double)> interface_split;
+    // Conforming interfaces (same node positions on both sides): nodal coupling as on broken lines, no point loop.
+    // interface_partner(side, node) = (block, node across); interface_value(block, node, v): that node's coefficients in
+    // this scheme's active layout; interface_low(block, node, n, u, flux_n): its four moments and the M1 normal flux
+    // F(u) n, computed as the owner computes them (so both sides of a face use the same states).
+    std::function<std::pair<int, int>(int, int, int)> interface_partner; // (side, element, node) -> (block, node)
+    std::function<void(int, int, Vec &)> interface_value;
+    std::function<void(int, int, const V3 &, Four &, Four &)> interface_low;
     // The same analytic pulse as an object (GPU path: the device evaluates its radial table, src/element_weno_gpu.cpp).
     std::shared_ptr<const uncollided::GaussianPulse> uncollided_pulse;
     // Lattice FCS (docs/FCS_LATTICE.md): the time table of rho_u at the FCS points; the GPU path builds it on the
@@ -237,6 +259,13 @@ public:
                ElementWenoDebug * = nullptr) const;
     Field advance_ssprk3(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
     Field advance_ssprk43(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
+    // One SSPRK(4,3) stage of advance_ssprk43 for drivers that step several schemes in lockstep (multi-block, serial):
+    // out = old a + fresh (x + dt/2 rate(t, x)), then the admissible-row nudge; `weight` is the stage weight of the
+    // boundary outflow ledger. advance_ssprk43 = react(dt/2), stages (t,0,1,1/6) (t+dt/2,0,1,1/6) (t+dt,2/3,1/3,1/6)
+    // (t+dt/2,0,1,1/2), react(dt/2).
+    Field ssprk43_stage(double t, double dt, const Field &x, const Field &a, double old, double fresh, double weight,
+                        ElementWenoStats * = nullptr) const;
+    bool reacts_public() const { return reacts(); }
     // One step of the integrator selected by options.ssprk43.
     Field advance(double time, double dt, const Field &a, ElementWenoStats *stats = nullptr) const {
         return options.ssprk43 ? advance_ssprk43(time, dt, a, stats) : advance_ssprk3(time, dt, a, stats);
@@ -295,6 +324,11 @@ public:
     Field interpolate(const std::function<Vec(const V3 &)> &) const;
     Field project_l2(const std::function<Vec(const V3 &)> &) const;
     Vec evaluate(const Field &a, const V3 &x) const;
+    // Multi-block setup: the node at position x of the element that contains `probe` (closest local node), and the
+    // nodes of all interface faces as (side, element, node).
+    int node_near(const V3 &x, const V3 &probe) const;
+    void for_each_interface_node(const std::function<void(int, int, int)> &visit) const;
+    V3 element_centre(int e) const;
     V3 node_position(int node) const;
     // Diagnostics of the ghost estimators (requires positivity_projection in full mode, i.e. the full-sphere rule):
     // for every ghost pair (boundary node, side) the outgoing half moments of
@@ -397,6 +431,27 @@ private:
     // Face-row layout of add_boundary (see the constructor).
     std::vector<int> face_row_, face_row_side_, boundary_row_offsets_, boundary_rows_;
     std::array<int, 7> side_row_start_{};
+    // Rows of the faces on broken lines: side_row_start_[s] <= break_row_start_[s] <= side_row_start_[s + 1]
+    // (domain faces first; equal to side_row_start_[s + 1] without broken lines). Their face matrix .5 (A_n - I)^T is
+    // sparse (interface_sparse_t_).
+    std::array<int, 6> break_row_start_{};
+    // Partner node across a broken line of face `index` for its face node n (conforming: same position).
+    int broken_partner_node(int index, int n) const;
+    // Low-order face terms of a broken-line face (rows face_row_[index] .. + nf of L, BR, FA, AR, IN, zeroed by the
+    // caller): bar states node by node with the lumped face weights and the partner's nodal state and flux (shared by
+    // add_boundary and the GPU host path).
+    void broken_face_low(int index, const Field &low, const Field &low_flux, Field &L, Field &BR, Field &FA, Vec &AR,
+                         Vec &IN) const;
+    // The same for a conforming interface face (partner data from interface_partner / interface_low).
+    void interface_face_low(int index, const Field &low, const Field &low_flux, Field &L, Field &BR, Field &FA, Vec &AR,
+                            Vec &IN) const;
+    // V rows (face mass times the partner trace) of a broken-line or conforming interface face.
+    void nodal_partner_rows(int index, const Field &a, Eigen::Ref<Field> rows) const;
+    bool nodal_interface(int side_id) const { return options.interface_side[side_id] && bool(options.interface_partner); }
+    void nodal_face_low(int index, const Field &low, const Field &low_flux,
+                        const std::function<void(int, Four &, Four &)> &partner, Field &L, Field &BR, Field &FA, Vec &AR,
+                        Vec &IN) const;
+    std::array<Sparse, 6> interface_sparse_t_;
     // Positivity projection warm start per ghost pair (multiplier and rule of the last accepted projection). Only a
     // starting guess: the projection is unique, so the result does not depend on it beyond the solver tolerance.
     mutable std::vector<PositivityProjectionWarm> projection_warm_;
@@ -472,10 +527,16 @@ private:
     std::array<Mat, 6> boundary_flux_t_; // (A_n - llf_homogeneous)^T per face side (active moments)
     std::vector<char> parity_odd_;       // odd under the reflections of the angular reduction (full index)
     std::array<Mat, 6> datum_t_;         // llf_datum^T restricted to the active moments (r x moments)
+    bool broken_ = false;                         // options.breaks non-empty
+    std::array<std::vector<int>, 3> break_offset_; // per axis and element: number of broken lines k <= element
+    std::array<std::vector<double>, 3> node_coord_; // per axis and 1D node (broken meshes)
+    std::vector<char> face_break_;                  // per face: on a broken line (partner element across)
+    std::array<Mat, 6> interface_t_;     // .5 (A_n - I)^T on interface sides (neighbour trace term)
     std::array<Mat, 6> exterior_t_;      // (llf_homogeneous - (A_n + I)/2)^T (projection_high_order)
     // Boundary nodes (compact row index of the PN boundary load) and the distinct (side, node) pairs of the
     // C6 ghost state; ghost_of_face_ maps (face, face node) to such a pair.
     std::vector<int> boundary_slot_, boundary_nodes_, ghost_node_, ghost_side_, ghost_of_face_;
+    std::vector<char> vacuum_limit_node_; // per node: on a domain boundary face (C2 applies; not on interfaces only)
     mutable double spectral_radius_ = -1;
     const DistributedHooks *dist_ = nullptr;
     std::vector<char> owned_;

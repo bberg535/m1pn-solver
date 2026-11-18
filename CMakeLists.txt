@@ -49,6 +49,9 @@ endif()
 # accuracy, smooth outflow, ghost study, step cache).
 add_executable(m1pn_fast src/fast_main.cpp)
 target_link_libraries(m1pn_fast PRIVATE m1pn_element)
+# m1pn_blocks: static hp blocks, lockstep multi-block driver (docs/STATIC_HP_BLOCKS.md; lattice-paul, CPU).
+add_executable(m1pn_blocks src/blocks_main.cpp)
+target_link_libraries(m1pn_blocks PRIVATE m1pn_element)
 add_executable(m1pn_element_weno src/element_weno_main.cpp)
 target_link_libraries(m1pn_element_weno PRIVATE m1pn_element)
 add_executable(m1pn_element_weno_time_study tests/element_weno_time_study.cpp)
