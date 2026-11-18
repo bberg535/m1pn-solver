@@ -1,0 +1,4 @@
+Compiler: g++ (Debian 14.2.0-19) 14.2.0
+CPU: INTEL(R) XEON(R) PLATINUM 8573C
+Timing: ein CPU-Kern, OMP_NUM_THREADS=1
+Solver-Commit: c5adf8c701d8ebce618f96e6225110917c1b7dff
