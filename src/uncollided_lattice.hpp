@@ -95,10 +95,16 @@ struct LatticeUncollidedTable {
         m0 = first_for(start_time);
         const int W = width();
         table.assign(points.size() * std::size_t(W), 0.);
+        const auto px = gauss_legendre(lattice.phi_order, 0, 1);
+        const auto tx = gauss_legendre(lattice.theta_order, 0, 1);
+        const LatticeView lv = lattice.view(px.first, px.second, tx.first, tx.second);
+        const double sS = lattice_sigma(lv, lv.si, lv.sj);
+        std::vector<double> exp_tab(W);
+        for (int i = 0; i < W; ++i)
+            exp_tab[i] = std::exp(-sS * ((m0 + i) * dt));
         parallel_for(int(points.size()), [&](int k) {
             double *row = &table[std::size_t(k) * W];
-            for (int m = std::max(m0, 1); m <= M; ++m)
-                row[m - m0] = lattice.density(points[k][0], points[k][1], m * dt);
+            lattice_density_row(lv, points[k][0], points[k][1], m0, M, dt, row, exp_tab.data());
         });
         build_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     }

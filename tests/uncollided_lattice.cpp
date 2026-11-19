@@ -178,6 +178,23 @@ int main(int argc, char **argv) {
         // time integral at the centre: int_0^0.5 (1 - e^-s) ds = 0.5 - (1 - e^-0.5)
         const double ti = tab.time_integral(0, .5), ref = .5 - (1 - std::exp(-.5));
         check(std::abs(ti - ref) < 1e-6, "time integral at the centre, t = 0.5", std::abs(ti - ref));
+        // 4b. Direct check of lattice_density_row (table entries) against per-time lattice.density on random points.
+        double row_err = 0;
+        std::mt19937 rng2(19);
+        std::uniform_real_distribution<double> ux2(0, 7);
+        std::vector<V3> rx(40);
+        for (auto &p : rx)
+            p = V3(ux2(rng2), ux2(rng2), 0);
+        uncollided::LatticeUncollidedTable rtab;
+        rtab.lattice = c;
+        rtab.build(rx, 3.2);
+        for (std::size_t k = 0; k < rx.size(); ++k)
+            for (int m = 1; m <= rtab.M; m += 7) {
+                const double ex = c.density(rx[k][0], rx[k][1], m * rtab.dt);
+                const double got = rtab.table[k * std::size_t(rtab.width()) + m];
+                row_err = std::max(row_err, std::abs(got - ex) / (ex + 1e-4));
+            }
+        check(row_err < 1e-7, "lattice_density_row vs direct density (rel., floor 1e-4)", row_err);
     }
     if (full) {
         // 5. Independent area-integral formulation (outside S; 1/r kernel smooth there).
