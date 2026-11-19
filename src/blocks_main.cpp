@@ -501,7 +501,25 @@ int main(int argc, char **argv) {
                         return;
                     }
                     // Nested: `outer` blocks at a time, each with threads / outer threads for its host phases.
-                    const int outer = std::min(B, threads), inner = std::max(1, threads / outer);
+                    const int outer = std::min(B, threads), inner_equal = std::max(1, threads / outer);
+                    // Host threads per block: proportional to the block's work (nodes x moments), at least one
+                    // (M1PN_BLOCKS_THREADS=equal: threads / outer each). The large high-order blocks need their host
+                    // phases parallel, or they hold up the phase barrier.
+                    static const bool equal = [] {
+                        const char *e = std::getenv("M1PN_BLOCKS_THREADS");
+                        return e && std::string(e) == "equal";
+                    }();
+                    static std::vector<int> inner_of;
+                    if (int(inner_of.size()) != B) {
+                        inner_of.assign(B, inner_equal);
+                        if (!equal) {
+                            double total = 0;
+                            for (int k = 0; k < B; ++k) total += double(blocks[k].scheme->nodes) * blocks[k].scheme->moments;
+                            for (int k = 0; k < B; ++k)
+                                inner_of[k] = std::max(1, int(std::lround(threads * double(blocks[k].scheme->nodes) *
+                                                                           blocks[k].scheme->moments / total)));
+                        }
+                    }
                     static std::vector<int> by_cost; // largest blocks first (dynamic schedule)
                     if (int(by_cost.size()) != B) {
                         by_cost.resize(B);
@@ -515,7 +533,7 @@ int main(int argc, char **argv) {
                     std::exception_ptr error;
 #pragma omp parallel for num_threads(outer) schedule(dynamic, 1)
                     for (int m = 0; m < B; ++m) {
-                        omp_set_num_threads(inner);
+                        omp_set_num_threads(inner_of[by_cost[m]]);
                         try {
                             work(blocks[by_cost[m]]);
                         } catch (...) {
