@@ -556,7 +556,61 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         adaptive_rho_.resize(adaptive_plan_.num_tiles);
         adaptive_E_.resize(std::size_t(adaptive_plan_.num_tiles) * (adaptive_plan_.max_order + 1));
         adaptive_face_E_.resize(std::size_t(adaptive_plan_.num_tiles) * 6);
-        gpu::adaptive_setup(ctx_, adaptive_plan_);
+        // Build exact trailing LDL^T factorizations for every possible segment start r_start (tile borders and -1 grad pad).
+        gpu::AdaptiveSegFactorTable seg_factors;
+        auto fill_axis = [&](const ElementWeno::BandFactor &bf, int tb, int nt, int off,
+                             std::vector<int> &slot, std::vector<int> &offs,
+                             std::vector<double> &lo, std::vector<double> &invd) {
+            if (bf.n <= 0)
+                return;
+            const int p = bf.p;
+            slot.assign(bf.n, -1);
+            std::vector<int> starts{0};
+            for (int t = 0; t < nt; ++t) {
+                const int km = t * tb, kg = std::max(0, km - 1);
+                starts.push_back(std::clamp(km - off, 0, bf.n - 1));
+                starts.push_back(std::clamp(kg - off, 0, bf.n - 1));
+            }
+            std::sort(starts.begin(), starts.end());
+            starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+            std::vector<double> loc_l, loc_d, loc_invd;
+            for (int r0 : starts) {
+                slot[r0] = int(offs.size());
+                offs.push_back(int(invd.size()));
+                const int len = bf.n - r0;
+                loc_l.assign(std::size_t(len) * p, 0.);
+                loc_d.resize(len);
+                loc_invd.resize(len);
+                auto L = [&](int r, int c) -> double & { return loc_l[std::size_t(r) * p + (r - c) - 1]; };
+                for (int r = 0; r < len; ++r) {
+                    const int k = r0 + r;
+                    for (int j = std::max(0, r - p); j < r; ++j) {
+                        double v = bf.sub[std::size_t(k) * p + (r - j) - 1];
+                        for (int i = std::max(0, r - p); i < j; ++i)
+                            v -= L(r, i) * L(j, i) * loc_d[i];
+                        L(r, j) = v * loc_invd[j];
+                    }
+                    double v = bf.diag[k];
+                    for (int j = std::max(0, r - p); j < r; ++j)
+                        v -= L(r, j) * L(r, j) * loc_d[j];
+                    require(v > 0, "Adaptive GPU: segment 1D mass factorization failed");
+                    loc_d[r] = v;
+                    loc_invd[r] = 1. / v;
+                }
+                lo.insert(lo.end(), loc_l.begin(), loc_l.end());
+                invd.insert(invd.end(), loc_invd.begin(), loc_invd.end());
+            }
+        };
+        for (int d = 0; d < s.dimension; ++d) {
+            fill_axis(s.band_natural_[d], adaptive_plan_.tb[d], adaptive_plan_.nt[d], 0,
+                      seg_factors.slot[d], seg_factors.off[d], seg_factors.lower[d], seg_factors.invdiag[d]);
+            if (s.mirror_index_[d] >= 0) {
+                const int off = s.mirror_index_[d] == 0 ? 1 : 0;
+                fill_axis(s.band_dirichlet_[d], adaptive_plan_.tb[d], adaptive_plan_.nt[d], off,
+                          seg_factors.dslot[d], seg_factors.doff[d], seg_factors.dlower[d], seg_factors.dinvdiag[d]);
+            }
+        }
+        gpu::adaptive_setup(ctx_, adaptive_plan_, seg_factors);
     }
 }
 ElementWenoGpu::~ElementWenoGpu() {

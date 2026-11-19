@@ -64,7 +64,7 @@ struct Setup {
     const double *lumped = nullptr;          // nodes
     // Options.
     bool weno = true, stabilize = true, limit = true, outward_bar_rounding = true, scale_invariant_weno = true;
-    double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
+    double weno_q = 3, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
     double element_theta = .999;
     int fallback_capacity = 1 << 16;
 };
@@ -246,8 +246,13 @@ void boundary_high(Context *, const double *state, double *out, const double *pi
 // Device scratch for uploading small index/row lists.
 int *device_ints(Context *, int slot, int count);
 double *device_doubles(Context *, int slot, std::size_t count);
+// Exact trailing LDL^T factorizations of principal submatrices M_{[r_start, nn)} per axis for adaptive segment solves.
+struct AdaptiveSegFactorTable {
+    std::array<std::vector<int>, 3> slot, off, dslot, doff;
+    std::array<std::vector<double>, 3> lower, invdiag, dlower, dinvdiag;
+};
 // Dynamic tile-based adaptive PN on the device (experiment/dynamic-adaptive-pn).
-void adaptive_setup(Context *, const AdaptivePnPlan &plan);
+void adaptive_setup(Context *, const AdaptivePnPlan &plan, const AdaptiveSegFactorTable &seg_factors);
 void adaptive_enable(Context *, bool on);
 // Evaluate per-tile max density, per-degree amplitude and border top-shell amplitude into host arrays.
 void adaptive_sensor(Context *, const double *state, bool initial, double *host_rho, double *host_E, double *host_face_E);

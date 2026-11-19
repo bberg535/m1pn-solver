@@ -28,9 +28,9 @@ $$a_{i, c} \equiv 0 \quad \forall\, i \in T,\; c \ge q_T.$$
 
 Da die niedrigen Momente $c \in \{0, 1, 2, 3\}$ ($\rho, \mathbf{J}$) immer überall aktiv sind, bleiben **M1-Kegel-Realisierbarkeit, Massenerhaltung, WENO-Gewichte, Element-Limiter, Split-Breaks und Spiegelrandbedingungen** exakt erhalten.
 
-### 2.2 Exakte 1D-Band-Lösung auf aktiven Segmenten ohne Neufaktorisierung
+### 2.2 Exakte 1D-Band-Lösung auf aktiven Segmenten
 
-Die bestehenden 1D-Massenmatrizen $M_d$ werden einmalig in natürlicher Reihenfolge bandfaktorisiert ($M_d = L_d D_d L_d^T$, Bandbreite $p$). Für jede aktive Moment-Gruppe und jede 1D-Gitterlinie werden zusammenhängende aktive Knotenintervalle $[k_0, k_1)$ in kompakten Segmentlisten gesammelt (`line_segs_grad[d]` mit 1 Knoten Rand-Padding für $C_d a$, `line_segs_mass[d]` ohne Padding für $M_d^{-1} r$). Die Einschränkung von $L_d, D_d$ auf $[k_0, k_1)$ invertiert $\tilde L \tilde D \tilde L^T$ (strikte SPD-Matrix, exakt an allen inneren Knoten) ohne jede Neufaktorisierung bei Ordnungswechseln.
+Für jede aktive Moment-Gruppe und jede 1D-Gitterlinie werden zusammenhängende aktive Knotenintervalle $[k_0, k_1)$ in kompakten Segmentlisten gesammelt (`line_segs_grad[d]` mit 1 Knoten Rand-Padding für $C_d a$, `line_segs_mass[d]` ohne Padding für $M_d^{-1} r$). Auf jedem Segment wird die **exakte Hauptteilmatrix** $(M_d)_{[k_0, k_1)}$ invertiert: auf der CPU über eine lokale Band-$LDL^T$-Faktorisierung von $(M_d)_{[k_0, k_1)}$ (für $k_0 = 0$ direkt über die globale Faktorisierung), auf der GPU über einmalig im Konstruktor vorberechnete Trailing-Faktorisierungen von $(M_d)_{[r_0, n_d)}$ für alle möglichen Kachel-Startindizes $r_0$ (deren führender Block $[r_0, r_1)$ exakt mit der $LDL^T$-Zerlegung von $(M_d)_{[r_0, r_1)}$ übereinstimmt). Damit ist die Teilmatrixlösung exakt symmetrisch und ohne Schur-Komplement-Fehler am linken Segmentrand.
 
 ### 2.3 Online-Spektralsensor mit Hysterese & randgetriggerter Wellenfront-Dilatation
 
