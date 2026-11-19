@@ -78,7 +78,35 @@ Begrenzung). Job 162683.
 abgeschnitten (Spiegelrand), Karte muss symmetrisch sein, Integrale × 2, Ausgabe gespiegelt. Ein Block bitgleich zu
 `m1pn_fast` mit Spiegel; Karte mit/ohne Spiegel 1,3e-5 (Δt-Schätzung auf dem Halbgebiet).
 
-KARTEN_ERGEBNIS_FOLGT
+**Karten gegen einheitliches P35 (Jobs 162687, 162692; GB, Trennebenen geteilt, Spiegel, gegen MC).** Pilotkosten
+gehören zur Rechenzeit: `m1pn_lattice_mc` bis l = 35 braucht auf NX (64 Kerne) 2 s (1e7), 12 s (1e8), 1e9 220 s auf
+32 Kernen (≈ 110 s auf 64). Auf den 16 Kernen eines tardis-Jobs etwa viermal so lange.
+
+| Karte (Pilot, Pixel, tol) | Koeff. | Lauf (wall) | Masse/Absorption/Rate % | Feld L1 |
+|---|---|---|---|---|
+| einheitlich P35 (`m1pn_fast`) | 114 M | 121 s | −0,026 / +0,042 / +0,049 | 7,7e-4 |
+| `all35` (ein Block) | 114 M | 120 s | −0,026 / +0,042 / +0,049 | 7,6e-4 |
+| Ringe 35/27/21 (7 Blöcke) | 83 M | 138 s | −0,027 / +0,045 / +0,057 | 7,8e-4 |
+| 1e9, 28, 3e-4 | 44 M | 100 s | −0,008 / +0,008 / −0,022 | 8,1e-4 |
+| 1e9, 28, 1e-4 | 73 M | 166 s | −0,025 / +0,040 / +0,048 | 7,8e-4 |
+| 1e9, 28, 1e-3 | 14 M | 40 s | −0,069 / +0,121 / +0,191 | 1,6e-3 |
+| 1e8, 7, 3e-4 | 19 M | 71 s | −0,051 / +0,087 / +0,057 | 2,4e-3 |
+| 1e8, 14, 3e-4 | 36 M | 103 s | −0,029 / +0,047 / +0,065 | 1,2e-3 |
+| 1e8, 28, 3e-4 | 66 M | 179 s | −0,023 / +0,036 / +0,035 | 8,5e-4 |
+| 1e8, 14, 1e-4 | 71 M | 167 s | −0,028 / +0,046 / +0,061 | 8,3e-4 |
+| 1e7, 7, 3e-4 | 31 M | 93 s | +0,041 / −0,083 / −0,139 | 1,9e-3 |
+| 1e7, 28, 1e-4 | 94 M | 203 s | −0,026 / +0,043 / +0,053 | 7,7e-4 |
+
+Befund: (i) Die Blockkarte kostet selbst: Ringe 35/27/21 mit 73 % der Koeffizienten sind langsamer als einheitlich
+(Grenzflächen-Teilschritt, Barrieren, kleinere Kernel). (ii) Die 1e9-Karte spart ~20 s im Lauf, der Pilot kostet ein
+Mehrfaches. (iii) Billige Piloten sind verrauscht (Tail-Rauschen / Schranke 6–200): die Bias-Korrektur E − Var hilft
+im Mittel, aber Schwankungen setzen viele Blöcke unnötig auf L (1e7/1e8 bei 28 Pixeln: 66–94 M Koeffizienten, langsamer
+als einheitlich) oder grobe Pixel mitteln die Winkelstruktur weg (7 Pixel: ungenau). **Stand: keine Karte schlägt
+einheitliches P35 bei gleicher Genauigkeit, wenn der Pilot mitgezählt wird.**
+
+Rauschfeste Karte (`order_map_from_mc.py --significance 3 --mirror-x`): nur Koeffizienten mit |u_lm| > 3·stderr zählen.
+1e8 bei 28 Pixeln weicht dann im Mittel 1,2 Ordnungen von der 1e9-Karte ab (vorher 3,1), Zustandsanteil 0,24 statt
+0,34. Test: Job 162698 (SIGMAPS_FOLGT).
 
 ## 5. CUDA-Kernel
 

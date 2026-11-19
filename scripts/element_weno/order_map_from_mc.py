@@ -6,7 +6,12 @@ bias E[hat u^2] = u^2 + Var: E_l <- max(0, E_l - sum_m stderr_lm^2). The tail T_
 n(x) = min{n >= 1 : T_n <= tol * max rho_c} as for the deterministic pilot (order_map_from_spectrum.py); a block gets the
 largest order of its pixels. Orders are capped at the tallied order L (the map reports how many blocks hit L).
 
-Usage: order_map_from_mc.py MOMENTS.csv TOL NB OUT.txt [--no-bias-correction] [--length 7]
+--significance K: instead of the bias correction, keep only coefficients with |u_lm| > K * stderr_lm (hard threshold;
+noise-robust for cheap pilots, docs/BIG_REBUILDS.md). --mirror-x: symmetrize the map in x (maximum of both halves, for
+m1pn_blocks --mirror-x on).
+
+Usage: order_map_from_mc.py MOMENTS.csv TOL NB OUT.txt [--no-bias-correction] [--significance K] [--mirror-x]
+       [--length 7]
 """
 import argparse
 import math
@@ -19,6 +24,8 @@ ap.add_argument("tol", type=float)
 ap.add_argument("nb", type=int)
 ap.add_argument("out")
 ap.add_argument("--no-bias-correction", action="store_true")
+ap.add_argument("--significance", type=float, default=0.)
+ap.add_argument("--mirror-x", action="store_true")
 ap.add_argument("--length", type=float, default=7.)
 a = ap.parse_args()
 d = np.loadtxt(a.moments, delimiter=",", skiprows=1)
@@ -26,9 +33,10 @@ ix, iy, ls, mean, err = d[:, 0].astype(int), d[:, 1].astype(int), d[:, 5].astype
 P, L = ix.max() + 1, ls.max()
 E = np.zeros((P, P, L + 1))
 V = np.zeros((P, P, L + 1))
-np.add.at(E, (iy, ix, ls), mean ** 2)
+u = np.where(np.abs(mean) > a.significance * err, mean, 0.) if a.significance > 0 else mean
+np.add.at(E, (iy, ix, ls), u ** 2)
 np.add.at(V, (iy, ix, ls), err ** 2)
-if not a.no_bias_correction:
+if not a.no_bias_correction and a.significance <= 0:
     E = np.maximum(0., E - V)
 rho = np.zeros((P, P))
 m0 = ls == 0
@@ -44,6 +52,8 @@ bi = np.minimum((c / a.length * a.nb).astype(int), a.nb - 1)
 for j in range(P):
     for i in range(P):
         g[bi[j], bi[i]] = max(g[bi[j], bi[i]], need[j, i])
+if a.mirror_x:
+    g = np.maximum(g, g[:, ::-1])
 np.savetxt(a.out, g, fmt="%d")
 frac = ((g + 1) ** 2).sum() / (a.nb * a.nb * (L + 1) ** 2)
 print(f"{a.out}: L = {L}, pixels {P}^2, state fraction (vs P{L}) {frac:.2f}, blocks at L {np.mean(g == L):.0%}, "
