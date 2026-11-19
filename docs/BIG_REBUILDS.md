@@ -60,7 +60,38 @@ Trennebenen. Ein Block mit GB-Ebenen ist in den Integralen bitgleich zu `m1pn_fa
 Einschränkung: Blockgrenzen sind einseitige Knoten wie Trennebenen, der geteilte Schritt deckt sie nicht ab (Partner
 in einem anderen Block); der Blocktreiber hat keine Spiegelreduktion.
 
-KARTEN_FOLGEN
+**Fehler gefunden und behoben (077789d):** Die Klassentabellen des Streifenkerns lagen im `__constant__`-Speicher, den
+alle GPU-Kontexte teilen. Mit mehreren abgestuften Blöcken überschrieb der zuletzt aufgebaute Block die Tabellen der
+anderen: falsche Ergebnisse (Masse 0,659 statt 0,680 ohne Trennebenen) und Abbrüche „limiter endpoint rounding check
+failed“ mit Trennebenen (auch seriell, Job 162676). Jetzt je Kontext im globalen Speicher (`__ldg`); CPU gegen GPU
+1,9e-11 (ohne) / 7,8e-14 (mit Trennebenen), Job 162681. Ein Kontext bleibt bitgleich.
+
+**Geteilter Schritt an Blockgrenzen (18623bd):** Blockgrenzflächen zählen wie Trennebenen (`split_face`, `split_row`;
+eigene Schranke, getrennte Summen). Die Stufe zerfällt in zwei Hälften mit Barriere: `split_compute_y` (Zwischenzustand
+y, für die Partner abgelegt), dann `split_apply` mit dem y des Partnerblocks (`interface_split_y` →
+`split_y_state`). CPU: `ssprk43_stage_a/b`; GPU: `stage_end(defer)` + `stage_end_finish`, `lockstep_end_a/b`.
+Ohne Blockgrenzen bitgleich zum bisherigen geteilten Schritt. 5 abgestufte Blöcke P21/P7: 203 → 134 Schritte, Integrale
+wie beim Einblock-Fall (Rate 2e-4 gegen ungeteilt, Bilanz 4e-8); CPU gegen GPU 2e-10 (c21_7) bzw. 2,3e-7 (c7_3, mehr
+Begrenzung). Job 162683.
+
+**Spiegel im Blocktreiber (9f8a949, `--mirror-x on`):** Rechengebiet x ≥ 3,5, Blöcke links entfallen, über 3,5
+abgeschnitten (Spiegelrand), Karte muss symmetrisch sein, Integrale × 2, Ausgabe gespiegelt. Ein Block bitgleich zu
+`m1pn_fast` mit Spiegel; Karte mit/ohne Spiegel 1,3e-5 (Δt-Schätzung auf dem Halbgebiet).
+
+KARTEN_ERGEBNIS_FOLGT
+
+## 5. CUDA-Kernel
+
+nsys (Job 162662, GB P35 geteilt, Spiegel, t = 0,8; Kernel 28,1 s ≈ Rechenzeit 25,7 s, also GPU-gebunden): Zeilenlöser
+40 % (3,2 ms, ~1,1 TB/s von ~1,9), Streifenkern 20 % (4,8 ms), Kombination 14 %, Reaktion 13 % (6,8 ms bei ~1,2 ms
+Bandbreitenminimum).
+- **Reaktion (eb68ff2):** ein Thread je (Knoten, Moment) statt je Knoten (vorher kein Coalescing, 666 `exp` seriell).
+  Bitgleich; GB P35 t = 0,8: 25,4 → 23,4 s (−8 %), Job 162681.
+- **Fusion PN-Kombination in die letzte Massenlösung (690ec1b):** bitgleich, aber langsamer (29,5 statt 23,0 s;
+  verstreute Lesezugriffe auf Flussmatrix und Gradienten); Standard aus, `M1PN_GPU_FUSE=1`.
+- **Konstantenspeicher → global** (siehe 3): Zeit unverändert innerhalb der Messgenauigkeit.
+- Offen: Vorauslade-Tiefe/Blockgröße des Zeilenlösers (`M1PN_GPU_LINE_CHUNK/BLOCK`, Job 162672), Nsight Compute
+  (Job 162674).
 
 ## 4. Lokale Zeitschritte: Kostenmodell statt Umsetzung
 
