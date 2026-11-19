@@ -1557,9 +1557,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         c0 = seconds();
         amr_axes = next;
         amr_apply_mesh(amr_axes);
-        if (fcs_lattice) // the time table belongs to the FCS points of a mesh
-            (lattice3d ? lattice3_table->points : lattice_table->points).clear();
         amr_next_window(); // with the old scheme's FCS points (absorption of the closing window)
+        if (fcs_lattice)   // the time table belongs to the FCS points of a mesh
+            (lattice3d ? lattice3_table->points : lattice_table->points).clear();
         eo.adaptive_restart = o.amr_pn_restart; // efficiency iteration 3
         eo.adaptive_node_order.clear();
         if (o.amr_carry_pn && o.adaptive_pn) { // coupling A: node orders of the old mesh, mapped by the transfer support
@@ -1581,14 +1581,18 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         // Mirror planes: the moments odd under the reflection vanish there (restriction of the mirrored full field).
         const ElementWeno &S = *scheme_ptr;
         for (int d = 0; d < dim; ++d) {
-            if (!eo.mirror[2 * d])
+            const bool lo = eo.mirror[2 * d], hi = eo.mirror[2 * d + 1];
+            if (!lo && !hi)
                 continue;
             const long stride_d = d == 0 ? 1 : (d == 1 ? S.nodes_per_axis[0] : long(S.nodes_per_axis[0]) * S.nodes_per_axis[1]);
-            for (long i = 0; i < S.nodes; ++i)
-                if ((i / stride_d) % S.nodes_per_axis[d] == 0)
+            const int last = S.nodes_per_axis[d] - 1;
+            for (long i = 0; i < S.nodes; ++i) {
+                const long idx = (i / stride_d) % S.nodes_per_axis[d];
+                if ((lo && idx == 0) || (hi && idx == last))
                     for (int c = 0; c < S.moments; ++c)
                         if (S.reflect_odd(d, c))
                             b(i, c) = 0;
+            }
         }
         a = std::move(b);
         const double defect = mass_of(a) - mass_old; // rounding of the conservative transfer (ledger term)
