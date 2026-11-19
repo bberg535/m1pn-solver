@@ -1984,7 +1984,8 @@ void react(Context *ctx, double *state, double tau, const double *host_table, in
             rd->table_size = std::size_t(n + 1) * 2;
             CK(cudaMalloc(&r.table, rd->table_size * sizeof(double)));
         }
-        CK(cudaMemcpy(r.table, host_table, std::size_t(n + 1) * sizeof(double), cudaMemcpyHostToDevice));
+        CK(cudaMemcpyAsync(r.table, host_table, std::size_t(n + 1) * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
+        CK(cudaStreamSynchronize(ctx->stream));
         k_fcs_points<<<blocks(std::size_t(v.cells) * r.P), 256, 0, ctx->stream>>>(v, r, n, dr, cx, cy);
         k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
         k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
@@ -2090,7 +2091,8 @@ void react_lattice(Context *ctx, double *state, double tau, double source_time) 
 }
 Ledger ledger(Context *ctx) {
     double h[2];
-    CK(cudaMemcpy(h, ctx->reaction->r.ledger, sizeof h, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpyAsync(h, ctx->reaction->r.ledger, sizeof h, cudaMemcpyDeviceToHost, ctx->stream));
+    CK(cudaStreamSynchronize(ctx->stream));
     Ledger l;
     l.absorbed = h[0], l.injected = h[1];
     return l;
@@ -2495,6 +2497,7 @@ void download(void *host, const void *device, std::size_t bytes) {
     CK(cudaMemcpy(host, device, bytes, cudaMemcpyDeviceToHost));
 }
 void synchronize() { CK(cudaDeviceSynchronize()); }
+void synchronize(Context *ctx) { CK(cudaStreamSynchronize(ctx->stream)); }
 void *host_alloc(std::size_t bytes) {
     void *p = nullptr;
     CK(cudaMallocHost(&p, bytes ? bytes : 1));
@@ -2725,7 +2728,8 @@ Counters convert(const DeviceCounters &d);
 Counters counters(Context *ctx) {
     CK(cudaGetLastError()); // launch failures (e.g. resource limits) since the last call
     DeviceCounters d;
-    CK(cudaMemcpy(&d, ctx->v.counters, sizeof d, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpyAsync(&d, ctx->v.counters, sizeof d, cudaMemcpyDeviceToHost, ctx->stream)); // context stream only
+    CK(cudaStreamSynchronize(ctx->stream));
     return convert(d);
 }
 namespace {
@@ -2788,7 +2792,8 @@ void reset_counters(Context *ctx) {
     const double one = 1;
     std::memcpy(&d.min_limiter_bits, &one, 8);
     std::memcpy(&d.min_gamma_bits, &one, 8);
-    CK(cudaMemcpy(ctx->v.counters, &d, sizeof d, cudaMemcpyHostToDevice));
+    CK(cudaMemcpyAsync(ctx->v.counters, &d, sizeof d, cudaMemcpyHostToDevice, ctx->stream));
+    CK(cudaStreamSynchronize(ctx->stream));
 }
 const int *closure_fallback_list(Context *ctx) { return ctx->v.closure_list; }
 const int *limiter_fallback_list(Context *ctx) { return ctx->v.limiter_list; }
@@ -2799,14 +2804,16 @@ void gather_device(Context *ctx, const double *field, int cols, const int *devic
         return;
     double *buf = device_doubles(ctx, 0, std::size_t(count) * cols);
     k_gather<<<blocks(std::size_t(count) * cols), 256, 0, ctx->stream>>>(field, cols, device_index, count, buf, rows_soa);
-    CK(cudaMemcpy(host_out, buf, std::size_t(count) * cols * sizeof(double), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpyAsync(host_out, buf, std::size_t(count) * cols * sizeof(double), cudaMemcpyDeviceToHost, ctx->stream));
+    CK(cudaStreamSynchronize(ctx->stream));
 }
 void scatter_device(Context *ctx, double *field, int cols, const int *device_index, int count, const double *host_in,
                     bool add, long long rows_soa) {
     if (!count)
         return;
     double *buf = device_doubles(ctx, 1, std::size_t(count) * cols);
-    CK(cudaMemcpy(buf, host_in, std::size_t(count) * cols * sizeof(double), cudaMemcpyHostToDevice));
+    CK(cudaMemcpyAsync(buf, host_in, std::size_t(count) * cols * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
+    CK(cudaStreamSynchronize(ctx->stream)); // host_in may be pageable and reused by the caller
     k_scatter<<<blocks(std::size_t(count) * cols), 256, 0, ctx->stream>>>(field, cols, device_index, count, buf, add, rows_soa);
 }
 } // namespace gpu

@@ -87,6 +87,7 @@ Buffers buffers(Context *);
 void upload(void *device, const void *host, std::size_t bytes);
 void download(void *host, const void *device, std::size_t bytes);
 void synchronize();
+void synchronize(Context *); // the context stream only (other contexts keep running)
 // Row gathers/scatters through a device index list (synchronous transfers of the compact rows).
 // rows_soa > 0: the field is column-major with rows_soa rows (low, low_flux, closure, moment_rate, stab_low,
 // element_limited); 0: row-major.

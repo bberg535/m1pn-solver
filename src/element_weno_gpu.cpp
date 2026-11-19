@@ -1299,10 +1299,10 @@ int ElementWenoGpu::stage_begin(double time, const double *x, double *out, doubl
         t_sync += seconds() - t0;
     }
     if (gpu::snapshot(ctx_).closure_fallbacks) { // rare: near-beam closures on the host, then fetch again
-        gpu::synchronize();
+        gpu::synchronize(ctx_);
         closure_fallback(x);
         fetch();
-        gpu::synchronize();
+        gpu::synchronize(ctx_);
     }
     unpack();
     return buffer;
@@ -1420,11 +1420,11 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
     if (c.error)
         check_error();
     if (c.limiter_fallbacks) { // rare: stable base bars on the host, then gather again
-        gpu::synchronize();
+        gpu::synchronize(ctx_);
         limiter_fallback(stats);
         gpu::gather_load(ctx_);
         gpu::gather_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_, 5);
-        gpu::synchronize();
+        gpu::synchronize(ctx_);
     }
     {
         const double t0 = seconds();
