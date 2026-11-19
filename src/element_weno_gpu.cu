@@ -2543,6 +2543,20 @@ void line_solve(Context *ctx, int d, int count, double *f, const double *src = n
         }
         return;
     }
+    // Experiment: chunk (prefetch depth) and block size of the Q1 line solve (M1PN_GPU_LINE_CHUNK 8|16|32,
+    // M1PN_GPU_LINE_BLOCK 32..256); the arithmetic per thread is unchanged.
+    static const int chunk = [] { const char *e = std::getenv("M1PN_GPU_LINE_CHUNK"); return e ? std::atoi(e) : 16; }();
+    static const int lb = [] { const char *e = std::getenv("M1PN_GPU_LINE_BLOCK"); return e ? std::atoi(e) : 64; }();
+    if (v.degree == 1 && (chunk != 16 || lb != 64)) {
+        const dim3 g2(blocks(work, lb), count);
+        if (chunk == 8)
+            k_line_solve<1, 8><<<g2, lb, 0, ctx->stream>>>(v, d, f, src);
+        else if (chunk == 32)
+            k_line_solve<1, 32><<<g2, lb, 0, ctx->stream>>>(v, d, f, src);
+        else
+            k_line_solve<1, LINE_CHUNK><<<g2, lb, 0, ctx->stream>>>(v, d, f, src);
+        return;
+    }
     switch (v.degree) {
     case 1: k_line_solve<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
     case 2: k_line_solve<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
@@ -2617,8 +2631,15 @@ bool mass_solve_combine(Context *ctx, double *field, const double *x, const doub
     }
     for (int d = 0; d < last; ++d)
         line_solve(ctx, d, 1, field);
-    const dim3 grid(blocks(std::size_t(v.nodes / v.npa[last]) * v.q, 64), 1);
-    k_line_solve<1, LINE_CHUNK, true><<<grid, 64, 0, ctx->stream>>>(v, last, field, nullptr, x, a, old, fresh, tau);
+    static const int chunk = [] { const char *e = std::getenv("M1PN_GPU_LINE_CHUNK"); return e ? std::atoi(e) : 16; }();
+    static const int lb = [] { const char *e = std::getenv("M1PN_GPU_LINE_BLOCK"); return e ? std::atoi(e) : 64; }();
+    const dim3 grid(blocks(std::size_t(v.nodes / v.npa[last]) * v.q, lb), 1);
+    if (chunk == 8)
+        k_line_solve<1, 8, true><<<grid, lb, 0, ctx->stream>>>(v, last, field, nullptr, x, a, old, fresh, tau);
+    else if (chunk == 32)
+        k_line_solve<1, 32, true><<<grid, lb, 0, ctx->stream>>>(v, last, field, nullptr, x, a, old, fresh, tau);
+    else
+        k_line_solve<1, LINE_CHUNK, true><<<grid, lb, 0, ctx->stream>>>(v, last, field, nullptr, x, a, old, fresh, tau);
     CK(cudaGetLastError());
     return true;
 }
