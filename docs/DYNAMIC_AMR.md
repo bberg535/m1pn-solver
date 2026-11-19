@@ -141,6 +141,60 @@ Knoten.
 - ctest 13/13 (neu: `amr_transfer`, 17 Prüfungen: Unterteilung, 1D-/2D-Transfer gegen die `lumped`-Massen des
   Solvers, Kegel, exakte Verfeinerung, Indikator/2:1, Fenstertabelle bitgleich).
 
+## 4b. Kopplung mit dem adaptiven $P_N$ (A, B)
+
+Ohne Kopplung entscheiden AMR (Ortsauflösung, Indikator auf $\rho, \mathbf{J}$) und adaptives $P_N$ (Ordnung je
+Kachel, Winkelschalen) unabhängig; beide messen gegen die *globale* Maximaldichte, und nach jeder Neuvernetzung
+berechnet das adaptive $P_N$ seine Ordnungen neu (breite Initial-Dilatation).
+
+- **A — Ordnungen mitnehmen** (`--amr-carry-pn`, Standard an): vor der Neuvernetzung bekommt jeder Knoten die Ordnung
+  seiner Kachel; pro neuem Knoten das Maximum über das Transfer-Stencil (`amr::apply_max`), pro neuer Kachel das
+  Maximum. Die erste Anpassung auf dem neuen Gitter ist eine reguläre (±2, Hysterese, randgetriggerte Dilatation). Die
+  Null-Invariante bleibt exakt (jeder neue Knoten mischt nur Knoten mit Ordnung ≤ seiner; Test `amr_transfer`).
+  Die Kacheln bleiben knotenbasiert (GPU-Kerne setzen gleich große Kacheln voraus).
+- **B — lokale Toleranz** (`--adaptive-floor F` für $P_N$, `--amr-floor F` für AMR; 0 = global, bitgleich): Schwellen je
+  Kachel gegen $\max(\rho_T, F\,\rho_{\max})$ statt $\rho_{\max}$. $F = 1$ ist wieder die globale Regel.
+
+Messung (Lattice-FCS, GPU, $t = 3{,}2$, gegen MC):
+
+| Fall | Lauf | gesamt | Solve | PN-Anteil | Masse / Abs. / Rate % | L1 | Median |
+|---|---|---:|---:|---:|---|---:|---:|
+| P21, GBQ | uniformes $P_N$ | 44,9 s | 20,3 s | 1,00 | −0,148 / +0,181 / +0,102 | 4,1e-3 | 6,4e-3 |
+| | adaptiv (global) | 25,3 s | 4,0 s | 0,34 | −0,150 / +0,185 / +0,103 | 4,2e-3 | 1,0e-2 |
+| | adaptiv, B $P_N$ 1e-3 | 34,3 s | 7,8 s | 0,61 | −0,148 / +0,181 / +0,102 | 4,1e-3 | 6,4e-3 |
+| | adaptiv, B $P_N$ 1e-2 | 33,3 s | 7,3 s | 0,56 | −0,148 / +0,181 / +0,102 | 4,1e-3 | 6,5e-3 |
+| | **adaptiv, B $P_N$ 1e-1** | 26,9 s | **5,1 s** | 0,48 | −0,149 / +0,182 / +0,101 | 4,1e-3 | **6,5e-3** |
+| P21, AMR L3 | uniformes $P_N$ | 55,0 s | 52,5 s | 1,00 | −0,146 / +0,178 / +0,093 | 3,8e-3 | 5,4e-3 |
+| | adaptiv (global) | 38,3 s | 35,9 s | 0,37 | −0,147 / +0,179 / +0,093 | 3,8e-3 | 6,1e-3 |
+| | A | 39,9 s | 35,5 s | 0,33 | −0,148 / +0,181 / +0,098 | 3,9e-3 | 8,7e-3 |
+| | B $P_N$ 1e-3 | 43,4 s | 38,9 s | 0,65 | −0,146 / +0,178 / +0,092 | 3,8e-3 | 5,4e-3 |
+| | A + B $P_N$ 1e-3 | 40,9 s | 37,9 s | 0,63 | −0,146 / +0,178 / +0,092 | 3,8e-3 | 5,4e-3 |
+| | **A + B $P_N$ 1e-1** | 44,6 s | 42,0 s | 0,48 | −0,146 / +0,178 / +0,092 | 3,8e-3 | **5,4e-3** |
+| | A + B $P_N$ 1e-3 + B AMR 1e-3 | 57,3 s | 54,3 s | 0,52 | −0,145 / +0,177 / +0,117 | 3,8e-3 | 5,1e-3 |
+| P35, GBQ | uniformes $P_N$ | 206 s | 180 s | 1,00 | −0,145 / +0,176 / +0,084 | 4,1e-3 | 6,5e-3 |
+| | adaptiv (global) | 35,9 s | 6,3 s | 0,18 | −0,148 / +0,181 / +0,089 | 4,2e-3 | 1,0e-2 |
+| | **adaptiv, B $P_N$ 1e-1** | 33,3 s | **8,5 s** | 0,33 | −0,146 / +0,177 / +0,084 | 4,1e-3 | **6,5e-3** |
+| P35, AMR L3 | uniformes $P_N$ | 234 s | 226 s | 1,00 | −0,143 / +0,172 / +0,075 | 3,8e-3 | 5,5e-3 |
+| | adaptiv (global) | 56,3 s | 51,0 s | 0,16 | −0,146 / +0,177 / +0,086 | 3,9e-3 | 9,4e-3 |
+| | **A + B $P_N$ 1e-1** | 62,5 s | 57,1 s | 0,34 | −0,143 / +0,173 / +0,075 | 3,8e-3 | **5,5e-3** |
+| P21 fein 64, GBH | uniformes $P_N$ | 195 s | 113 s | 1,00 | −0,069 / +0,105 / +0,109 | 1,7e-3 | 3,0e-3 |
+| | adaptiv (global) | 131 s | 29,6 s | 0,32 | −0,072 / +0,110 / +0,119 | 1,8e-3 | 7,4e-3 |
+| | **adaptiv, B $P_N$ 1e-1** | 139 s | **37,4 s** | 0,44 | −0,069 / +0,106 / +0,108 | 1,7e-3 | **3,1e-3** |
+| P21 fein 64, AMR L4 | uniformes $P_N$ | 256 s | 248 s | 1,00 | −0,068 / +0,104 / +0,110 | 1,6e-3 | 3,1e-3 |
+| | adaptiv (global) | 166 s | 160 s | 0,40 | −0,070 / +0,107 / +0,114 | 1,7e-3 | 5,6e-3 |
+| | **A + B $P_N$ 1e-1** | 174 s | 167 s | 0,53 | −0,069 / +0,104 / +0,110 | 1,6e-3 | **3,1e-3** |
+
+Ergebnis:
+- **B für $P_N$ ist der entscheidende Schritt** (auch ohne AMR): der Genauigkeitsverlust des adaptiven $P_N$ kam ganz
+  von der globalen Schwelle (dünne Bereiche bekamen zu niedrige Ordnung). Mit $F = 10^{-1}$ trifft das adaptive $P_N$ in
+  allen Fällen das uniforme $P_N$ (Größen auf 0,001 %-Punkte, Feld gleich) bei 33–53 % der Koeffizienten: P35 auf GBQ
+  8,5 s statt 180 s (21×), GBH 37 s statt 113 s.
+- **A** spart mit B 1–7 % Koeffizienten bei gleicher Genauigkeit; mit globaler Schwelle verschlechtert es das Feld
+  (dann fehlt die breite Dilatation, die die zu niedrigen Ordnungen kaschierte).
+- **B für AMR** lohnt nicht (mehr Knoten, Rate schlechter).
+- AMR gegen statisch bei gleichem Kopplungsstand: AMR genauer im Feld (Median 5,4e-3 gegen 6,5e-3 bei fein 32),
+  statisch schneller (FCS-Tabelle, siehe 4.1).
+
 ## 5. Optionen
 
 ```
@@ -153,6 +207,9 @@ Knoten.
 --amr-interval DT            Prüfintervall (Standard: B x kleinste Basisbreite)
 --amr-radius-iterations K    Warmstart-Iterationen des Schrittschätzers (0: kalt, 60)
 --amr-pn-restart on|off      randgetriggerte P_N-Dilatation nach Neuvernetzung (Standard off)
+--amr-carry-pn on|off        P_N-Ordnungen über die Neuvernetzung mitnehmen (Standard on)
+--adaptive-floor F           lokale P_N-Toleranz (0 = global; empfohlen 1e-1)
+--amr-floor F                lokaler AMR-Indikator (0 = global; nicht empfohlen)
 M1PN_AMR_RADIUS_CHECK=1      zusätzlich kalter Radius je Neuvernetzung (Validierung)
 ```
 

@@ -548,6 +548,9 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         adaptive_plan_.init(s.dimension, s.nodes_per_axis, s.pn.order, s.active, o.adaptive_tile,
                             o.adaptive_tol, o.adaptive_hysteresis, o.adaptive_min_order, o.adaptive_halo);
         adaptive_plan_.restart = o.adaptive_restart;
+        adaptive_plan_.floor = o.adaptive_floor;
+        if (!o.adaptive_node_order.empty())
+            adaptive_plan_.set_preset_from_nodes(o.adaptive_node_order);
         s.init_adaptive_inflow_floor(adaptive_plan_);
         s.update_adaptive_side_q(adaptive_plan_);
         adaptive_rho_.resize(adaptive_plan_.num_tiles);

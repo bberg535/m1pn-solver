@@ -201,8 +201,33 @@ void test_table_window() {
     check(integral < 1e-12, "window integrals add up to the time integral", integral);
     check(win.width() < full.width() / 2, "window table is shorter", win.width());
 }
+void test_carried_orders() {
+    // Null invariant: moments above the node order vanish before the transfer -> above the mapped order after it.
+    std::array<amr::Axis, 3> A{axis(8, {0, 1, 2, 2, 1, 0, 0, 0}, {1.0}, 1), axis(8, {2, 2, 1, 0, 0, 1, 2, 1}, {1.0}, 1), {}};
+    std::array<amr::Axis, 3> B{axis(8, {1, 2, 1, 0, 0, 1, 1, 0}, {1.0}, 1), axis(8, {1, 1, 0, 0, 1, 2, 2, 2}, {1.0}, 1), {}};
+    const amr::Line ax = A[0].line(), ay = A[1].line();
+    std::array<int, 3> n{ax.nodes(), ay.nodes(), 1};
+    const int q = 36; // P5 moments, order of moment c: floor(sqrt(c))
+    std::mt19937 rng(5);
+    std::uniform_int_distribution<int> pick(0, 2);
+    std::vector<int> order(std::size_t(n[0]) * n[1]);
+    Field a = Field::Zero(long(order.size()), q);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        order[i] = 1 + 2 * pick(rng);
+        for (int c = 0; c < (order[i] + 1) * (order[i] + 1); ++c) a(long(i), c) = 1 + c;
+    }
+    std::array<amr::Rows, 3> T;
+    for (int d = 0; d < 2; ++d) T[d] = amr::transfer(A[d].line(), B[d].line());
+    const Field b = amr::apply(a, n, 2, T);
+    const auto ob = amr::apply_max(order, n, 2, T);
+    double leak = 0;
+    for (long i = 0; i < b.rows(); ++i)
+        for (int c = (ob[i] + 1) * (ob[i] + 1); c < q; ++c) leak = std::max(leak, std::abs(b(i, c)));
+    check(leak == 0, "carried PN orders keep the null invariant through the transfer", leak);
+}
 } // namespace
 int main() {
+    test_carried_orders();
     test_table_window();
     test_subdivision();
     test_transfer_1d();

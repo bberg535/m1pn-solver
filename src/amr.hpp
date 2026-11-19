@@ -227,6 +227,38 @@ inline Field apply(const Field &in, std::array<int, 3> n, int dim, const std::ar
     return cur;
 }
 
+// Carried adaptive-PN orders (coupling A): per new node the largest order of the old nodes in the support of its
+// transfer row (axis by axis). Every new node mixes only old nodes of order <= its order, so the null invariant of the
+// adaptive PN (moments above the tile order vanish) is kept by the transfer.
+inline std::vector<int> apply_max(const std::vector<int> &in, std::array<int, 3> n, int dim, const std::array<Rows, 3> &T) {
+    std::vector<int> cur = in;
+    for (int d = 0; d < dim; ++d) {
+        std::array<int, 3> m = n;
+        m[d] = T[d].rows();
+        long low = 1, high = 1;
+        for (int k = 0; k < d; ++k)
+            low *= n[k];
+        for (int k = d + 1; k < 3; ++k)
+            high *= n[k];
+        std::vector<int> out(std::size_t(m[0]) * m[1] * m[2], 0);
+        const Rows &R = T[d];
+        for (long line = 0; line < low * high; ++line) {
+            const long a = line % low, b = line / low;
+            const long in_base = a + b * low * n[d], out_base = a + b * low * m[d];
+            for (int I = 0; I < R.rows(); ++I) {
+                int v = 0;
+                for (int k = R.start[I]; k < R.start[I + 1]; ++k)
+                    if (R.w[k] != 0)
+                        v = std::max(v, cur[in_base + long(R.col[k]) * low]);
+                out[out_base + I * low] = v;
+            }
+        }
+        cur.swap(out);
+        n = m;
+    }
+    return cur;
+}
+
 // Base mesh and levels of one axis.
 struct Axis {
     std::vector<double> base;   // base planes (count_base + 1)
@@ -266,6 +298,7 @@ struct Settings {
     double tol = 1e-3;        // refine where eta > tol (eta relative to the largest density coefficient)
     double hysteresis = .25;  // coarsen where 4 eta < hysteresis * tol
     int buffer = 1;           // base cells of dilation around every refined cell (front motion per interval)
+    double floor = 0;         // coupling B: eta relative to max(local |u0|, floor * scale); 0: relative to scale
 };
 
 // Indicator per axis and base cell: eta = max over the nodes of the base cell (along d) of the second divided
@@ -274,7 +307,7 @@ struct Settings {
 // to the constant): coarsening multiplies it by 4. Differences never cross a broken line (separate continuous spaces).
 // low: nodes x 4 (density-like coefficient in column 0).
 inline std::array<std::vector<double>, 3> indicator(const Field &u4, int dim, const std::array<Axis, 3> &axes,
-                                                     double scale) {
+                                                     double scale, double floor = 0) {
     std::array<std::vector<double>, 3> eta;
     std::array<int, 3> n{1, 1, 1};
     std::array<Line, 3> L;
@@ -325,7 +358,10 @@ inline std::array<std::vector<double>, 3> indicator(const Field &u4, int dim, co
                     const double dd = 2 * ((up[c] - u0[c]) / hr - (u0[c] - um[c]) / hl) / (hl + hr);
                     m = std::max(m, std::abs(dd));
                 }
-                const double e = m * width[k] * width[k] * inv;
+                const double local = floor > 0 ? 1 / std::max({std::abs(um[0]), std::abs(u0[0]), std::abs(up[0]),
+                                                                  floor * scale, 1e-300})
+                                               : inv;
+                const double e = m * width[k] * width[k] * local;
                 mine[base_lo[k]] = std::max(mine[base_lo[k]], e);
                 mine[base_hi[k]] = std::max(mine[base_hi[k]], e);
             }

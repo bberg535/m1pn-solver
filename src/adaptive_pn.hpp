@@ -53,6 +53,22 @@ struct AdaptivePnPlan {
     // Dynamic AMR restart (docs/DYNAMIC_AMR.md): the initial adaptation of a transferred state dilates only across
     // borders with significant energy (as later updates), not around every tile above the minimum order.
     bool restart = false;
+    // Local relative tolerance (docs/DYNAMIC_AMR.md, coupling B): bounds per tile against max(rho_T, floor rho_max)
+    // instead of rho_max. 0: global (the original rule, bitwise).
+    double floor = 0;
+    // Carried orders (coupling A): per tile the order mapped from the previous mesh. The initial adaptation then starts
+    // from these orders like a regular update (+-2 with hysteresis, border-triggered dilation). Empty: none.
+    std::vector<int> preset;
+    // preset[T] = max over the nodes of tile T of node_order (odd, clamped).
+    void set_preset_from_nodes(const std::vector<int> &node_order) {
+        preset.assign(num_tiles, min_order);
+        for (int i = 0; i < nodes && i < int(node_order.size()); ++i) {
+            int &p = preset[node_tile(i)];
+            p = std::max(p, node_order[i]);
+        }
+        for (int &p : preset)
+            p = clamp_odd_order(p);
+    }
 
     std::vector<int> order_q;     // [0..max_order]: number of active moments with degree <= n
     std::vector<int> deg_start;   // [0..max_order+1]: start index of degree l in [0, q_max)
@@ -175,14 +191,18 @@ struct AdaptivePnPlan {
         for (int t = 0; t < num_tiles; ++t)
             rho_max = std::max(rho_max, tile_rho[t]);
         const double scale = std::max(rho_max, 1e-30);
-        const double bound_up = tol * scale;
-        const double bound_down = hysteresis * bound_up;
+        std::vector<double> up(num_tiles, tol * scale);
+        if (floor > 0)
+            for (int t = 0; t < num_tiles; ++t)
+                up[t] = tol * std::max(tile_rho[t], floor * scale);
+        const bool carried = initial && int(preset.size()) == num_tiles;
 
         std::vector<int> next_ord(num_tiles, min_order);
         for (int t = 0; t < num_tiles; ++t) {
             const double *E = &tile_E[std::size_t(t) * L1];
-            const int cur = initial ? max_order : tile_order[t];
-            if (initial) {
+            const double bound_up = up[t], bound_down = hysteresis * bound_up;
+            const int cur = carried ? preset[t] : (initial ? max_order : tile_order[t]);
+            if (initial && !carried) {
                 double tail_sq = 0.0;
                 int need = min_order;
                 for (int l = max_order; l >= min_order; --l) {
@@ -261,10 +281,10 @@ struct AdaptivePnPlan {
                             // Border-triggered dilation: propagate to face neighbor only when this tile's
                             // border strip facing that neighbor has significant angular energy.
                             const double *fe = &tile_face_E[std::size_t(t) * 6];
-                            const double face_thresh = (ord == 1) ? 0.25 * bound_up : bound_up;
+                            const double face_thresh = (ord == 1) ? 0.25 * up[t] : up[t];
                             bool active_face[6] = {};
                             for (int f = 0; f < 2 * dim; ++f)
-                                active_face[f] = (initial && !restart) ? (ord > min_order) : (fe[f] > face_thresh);
+                                active_face[f] = (initial && !restart && !carried) ? (ord > min_order) : (fe[f] > face_thresh);
                             const int step_d[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
                             for (int d = 0; d < dim; ++d) {
                                 for (int s = 0; s < 2; ++s) {
@@ -311,6 +331,8 @@ struct AdaptivePnPlan {
             tile_order[t] = next_ord[t];
             tile_q[t] = nq;
         }
+        if (carried)
+            preset.clear(); // used once (first adaptation on the transferred state)
         if (changed || initial)
             rebuild_worklists();
         return changed || initial;

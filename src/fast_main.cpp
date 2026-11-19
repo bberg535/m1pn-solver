@@ -13,6 +13,7 @@
 #include "element_weno_gpu.hpp"
 #endif
 #include "amr.hpp"
+#include <optional>
 #include "element_weno.hpp"
 #include "element_weno_mpi.hpp"
 #include "hardware.hpp"
@@ -85,7 +86,10 @@ struct Options {
     int amr_levels = 2, amr_min_level = 0, amr_buffer = 1;
     double amr_tol = 3e-3, amr_hysteresis = .25, amr_interval = 0; // interval 0: buffer * smallest base width
     bool amr_pn_restart = false; // border-triggered adaptive-PN dilation after a remesh (measured: fewer coefficients, worse field)
-    int amr_radius_iterations = 20; // warm-started power iteration per remesh (0: cold 60 iterations)
+    int amr_radius_iterations = 20;
+    double amr_floor = 0;       // coupling B: local relative AMR indicator (0: relative to the global maximum)
+    bool amr_carry_pn = true;   // coupling A: carry the adaptive-PN orders through remeshes (measured: fewer coefficients)
+    double adaptive_floor = 0;  // coupling B: local relative adaptive-PN tolerance (0: global) // warm-started power iteration per remesh (0: cold 60 iterations)
     std::string problem = "smooth", inflow = "vacuum", output = "tmp/run";
 };
 Options parse(int argc, char **argv) {
@@ -111,6 +115,7 @@ Options parse(int argc, char **argv) {
                    " --mirror-reduction auto|off (half/quarter/octant domain for mirror-symmetric cases)\n"
                    " --shadow-sigma S --beam-density B --material-subcells K --history-stride S --skip-fields\n"
                    " --amr on|off --amr-levels L --amr-min-level l --amr-tol T --amr-hysteresis H --amr-buffer B\n"
+                   "   --amr-floor F --amr-carry-pn on|off --adaptive-floor F (coupling, docs/DYNAMIC_AMR.md)\n"
                    "   --amr-interval DT --amr-radius-iterations K (dynamic AMR on graded tensor meshes, base = given mesh; docs/DYNAMIC_AMR.md)\n"
                    " --cells-per-unit n0,n1,... (graded mesh, 1D/2D, serial CPU: every axis is split into as many equal\n"
                    "   segments as entries, entry k = elements in segment k; e.g. lattice: 7 unit segments)\n"
@@ -296,6 +301,13 @@ Options parse(int argc, char **argv) {
         else if (key == "--amr-pn-restart") {
             require(v == "on" || v == "off", "--amr-pn-restart must be on or off");
             o.amr_pn_restart = v == "on";
+        } else if (key == "--amr-floor")
+            o.amr_floor = real();
+        else if (key == "--adaptive-floor")
+            o.adaptive_floor = real();
+        else if (key == "--amr-carry-pn") {
+            require(v == "on" || v == "off", "--amr-carry-pn must be on or off");
+            o.amr_carry_pn = v == "on";
         } else if (key == "--amr-radius-iterations")
             o.amr_radius_iterations = integer();
         else
@@ -699,6 +711,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     eo.adaptive_stride = o.adaptive_stride;
     eo.adaptive_min_order = o.adaptive_min_order;
     eo.adaptive_halo = o.adaptive_halo;
+    eo.adaptive_floor = o.adaptive_floor;
     // ---- First-collision source (docs/FCS.md) ----------------------------------------------------------------------
     // The grid carries the collided part psi_c (initially the isotropic floor), the Gaussian pulse is uncollided and
     // known analytically in the homogeneous infinite medium; it feeds sigma_s rho_u into psi_c.
@@ -1046,7 +1059,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                     u(long(i), 0) += unc[i] / std::sqrt(4 * pi);
             }
             const double scale = u.col(0).cwiseAbs().maxCoeff();
-            const auto e = amr::indicator(u, dim, axes, scale);
+            const auto e = amr::indicator(u, dim, axes, scale, o.amr_floor);
             for (int d = 0; d < dim; ++d) {
                 if (eta[d].empty())
                     eta[d] = e[d];
@@ -1523,8 +1536,11 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         }
         ++amr_remeshes;
 #ifdef M1PN_ELEMENT_GPU
+        std::optional<AdaptivePnPlan> old_gpu_plan;
         if (device) {
             a = device->end(stats);
+            if (device->adaptive_plan())
+                old_gpu_plan = *device->adaptive_plan();
             device.reset(); // holds a reference to the old scheme
         }
 #endif
@@ -1545,6 +1561,20 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             (lattice3d ? lattice3_table->points : lattice_table->points).clear();
         amr_next_window(); // with the old scheme's FCS points (absorption of the closing window)
         eo.adaptive_restart = o.amr_pn_restart; // efficiency iteration 3
+        eo.adaptive_node_order.clear();
+        if (o.amr_carry_pn && o.adaptive_pn) { // coupling A: node orders of the old mesh, mapped by the transfer support
+            const AdaptivePnPlan *P = scheme_ptr->adaptive_plan();
+#ifdef M1PN_ELEMENT_GPU
+            if (old_gpu_plan)
+                P = &*old_gpu_plan;
+#endif
+            if (P && P->num_tiles > 0) {
+                std::vector<int> order(scheme_ptr->nodes);
+                for (int i = 0; i < scheme_ptr->nodes; ++i)
+                    order[i] = P->tile_order[P->node_tile(i)];
+                eo.adaptive_node_order = amr::apply_max(order, scheme_ptr->nodes_per_axis, dim, T);
+            }
+        }
         build_scheme();
         t_amr_scheme += seconds() - c0;
         c0 = seconds();
@@ -1826,7 +1856,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
            << ",\"seconds\":{\"indicator\":" << t_amr_indicator << ",\"transfer\":" << t_amr_transfer
            << ",\"scheme\":" << t_amr_scheme << ",\"gpu_setup\":" << t_amr_gpu << ",\"table\":" << t_amr_table << ",\"step_estimate\":" << t_amr_radius
            << "},\"radius_iterations\":" << o.amr_radius_iterations << ",\"radius_cold_over_warm\":" << amr_radius_ratio
-           << ",\"angular_cache_loads\":" << (eo.angular_cache ? angular_cache_loads(*eo.angular_cache) : 0)
+           << ",\"floor\":" << o.amr_floor << ",\"carry_pn\":" << (o.amr_carry_pn ? "true" : "false")
+           << ",\"adaptive_floor\":" << o.adaptive_floor << ",\"angular_cache_loads\":" << (eo.angular_cache ? angular_cache_loads(*eo.angular_cache) : 0)
            << ",\"meshes\":[" << amr_log.str() << "]}"
            << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << out_scheme().cells
            << ",\"mpi_ranks\":" << ranks

@@ -46,6 +46,7 @@ public:
     double spectral_radius(int iterations, const std::array<Field, 2> *start, std::array<Field, 2> *end);
     // Lattice FCS: (re)build the device time table for the window of the shared table object (dynamic AMR).
     void build_lattice_table();
+    const AdaptivePnPlan *adaptive_plan() const { return adaptive_enabled_ ? &adaptive_plan_ : nullptr; }
     // Host-side profile.
     double t_boundary = 0, t_boundary_high = 0, t_face_data = 0, t_correction = 0, t_fallback = 0, t_wait = 0, t_sync = 0;
     long closure_fallbacks = 0, limiter_fallbacks = 0;

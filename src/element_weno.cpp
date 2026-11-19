@@ -1352,6 +1352,9 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         adaptive_plan_->init(dimension, nodes_per_axis, pn.order, active, o.adaptive_tile,
                              o.adaptive_tol, o.adaptive_hysteresis, o.adaptive_min_order, o.adaptive_halo);
         adaptive_plan_->restart = options.adaptive_restart;
+        adaptive_plan_->floor = options.adaptive_floor;
+        if (!options.adaptive_node_order.empty())
+            adaptive_plan_->set_preset_from_nodes(options.adaptive_node_order);
         init_adaptive_inflow_floor(*adaptive_plan_);
         update_adaptive_side_q(*adaptive_plan_);
         build_band_factors();
@@ -1500,6 +1503,9 @@ void ElementWeno::reset_adaptive_pn() const {
                          options.adaptive_tol, options.adaptive_hysteresis, options.adaptive_min_order,
                          options.adaptive_halo);
     adaptive_plan_->restart = options.adaptive_restart;
+        adaptive_plan_->floor = options.adaptive_floor;
+        if (!options.adaptive_node_order.empty())
+            adaptive_plan_->set_preset_from_nodes(options.adaptive_node_order);
     init_adaptive_inflow_floor(*adaptive_plan_);
     update_adaptive_side_q(*adaptive_plan_);
     adaptive_active_ = false;

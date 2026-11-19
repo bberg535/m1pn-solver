@@ -196,7 +196,9 @@ struct ElementWenoOptions {
     int adaptive_min_order = 1;
     int adaptive_halo = 1; // 0: off, 1: border-aware neighbor dilation, 2: full 3x3 dilation
     std::shared_ptr<ElementWenoAngularCache> angular_cache; // optional (see make_angular_cache)
-    bool adaptive_restart = false; // adaptive PN on a transferred state (dynamic AMR): border-triggered initial dilation
+    bool adaptive_restart = false;
+    double adaptive_floor = 0;                // local relative PN tolerance (AdaptivePnPlan::floor), 0: global
+    std::vector<int> adaptive_node_order;     // carried PN order per node (dynamic AMR), empty: none // adaptive PN on a transferred state (dynamic AMR): border-triggered initial dilation
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
