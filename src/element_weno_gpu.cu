@@ -59,6 +59,10 @@ struct View {
     int classes;
     bool structured;
     const int *strip_elem[2];         // broken 2D Q1: element line left/right of a node line (see GpuSetup)
+    // 2D Q1 strip kernel tables per size class (16 per class: nu K rows, C_0^T, C_1^T rows; one nu per class), per
+    // context in global memory. They were in __constant__ memory, which is shared by all contexts: with several graded
+    // blocks (m1pn_blocks) the last block's classes overwrote the others' (wrong results, cone failures).
+    const double *strip_kv, *strip_c0, *strip_c1, *strip_nu;
     const double *class_viscosity;    // classes (nullptr: viscosity)
     const double *ext_list;           // graded WENO extensions (ext_count x local x local)
     const int *ext_index;             // cells x 2 dimension (nullptr: extension[d][side])
@@ -792,8 +796,7 @@ __global__ void k_stabilization(View v, const double *a, double *result, bool wa
 }
 constexpr int max_strip_classes = 64; // graded 2D Q1: size classes held in constant memory for the strip kernel
 // 2D Q1 element tables per size class c at 16 c: stiffness rows, nu K, C_d^T rows; cNu[c]: viscosity.
-__constant__ double cK[16 * max_strip_classes], cKv[16 * max_strip_classes], cC0[16 * max_strip_classes],
-    cC1[16 * max_strip_classes], cNu[max_strip_classes];
+// (class tables: View::strip_kv, strip_c0, strip_c1, strip_nu)
 // 2D Q1: the gathered residual of node i only involves its 3 x 3 neighbourhood. One thread per (x, component) walks a
 // strip of SY rows in y with a sliding 3 x 3 window of a, g_0, g_1 in registers (9 loads per output); the four elements
 // around a node are visited as quadrants with compile-time local indices.
@@ -832,7 +835,7 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
                 const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
                 const int kc = 16 * klass_of(v, e);
                 const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
-                const double weight = -cNu[kc / 16] * g;
+                const double weight = -__ldg(v.strip_nu + kc / 16) * g;
                 // nu K a + weight (C_0^T g_0 + C_1^T g_1), nu K prescaled (cKv)
                 double stiff = 0, conv = 0;
 #pragma unroll
@@ -840,9 +843,9 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
 #pragma unroll
                     for (int mx = 0; mx < 2; ++mx) {
                         const int m = mx + 2 * my;
-                        stiff += cKv[kc + 4 * l + m] * W[0][qy + my][qx + mx];
-                        conv += cC0[kc + 4 * l + m] * W[1][qy + my][qx + mx] +
-                                cC1[kc + 4 * l + m] * W[2][qy + my][qx + mx];
+                        stiff += __ldg(v.strip_kv + kc + 4 * l + m) * W[0][qy + my][qx + mx];
+                        conv += __ldg(v.strip_c0 + kc + 4 * l + m) * W[1][qy + my][qx + mx] +
+                                __ldg(v.strip_c1 + kc + 4 * l + m) * W[2][qy + my][qx + mx];
                     }
                 const double term = stiff + weight * conv;
                 if (want_low && c < 4) {
@@ -2208,12 +2211,12 @@ Context *create(const Setup &s) {
             for (int k = 0; k < 16; ++k)
                 kv[16 * c + k] = nu[c] * s.stiffness_rows[16 * c + k];
         }
-        CK(cudaMemcpyToSymbol(cK, s.stiffness_rows, m * sizeof(double)));
-        CK(cudaMemcpyToSymbol(cKv, kv.data(), m * sizeof(double)));
-        CK(cudaMemcpyToSymbol(cC0, s.convection_t_rows[0], m * sizeof(double)));
-        CK(cudaMemcpyToSymbol(cC1, s.convection_t_rows[1], m * sizeof(double)));
-        CK(cudaMemcpyToSymbol(cNu, nu.data(), C * sizeof(double)));
-    }
+        v.strip_kv = own(dcopy(kv.data(), m));
+        v.strip_c0 = own(dcopy(s.convection_t_rows[0], m));
+        v.strip_c1 = own(dcopy(s.convection_t_rows[1], m));
+        v.strip_nu = own(dcopy(nu.data(), C));
+    } else
+        v.strip_kv = v.strip_c0 = v.strip_c1 = v.strip_nu = nullptr;
     v.weno = s.weno, v.stabilize = s.stabilize, v.limit = s.limit, v.outward_bar_rounding = s.outward_bar_rounding;
     v.scale_invariant_weno = s.scale_invariant_weno;
     v.weno_q = s.weno_q, v.weno_r = s.weno_r, v.weno_epsilon = s.weno_epsilon, v.weno_linear = s.weno_linear;
@@ -2621,9 +2624,11 @@ bool mass_solve_combine(Context *ctx, double *field, const double *x, const doub
                         double tau) {
     const View &v = ctx->v;
     const int last = v.dimension - 1;
+    // Default off: bitwise equal, but slower than mass_solve + combine_pn (P35 GB: 29.5 s against 23.0 s, job 162668;
+    // the fused solve reads the flux table and the gradient rows scattered). M1PN_GPU_FUSE=1 enables it.
     static const bool off = [] {
         const char *e = std::getenv("M1PN_GPU_FUSE");
-        return e && std::atoi(e) == 0;
+        return !(e && std::atoi(e) == 1);
     }();
     if (off || v.periodic || v.mirror_index[last] >= 0 || v.degree != 1) {
         mass_solve(ctx, field);
