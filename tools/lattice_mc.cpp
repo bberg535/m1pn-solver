@@ -15,6 +15,7 @@
 //
 // Reproducibility: history h of batch b draws from a counter-based stream (SplitMix64 of seed, stream, b, h); batch
 // sums are combined in batch order, so the result is bitwise independent of the thread count.
+#include "angular.hpp"
 #include "benchmark_cases.hpp"
 #include "uncollided_lattice.hpp"
 #include "uncollided_lattice3d.hpp"
@@ -108,6 +109,17 @@ struct Counters {
     }
 };
 
+// Angular moment census (pilot for the order map, docs/STATIC_HP_BLOCKS.md): on P x P pixels the weight times the real
+// spherical harmonics Y_k(Omega), k = l^2 + l + m <= (L + 1)^2 - 1, of the particles at the final time, i.e. the pixel
+// averages of u_k = <Y_k psi>(T) in the normalization of the solver (src/angular.hpp). keep: the stored full indices
+// (2D slab: the harmonics even in Omega_z). collided_only: particles that have scattered at least once (FCS: the
+// uncollided part is exact in the solver).
+struct MomentTally {
+    int pixels = 0, order = 0;
+    std::vector<int> keep;
+    bool collided_only = true;
+};
+
 void direction(Rng &r, double o[3]) {
     const double mu = 2 * r.uniform() - 1, phi = 2 * pi * r.uniform(), s = std::sqrt(std::max(0., 1 - mu * mu));
     o[0] = s * std::cos(phi), o[1] = s * std::sin(phi), o[2] = mu;
@@ -116,8 +128,10 @@ void direction(Rng &r, double o[3]) {
 // One history from (x, t0) with weight w0 (t0 < T); adds into acc[k * NQ + q] for all snapshot times t_k > t0.
 // Conventions: a particle at time t_k on a segment (t, t_end] with t_k <= t_end counts as mass; outflow at time t counts
 // for t_k > t only.
+// field (optional, 2D): P x P pixels over [0,7]^2; the weight at the final time is added to the pixel of the position.
 void history(const Geometry &g, const std::vector<double> &times, double x[3], double t0, double w0, Rng &r,
-             double *acc, Counters &cnt) {
+             double *acc, Counters &cnt, double *field = nullptr, int pixels = 0, const MomentTally *mt = nullptr,
+             double *moments = nullptr) {
     const int K = int(times.size());
     const double T = times.back();
     int c[3] = {0, 0, 0};
@@ -180,8 +194,23 @@ void history(const Geometry &g, const std::vector<double> &times, double x[3], d
         t = tend;
         while (first < K && times[first] <= t)
             ++first;
-        if (event == 0)
+        if (event == 0) {
+            if (field) {
+                const int ix = std::min(pixels - 1, std::max(0, int(x[0] / N * pixels)));
+                const int iy = std::min(pixels - 1, std::max(0, int(x[1] / N * pixels)));
+                field[std::size_t(iy) * pixels + ix] += w;
+            }
+            if (moments && (!mt->collided_only || collided)) {
+                const int P = mt->pixels, nk = int(mt->keep.size());
+                const int ix = std::min(P - 1, std::max(0, int(x[0] / N * P)));
+                const int iy = std::min(P - 1, std::max(0, int(x[1] / N * P)));
+                const m1pn::Vec Y = m1pn::harmonics(mt->order, V3(o[0], o[1], o[2]));
+                double *row = moments + (std::size_t(iy) * P + ix) * nk;
+                for (int j = 0; j < nk; ++j)
+                    row[j] += w * Y[mt->keep[j]];
+            }
             break;
+        }
         if (event == 1) {
             direction(r, o);
             eta = -std::log(r.open());
@@ -205,6 +234,8 @@ void history(const Geometry &g, const std::vector<double> &times, double x[3], d
 }
 
 struct Estimate {
+    std::vector<double> field_mean, field_stderr; // pixels^2, density (pixel average of rho at the final time)
+    std::vector<double> moment_mean, moment_stderr; // moment pixels^2 x keep.size(), pixel averages of u_k(T)
     std::vector<double> mean, stderr_; // K * NQ, already scaled to physical units
     Counters counters;
     double histories = 0, seconds = 0;
@@ -213,11 +244,15 @@ struct Estimate {
 // kind 0: source histories (t0 ~ U(0, T), x ~ U(source cell)), scale q0 |S| T / n per history.
 // kind 1: initial background (t0 = 0, x ~ U(domain)), scale background |D| / n per history.
 Estimate run(const Geometry &g, const std::vector<double> &times, int kind, double scale_total, long batches,
-             long per_batch, std::uint64_t seed) {
+             long per_batch, std::uint64_t seed, int pixels = 0, const MomentTally *mt = nullptr) {
     const int K = int(times.size());
     const double T = times.back();
     std::vector<double> sums(std::size_t(batches) * K * NQ, 0.);
     std::vector<Counters> counters(batches);
+    const std::size_t npix = std::size_t(pixels) * pixels;
+    std::vector<double> fields(std::size_t(batches) * npix, 0.);
+    const std::size_t nmom = mt && mt->pixels > 0 ? std::size_t(mt->pixels) * mt->pixels * mt->keep.size() : 0;
+    std::vector<double> moment_sums(std::size_t(batches) * nmom, 0.);
     const auto start = std::chrono::steady_clock::now();
 #pragma omp parallel for schedule(dynamic, 1)
     for (long b = 0; b < batches; ++b) {
@@ -233,7 +268,8 @@ Estimate run(const Geometry &g, const std::vector<double> &times, int kind, doub
             } else
                 for (int a = 0; a < g.dim; ++a)
                     x[a] = N * r.uniform();
-            history(g, times, x, t0, 1., r, acc, cnt);
+            history(g, times, x, t0, 1., r, acc, cnt, pixels ? &fields[std::size_t(b) * npix] : nullptr, pixels, mt,
+                    nmom ? &moment_sums[std::size_t(b) * nmom] : nullptr);
         }
         counters[b] = cnt;
     }
@@ -251,6 +287,34 @@ Estimate run(const Geometry &g, const std::vector<double> &times, int kind, doub
         }
         e.mean[q] = m;
         e.stderr_[q] = std::sqrt(std::max(0., m2) / (batches - 1) / batches);
+    }
+    if (pixels) { // pixel density: weight * scale / pixel area, mean and standard error over the batches (batch order)
+        const double area = double(N) / pixels * double(N) / pixels;
+        e.field_mean.assign(npix, 0.), e.field_stderr.assign(npix, 0.);
+        for (std::size_t k = 0; k < npix; ++k) {
+            double m = 0, m2 = 0;
+            for (long b = 0; b < batches; ++b) {
+                const double v = scale * fields[std::size_t(b) * npix + k] / area, d = v - m;
+                m += d / (b + 1);
+                m2 += d * (v - m);
+            }
+            e.field_mean[k] = m;
+            e.field_stderr[k] = std::sqrt(std::max(0., m2) / (batches - 1) / batches);
+        }
+    }
+    if (nmom) { // pixel moments: weight * Y * scale / pixel area, mean and standard error over the batches (batch order)
+        const double area = double(N) / mt->pixels * double(N) / mt->pixels;
+        e.moment_mean.assign(nmom, 0.), e.moment_stderr.assign(nmom, 0.);
+        for (std::size_t k = 0; k < nmom; ++k) {
+            double m = 0, m2 = 0;
+            for (long b = 0; b < batches; ++b) {
+                const double v = scale * moment_sums[std::size_t(b) * nmom + k] / area, d = v - m;
+                m += d / (b + 1);
+                m2 += d * (v - m);
+            }
+            e.moment_mean[k] = m;
+            e.moment_stderr[k] = std::sqrt(std::max(0., m2) / (batches - 1) / batches);
+        }
     }
     for (const auto &c : counters)
         e.counters.add(c);
@@ -328,6 +392,9 @@ int main(int argc, char **argv) {
         std::string name = "lattice-paul", output, check_times_arg;
         double T = 3.2, background = 1e-10;
         long histories = 1000000, batches = 1000, snapshots = 32;
+        int field_pixels = 0;
+        std::string field_output, moment_output;
+        MomentTally mt;
         std::uint64_t seed = 20261116;
         int check_panels = 0, check_order = 4;
         std::string times_arg;
@@ -358,14 +425,32 @@ int main(int argc, char **argv) {
                 output = next();
             else if (key == "--check-uncollided")
                 check_panels = std::stoi(next());
-            else if (key == "--check-order")
+            else if (key == "--field-pixels")
+                field_pixels = std::stoi(next());
+            else if (key == "--field-output")
+                field_output = next();
+            else if (key == "--moment-pixels")
+                mt.pixels = std::stoi(next());
+            else if (key == "--moment-order")
+                mt.order = std::stoi(next());
+            else if (key == "--moment-output")
+                moment_output = next();
+            else if (key == "--moment-part") {
+                const std::string v = next();
+                if (v != "collided" && v != "all")
+                    throw std::runtime_error("--moment-part collided|all");
+                mt.collided_only = v == "collided";
+            } else if (key == "--check-order")
                 check_order = std::stoi(next());
             else if (key == "--check-times")
                 check_times_arg = next();
             else if (key == "--help" || key == "-h") {
                 std::cout << "m1pn_lattice_mc --case lattice-paul|lattice-3d --time T [--times t1,..,T | --snapshots K]\n"
                              "  --histories N --batches B --seed S --background RHO0 --output FILE.json\n"
-                             "  --check-uncollided PANELS [--check-order G --check-times t1,..]  (analytic quadrature)\n";
+                             "  --check-uncollided PANELS [--check-order G --check-times t1,..]  (analytic quadrature)\n"
+                             "  --field-pixels P --field-output FILE.csv  (2D: pixel averages of rho(T) on P x P pixels)\n"
+                             "  --moment-pixels P --moment-order L --moment-output FILE.csv [--moment-part collided|all]\n"
+                             "      (2D: pixel averages of the angular moments u_k(T), k <= (L+1)^2 - 1, even in Omega_z)\n";
                 return 0;
             } else
                 throw std::runtime_error("unknown option " + key);
@@ -384,11 +469,34 @@ int main(int argc, char **argv) {
         const Geometry g = make_geometry(name);
         const int K = int(times.size());
         const long per_batch = histories / batches;
-        const Estimate src = run(g, times, 0, T /* q0 |S| T */, batches, per_batch, seed);
+        if (field_pixels > 0 && (g.dim != 2 || field_output.empty()))
+            throw std::runtime_error("--field-pixels: 2D case and --field-output required");
+        if (mt.pixels > 0) {
+            if (g.dim != 2 || moment_output.empty() || mt.order < 1)
+                throw std::runtime_error("--moment-pixels: 2D case, --moment-order >= 1 and --moment-output required");
+            // Harmonics even in Omega_z (the 2D slab solution is even in Omega_z), from fixed test directions.
+            const int q = (mt.order + 1) * (mt.order + 1);
+            std::vector<char> even(q, 1);
+            Rng r(seed, 99, 0, 0);
+            for (int t = 0; t < 16; ++t) {
+                double o[3];
+                direction(r, o);
+                const m1pn::Vec a = m1pn::harmonics(mt.order, V3(o[0], o[1], o[2]));
+                const m1pn::Vec b = m1pn::harmonics(mt.order, V3(o[0], o[1], -o[2]));
+                for (int k = 0; k < q; ++k)
+                    if (std::abs(a[k] - b[k]) > 1e-10 * (1 + std::abs(a[k])))
+                        even[k] = 0;
+            }
+            for (int k = 0; k < q; ++k)
+                if (even[k])
+                    mt.keep.push_back(k);
+        }
+        const MomentTally *mtp = mt.pixels > 0 ? &mt : nullptr;
+        const Estimate src = run(g, times, 0, T /* q0 |S| T */, batches, per_batch, seed, field_pixels, mtp);
         Estimate bg;
         const long bg_per_batch = std::max(1L, per_batch / 64);
         if (background > 0)
-            bg = run(g, times, 1, background * g.volume(), batches, bg_per_batch, seed);
+            bg = run(g, times, 1, background * g.volume(), batches, bg_per_batch, seed, field_pixels, mtp);
         std::ostringstream js;
         js << std::setprecision(17);
         js << "{\"case\":\"" << name << "\",\"dimension\":" << g.dim << ",\"final_time\":" << T
@@ -420,6 +528,49 @@ int main(int argc, char **argv) {
             for (int q = 0; q < K * NQ; ++q)
                 total.mean[q] += bg.mean[q], total.stderr_[q] = std::hypot(src.stderr_[q], bg.stderr_[q]);
         block("total", total);
+        if (field_pixels > 0) { // ix, iy, pixel centre, mean, standard error (source + background)
+            std::ofstream f(field_output);
+            f << std::setprecision(17) << "ix,iy,x,y,rho,stderr\n";
+            double field_mass = 0;
+            const double a = double(N) / field_pixels;
+            for (int iy = 0; iy < field_pixels; ++iy)
+                for (int ix = 0; ix < field_pixels; ++ix) {
+                    const std::size_t k = std::size_t(iy) * field_pixels + ix;
+                    const double m = src.field_mean[k] + (background > 0 ? bg.field_mean[k] : 0.);
+                    const double e = background > 0 ? std::hypot(src.field_stderr[k], bg.field_stderr[k]) : src.field_stderr[k];
+                    f << ix << "," << iy << "," << (ix + .5) * a << "," << (iy + .5) * a << "," << m << "," << e << "\n";
+                    field_mass += m * a * a;
+                }
+            if (!f)
+                throw std::runtime_error("cannot write " + field_output);
+            js << ",\"field\":{\"pixels\":" << field_pixels << ",\"file\":\"" << field_output
+               << "\",\"mass\":" << field_mass << "}";
+        }
+        if (mt.pixels > 0) { // ix, iy, pixel centre, full index k = l^2 + l + m, l, mean, standard error
+            std::ofstream f(moment_output);
+            f << std::setprecision(17) << "ix,iy,x,y,k,l,mean,stderr\n";
+            const double a = double(N) / mt.pixels;
+            const int nk = int(mt.keep.size());
+            double moment_mass = 0; // sqrt(4 pi) sum u_0 |pixel| = mass of the tallied part at T
+            for (int iy = 0; iy < mt.pixels; ++iy)
+                for (int ix = 0; ix < mt.pixels; ++ix)
+                    for (int j = 0; j < nk; ++j) {
+                        const std::size_t at = (std::size_t(iy) * mt.pixels + ix) * nk + j;
+                        const double m = src.moment_mean[at] + (background > 0 ? bg.moment_mean[at] : 0.);
+                        const double e = background > 0 ? std::hypot(src.moment_stderr[at], bg.moment_stderr[at])
+                                                        : src.moment_stderr[at];
+                        const int k = mt.keep[j], l = int(std::sqrt(double(k) + .5));
+                        f << ix << "," << iy << "," << (ix + .5) * a << "," << (iy + .5) * a << "," << k << "," << l << ","
+                          << m << "," << e << "\n";
+                        if (k == 0)
+                            moment_mass += std::sqrt(4 * pi) * m * a * a;
+                    }
+            if (!f)
+                throw std::runtime_error("cannot write " + moment_output);
+            js << ",\"moments\":{\"pixels\":" << mt.pixels << ",\"order\":" << mt.order << ",\"stored\":" << nk
+               << ",\"part\":\"" << (mt.collided_only ? "collided" : "all") << "\",\"file\":\"" << moment_output
+               << "\",\"mass\":" << moment_mass << "}";
+        }
         if (check_panels > 0) {
             std::vector<double> ct = check_times_arg.empty() ? std::vector<double>{T} : parse_list(check_times_arg);
             js << ",\"uncollided_check\":[";

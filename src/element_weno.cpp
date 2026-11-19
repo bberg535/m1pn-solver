@@ -1,6 +1,7 @@
 #include "element_weno.hpp"
 #include "base_bar.hpp"
 #include "parallel.hpp"
+#include <iostream>
 #include <algorithm>
 #include <atomic>
 #include <string>
@@ -8,6 +9,7 @@
 #include <sstream>
 #include <random>
 #ifdef _OPENMP
+#include <map>
 #include <omp.h>
 #endif
 #include <Eigen/Eigenvalues>
@@ -212,10 +214,65 @@ Field row_product(const Field &A, const Mat &B) {
 }
 } // namespace
 
+// Angular data shared between schemes on different meshes (dynamic AMR). Keyed by everything the angular block of the
+// constructor reads besides the angular basis itself (same Angular object required).
+struct ElementWenoAngularCache {
+    std::string key;
+    const Angular *pn = nullptr;
+    std::shared_ptr<CanonicalC1> canonical;
+    std::array<std::shared_ptr<Boundary>, 6> boundaries;
+    std::array<Mat, 6> boundary_flux_t, interface_t, exterior_t, datum_t;
+    std::array<Sparse, 6> interface_sparse_t;
+    std::array<ElementWeno::OutRule, 6> out_rules;
+    std::array<std::shared_ptr<const SeparableTrace>, 6> separable;
+    std::array<Field, 6> out_harmonics;
+    std::vector<ElementWeno::AdaptiveGhostTier> tiers;
+    long loads = 0;
+    bool load(ElementWeno &s) const {
+        if (pn != &s.pn || key != s.angular_key())
+            return false;
+        s.canonical_ = canonical, s.boundaries_ = boundaries;
+        s.boundary_flux_t_ = boundary_flux_t, s.interface_t_ = interface_t, s.exterior_t_ = exterior_t;
+        s.datum_t_ = datum_t, s.interface_sparse_t_ = interface_sparse_t, s.out_rules_ = out_rules;
+        s.separable_ = separable, s.out_harmonics_ = out_harmonics, s.adaptive_ghost_tiers_ = tiers;
+        ++const_cast<ElementWenoAngularCache *>(this)->loads;
+        return true;
+    }
+    void store(const ElementWeno &s) {
+        key = s.angular_key(), pn = &s.pn;
+        canonical = s.canonical_, boundaries = s.boundaries_;
+        boundary_flux_t = s.boundary_flux_t_, interface_t = s.interface_t_, exterior_t = s.exterior_t_;
+        datum_t = s.datum_t_, interface_sparse_t = s.interface_sparse_t_, out_rules = s.out_rules_;
+        separable = s.separable_, out_harmonics = s.out_harmonics_, tiers = s.adaptive_ghost_tiers_;
+    }
+};
+std::shared_ptr<ElementWenoAngularCache> make_angular_cache() { return std::make_shared<ElementWenoAngularCache>(); }
+long angular_cache_loads(const ElementWenoAngularCache &c) { return c.loads; }
+std::string ElementWeno::angular_key() const {
+    std::ostringstream k;
+    k << std::setprecision(17) << dimension << ' ' << moments << ' ' << options.reduce_angular << ' '
+      << options.positivity_projection << ' ' << options.projection_rule << ' ' << options.projection_half_range << ' '
+      << options.projection_incoming_weight << ' ' << options.projection_high_order << ' ' << broken_ << ' '
+      << options.adaptive_pn << ' ' << options.fullsphere_ghost << ' ' << options.periodic;
+    for (bool b : options.interface_side)
+        k << b;
+    for (int a : active)
+        k << ' ' << a;
+    return k.str();
+}
 ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, Inflow in)
     : pn(angular), options(o), inflow(std::move(in)), degree(o.degree), dimension(o.dimension),
       elements(o.elements) {
     require(degree >= 1 && degree <= 12, "Element WENO supports Bernstein degrees 1 to 12");
+    // Constructor phases to stderr with M1PN_CTOR_TIMING=1 (diagnostics only).
+    const bool ctor_timing = [] { const char *e = std::getenv("M1PN_CTOR_TIMING"); return e && std::atoi(e); }();
+    double ctor_last = seconds();
+    auto ctor_mark = [&](const char *what) {
+        const double now = seconds();
+        if (ctor_timing)
+            std::cerr << "ctor: " << what << " " << now - ctor_last << " s\n";
+        ctor_last = now;
+    };
     require(!o.m1_target || (angular.order == 1 && !o.periodic &&
                              std::none_of(o.mirror.begin(), o.mirror.end(), [](bool m) { return m; })),
             "The M1 target needs P1, an open mesh and no mirror sides");
@@ -230,7 +287,6 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     }
     require(o.elements_per_axis[0] == 0 || o.elements_per_axis[0] == o.elements,
             "elements_per_axis[0] must equal elements");
-    require(o.positivity_fraction > 0 && o.positivity_fraction < 1, "epsilon must lie in (0,1)");
     require(o.element_theta > 0 && o.element_theta < 1, "theta must lie in (0,1)");
     require(o.filter_strength >= 0 && std::isfinite(o.filter_strength), "Invalid filter strength");
     require(o.sigma_s >= 0 && o.sigma_a >= 0 && std::isfinite(o.sigma_s) && std::isfinite(o.sigma_a),
@@ -240,9 +296,51 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     const int p = degree, one = p + 1;
     require(o.length > 0 && std::isfinite(o.length), "Invalid element WENO domain length");
     h = o.length / elements;
+    graded_ = std::any_of(o.planes.begin(), o.planes.end(), [](const auto &v) { return !v.empty(); });
+    if (graded_) {
+        // Mirror sides (docs/STATIC_HP_BLOCKS.md, "Spiegelreduktion"): the mirrored neighbour has the own width
+        // (extension with width ratio 1), the 1D masses and their Dirichlet factors are assembled from the widths.
+        require(!o.periodic && std::none_of(o.cut.begin(), o.cut.end(), [](bool c) { return c; }) &&
+                    o.element_offset == std::array<int, 3>{0, 0, 0},
+                "Graded mesh: serial, open (docs/GRADED_MESH.md)");
+        require(!o.symmetric_residual, "Graded mesh: the symmetric residual form is not supported");
+        double smallest = std::numeric_limits<double>::infinity();
+        for (int d = 0; d < dimension; ++d) {
+            const auto &P = o.planes[d];
+            require(int(P.size()) == count[d] + 1, "Graded mesh: planes per axis must be count + 1");
+            require(P.front() == o.origin[d], "Graded mesh: the first plane is the origin");
+            axis_width_[d].resize(count[d]);
+            for (int i = 0; i < count[d]; ++i) {
+                axis_width_[d][i] = P[i + 1] - P[i];
+                require(axis_width_[d][i] > 0 && std::isfinite(axis_width_[d][i]), "Graded mesh: planes must increase");
+                smallest = std::min(smallest, axis_width_[d][i]);
+            }
+        }
+        h = smallest; // reporting only; every geometric quantity uses width() / volume()
+    }
+    broken_ = std::any_of(o.breaks.begin(), o.breaks.end(), [](const auto &v) { return !v.empty(); });
+    if (broken_) {
+        // Mirror sides allowed (the mirror plane is a domain end, never a broken line: 0 < k < count).
+        require(!o.periodic && std::none_of(o.cut.begin(), o.cut.end(), [](bool c) { return c; }) &&
+                    o.element_offset == std::array<int, 3>{0, 0, 0},
+                "Broken lines: serial, open mesh");
+        for (int d = 0; d < 3; ++d) {
+            const auto &k = o.breaks[d];
+            require(d < dimension || k.empty(), "Broken lines beyond the dimension");
+            for (std::size_t i = 0; i < k.size(); ++i)
+                require(k[i] > 0 && k[i] < count[d] && (i == 0 || k[i] > k[i - 1]),
+                        "Broken lines: increasing element lines 0 < k < count");
+            break_offset_[d].assign(std::max(1, count[d]), 0);
+            for (int e = 0, m = 0; e < count[d]; ++e) {
+                while (m < int(k.size()) && k[m] <= e)
+                    ++m;
+                break_offset_[d][e] = m;
+            }
+        }
+    }
     nodes = cells = local_nodes = 1;
     for (int d = 0; d < dimension; ++d) {
-        nodes_per_axis[d] = count[d] * p + (o.periodic ? 0 : 1);
+        nodes_per_axis[d] = count[d] * p + (o.periodic ? 0 : 1) + int(o.breaks[d].size());
         nodes *= nodes_per_axis[d];
         cells *= count[d];
         local_nodes *= one;
@@ -393,6 +491,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             extension_[d][side] = tensor(f, p);
         }
     }
+    ctor_mark("before connectivity");
     // Connectivity and von Neumann neighbors.
     connectivity_.resize(cells * local_nodes);
     neighbors_.assign(cells * 2 * dimension, -1);
@@ -402,7 +501,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int l = 0; l < local_nodes; ++l) {
             int x = l, global = 0, scale = 1;
             for (int d = 0; d < dimension; ++d) {
-                int coordinate = id[d] * p + x % one;
+                int coordinate = id[d] * p + x % one + (broken_ ? break_offset_[d][id[d]] : 0);
                 if (o.periodic)
                     coordinate %= nodes_per_axis[d];
                 global += coordinate * scale;
@@ -414,9 +513,11 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int d = 0; d < dimension; ++d)
             for (int side = 0; side < 2; ++side) {
                 const int next = id[d] + (side ? 1 : -1);
-                if (next >= 0 && next < count[d])
+                if (next >= 0 && next < count[d]) {
                     neighbors_[e * 2 * dimension + 2 * d + side] = e + (next - id[d]) * powers[d];
-                else if (o.periodic)
+                    if (broken_ && std::binary_search(o.breaks[d].begin(), o.breaks[d].end(), side ? next : id[d]))
+                        faces_.push_back({e, d, side}); // broken line: interface face with the element across
+                } else if (o.periodic)
                     neighbors_[e * 2 * dimension + 2 * d + side] =
                         e + ((next + count[d]) % count[d] - id[d]) * powers[d];
                 else if (o.mirror[2 * d + side])
@@ -425,6 +526,19 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                     faces_.push_back({e, d, side});
             }
     }
+    face_break_.assign(faces_.size(), 0);
+    for (std::size_t f = 0; f < faces_.size(); ++f)
+        face_break_[f] = neighbors_[faces_[f].element * 2 * dimension + 2 * faces_[f].direction + faces_[f].side] >= 0;
+    if (broken_)
+        for (int d = 0; d < dimension; ++d) {
+            node_coord_[d].assign(nodes_per_axis[d], 0.);
+            for (int e = 0; e < count[d]; ++e) {
+                const double x0 = graded_ ? o.planes[d][e] : o.origin[d] + e * h;
+                const double w = graded_ ? axis_width_[d][e] : h;
+                for (int j = 0; j < one; ++j)
+                    node_coord_[d][e * p + j + break_offset_[d][e]] = x0 + w * double(j) / p;
+            }
+        }
     // Element graph viscosity (report (10)), outward-rounded so |c|/d <= 1 is exact.
     viscosity_ij_ = Mat::Zero(local_nodes, local_nodes);
     for (int i = 0; i < local_nodes; ++i)
@@ -457,12 +571,139 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 pe.ct[d] = d < dimension ? convection_[d](j, i) : 0.;
             }
         }
+    ctor_mark("before graded classes");
+    // Graded mesh: element data per size class (docs/GRADED_MESH.md). With widths w: M = (prod w) M^, C_d =
+    // (prod_{k != d} w_k) C^_d, K_d = (prod_{k != d} w_k / w_d) K^_d; d_ij from the scaled c_ij as above.
+    // Stabilization with one viscosity per axis, nu_d = scale w_d / 2p (the uniform nu = scale h / 2p on cubes):
+    // nu_d (K_d a - gamma C_d^T g_d) is stored as nu (f_d K_d, f_d C_d^T) with nu = scale w_min / 2p, f_d = w_d / w_min.
+    // A single nu ~ w_max would make the stiffness of a stretched element w_max / w_min times too strong and cut the
+    // high-order step by that ratio.
+    if (graded_) {
+        std::array<std::vector<double>, 3> distinct;
+        for (int d = 0; d < dimension; ++d) {
+            distinct[d] = axis_width_[d];
+            std::sort(distinct[d].begin(), distinct[d].end());
+            distinct[d].erase(std::unique(distinct[d].begin(), distinct[d].end()), distinct[d].end());
+        }
+        std::map<std::array<int, 3>, int> index_of;
+        element_class_.resize(cells);
+        for (int e = 0; e < cells; ++e) {
+            std::array<int, 3> key{0, 0, 0}, id{e % count[0], (e / count[0]) % count[1], e / (count[0] * count[1])};
+            for (int d = 0; d < dimension; ++d)
+                key[d] = int(std::lower_bound(distinct[d].begin(), distinct[d].end(), axis_width_[d][id[d]]) -
+                             distinct[d].begin());
+            auto it = index_of.find(key);
+            if (it == index_of.end()) {
+                it = index_of.emplace(key, int(classes_.size())).first;
+                ElementClass c;
+                for (int d = 0; d < dimension; ++d)
+                    c.width[d] = distinct[d][key[d]];
+                std::vector<Mat> base(dimension, m1);
+                double vol = 1, wmin = std::numeric_limits<double>::infinity();
+                for (int d = 0; d < dimension; ++d)
+                    vol *= c.width[d], wmin = std::min(wmin, c.width[d]);
+                c.viscosity = o.viscosity_scale * wmin / (2. * p);
+                c.mass = vol * tensor(base, p);
+                c.stiffness = Mat::Zero(local_nodes, local_nodes);
+                for (int d = 0; d < 3; ++d)
+                    c.convection[d] = Mat::Zero(local_nodes, local_nodes);
+                for (int d = 0; d < dimension; ++d) {
+                    auto fc = base, fk = base;
+                    fc[d] = c1;
+                    fk[d] = k1;
+                    const double side_area = vol / c.width[d];
+                    c.convection[d] = side_area * tensor(fc, p);
+                    c.stiffness += (c.width[d] / wmin) * (side_area / c.width[d]) * tensor(fk, p);
+                }
+                c.viscosity_ij = Mat::Zero(local_nodes, local_nodes);
+                for (int i = 0; i < local_nodes; ++i)
+                    for (int j = 0; j < local_nodes; ++j) {
+                        if (i == j)
+                            continue;
+                        V3 cij = V3::Zero(), cji = V3::Zero();
+                        for (int d = 0; d < dimension; ++d)
+                            cij[d] = c.convection[d](i, j), cji[d] = c.convection[d](j, i);
+                        double value_ij = std::max(cij.norm(), cji.norm());
+                        while (value_ij > 0 && (!exact::cone(Four(value_ij, cij[0], cij[1], cij[2])) ||
+                                                !exact::cone(Four(value_ij, cji[0], cji[1], cji[2]))))
+                            value_ij = std::nextafter(value_ij, std::numeric_limits<double>::infinity());
+                        c.viscosity_ij(i, j) = value_ij;
+                    }
+                c.viscosity_ij = c.viscosity_ij.cwiseMax(Mat(c.viscosity_ij.transpose()));
+                c.pairs.resize(std::size_t(local_nodes) * (local_nodes - 1));
+                for (int i = 0, k = 0; i < local_nodes; ++i)
+                    for (int j = 0; j < local_nodes; ++j) {
+                        if (j == i)
+                            continue;
+                        PairEntry &pe = c.pairs[k++];
+                        pe.j = j, pe.d = c.viscosity_ij(i, j), pe.m = c.mass(i, j);
+                        for (int d = 0; d < 3; ++d) {
+                            pe.c[d] = d < dimension ? c.convection[d](i, j) : 0.;
+                            pe.ct[d] = d < dimension ? c.convection[d](j, i) : 0.;
+                        }
+                    }
+                c.total_viscosity = c.viscosity_ij.rowwise().sum();
+                c.mass_row = c.mass.rowwise().sum();
+                c.stiffness_rows.resize(std::size_t(local_nodes) * local_nodes);
+                for (int d = 0; d < dimension; ++d)
+                    c.convection_t_rows[d].resize(std::size_t(local_nodes) * local_nodes);
+                for (int l = 0; l < local_nodes; ++l)
+                    for (int m = 0; m < local_nodes; ++m) {
+                        c.stiffness_rows[std::size_t(l) * local_nodes + m] = c.stiffness(l, m);
+                        for (int d = 0; d < dimension; ++d)
+                            c.convection_t_rows[d][std::size_t(l) * local_nodes + m] =
+                                (c.width[d] / wmin) * c.convection[d](m, l);
+                    }
+                classes_.push_back(std::move(c));
+            }
+            element_class_[e] = it->second;
+        }
+        // WENO extension of a neighbour of width r w onto this element (width w), per axis, side and ratio r:
+        // the neighbour's polynomial at reference s of this element is at t = s / r + 1 (low side) or (s - 1) / r.
+        Eigen::LDLT<Mat> m1_ldlt(m1);
+        std::map<std::array<double, 3>, int> ext_of; // (axis, side, ratio)
+        extension_index_.assign(std::size_t(cells) * 2 * dimension, -1);
+        for (int e = 0; e < cells; ++e) {
+            std::array<int, 3> id{e % count[0], (e / count[0]) % count[1], e / (count[0] * count[1])};
+            for (int d = 0; d < dimension; ++d)
+                for (int side = 0; side < 2; ++side) {
+                    const int next = neighbors_[e * 2 * dimension + 2 * d + side];
+                    if (next == -1)
+                        continue;
+                    // -2: mirror side, the neighbour is this element reflected (same width, ratio 1)
+                    const double r = next == -2 ? 1. : axis_width_[d][id[d] + (side ? 1 : -1)] / axis_width_[d][id[d]];
+                    const std::array<double, 3> key{double(d), double(side), r};
+                    auto it = ext_of.find(key);
+                    if (it == ext_of.end()) {
+                        Mat load = Mat::Zero(one, one);
+                        for (int q = 0; q < xq.size(); ++q) {
+                            const double t = side ? (xq[q] - 1) / r : xq[q] / r + 1;
+                            for (int i = 0; i < one; ++i)
+                                for (int j = 0; j < one; ++j)
+                                    load(i, j) += wq[q] * bernstein(i, p, 0, xq[q]) * bernstein(j, p, 0, t);
+                        }
+                        std::vector<Mat> f(dimension, Mat::Identity(one, one));
+                        f[d] = m1_ldlt.solve(load);
+                        it = ext_of.emplace(key, int(extension_list_.size())).first;
+                        extension_list_.push_back(tensor(f, p));
+                    }
+                    extension_index_[std::size_t(e) * 2 * dimension + 2 * d + side] = it->second;
+                }
+        }
+    }
+    ctor_mark("before lumped and 1D masses");
     // Lumped masses, one-dimensional consistent mass factor, boundary rules.
     lumped = Vec::Zero(nodes);
-    const Vec row = mass_.rowwise().sum();
-    for (int e = 0; e < cells; ++e)
-        for (int l = 0; l < local_nodes; ++l)
-            lumped[connectivity_[e * local_nodes + l]] += row[l];
+    if (graded_) {
+        for (int e = 0; e < cells; ++e)
+            for (int l = 0; l < local_nodes; ++l)
+                lumped[connectivity_[e * local_nodes + l]] += klass(e).mass_row[l];
+    } else {
+        const Vec row = mass_.rowwise().sum();
+        for (int e = 0; e < cells; ++e)
+            for (int l = 0; l < local_nodes; ++l)
+                lumped[connectivity_[e * local_nodes + l]] += row[l];
+    }
     // Assembled one-dimensional mass and convection matrices per axis (they differ only in the element count).
     std::array<Eigen::SparseMatrix<double>, 3> m1d;
     for (int d = 0; d < dimension; ++d) {
@@ -471,10 +712,11 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int e = 0; e < count[d]; ++e)
             for (int i = 0; i < one; ++i)
                 for (int j = 0; j < one; ++j) {
-                    int a = e * p + i, b = e * p + j;
+                    const int shift = broken_ ? break_offset_[d][e] : 0;
+                    int a = e * p + i + shift, b = e * p + j + shift;
                     if (o.periodic)
                         a %= n1, b %= n1;
-                    triplets.emplace_back(a, b, h * m1(i, j));
+                    triplets.emplace_back(a, b, (graded_ ? axis_width_[d][e] : h) * m1(i, j));
                     m1_reference_ = m1;
                     entries.emplace_back(a, b, c1(i, j));
                 }
@@ -496,6 +738,16 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             for (int d = 0; d < dimension; ++d)
                 convection_t_rows_[d][std::size_t(l) * local_nodes + m] = convection_[d](m, l);
         }
+    if (!graded_) { // the single class of the uniform mesh: copies of the members above (bitwise the old data)
+        ElementClass c;
+        c.width = V3(h, dimension > 1 ? h : 1., dimension > 2 ? h : 1.);
+        c.viscosity = viscosity;
+        c.mass = mass_, c.stiffness = stiffness_, c.viscosity_ij = viscosity_ij_, c.convection = convection_;
+        c.pairs = pair_table_;
+        c.mass_row = mass_.rowwise().sum();
+        c.stiffness_rows = stiffness_rows_, c.convection_t_rows = convection_t_rows_;
+        classes_.assign(1, std::move(c)); // total_viscosity is set with total_viscosity_ below
+    }
     for (int d = 0; d < dimension; ++d) {
         flux_t_[d] = Mat(restrict_square(Mat(pn.A[d]), "A_d").transpose()).sparseView();
         flux_t_[d].makeCompressed();
@@ -568,6 +820,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             if ((i / stride(d)) % nodes_per_axis[d] == removed)
                 mirror_nodes_[d].push_back(i);
     }
+    ctor_mark("before nodal reaction data");
     // Nodal reaction data: positive averages int c phi_i / int phi_i by composite Gauss quadrature.
     node_sigma_a = node_sigma_s = node_source = Vec::Zero(nodes);
     if (o.material) {
@@ -588,7 +841,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         int points = 1;
         for (int d = 0; d < dimension; ++d)
             points *= per;
-        const double volume = std::pow(h, dimension);
+        const double uniform_volume = std::pow(h, dimension);
         // Element by element in parallel into per-element buffers, then gathered in element order (deterministic,
         // independent of the thread count).
         std::vector<double> local(std::size_t(cells) * local_nodes * 4, 0.), element_integrals(std::size_t(cells) * 4, 0.);
@@ -598,11 +851,11 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             double *loc = &local[std::size_t(e) * local_nodes * 4], *ints = &element_integrals[std::size_t(e) * 4];
             for (int point = 0; point < points; ++point) {
                 V3 x = origin;
-                double w = volume;
+                double w = graded_ ? this->volume(e) : uniform_volume;
                 std::array<int, 3> idx{0, 0, 0};
                 for (int d = 0, k = point; d < dimension; ++d, k /= per) {
                     idx[d] = k % per;
-                    x[d] += h * x1[idx[d]];
+                    x[d] += width(e, d) * x1[idx[d]];
                     w *= w1[idx[d]];
                 }
                 const double ca = mat.sigma_a ? mat.sigma_a(x) : 0., cs = mat.sigma_s ? mat.sigma_s(x) : 0.,
@@ -649,7 +902,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         fcs_shape_.resize(local_nodes, points);
         std::vector<double> wref(points);
         for (int k = 0; k < points; ++k) {
-            double w = std::pow(h, dimension);
+            double w = graded_ ? 1. : std::pow(h, dimension); // graded: times volume(e) per element
             std::array<int, 3> idx{0, 0, 0};
             for (int d = 0, r = k; d < dimension; ++d, r /= per)
                 idx[d] = r % per, w *= gw[idx[d]];
@@ -669,26 +922,40 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             element_origin(e, origin);
             for (int k = 0; k < points; ++k) {
                 V3 x = origin;
-                for (int d = 0, r = k; d < dimension; ++d, r /= per)
-                    x[d] += h * gx[r % per];
+                if (graded_)
+                    for (int d = 0, r = k; d < dimension; ++d, r /= per)
+                        x[d] += width(e, d) * gx[r % per];
+                else
+                    for (int d = 0, r = k; d < dimension; ++d, r /= per)
+                        x[d] += h * gx[r % per];
                 const std::size_t at = std::size_t(e) * points + k;
                 fcs_points_[at] = x;
-                fcs_weight_[at] = wref[k];
+                if (graded_)
+                    fcs_weight_[at] = wref[k] * this->volume(e);
+                else
+                    fcs_weight_[at] = wref[k];
                 const double ss = (o.material && o.material->sigma_s ? o.material->sigma_s(x) : 0.) + o.sigma_s;
                 require(ss >= 0 && std::isfinite(ss), "FCS: sigma_s must be finite and nonnegative");
                 fcs_sigma_s_[at] = ss;
             }
         });
         fcs_node_mass_ = Vec::Zero(nodes);
-        for (int e = 0; e < cells; ++e)
-            for (int l = 0; l < local_nodes; ++l)
-                for (int k = 0; k < points; ++k)
-                    fcs_node_mass_[connectivity_[e * local_nodes + l]] += wref[k] * fcs_shape_(l, k);
+        if (graded_)
+            for (int e = 0; e < cells; ++e)
+                for (int l = 0; l < local_nodes; ++l)
+                    for (int k = 0; k < points; ++k)
+                        fcs_node_mass_[connectivity_[e * local_nodes + l]] += wref[k] * this->volume(e) * fcs_shape_(l, k);
+        else
+            for (int e = 0; e < cells; ++e)
+                for (int l = 0; l < local_nodes; ++l)
+                    for (int k = 0; k < points; ++k)
+                        fcs_node_mass_[connectivity_[e * local_nodes + l]] += wref[k] * fcs_shape_(l, k);
     }
     if (!o.periodic) {
         const auto [fx, fw] = unit_gauss(p + pn.order + 3);
         const int nfp = dimension == 1 ? 1 : (dimension == 2 ? fx.size() : fx.size() * fx.size());
         const int nfn = dimension == 1 ? 1 : (dimension == 2 ? one : one * one);
+        ctor_mark("before boundary rules");
         for (int d = 0; d < dimension; ++d)
             for (int side = 0; side < 2; ++side) {
                 FaceRule &rule = rules_[2 * d + side];
@@ -717,7 +984,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                         a /= fx.size();
                     }
                     rule.points.row(q) = ref.transpose();
-                    rule.weights[q] = weight * area;
+                    rule.weights[q] = weight * (graded_ ? 1. : area); // graded: times face_scale_ per face
                     for (int n = 0; n < nfn; ++n) {
                         int x = rule.local[n];
                         double value_n = 1;
@@ -728,10 +995,18 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
                 rule.mass = rule.shape * rule.weights.asDiagonal() * rule.shape.transpose();
             }
+        ctor_mark("before face scales");
+        face_scale_.assign(faces_.size(), 1.);
+        if (graded_)
+            for (std::size_t f = 0; f < faces_.size(); ++f)
+                for (int d = 0; d < dimension; ++d)
+                    if (d != faces_[f].direction)
+                        face_scale_[f] *= width(faces_[f].element, d);
         boundary_slot_.assign(nodes, -1);
         ghost_of_face_.reserve(faces_.size() * nfn);
         std::array<std::vector<int>, 6> ghost_slot;
-        for (const auto &f : faces_) {
+        for (std::size_t fi = 0; fi < faces_.size(); ++fi) {
+            const auto &f = faces_[fi];
             const int side_id = 2 * f.direction + f.side;
             if (ghost_slot[side_id].empty())
                 ghost_slot[side_id].assign(nodes, -1);
@@ -741,6 +1016,10 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                     boundary_slot_[node] = boundary_nodes_.size();
                     boundary_nodes_.push_back(node);
                 }
+                if (o.interface_side[side_id] || face_break_[fi]) { // interface faces: neighbour exterior, no ghost
+                    ghost_of_face_.push_back(-1);
+                    continue;
+                }
                 if (ghost_slot[side_id][node] < 0) {
                     ghost_slot[side_id][node] = ghost_node_.size();
                     ghost_node_.push_back(node);
@@ -749,22 +1028,35 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 ghost_of_face_.push_back(ghost_slot[side_id][node]);
             }
         }
+        vacuum_limit_node_.assign(nodes, 0);
+        for (std::size_t fi = 0; fi < faces_.size(); ++fi) {
+            const int side_id = 2 * faces_[fi].direction + faces_[fi].side;
+            if (o.interface_side[side_id] || face_break_[fi])
+                continue;
+            for (int l : rules_[side_id].local)
+                vacuum_limit_node_[connectivity_[faces_[fi].element * local_nodes + l]] = 1;
+        }
         for (std::size_t k = 0; k < ghost_node_.size(); ++k)
             ghost_by_side_[ghost_side_[k]].push_back(int(k));
         // Face rows (add_boundary): the rows of face f are face_row_[f] + n, n < nf; the faces of one side are
         // contiguous (rows side_row_start_[s] ..), in ascending face index. boundary_rows_ lists, per boundary slot,
         // the rows of its node in ascending face index (the order of the former serial reduction).
+        ctor_mark("before face rows");
         face_row_.assign(faces_.size(), 0);
         side_row_start_.fill(0);
         {
             int row = 0;
             for (int side = 0; side < 6; ++side) {
                 side_row_start_[side] = row;
-                for (std::size_t index = 0; index < faces_.size(); ++index)
-                    if (2 * faces_[index].direction + faces_[index].side == side) {
-                        face_row_[index] = row;
-                        row += int(rules_[side].local.size());
-                    }
+                for (int broken = 0; broken < 2; ++broken) { // domain faces first, then the broken-line faces
+                    if (broken)
+                        break_row_start_[side] = row;
+                    for (std::size_t index = 0; index < faces_.size(); ++index)
+                        if (2 * faces_[index].direction + faces_[index].side == side && face_break_[index] == broken) {
+                            face_row_[index] = row;
+                            row += int(rules_[side].local.size());
+                        }
+                }
             }
             side_row_start_[6] = row;
             face_row_side_.assign(row, 0);
@@ -786,6 +1078,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             for (const auto &list : per_slot)
                 boundary_rows_.insert(boundary_rows_.end(), list.begin(), list.end());
         }
+        ctor_mark("before projection warm");
         if (options.positivity_projection)
             projection_warm_.assign(ghost_node_.size(), PositivityProjectionWarm{});
         if (options.ghost_filter > 0) {
@@ -795,15 +1088,32 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 ghost_sigma_[c] = l <= 1 ? 1. : std::exp(-options.ghost_filter * std::pow(l / (angular.order + 1.), 4));
             }
         }
+        ctor_mark("before canonical C1");
+        if (options.angular_cache && options.angular_cache->load(*this))
+            angular_cached_ = true;
+        else {
         canonical_ = std::make_unique<CanonicalC1>(pn);
-        for (int d = 0; d < dimension; ++d)
-            for (int side = 0; side < 2; ++side) {
+        ctor_mark("before per-side out rules/separable/facets");
+        // The sides are independent (each writes only its own slots): built in parallel, the same data as serially.
+        parallel_for(2 * dimension, [&](int side_id) {
+            {
+                const int d = side_id / 2, side = side_id % 2;
                 V3 normal = V3::Zero();
                 normal[d] = side ? 1 : -1;
                 boundaries_[2 * d + side] = std::make_unique<Boundary>(pn, *canonical_, normal, false, false);
                 // Face integrand .5 (A_n - I)(u - exterior(u, datum)) = (A_n - llf_homogeneous) u - llf_datum datum.
                 boundary_flux_t_[2 * d + side] =
                     restrict_square(pn.normal(normal) - boundaries_[2 * d + side]->llf_homogeneous, "boundary flux").transpose();
+                if (options.interface_side[2 * d + side] || broken_) {
+                    interface_t_[2 * d + side] =
+                        restrict_square(.5 * (pn.normal(normal) - Mat::Identity(pn.q, pn.q)), "interface flux").transpose();
+                    interface_sparse_t_[2 * d + side] = interface_t_[2 * d + side].sparseView();
+                    interface_sparse_t_[2 * d + side].makeCompressed();
+                }
+                if (options.interface_side[2 * d + side]) {
+                    require(bool(options.interface_trace), "Interface side without interface_trace");
+                    boundary_flux_t_[2 * d + side] = interface_t_[2 * d + side];
+                }
                 if (options.projection_high_order)
                     exterior_t_[2 * d + side] =
                         restrict_square(boundaries_[2 * d + side]->llf_homogeneous -
@@ -868,22 +1178,106 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
                 out_harmonics_[2 * d + side] = out.harmonics;
             }
+        });
+        } // angular data built (not from the cache)
     }
+    if (!angular_cached_ && options.adaptive_pn && options.fullsphere_ghost && options.positivity_projection &&
+        options.projection_rule == 0) {
+        constexpr int kTierOrders[] = {3, 7, 15};
+        std::vector<int> hemispheres{+1};
+        if (!options.projection_half_range)
+            hemispheres.push_back(-1);
+        for (int tier_ord : kTierOrders) {
+            if (tier_ord >= pn.order)
+                continue;
+            std::vector<int> active_tier;
+            for (int g : active) {
+                const int l = int(std::sqrt(double(g) + .5));
+                if (l <= tier_ord)
+                    active_tier.push_back(g);
+            }
+            if (active_tier.empty())
+                continue;
+            AdaptiveGhostTier tier;
+            tier.max_order = tier_ord;
+            tier.q_tier = int(active_tier.size());
+            const int rule_n = tier_ord + 1;
+            for (int side_id = 0; side_id < 6; ++side_id) {
+                if (!boundaries_[side_id])
+                    continue;
+                OutRule &out = tier.out_rules[side_id];
+                auto points = sphere_rule(rule_n, +1);
+                out.outgoing = int(points.size());
+                if (!options.projection_half_range) {
+                    const auto incoming = sphere_rule(rule_n, -1);
+                    points.insert(points.end(), incoming.begin(), incoming.end());
+                }
+                out.omega.resize(points.size(), 3);
+                out.weight.resize(points.size());
+                for (std::size_t k = 0; k < points.size(); ++k) {
+                    const V3 w = boundaries_[side_id]->frame * points[k].omega;
+                    out.omega.row(k) = w.transpose();
+                    out.weight[k] = points[k].weight;
+                }
+                out.ox = out.omega.col(0);
+                out.oy = out.omega.col(1);
+                out.oz = out.omega.col(2);
+                tier.separable[side_id] = std::make_shared<SeparableTrace>(
+                    tier_ord, active_tier, boundaries_[side_id]->frame, rule_n, hemispheres);
+                std::vector<double> rings;
+                for (int h : hemispheres) {
+                    const auto local = sphere_rule(rule_n, h);
+                    for (std::size_t k = 0; k < local.size(); k += 2 * rule_n + 4)
+                        rings.push_back(local[k].omega[2]);
+                }
+                out.facets = lat_long_facets(rings, 2 * rule_n + 4, boundaries_[side_id]->frame);
+                if (options.projection_incoming_weight != 1 && !options.projection_half_range) {
+                    const int all = int(out.weight.size());
+                    out.c = Vec::Ones(all);
+                    out.c.tail(all - out.outgoing).setConstant(options.projection_incoming_weight);
+                    out.cinv = out.c.cwiseInverse();
+                }
+                require(out.facets.count() > 0, "Adaptive ghost tier: hull facets failed verification");
+            }
+            adaptive_ghost_tiers_.push_back(std::move(tier));
+        }
+    }
+    if (options.angular_cache && !angular_cached_)
+        options.angular_cache->store(*this);
+    ctor_mark("before rates");
     // Forward Euler bound of report (19), including the boundary bar states.
     Vec rates = Vec::Zero(nodes);
     const Vec sum = viscosity_ij_.rowwise().sum();
     for (int e = 0; e < cells; ++e)
         for (int l = 0; l < local_nodes; ++l)
-            rates[connectivity_[e * local_nodes + l]] += 2 * sum[l];
-    for (const auto &f : faces_) {
+            rates[connectivity_[e * local_nodes + l]] += 2 * (graded_ ? klass(e).total_viscosity[l] : sum[l]);
+    bool any_nodal = false;
+    for (int s = 0; s < 6; ++s)
+        any_nodal = any_nodal || nodal_interface(s);
+    const bool split = options.split_breaks && (broken_ || any_nodal);
+    split_active_ = split;
+    require(!options.split_breaks || ((broken_ || any_nodal) && !o.periodic),
+            "split_breaks: broken lines or conforming interfaces, open mesh, serial");
+    Vec break_rates = Vec::Zero(nodes); // split_breaks: the broken-line face weights A_i (second convex step)
+    for (std::size_t fi = 0; fi < faces_.size(); ++fi) {
+        const auto &f = faces_[fi];
         const auto &rule = rules_[2 * f.direction + f.side];
         for (std::size_t n = 0; n < rule.local.size(); ++n)
-            rates[connectivity_[f.element * local_nodes + rule.local[n]]] +=
-                (rule.shape.row(n).transpose().array() * rule.weights.array()).sum();
+            (split && split_face(fi) ? break_rates : rates)[connectivity_[f.element * local_nodes + rule.local[n]]] +=
+                face_scale_[fi] * (rule.shape.row(n).transpose().array() * rule.weights.array()).sum();
     }
     node_dt_bound = lumped.array() / rates.array();
+    if (split) { // both convex steps: tau (sum 2 tv + A_dom) <= m and tau A_break <= m
+        for (int i = 0; i < nodes; ++i)
+            if (break_rates[i] > 0) {
+                node_dt_bound[i] = std::min(node_dt_bound[i], lumped[i] / break_rates[i]);
+                split_nodes_.push_back(i);
+            }
+    }
     dt_bound = node_dt_bound.minCoeff();
     total_viscosity_ = viscosity_ij_.rowwise().sum();
+    if (!graded_)
+        classes_[0].total_viscosity = total_viscosity_;
     node_offsets_.assign(nodes + 1, 0);
     for (int entry = 0; entry < cells * local_nodes; ++entry)
         ++node_offsets_[connectivity_[entry] + 1];
@@ -895,6 +1289,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int entry = 0; entry < cells * local_nodes; ++entry)
             node_entries_[fill[connectivity_[entry]]++] = entry;
     }
+    ctor_mark("before inflow data");
     // A constant inflow density gives the same angular data at every boundary
     // point of one normal; evaluate that part once instead of per point and stage.
     if (!o.periodic && inflow.density && inflow.constant_density) {
@@ -917,7 +1312,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             for (std::size_t point = 0; point < points; ++point) {
                 V3 x = origin;
                 for (int d = 0; d < dimension; ++d)
-                    x[d] += h * rule.points(point, d);
+                    x[d] += width(f.element, d) * rule.points(point, d);
                 steady_data_[index * points + point] = face_data(side_id, x, 0.);
             }
         });
@@ -934,7 +1329,8 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 bool uniform = true;
                 for (std::size_t point = 1; point < points && uniform; ++point)
                     uniform = same(first, steady_data_[std::size_t(index) * points + point]);
-                face_uniform_[index] = uniform;
+                face_uniform_[index] = uniform && !o.interface_side[2 * faces_[index].direction + faces_[index].side] &&
+                                       !face_break_[index];
                 for (int n = 0; n < int(rule.local.size()); ++n) {
                     double w = 0;
                     for (std::size_t point = 0; point < points; ++point) {
@@ -942,7 +1338,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                         if (weight != 0)
                             w += weight;
                     }
-                    face_weight_[face_row_[index] + n] = w;
+                    face_weight_[face_row_[index] + n] = face_scale_[index] * w;
                 }
             });
         }
@@ -951,6 +1347,366 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         boundary_nodes_sorted_ = boundary_nodes_;
         std::sort(boundary_nodes_sorted_.begin(), boundary_nodes_sorted_.end());
     }
+    if (o.adaptive_pn && !o.periodic) {
+        adaptive_plan_ = std::make_unique<AdaptivePnPlan>();
+        adaptive_plan_->init(dimension, nodes_per_axis, pn.order, active, o.adaptive_tile,
+                             o.adaptive_tol, o.adaptive_hysteresis, o.adaptive_min_order, o.adaptive_halo);
+        adaptive_plan_->restart = options.adaptive_restart;
+        adaptive_plan_->floor = options.adaptive_floor;
+        if (!options.adaptive_node_order.empty())
+            adaptive_plan_->set_preset_from_nodes(options.adaptive_node_order);
+        init_adaptive_inflow_floor(*adaptive_plan_);
+        update_adaptive_side_q(*adaptive_plan_);
+        build_band_factors();
+    }
+    ctor_mark("tail (inflow data, ghosts)");
+}
+
+void ElementWeno::build_band_factors() {
+    const int p = degree;
+    for (int d = 0; d < dimension; ++d) {
+        const Sparse &M = mass_1d_[d];
+        auto entry = [&](int r, int c) {
+            for (int e = M.outerIndexPtr()[r]; e < M.outerIndexPtr()[r + 1]; ++e)
+                if (M.innerIndexPtr()[e] == c)
+                    return M.valuePtr()[e];
+            return 0.;
+        };
+        auto factor = [&](int first, int cnt, BandFactor &bf) {
+            bf.n = cnt;
+            bf.p = p;
+            bf.lower.assign(std::size_t(cnt) * p, 0.);
+            bf.invdiag.assign(cnt, 0.);
+            std::vector<double> dg(cnt, 0.);
+            auto L = [&](int r, int c) -> double & { return bf.lower[std::size_t(r) * p + (r - c) - 1]; };
+            for (int k = 0; k < cnt; ++k) {
+                for (int j = std::max(0, k - p); j < k; ++j) {
+                    double v = entry(first + k, first + j);
+                    for (int i = std::max(0, k - p); i < j; ++i)
+                        v -= L(k, i) * L(j, i) * dg[i];
+                    L(k, j) = v / dg[j];
+                }
+                double v = entry(first + k, first + k);
+                for (int j = std::max(0, k - p); j < k; ++j)
+                    v -= L(k, j) * L(k, j) * dg[j];
+                require(v > 0, "Adaptive CPU: 1D mass factorization failed");
+                dg[k] = v;
+                bf.invdiag[k] = 1. / v;
+            }
+        };
+        const int n1 = nodes_per_axis[d];
+        factor(0, n1, band_natural_[d]);
+        if (mirror_index_[d] >= 0) {
+            require(mirror_index_[d] == 0 || mirror_index_[d] == n1 - 1, "Adaptive CPU: mirror node not at line end");
+            factor(mirror_index_[d] == 0 ? 1 : 0, n1 - 1, band_dirichlet_[d]);
+        }
+    }
+}
+
+void ElementWeno::solve_band_segment(const BandFactor &f, double *buf, int width, int k0, int k1) const {
+    const int p = f.p;
+    const int len = k1 - k0;
+    const double *L = f.lower.data(), *ID = f.invdiag.data();
+    for (int r = 0; r < len; ++r) {
+        const int k = k0 + r;
+        double *yr = buf + std::size_t(r) * width;
+        for (int m = 1; m <= p; ++m)
+            if (r - m >= 0) {
+                const double lv = L[std::size_t(k) * p + m - 1];
+                const double *yp = buf + std::size_t(r - m) * width;
+#pragma omp simd
+                for (int c = 0; c < width; ++c)
+                    yr[c] -= lv * yp[c];
+            }
+    }
+    for (int r = 0; r < len; ++r) {
+        const double inv = ID[k0 + r];
+        double *yr = buf + std::size_t(r) * width;
+#pragma omp simd
+        for (int c = 0; c < width; ++c)
+            yr[c] *= inv;
+    }
+    for (int r = len - 1; r >= 0; --r) {
+        const int k = k0 + r;
+        double *yr = buf + std::size_t(r) * width;
+        for (int m = 1; m <= p; ++m)
+            if (r + m < len) {
+                const double lv = L[std::size_t(k + m) * p + m - 1];
+                const double *yn = buf + std::size_t(r + m) * width;
+#pragma omp simd
+                for (int c = 0; c < width; ++c)
+                    yr[c] -= lv * yn[c];
+            }
+    }
+}
+
+void ElementWeno::init_adaptive_inflow_floor(AdaptivePnPlan &plan) const {
+    plan.tile_floor.assign(plan.num_tiles, plan.min_order);
+    const bool has_nonsteady_inflow = !inflow.steady && (bool(inflow.density) || bool(inflow.atoms));
+    for (std::size_t index = 0; index < faces_.size(); ++index) {
+        const auto &f = faces_[index];
+        const int side_id = 2 * f.direction + f.side;
+        if ((broken_ && face_break_[index]) || nodal_interface(side_id))
+            continue;
+        bool nonzero = has_nonsteady_inflow;
+        if (!nonzero && inflow.steady && !steady_data_.empty()) {
+            const auto &rule = rules_[side_id];
+            const std::size_t npts = rule.weights.size();
+            for (std::size_t p = 0; p < npts; ++p)
+                if (!steady_data_[index * npts + p].d.isZero(0)) {
+                    nonzero = true;
+                    break;
+                }
+        }
+        if (!nonzero)
+            continue;
+        const auto &rule = rules_[side_id];
+        for (int loc : rule.local) {
+            const int node = connectivity_[std::size_t(f.element) * local_nodes + loc];
+            const int T = plan.node_tile(node);
+            plan.tile_floor[T] = plan.max_order;
+        }
+    }
+}
+
+void ElementWeno::update_adaptive_side_q(AdaptivePnPlan &plan) const {
+    plan.side_q_dom.fill(0);
+    plan.side_q_brk.fill(0);
+    int bmax = 4;
+    for (std::size_t index = 0; index < faces_.size(); ++index) {
+        const auto &f = faces_[index];
+        const int side_id = 2 * f.direction + f.side;
+        const auto &rule = rules_[side_id];
+        const bool is_brk = broken_ && face_break_[index];
+        int fq = 4;
+        for (int n = 0; n < int(rule.local.size()); ++n) {
+            const int node = connectivity_[std::size_t(f.element) * local_nodes + rule.local[n]];
+            fq = std::max(fq, plan.tile_q[plan.node_tile(node)]);
+            if (is_brk) {
+                const int pnode = broken_partner_node(int(index), n);
+                fq = std::max(fq, plan.tile_q[plan.node_tile(pnode)]);
+            }
+        }
+        if (is_brk)
+            plan.side_q_brk[side_id] = std::max(plan.side_q_brk[side_id], fq);
+        else
+            plan.side_q_dom[side_id] = std::max(plan.side_q_dom[side_id], fq);
+        bmax = std::max(bmax, fq);
+    }
+    plan.bnd_max_q = std::min(moments, bmax);
+}
+
+void ElementWeno::reset_adaptive_pn() const {
+    if (!adaptive_plan_)
+        return;
+    adaptive_plan_->init(dimension, nodes_per_axis, pn.order, active, options.adaptive_tile,
+                         options.adaptive_tol, options.adaptive_hysteresis, options.adaptive_min_order,
+                         options.adaptive_halo);
+    adaptive_plan_->restart = options.adaptive_restart;
+        adaptive_plan_->floor = options.adaptive_floor;
+        if (!options.adaptive_node_order.empty())
+            adaptive_plan_->set_preset_from_nodes(options.adaptive_node_order);
+    init_adaptive_inflow_floor(*adaptive_plan_);
+    update_adaptive_side_q(*adaptive_plan_);
+    adaptive_active_ = false;
+    adaptive_step_counter_ = 0;
+}
+
+void ElementWeno::adapt_pn_state(Field &a, bool initial, ElementWenoStats *stats) const {
+    if (!adaptive_plan_)
+        return;
+    const double t0 = seconds();
+    AdaptivePnPlan &P = *adaptive_plan_;
+    const int L1 = P.max_order + 1, q = moments;
+    const double s0 = std::sqrt(4 * pi);
+    std::vector<double> tile_rho(P.num_tiles, 0.0);
+    std::vector<double> tile_E(std::size_t(P.num_tiles) * L1, 0.0);
+    std::vector<double> tile_face_E(std::size_t(P.num_tiles) * 6, 0.0);
+    parallel_for(P.num_tiles, [&](int T) {
+        const int tx = T % P.nt[0], ty = (T / P.nt[0]) % P.nt[1], tz = T / (P.nt[0] * P.nt[1]);
+        const int x0 = tx * P.tb[0], x1 = std::min(P.npa[0], x0 + P.tb[0]);
+        const int y0 = ty * P.tb[1], y1 = std::min(P.npa[1], y0 + P.tb[1]);
+        const int z0 = tz * P.tb[2], z1 = std::min(P.npa[2], z0 + P.tb[2]);
+        const int ord = initial ? P.max_order : P.tile_order[T];
+        const int margin = AdaptivePnPlan::kBorderMargin;
+        double rmax = 0.0;
+        double *E = &tile_E[std::size_t(T) * L1];
+        double *FE = &tile_face_E[std::size_t(T) * 6];
+        for (int iz = z0; iz < z1; ++iz)
+            for (int iy = y0; iy < y1; ++iy)
+                for (int ix = x0; ix < x1; ++ix) {
+                    const int i = iz * P.stride[2] + iy * P.stride[1] + ix;
+                    const double *row = a.data() + std::size_t(i) * q;
+                    rmax = std::max(rmax, std::abs(s0 * row[0]));
+                    bool on_face[6] = {
+                        ix - x0 < margin, x1 - 1 - ix < margin,
+                        dimension > 1 && iy - y0 < margin, dimension > 1 && y1 - 1 - iy < margin,
+                        dimension > 2 && iz - z0 < margin, dimension > 2 && z1 - 1 - iz < margin
+                    };
+                    double sq_prev = 0.0, sq_hi = 0.0;
+                    for (int l = 0; l <= ord; ++l) {
+                        double sq = 0.0;
+                        for (int c = P.deg_start[l]; c < P.deg_start[l + 1]; ++c)
+                            sq += row[c] * row[c];
+                        E[l] = std::max(E[l], sq);
+                        if (l == ord - 1) sq_prev = sq;
+                        if (l == ord) sq_hi = sq;
+                    }
+                    const double sq_top = (ord == 1) ? sq_hi : (sq_prev + sq_hi);
+                    for (int f = 0; f < 2 * dimension; ++f)
+                        if (on_face[f])
+                            FE[f] = std::max(FE[f], sq_top);
+                }
+        tile_rho[T] = rmax;
+        for (int l = 0; l <= ord; ++l)
+            E[l] = std::sqrt(E[l]);
+        for (int f = 0; f < 2 * dimension; ++f)
+            FE[f] = std::sqrt(FE[f]);
+    });
+    std::vector<int> shrunken;
+    const bool changed = P.update_from_energies(tile_rho, tile_E, tile_face_E, initial, shrunken);
+    if (changed) {
+        update_adaptive_side_q(P);
+        // Zero both newly deactivated (shrunken) and newly activated (grown) entries of `a` so every active entry
+        // starts clean and every inactive entry is 0.
+        parallel_for(P.num_tiles, [&](int T) {
+            const int q_new = P.tile_q[T], q_old = P.tile_q_prev[T];
+            const int c_lo = std::min(q_new, q_old), c_hi = initial ? q : std::max(q_new, q_old);
+            const int z_lo = initial ? q_new : c_lo;
+            if (z_lo >= c_hi)
+                return;
+            const int tx = T % P.nt[0], ty = (T / P.nt[0]) % P.nt[1], tz = T / (P.nt[0] * P.nt[1]);
+            const int x0 = tx * P.tb[0], x1 = std::min(P.npa[0], x0 + P.tb[0]);
+            const int y0 = ty * P.tb[1], y1 = std::min(P.npa[1], y0 + P.tb[1]);
+            const int z0 = tz * P.tb[2], z1 = std::min(P.npa[2], z0 + P.tb[2]);
+            for (int iz = z0; iz < z1; ++iz)
+                for (int iy = y0; iy < y1; ++iy)
+                    for (int ix = x0; ix < x1; ++ix) {
+                        const int i = iz * P.stride[2] + iy * P.stride[1] + ix;
+                        std::fill_n(&a.coeffRef(i, z_lo), c_hi - z_lo, 0.0);
+                    }
+        });
+    }
+    adaptive_active_ = true;
+    if (stats) {
+        ++stats->adaptive_updates;
+        stats->t_adaptive_sensor += seconds() - t0;
+    }
+}
+
+void ElementWeno::adaptive_solve_lines(Field &b, int d, bool gradient, bool is_grad_segs) const {
+    const AdaptivePnPlan &P = *adaptive_plan_;
+    const auto &segs = is_grad_segs ? P.line_segs_grad[d] : P.line_segs_mass[d];
+    const int q = b.cols(), s = stride(d), n = nodes_per_axis[d], mi = mirror_index_[d];
+    const int lines = nodes / n, q4 = std::min(4, q);
+    auto solve_one = [&](int line, int c0, int width, int ks, int ke) {
+        const int start = (line / s) * (s * n) + line % s;
+        if (mi < 0) {
+            const int len = ke - ks;
+            thread_local std::vector<double> buf;
+            buf.resize(std::size_t(len) * width);
+            for (int r = 0; r < len; ++r)
+                std::copy_n(&b.coeffRef(start + (ks + r) * s, c0), width, &buf[std::size_t(r) * width]);
+            solve_band_segment(band_natural_[d], buf.data(), width, ks, ke);
+            for (int r = 0; r < len; ++r)
+                std::copy_n(&buf[std::size_t(r) * width], width, &b.coeffRef(start + (ks + r) * s, c0));
+            return;
+        }
+        int g_comps[2][AdaptivePnPlan::kChunk];
+        int g_cnt[2] = {0, 0};
+        for (int k = 0; k < width; ++k) {
+            const int c = c0 + k;
+            const int g = (bool(reflect_odd_[d][c]) != gradient) ? 1 : 0;
+            g_comps[g][g_cnt[g]++] = c;
+        }
+        thread_local std::vector<double> buf;
+        for (int g = 0; g < 2; ++g) {
+            const int w = g_cnt[g];
+            if (w == 0)
+                continue;
+            const int off = (g && mi == 0) ? 1 : 0, nn = g ? n - 1 : n;
+            const int r0 = std::max(0, ks - off), r1 = std::min(nn, ke - off);
+            if (r0 < r1) {
+                const int len = r1 - r0;
+                buf.resize(std::size_t(len) * w);
+                for (int r = 0; r < len; ++r) {
+                    const double *row = &b.coeffRef(start + (r0 + r + off) * s, 0);
+                    double *dst = &buf[std::size_t(r) * w];
+                    for (int k = 0; k < w; ++k)
+                        dst[k] = row[g_comps[g][k]];
+                }
+                solve_band_segment(g ? band_dirichlet_[d] : band_natural_[d], buf.data(), w, r0, r1);
+                for (int r = 0; r < len; ++r) {
+                    double *row = &b.coeffRef(start + (r0 + r + off) * s, 0);
+                    const double *src = &buf[std::size_t(r) * w];
+                    for (int k = 0; k < w; ++k)
+                        row[g_comps[g][k]] = src[k];
+                }
+            }
+            if (g && ks <= mi && mi < ke) {
+                double *row = &b.coeffRef(start + mi * s, 0);
+                for (int k = 0; k < w; ++k)
+                    row[g_comps[g][k]] = 0.0;
+            }
+        }
+    };
+    const int nsegs = int(segs.size());
+    parallel_for(lines + nsegs, [&](int idx) {
+        if (idx < lines)
+            solve_one(idx, 0, q4, 0, n);
+        else {
+            const AdaptiveLineSeg &seg = segs[idx - lines];
+            solve_one(seg.line, seg.c0, std::min(AdaptivePnPlan::kChunk, q - seg.c0), seg.k_start, seg.k_end);
+        }
+    });
+}
+
+Field ElementWeno::adaptive_projected_gradient(const Field &a, int d) const {
+    const AdaptivePnPlan &P = *adaptive_plan_;
+    const auto &segs = P.line_segs_grad[d];
+    const int q = a.cols(), s = stride(d), n = nodes_per_axis[d], lines = nodes / n, q4 = std::min(4, q);
+    const int *outer = convection_1d_[d].outerIndexPtr(), *inner = convection_1d_[d].innerIndexPtr();
+    const double *value = convection_1d_[d].valuePtr();
+    const double *data = a.data();
+    Field out(nodes, q);
+    const int nsegs = int(segs.size());
+    parallel_for(lines + nsegs, [&](int idx) {
+        if (idx < lines) {
+            const int start = (idx / s) * (s * n) + idx % s;
+            for (int k = 0; k < n; ++k) {
+                double *__restrict y = &out.coeffRef(start + k * s, 0);
+                std::fill_n(y, q4, 0.0);
+                for (int e = outer[k]; e < outer[k + 1]; ++e) {
+                    const double cv = value[e];
+                    const double *x = data + std::size_t(start + inner[e] * s) * q;
+                    for (int j = 0; j < q4; ++j)
+                        y[j] += cv * x[j];
+                }
+            }
+            return;
+        }
+        const AdaptiveLineSeg &seg = segs[idx - lines];
+        const int start = (seg.line / s) * (s * n) + seg.line % s;
+        const int width = std::min(AdaptivePnPlan::kChunk, q - seg.c0);
+        for (int k = seg.k_start; k < seg.k_end; ++k) {
+            double *__restrict y = &out.coeffRef(start + k * s, seg.c0);
+            std::fill_n(y, width, 0.0);
+            for (int e = outer[k]; e < outer[k + 1]; ++e) {
+                const double cv = value[e];
+                const int nbr = start + inner[e] * s;
+                const int q_nbr = P.tile_q[P.node_tile(nbr)];
+                const int lim = std::min(width, std::max(0, q_nbr - seg.c0));
+                if (lim <= 0)
+                    continue;
+                const double *x = data + std::size_t(nbr) * q + seg.c0;
+#pragma omp simd
+                for (int j = 0; j < lim; ++j)
+                    y[j] += cv * x[j];
+            }
+        }
+    });
+    adaptive_solve_lines(out, d, true, true);
+    return out;
 }
 
 int ElementWeno::stride(int direction) const {
@@ -962,6 +1718,13 @@ int ElementWeno::stride(int direction) const {
 void ElementWeno::element_origin(int element, V3 &origin) const {
     origin = V3::Zero();
     int x = element;
+    if (graded_) {
+        for (int d = 0; d < dimension; ++d) {
+            origin[d] = options.planes[d][x % count[d]];
+            x /= count[d];
+        }
+        return;
+    }
     for (int d = 0; d < dimension; ++d) {
         origin[d] = options.origin[d] + (options.element_offset[d] + x % count[d]) * h;
         x /= count[d];
@@ -970,6 +1733,21 @@ void ElementWeno::element_origin(int element, V3 &origin) const {
 V3 ElementWeno::node_position(int node) const {
     V3 x = V3::Zero();
     int value = node;
+    if (broken_) {
+        for (int d = 0; d < dimension; ++d) {
+            x[d] = node_coord_[d][value % nodes_per_axis[d]];
+            value /= nodes_per_axis[d];
+        }
+        return x;
+    }
+    if (graded_) {
+        for (int d = 0; d < dimension; ++d) {
+            const int i = value % nodes_per_axis[d], e = std::min(i / degree, count[d] - 1);
+            x[d] = options.planes[d][e] + axis_width_[d][e] * double(i - e * degree) / degree;
+            value /= nodes_per_axis[d];
+        }
+        return x;
+    }
     for (int d = 0; d < dimension; ++d) {
         x[d] = options.origin[d] + (options.element_offset[d] * degree + value % nodes_per_axis[d]) * h / degree;
         value /= nodes_per_axis[d];
@@ -1033,6 +1811,10 @@ void ElementWeno::distributed_random(Field &x, std::mt19937 &rng, std::uniform_r
         u(rng);
 }
 void ElementWeno::solve_lines(Field &b, int d, bool gradient) const {
+    if (adaptive_active_ && adaptive_plan_ && b.cols() == moments && !dist_) {
+        adaptive_solve_lines(b, d, gradient, gradient);
+        return;
+    }
     if (dist_ && d == dist_->axis) {
         dist_->solve_axis(b);
         return;
@@ -1124,6 +1906,8 @@ Field ElementWeno::solve_mass(Field b) const {
 // assembled one-dimensional matrices, so M^-1 C_d acts along the grid lines of direction d only.
 Field ElementWeno::projected_gradient(const Field &a, int d) const {
     require(a.rows() == nodes, "Gradient size mismatch");
+    if (adaptive_active_ && adaptive_plan_ && a.cols() == moments && !dist_)
+        return adaptive_projected_gradient(a, d);
     const int q = a.cols(), s = stride(d), per_direction = nodes_per_axis[d], lines = nodes / per_direction;
     const LineFactor &natural = natural_[d];
     Field out(nodes, q);
@@ -1242,7 +2026,9 @@ Vec ElementWeno::weno_gamma(const Field &a) const {
                     continue;
                 for (int l = 0; l < n; ++l) // -2: mirror side, the neighbour is this element reflected in d
                     other[l] = density[next >= 0 ? connectivity_[next * n + l] : connectivity_[e * n + reflected_local_[d][l]]];
-                candidates.col(++m).noalias() = extension_[d][side] * other;
+                const Mat &ext = graded_ ? extension_list_[extension_index_[std::size_t(e) * 2 * dimension + 2 * d + side]]
+                                         : extension_[d][side];
+                candidates.col(++m).noalias() = ext * other;
             }
         Eigen::Matrix<double, Eigen::Dynamic, 1, 0, 7, 1> smoothness(m + 1), weights(m + 1);
         smoothness[0] = power(scale);
@@ -1298,7 +2084,8 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, const st
                     ae.row(l) = a.row(connectivity_[e * local_nodes + l]);
                     ge.row(l) = gradient[d].row(connectivity_[e * local_nodes + l]);
                 }
-                const Mat res = (convection_[d] * ae - mass_ * ge) * (viscosity * gamma[e]);
+                const ElementClass &C = klass(e);
+                const Mat res = (C.convection[d] * ae - C.mass * ge) * (C.viscosity * gamma[e]);
                 for (int l = 0; l < local_nodes; ++l)
                     for (int c = 0; c < q; ++c) weighted(e, l * q + c) = res(l, c);
             });
@@ -1309,7 +2096,8 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, const st
             Mat ae(local_nodes, q);
             for (int l = 0; l < local_nodes; ++l)
                 ae.row(l) = a.row(connectivity_[e * local_nodes + l]);
-            Mat r = stiffness_ * ae;
+            const ElementClass &C = klass(e);
+            Mat r = C.stiffness * ae;
             Mat second = Mat::Zero(local_nodes, q);
             for (int d = 0; d < dimension; ++d) {
                 Mat g(local_nodes, q), ye(local_nodes, q);
@@ -1317,10 +2105,10 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, const st
                     g.row(l) = gradient[d].row(connectivity_[e * local_nodes + l]);
                     ye.row(l) = y[d].row(connectivity_[e * local_nodes + l]);
                 }
-                r.noalias() -= gamma[e] * convection_[d].transpose() * g;
-                second.noalias() += convection_[d].transpose() * ye;
+                r.noalias() -= gamma[e] * C.convection[d].transpose() * g;
+                second.noalias() += C.convection[d].transpose() * ye;
             }
-            r = viscosity * r - second;
+            r = C.viscosity * r - second;
             for (int l = 0; l < local_nodes; ++l)
                 for (int c = 0; c < q; ++c) sym(e, l * q + c) = r(l, c);
         });
@@ -1337,13 +2125,14 @@ Field ElementWeno::stabilization_load(const Field &a, const Vec &gamma, const st
         std::fill_n(out, std::size_t(local_nodes) * q, 0.);
         for (int l = 0; l < local_nodes; ++l)
             rows[l] = a.data() + std::size_t(map[l]) * q;
-        apply_rows(local_nodes, local_nodes, q, stiffness_rows_.data(), viscosity, rows.data(), out);
-        const double weight = -viscosity * gamma[e];
+        const ElementClass &C = klass(e);
+        apply_rows(local_nodes, local_nodes, q, C.stiffness_rows.data(), C.viscosity, rows.data(), out);
+        const double weight = -C.viscosity * gamma[e];
         if (weight != 0)
             for (int d = 0; d < dimension; ++d) {
                 for (int l = 0; l < local_nodes; ++l)
                     rows[l] = gradient[d].data() + std::size_t(map[l]) * q;
-                apply_rows(local_nodes, local_nodes, q, convection_t_rows_[d].data(), weight, rows.data(), out);
+                apply_rows(local_nodes, local_nodes, q, C.convection_t_rows[d].data(), weight, rows.data(), out);
             }
     });
     lap(timing.t_stab_local);
@@ -1358,6 +2147,89 @@ Field ElementWeno::stabilization_residual(const Field &a, const Vec &gamma, cons
     if (low)
         low->resize(cells, 4 * n);
     Field residual(nodes, q);
+    if (adaptive_active_ && adaptive_plan_ && q == moments && !options.symmetric_residual) {
+        const AdaptivePnPlan &P = *adaptive_plan_;
+        parallel_for(P.num_tiles, [&](int T) {
+            const int qi = P.tile_q[T];
+            const int qpad = qi <= 4 ? std::min(4, q) : std::min(q, 4 + ((qi - 4 + AdaptivePnPlan::kChunk - 1) / AdaptivePnPlan::kChunk) * AdaptivePnPlan::kChunk);
+            const int tx = T % P.nt[0], ty = (T / P.nt[0]) % P.nt[1], tz = T / (P.nt[0] * P.nt[1]);
+            const int x0 = tx * P.tb[0], x1 = std::min(P.npa[0], x0 + P.tb[0]);
+            const int y0 = ty * P.tb[1], y1 = std::min(P.npa[1], y0 + P.tb[1]);
+            const int z0 = tz * P.tb[2], z1 = std::min(P.npa[2], z0 + P.tb[2]);
+            // Fast path when all 3x3 neighbor tiles have tile_q >= qi (interior of a region): no per-neighbor tile lookup!
+            bool full_nbrs = true;
+            for (int dz = (dimension > 2 ? -1 : 0); dz <= (dimension > 2 ? 1 : 0) && full_nbrs; ++dz)
+                for (int dy = (dimension > 1 ? -1 : 0); dy <= (dimension > 1 ? 1 : 0) && full_nbrs; ++dy)
+                    for (int dx = -1; dx <= 1 && full_nbrs; ++dx) {
+                        const int nx = tx + dx, ny = ty + dy, nz = tz + dz;
+                        if (nx >= 0 && nx < P.nt[0] && ny >= 0 && ny < P.nt[1] && nz >= 0 && nz < P.nt[2])
+                            if (P.tile_q[P.tile_index(nx, ny, nz)] < qi)
+                                full_nbrs = false;
+                    }
+            thread_local std::vector<double> term;
+            thread_local std::vector<const double *> rows;
+            term.resize(qi);
+            rows.resize(n);
+            for (int iz = z0; iz < z1; ++iz)
+                for (int iy = y0; iy < y1; ++iy)
+                    for (int ix = x0; ix < x1; ++ix) {
+                        const int i = iz * P.stride[2] + iy * P.stride[1] + ix;
+                        double *__restrict out = &residual.coeffRef(i, 0);
+                        std::fill_n(out, qpad, 0.);
+                        for (int k = node_offsets_[i]; k < node_offsets_[i + 1]; ++k) {
+                            const int e = node_entries_[k] / n, l = node_entries_[k] % n;
+                            const int *map = &connectivity_[e * n];
+                            std::fill_n(term.data(), qi, 0.);
+                            const ElementClass &C = klass(e);
+                            if (full_nbrs) {
+                                for (int m = 0; m < n; ++m)
+                                    rows[m] = a.data() + std::size_t(map[m]) * q;
+                                apply_rows(1, n, qi, &C.stiffness_rows[std::size_t(l) * n], C.viscosity, rows.data(), term.data());
+                                const double weight = -C.viscosity * gamma[e];
+                                if (weight != 0)
+                                    for (int d = 0; d < dimension; ++d) {
+                                        for (int m = 0; m < n; ++m)
+                                            rows[m] = gradient[d].data() + std::size_t(map[m]) * q;
+                                        apply_rows(1, n, qi, &C.convection_t_rows[d][std::size_t(l) * n], weight, rows.data(), term.data());
+                                    }
+                            } else {
+                                int cm_of[27];
+                                for (int m = 0; m < n; ++m)
+                                    cm_of[m] = std::min(qi, P.tile_q[P.node_tile(map[m])]);
+                                const double *Krow = &C.stiffness_rows[std::size_t(l) * n];
+                                for (int m = 0; m < n; ++m) {
+                                    const double kv = C.viscosity * Krow[m];
+                                    const double *src = a.data() + std::size_t(map[m]) * q;
+#pragma omp simd
+                                    for (int c = 0; c < cm_of[m]; ++c)
+                                        term[c] += kv * src[c];
+                                }
+                                const double weight = -C.viscosity * gamma[e];
+                                if (weight != 0)
+                                    for (int d = 0; d < dimension; ++d) {
+                                        const double *Crow = &C.convection_t_rows[d][std::size_t(l) * n];
+                                        for (int m = 0; m < n; ++m) {
+                                            const double cv = weight * Crow[m];
+                                            const double *src = gradient[d].data() + std::size_t(map[m]) * q;
+#pragma omp simd
+                                            for (int c = 0; c < cm_of[m]; ++c)
+                                                term[c] += cv * src[c];
+                                        }
+                                    }
+                            }
+                            if (low)
+                                Eigen::Map<Four>(&low->coeffRef(e, 4 * l)) = project(Eigen::Map<const Vec>(term.data(), std::min(4, qi)));
+                            const double *__restrict t = term.data();
+#pragma omp simd
+                            for (int c = 0; c < qi; ++c)
+                                out[c] -= t[c];
+                        }
+                    }
+        });
+        if (stats)
+            stats->t_stab_local += seconds() - start;
+        return residual;
+    }
     if (options.symmetric_residual) {
         const Field local = stabilization_load(a, gamma, gradient);
         if (low)
@@ -1380,13 +2252,14 @@ Field ElementWeno::stabilization_residual(const Field &a, const Vec &gamma, cons
                 std::fill_n(term.data(), q, 0.);
                 for (int m = 0; m < n; ++m)
                     rows[m] = a.data() + std::size_t(map[m]) * q;
-                apply_rows(1, n, q, &stiffness_rows_[std::size_t(l) * n], viscosity, rows.data(), term.data());
-                const double weight = -viscosity * gamma[e];
+                const ElementClass &C = klass(e);
+                apply_rows(1, n, q, &C.stiffness_rows[std::size_t(l) * n], C.viscosity, rows.data(), term.data());
+                const double weight = -C.viscosity * gamma[e];
                 if (weight != 0)
                     for (int d = 0; d < dimension; ++d) {
                         for (int m = 0; m < n; ++m)
                             rows[m] = gradient[d].data() + std::size_t(map[m]) * q;
-                        apply_rows(1, n, q, &convection_t_rows_[d][std::size_t(l) * n], weight, rows.data(), term.data());
+                        apply_rows(1, n, q, &C.convection_t_rows[d][std::size_t(l) * n], weight, rows.data(), term.data());
                     }
                 if (low)
                     Eigen::Map<Four>(&low->coeffRef(e, 4 * l)) = project(Eigen::Map<const Vec>(term.data(), q));
@@ -1451,7 +2324,8 @@ Incoming ElementWeno::face_data(int side_id, const V3 &x, double time) const {
 }
 void ElementWeno::add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                                Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                               Field &bar, Vec *inflow_rate, PositivityProjectionStats *projection) const {
+                               Field &bar, Vec *inflow_rate, PositivityProjectionStats *projection,
+                               BreakAggregates *breaks) const {
     const double ghost_start = seconds();
     Inflow atoms_only;
     atoms_only.atoms = inflow.atoms;
@@ -1473,10 +2347,9 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         delta.resize(ghost_node_.size(), moments);
         has_delta.assign(ghost_node_.size(), 0);
     }
-    // Ghost moments of pair k from the PN trace psi at the points of out_rules_[side].
-    auto ghost_pair = [&](int k, const Vec &psi) {
+    // Ghost moments of pair k from the PN trace psi at the points of `out`.
+    auto ghost_pair = [&](int k, const Vec &psi, const OutRule &out) {
         const int side_id = ghost_side_[k], node = ghost_node_[k];
-        const OutRule &out = out_rules_[side_id];
         const Boundary &b = *boundaries_[side_id];
         thread_local Vec z;
         // C6: positive part on the outgoing hemisphere (first `outgoing` points).
@@ -1631,18 +2504,93 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             const std::vector<int> &list = ghost_by_side_[side];
             thread_local Mat at, traces;
             thread_local Vec psi;
-            at.resize(moments, end - begin);
-            for (int j = begin; j < end; ++j)
-                at.col(j - begin) = a.row(ghost_node_[list[j]]).transpose();
-            if (ghost_sigma_.size())
-                at = ghost_sigma_.asDiagonal() * at;
-            if (separable_[side])
-                separable_[side]->evaluate(at, traces);
-            else
-                traces.noalias() = out_rules_[side].harmonics * at;
+            const bool ad = adaptive_active_ && adaptive_plan_;
+            const bool can_analytic_p1 = ad && !options.projection_half_range && !high_exterior &&
+                                         out_rules_[side].c.size() == 0;
+            const bool use_tiers = ad && !high_exterior && !adaptive_ghost_tiers_.empty();
+            const int ntiers = use_tiers ? int(adaptive_ghost_tiers_.size()) : 0;
+            const V3 bn_vec = boundaries_[side]->n;
+            // Bucket indices: 0..ntiers-1 for adaptive_ghost_tiers_, ntiers for full rule.
+            thread_local std::vector<std::vector<int>> buckets;
+            thread_local std::vector<int> bmax_ord;
+            buckets.resize(ntiers + 1);
+            bmax_ord.assign(ntiers + 1, 0);
+            for (int b = 0; b <= ntiers; ++b)
+                buckets[b].clear();
             for (int j = begin; j < end; ++j) {
-                psi = traces.col(j - begin);
-                ghost_pair(list[j], psi);
+                const int k = list[j];
+                const int node = ghost_node_[k];
+                const int ord = ad ? adaptive_plan_->tile_order[adaptive_plan_->node_tile(node)] : pn.order;
+                if (can_analytic_p1 && ord == 1) {
+                    const double rho = low(node, 0);
+                    const double jx = low(node, 1), jy = low(node, 2), jz = low(node, 3);
+                    const double jn2 = jx * jx + jy * jy + jz * jz;
+                    if (rho <= 0.0 || 9.0 * jn2 <= rho * rho * (1.0 - 2e-12)) {
+                        Four m = Four::Zero();
+                        if (rho > 0.0) {
+                            const double jdotn = bn_vec[0] * jx + bn_vec[1] * jy + bn_vec[2] * jz;
+                            m[0] = 0.5 * rho + 0.75 * jdotn;
+                            m[1] = 0.25 * rho * bn_vec[0] + 0.5 * jx;
+                            m[2] = 0.25 * rho * bn_vec[1] + 0.5 * jy;
+                            m[3] = 0.25 * rho * bn_vec[2] + 0.5 * jz;
+                        }
+                        const double b_node = rho + bn_vec[0] * jx + bn_vec[1] * jy + bn_vec[2] * jz;
+                        const double a_ext = m[0] - bn_vec.dot(m.tail<3>());
+                        if (a_ext > b_node)
+                            m *= b_node > 0 ? b_node / a_ext : 0.;
+                        outgoing_moments[k] = m;
+                        if (project) {
+                            PositivityProjectionStats &ps = pstats[thread_id()];
+                            ++ps.calls;
+                            ++ps.identities;
+                            ps.vacuum += !(rho > 0.0);
+                        }
+                        continue;
+                    }
+                }
+                int bi = ntiers;
+                if (use_tiers) {
+                    for (int ti = 0; ti < ntiers; ++ti)
+                        if (ord <= adaptive_ghost_tiers_[ti].max_order) {
+                            bi = ti;
+                            break;
+                        }
+                }
+                buckets[bi].push_back(k);
+                bmax_ord[bi] = std::max(bmax_ord[bi], ord);
+            }
+            for (int bi = 0; bi <= ntiers; ++bi) {
+                const auto &bk = buckets[bi];
+                if (bk.empty())
+                    continue;
+                const int nrem = int(bk.size());
+                const int max_ord = bmax_ord[bi];
+                const bool is_tier = bi < ntiers;
+                const int q_tier = is_tier ? adaptive_ghost_tiers_[bi].q_tier : moments;
+                const int q_block = ad ? std::min(q_tier, adaptive_plan_->order_q[max_ord]) : moments;
+                at.resize(q_tier, nrem);
+                for (int r = 0; r < nrem; ++r) {
+                    const double *src = &a.coeffRef(ghost_node_[bk[r]], 0);
+                    double *dst = at.col(r).data();
+                    std::copy_n(src, q_block, dst);
+                    if (q_block < q_tier)
+                        std::fill_n(dst + q_block, q_tier - q_block, 0.0);
+                }
+                if (ghost_sigma_.size())
+                    at.topRows(q_block) = ghost_sigma_.head(q_block).asDiagonal() * at.topRows(q_block);
+                const OutRule &rule_use = is_tier ? adaptive_ghost_tiers_[bi].out_rules[side] : out_rules_[side];
+                const auto &sep_use = is_tier ? adaptive_ghost_tiers_[bi].separable[side] : separable_[side];
+                if (sep_use) {
+                    if (ad && max_ord < (is_tier ? adaptive_ghost_tiers_[bi].max_order : pn.order))
+                        sep_use->evaluate_upto(at, traces, max_ord);
+                    else
+                        sep_use->evaluate(at, traces);
+                } else
+                    traces.noalias() = rule_use.harmonics.leftCols(q_block) * at.topRows(q_block);
+                for (int r = 0; r < nrem; ++r) {
+                    psi = traces.col(r);
+                    ghost_pair(bk[r], psi, rule_use);
+                }
             }
         });
     }
@@ -1655,9 +2603,17 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     // Face rows (constructor): one row per (face, face node). The face loop writes its rows directly; no per-face
     // matrices (thousands of small allocations per call did not scale with the thread count).
     const int face_rows = side_row_start_[6];
+    const bool ad_bnd = adaptive_active_ && adaptive_plan_ && !high_exterior;
+    const int q_bnd = ad_bnd ? std::max(4, std::min(moments, adaptive_plan_->bnd_max_q)) : moments;
     Field G, D(face_rows, canonical_->r), L(face_rows, 4), BR(face_rows, 4), FA(face_rows, 3);
     Vec AR(face_rows), IN(face_rows);
-    G.resize(face_rows, moments);
+    G.resize(face_rows, q_bnd);
+    std::vector<int> row_q(ad_bnd ? face_rows : 0, 4);
+    const bool any_interface =
+        broken_ || std::any_of(options.interface_side.begin(), options.interface_side.end(), [](bool b) { return b; });
+    Field V; // face rows of the neighbour traces (interface sides)
+    if (any_interface)
+        V = Field::Zero(face_rows, q_bnd);
     Field K; // face rows of delta (projection_high_order)
     std::vector<char> face_delta;
     if (high_exterior) {
@@ -1725,7 +2681,113 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             }
             return state;
         };
-        if (!face_uniform_.empty() && face_uniform_[index]) { // uniform face: point-independent terms
+        int q_face = q_bnd;
+        if (ad_bnd) {
+            q_face = 4;
+            for (int n = 0; n < nf; ++n) {
+                q_face = std::max(q_face, adaptive_plan_->tile_q[adaptive_plan_->node_tile(global[n])]);
+                if (face_break_[index])
+                    q_face = std::max(q_face, adaptive_plan_->tile_q[adaptive_plan_->node_tile(broken_partner_node(int(index), n))]);
+            }
+            q_face = std::min(q_bnd, q_face);
+            for (int n = 0; n < nf; ++n)
+                row_q[r0 + n] = q_face;
+        }
+        if (face_break_[index]) {
+            // Broken line (conforming: the element across has its face nodes at the same positions). PN term exact by
+            // the face mass with the partner trace, V = M_face u_partner; low-order terms node by node
+            // (broken_face_low): no point loop, no closure evaluations.
+            nodal_partner_rows(int(index), a, V.block(r0, 0, nf, q_face), q_face);
+            broken_face_low(int(index), low, low_flux, L, BR, FA, AR, IN);
+        } else if (nodal_interface(side_id)) {
+            // Conforming interface: as a broken line with the partner in another block (driver callbacks).
+            nodal_partner_rows(int(index), a, V.block(r0, 0, nf, q_face), q_face);
+            interface_face_low(int(index), low, low_flux, L, BR, FA, AR, IN);
+        } else if (options.interface_side[side_id]) {
+            // Interface face: exterior = neighbour block at each face point (PN trace for the Rusanov term, its four
+            // low moments for the bar state); inflow rate for C2 = the incoming LLF half flux of the neighbour.
+            auto vrow = V.middleRows(r0, nf);
+            vrow.setZero();
+            thread_local Vec v;
+            int split = 1;
+            if (options.interface_split && !face_break_[index]) {
+                V3 centre = origin;
+                double tangential = 0;
+                for (int d = 0; d < dimension; ++d)
+                    if (d != f.direction)
+                        centre[d] += .5 * width(f.element, d), tangential = width(f.element, d);
+                    else if (f.side)
+                        centre[d] += width(f.element, d);
+                split = std::max(1, options.interface_split(side_id, centre, tangential));
+            }
+            int subfaces = 1;
+            for (int d = 0; d < dimension - 1; ++d)
+                subfaces *= split;
+            thread_local Vec shape_sub;
+            shape_sub.resize(nf);
+            for (int point = 0; point < subfaces * int(rule.weights.size()); ++point) {
+                const int qp = point % int(rule.weights.size()), sub = point / int(rule.weights.size());
+                V3 ref = V3::Zero();
+                for (int d = 0, rest = sub; d < dimension; ++d) {
+                    ref[d] = rule.points(qp, d);
+                    if (split > 1 && d != f.direction) {
+                        ref[d] = ((rest % split) + ref[d]) / split;
+                        rest /= split;
+                    }
+                }
+                // split 1: the precomputed rule (bitwise as before); else the shapes at the sub-face point
+                const double wq = split > 1 ? rule.weights[qp] / subfaces : rule.weights[qp];
+                for (int n = 0; n < nf; ++n) {
+                    if (split == 1) {
+                        shape_sub[n] = rule.shape(n, qp);
+                        continue;
+                    }
+                    double value_n = 1;
+                    for (int k = 0, xl = rule.local[n]; k < dimension; ++k, xl /= degree + 1)
+                        value_n *= bernstein(xl % (degree + 1), degree, 0, ref[k]);
+                    shape_sub[n] = value_n;
+                }
+                V3 x = origin;
+                for (int d = 0; d < dimension; ++d)
+                    x[d] += width(f.element, d) * ref[d];
+                if (face_break_[index]) {
+                    // Broken line: the trace of the element across at the same face point (conforming, same rule).
+                    const int partner = neighbors_[f.element * 2 * dimension + 2 * f.direction + f.side];
+                    const FaceRule &other = rules_[2 * f.direction + (1 - f.side)];
+                    v = Vec::Zero(moments);
+                    for (int n = 0; n < int(other.local.size()); ++n)
+                        v.noalias() += other.shape(n, qp) * a.row(connectivity_[partner * local_nodes + other.local[n]]).transpose();
+                } else
+                    options.interface_trace(side_id, x, v);
+                require(v.size() == moments && v.allFinite(), "Invalid interface trace");
+                Four ext = m1pn::project(v); // the local `project` flag shadows project()
+                nudge_into_cone(ext);
+                const Four outer = Levermore(ext).flux(b.n);
+                for (int n = 0; n < nf; ++n) {
+                    const double weight = face_scale_[index] * wq * shape_sub[n];
+                    if (weight == 0)
+                        continue;
+                    const int i = global[n];
+                    vrow.row(n).noalias() += weight * v.transpose();
+                    const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
+                    IN[r0 + n] += weight * std::max(0., .5 * (ext[0] - outer[0]));
+                    Four own = Four::Zero();
+                    for (int d = 0; d < dimension; ++d)
+                        own += b.n[d] * block(low_flux, i, d);
+                    Four state = .5 * (ui + own) + .5 * (ext - outer);
+                    if (options.outward_bar_rounding && !exact::cone(state)) {
+                        const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
+                        if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
+                            state[0] = norm_up(state);
+                    }
+                    AR[r0 + n] += weight;
+                    bar_row.row(n) += weight * state.transpose();
+                    for (int d = 0; d < dimension; ++d)
+                        fa_row(n, d) += weight * b.n[d];
+                    load_row.row(n) += weight * (state - ui).transpose();
+                }
+            }
+        } else if (!face_uniform_.empty() && face_uniform_[index]) { // uniform face: point-independent terms
             const Incoming &data = steady_data_[std::size_t(index) * rule.weights.size()];
             for (int n = 0; n < nf; ++n) {
                 const double weight = face_weight_[r0 + n];
@@ -1746,14 +2808,14 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
             for (int d = 0; d < dimension; ++d)
-                x[d] += h * rule.points(point, d);
+                x[d] += width(f.element, d) * rule.points(point, d);
             thread_local Incoming fresh;
             if (!inflow.steady)
                 face_data_into(side_id, x, time, fresh);
             const Incoming &data = inflow.steady ? steady_data_[std::size_t(index) * rule.weights.size() + point]
                                                  : fresh;
             for (int n = 0; n < nf; ++n) {
-                const double weight = rule.weights[point] * rule.shape(n, point);
+                const double weight = face_scale_[index] * rule.weights[point] * rule.shape(n, point);
                 if (weight == 0)
                     continue;
                 const int i = global[n];
@@ -1779,20 +2841,28 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
         // sum_points w phi_n [(A_n - llf_homogeneous) trace - llf_datum datum], with the exact face mass matrix;
         // the products with the dense q x q (and r x q) matrices are done per side below.
         thread_local Mat traces;
-        traces.resize(nf, moments);
+        const int q_tr = q_face;
+        traces.resize(nf, q_tr);
         for (int n = 0; n < nf; ++n)
-            traces.row(n) = a.row(global[n]);
-        G.middleRows(r0, nf).noalias() = rule.mass * traces;
+            traces.row(n) = a.row(global[n]).head(q_tr);
+        G.block(r0, 0, nf, q_tr).noalias() = rule.mass * traces;
+        if (graded_)
+            G.block(r0, 0, nf, q_tr) *= face_scale_[index];
+        if (q_tr < q_bnd)
+            G.block(r0, q_tr, nf, q_bnd - q_tr).setZero();
         if (high_exterior) {
             bool any = false;
             for (int n = 0; n < nf; ++n)
-                if (has_delta[ghost_id[n]]) {
+                if (ghost_id[n] >= 0 && has_delta[ghost_id[n]]) {
                     traces.row(n) = delta.row(ghost_id[n]);
                     any = true;
                 } else
                     traces.row(n).setZero();
-            if (any)
+            if (any) {
                 K.middleRows(r0, nf).noalias() = rule.mass * traces;
+                if (graded_)
+                    K.middleRows(r0, nf) *= face_scale_[index];
+            }
             else
                 K.middleRows(r0, nf).setZero();
         }
@@ -1805,7 +2875,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     // small block allocated workspace and did not scale with the thread count).
     Field H;
     {
-        H.resize(face_rows, moments);
+        H.resize(face_rows, q_bnd);
         std::array<bool, 6> datum_zero;
         datum_zero.fill(true);
         for (std::size_t index = 0; index < faces_.size(); ++index)
@@ -1813,17 +2883,56 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 datum_zero[2 * faces_[index].direction + faces_[index].side] = false;
         constexpr int rows_per_task = 16;
         std::vector<std::array<int, 3>> tasks; // side, first row, row count
+        std::vector<std::array<int, 3>> break_tasks;
         for (int side = 0; side < 6; ++side)
-            if (boundaries_[side])
-                for (int r = side_row_start_[side]; r < side_row_start_[side + 1]; r += rows_per_task)
-                    tasks.push_back({side, r, std::min(rows_per_task, side_row_start_[side + 1] - r)});
+            if (boundaries_[side]) {
+                const int end = broken_ ? break_row_start_[side] : side_row_start_[side + 1];
+                for (int r = side_row_start_[side]; r < end; r += rows_per_task)
+                    tasks.push_back({side, r, std::min(rows_per_task, end - r)});
+                if (broken_)
+                    for (int r = end; r < side_row_start_[side + 1]; r += 4 * rows_per_task)
+                        break_tasks.push_back({side, r, std::min(4 * rows_per_task, side_row_start_[side + 1] - r)});
+            }
+        // Broken-line rows: (G - V) .5 (A_n - I)^T with the sparse face matrix (a few nonzeros per column).
+        parallel_for(int(break_tasks.size()), [&](int t) {
+            const auto [side, r, n] = break_tasks[t];
+            int q_task = q_bnd;
+            if (ad_bnd) {
+                q_task = 4;
+                for (int rr = r; rr < r + n; ++rr)
+                    q_task = std::max(q_task, row_q[rr]);
+            }
+            if (q_task < moments)
+                H.block(r, 0, n, q_task) = (G.block(r, 0, n, q_task) - V.block(r, 0, n, q_task)) *
+                                           interface_sparse_t_[side].topLeftCorner(q_task, q_task);
+            else
+                H.middleRows(r, n) = (G.middleRows(r, n) - V.middleRows(r, n)) * interface_sparse_t_[side];
+        });
         parallel_for(int(tasks.size()), [&](int t) {
             const auto [side, r, n] = tasks[t];
-            H.middleRows(r, n).noalias() = G.middleRows(r, n).lazyProduct(boundary_flux_t_[side]);
-            if (!datum_zero[side])
-                H.middleRows(r, n).noalias() -= D.middleRows(r, n).lazyProduct(datum_t_[side]);
-            if (high_exterior && face_delta[side])
-                H.middleRows(r, n).noalias() -= K.middleRows(r, n).lazyProduct(exterior_t_[side]);
+            int q_task = q_bnd;
+            if (ad_bnd) {
+                q_task = 4;
+                for (int rr = r; rr < r + n; ++rr)
+                    q_task = std::max(q_task, row_q[rr]);
+            }
+            if (q_task < moments) {
+                H.block(r, 0, n, q_task).noalias() =
+                    G.block(r, 0, n, q_task).lazyProduct(boundary_flux_t_[side].topLeftCorner(q_task, q_task));
+                if (!datum_zero[side])
+                    H.block(r, 0, n, q_task).noalias() -= D.middleRows(r, n).lazyProduct(datum_t_[side].leftCols(q_task));
+                if (options.interface_side[side])
+                    H.block(r, 0, n, q_task).noalias() -=
+                        V.block(r, 0, n, q_task).lazyProduct(interface_t_[side].topLeftCorner(q_task, q_task));
+            } else {
+                H.middleRows(r, n).noalias() = G.middleRows(r, n).lazyProduct(boundary_flux_t_[side]);
+                if (!datum_zero[side])
+                    H.middleRows(r, n).noalias() -= D.middleRows(r, n).lazyProduct(datum_t_[side]);
+                if (options.interface_side[side])
+                    H.middleRows(r, n).noalias() -= V.middleRows(r, n).lazyProduct(interface_t_[side]);
+                if (high_exterior && face_delta[side])
+                    H.middleRows(r, n).noalias() -= K.middleRows(r, n).lazyProduct(exterior_t_[side]);
+            }
         });
     }
     const double products_done = seconds();
@@ -1832,11 +2941,24 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     // `high` has one row per node or, in rate(), one row per boundary node (boundary_slot_). Node by node in
     // parallel; each node sums its face rows in ascending face index (the order of the former serial loop).
     const bool compact = high.rows() != nodes;
+    const int q_sum = q_bnd;
     parallel_for(int(boundary_nodes_.size()), [&](int k) {
         const int i = boundary_nodes_[k];
+        const int qi = ad_bnd ? std::min(q_sum, adaptive_plan_->tile_q[adaptive_plan_->node_tile(i)]) : moments;
         for (int e = boundary_row_offsets_[k]; e < boundary_row_offsets_[k + 1]; ++e) {
             const int r = boundary_rows_[e];
-            high.row(compact ? k : i) += H.row(r);
+            high.row(compact ? k : i).head(qi) += H.row(r).head(qi); // the PN load keeps all rows (the high-order part is not split)
+            if (breaks && split_row(r)) {
+                // split_breaks: low-order sums of the broken-line rows apart (second convex step of the stage)
+                // project() of the row (the local flag `project` hides the function here)
+                const double s0 = std::sqrt(4 * pi), s1 = std::sqrt(4 * pi / 3);
+                breaks->high4.row(i) += Four(s0 * H(r, 0), s1 * H(r, 3), s1 * H(r, 1), s1 * H(r, 2)).transpose();
+                breaks->low.row(i) += L.row(r);
+                breaks->bar.row(i) += BR.row(r);
+                breaks->flux_area.row(i) += FA.row(r);
+                breaks->area[i] += AR[r];
+                continue;
+            }
             low_load.row(i) += L.row(r);
             bar.row(i) += BR.row(r);
             node_flux_area.row(i) += FA.row(r);
@@ -1848,11 +2970,118 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
     if (projection)
         projection->reduce_seconds += seconds() - products_done;
 }
+int ElementWeno::broken_partner_node(int index, int n) const {
+    const auto &f = faces_[index];
+    const int partner = neighbors_[f.element * 2 * dimension + 2 * f.direction + f.side];
+    int across = degree; // local index step to the partner's face node: digit p <-> 0 in direction d
+    for (int k = 0; k < f.direction; ++k)
+        across *= degree + 1;
+    if (f.side)
+        across = -across;
+    return connectivity_[partner * local_nodes + rules_[2 * f.direction + f.side].local[n] + across];
+}
+// Node-wise LLF bar states of a face with a partner across (broken line or conforming interface): lumped face weights,
+// partner(n, ext, outer) = exterior state and its normal flux F(ext) n. Rows face_row_[index] .. + nf (zeroed by the
+// caller).
+void ElementWeno::nodal_face_low(int index, const Field &low, const Field &low_flux,
+                                 const std::function<void(int, Four &, Four &)> &partner, Field &L, Field &BR, Field &FA,
+                                 Vec &AR, Vec &IN) const {
+    const auto &f = faces_[index];
+    const int side_id = 2 * f.direction + f.side;
+    const FaceRule &rule = rules_[side_id];
+    const Boundary &b = *boundaries_[side_id];
+    const int nf = int(rule.local.size()), r0 = face_row_[index];
+    for (int n = 0; n < nf; ++n) {
+        double weight = 0;
+        for (int point = 0; point < rule.weights.size(); ++point)
+            weight += rule.weights[point] * rule.shape(n, point);
+        weight *= face_scale_[index];
+        if (weight == 0)
+            continue;
+        const int i = connectivity_[f.element * local_nodes + rule.local[n]];
+        const Four ui(low(i, 0), low(i, 1), low(i, 2), low(i, 3));
+        Four own = Four::Zero(), ext, outer;
+        for (int d = 0; d < dimension; ++d)
+            own += b.n[d] * block(low_flux, i, d);
+        partner(n, ext, outer);
+        Four state = .5 * (ui + own) + .5 * (ext - outer);
+        if (options.outward_bar_rounding && !exact::cone(state)) {
+            const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
+            if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
+                state[0] = norm_up(state);
+        }
+        IN[r0 + n] += weight * std::max(0., .5 * (ext[0] - outer[0]));
+        AR[r0 + n] += weight;
+        BR.row(r0 + n) += weight * state.transpose();
+        for (int d = 0; d < dimension; ++d)
+            FA(r0 + n, d) += weight * b.n[d];
+        L.row(r0 + n) += weight * (state - ui).transpose();
+    }
+}
+void ElementWeno::broken_face_low(int index, const Field &low, const Field &low_flux, Field &L, Field &BR, Field &FA,
+                                  Vec &AR, Vec &IN) const {
+    const V3 normal = boundaries_[2 * faces_[index].direction + faces_[index].side]->n;
+    nodal_face_low(index, low, low_flux, [&](int n, Four &ext, Four &outer) {
+        const int j = broken_partner_node(index, n);
+        ext = Four(low(j, 0), low(j, 1), low(j, 2), low(j, 3));
+        outer = Four::Zero();
+        for (int d = 0; d < dimension; ++d)
+            outer += normal[d] * block(low_flux, j, d);
+    }, L, BR, FA, AR, IN);
+}
+void ElementWeno::interface_face_low(int index, const Field &low, const Field &low_flux, Field &L, Field &BR, Field &FA,
+                                     Vec &AR, Vec &IN) const {
+    const auto &f = faces_[index];
+    const int side_id = 2 * f.direction + f.side;
+    const V3 normal = boundaries_[side_id]->n;
+    const FaceRule &rule = rules_[side_id];
+    nodal_face_low(index, low, low_flux, [&](int n, Four &ext, Four &outer) {
+        const auto [block_id, node] =
+            options.interface_partner(side_id, f.element, connectivity_[f.element * local_nodes + rule.local[n]]);
+        options.interface_low(block_id, node, normal, ext, outer);
+    }, L, BR, FA, AR, IN);
+}
+void ElementWeno::nodal_partner_rows(int index, const Field &a, Eigen::Ref<Field> rows, int q_cols) const {
+    const auto &f = faces_[index];
+    const int side_id = 2 * f.direction + f.side;
+    const FaceRule &rule = rules_[side_id];
+    const int nf = int(rule.local.size());
+    const int qc = (q_cols > 0 && q_cols < moments) ? q_cols : moments;
+    thread_local Mat trace;
+    thread_local Vec v;
+    trace.resize(nf, qc);
+    for (int n = 0; n < nf; ++n)
+        if (face_break_[index])
+            trace.row(n) = a.row(broken_partner_node(index, n)).head(qc);
+        else {
+            const auto [block_id, node] =
+                options.interface_partner(side_id, f.element, connectivity_[f.element * local_nodes + rule.local[n]]);
+            options.interface_value(block_id, node, v);
+            trace.row(n) = v.head(qc).transpose();
+        }
+    rows.noalias() = rule.mass * trace;
+    if (graded_)
+        rows *= face_scale_[index];
+}
 Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
                         ElementWenoDebug *debug) const {
     require(a.rows() == nodes && a.cols() == moments, "Invalid element WENO state");
     const double finite_start = seconds();
-    {
+    if (adaptive_active_ && adaptive_plan_) {
+        const AdaptivePnPlan &P = *adaptive_plan_;
+        std::atomic<bool> finite{true};
+        const double *data = a.data();
+        parallel_for(nodes, [&](int i) {
+            const int qi = P.tile_q[P.node_tile(i)];
+            const double *row = data + std::size_t(i) * moments;
+            bool ok = true;
+            for (int c = 0; c < qi; ++c)
+                ok &= std::isfinite(row[c]);
+            if (!ok)
+                finite = false;
+        });
+        require(finite.load(), "Invalid element WENO state");
+    } else {
         // Parallel finiteness check; the serial a.allFinite() cost a quarter of the run time on 8 threads.
         std::atomic<bool> finite{true};
         const double *data = a.data();
@@ -1960,22 +3189,64 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     clock = seconds();
     timing.t_stabilization += clock - stabilization_start;
     // boundary_high holds one row per boundary node (boundary_slot_).
-    Field boundary_high = parallel_zero(boundary_nodes_.size(), q), boundary_low = parallel_zero(nodes, 4);
+    const int q_bh = (adaptive_active_ && adaptive_plan_) ? std::max(4, std::min(q, adaptive_plan_->bnd_max_q)) : q;
+    Field boundary_high = parallel_zero(boundary_nodes_.size(), q_bh), boundary_low = parallel_zero(nodes, 4);
     Field flux_area = parallel_zero(nodes, 3), boundary_bar = parallel_zero(nodes, 4);
     Vec boundary_area = parallel_zero(nodes), boundary_inflow = parallel_zero(nodes);
+    const bool split = split_active_;
+    BreakAggregates breaks;
+    if (split) {
+        breaks.high4 = parallel_zero(nodes, 4), breaks.low = parallel_zero(nodes, 4);
+        breaks.bar = parallel_zero(nodes, 4), breaks.flux_area = parallel_zero(nodes, 3);
+        breaks.area = parallel_zero(nodes);
+    }
     if (!faces_.empty()) {
         add_boundary(time, a, low, low_flux, boundary_high, boundary_low, flux_area, boundary_area,
-                     boundary_bar, &boundary_inflow, &timing.projection);
-        if (!options.m1_target)
-            for (std::size_t k = 0; k < boundary_nodes_.size(); ++k)
-                residual.row(boundary_nodes_[k]) += boundary_high.row(k);
+                     boundary_bar, &boundary_inflow, &timing.projection, split ? &breaks : nullptr);
+        if (!options.m1_target) {
+            if (adaptive_active_ && adaptive_plan_) {
+                const AdaptivePnPlan &P = *adaptive_plan_;
+                for (std::size_t k = 0; k < boundary_nodes_.size(); ++k) {
+                    const int bn = boundary_nodes_[k];
+                    const int qb = P.tile_q[P.node_tile(bn)];
+                    for (int c = 0; c < qb; ++c)
+                        residual(bn, c) += boundary_high(k, c);
+                }
+            } else
+                for (std::size_t k = 0; k < boundary_nodes_.size(); ++k)
+                    residual.row(boundary_nodes_[k]) += boundary_high.row(k);
+        }
     }
     lap(timing.t_boundary);
     Field high_rate = options.stabilize || !faces_.empty() ? solve_mass(std::move(residual)) : std::move(residual);
     Field moment_rate(nodes, 4);
-    if (!options.m1_target)
-        for (int d = 0; d < dimension; ++d)
-            add_flux_rows(flux_t_[d], gradient[d], -1., high_rate);
+    if (!options.m1_target) {
+        if (adaptive_active_ && adaptive_plan_) {
+            const AdaptivePnPlan &P = *adaptive_plan_;
+            parallel_for(nodes, [&](int i) {
+                const int qi = P.tile_q[P.node_tile(i)];
+                const int qpad = qi <= 4 ? std::min(4, q) : std::min(q, 4 + ((qi - 4 + AdaptivePnPlan::kChunk - 1) / AdaptivePnPlan::kChunk) * AdaptivePnPlan::kChunk);
+                double *out = &high_rate.coeffRef(i, 0);
+                for (int d = 0; d < dimension; ++d) {
+                    const Sparse &at = flux_t_[d];
+                    const int *outer = at.outerIndexPtr(), *inner = at.innerIndexPtr();
+                    const double *value = at.valuePtr();
+                    const double *gx = gradient[d].data() + std::size_t(i) * q;
+                    for (int j = 0; j < qi; ++j) {
+                        double sum = 0;
+                        for (int e = outer[j]; e < outer[j + 1]; ++e) {
+                            const int col = inner[e];
+                            if (col < qpad)
+                                sum += value[e] * gx[col];
+                        }
+                        out[j] -= sum;
+                    }
+                }
+            });
+        } else
+            for (int d = 0; d < dimension; ++d)
+                add_flux_rows(flux_t_[d], gradient[d], -1., high_rate);
+    }
     parallel_for(nodes, [&](int i) { moment_rate.row(i) = project(high_rate.row(i).transpose()).transpose(); });
     if (dist_ && !options.m1_target)
         dist_->exchange(moment_rate); // the limiter of owned nodes reads the halo rows
@@ -1988,7 +3259,8 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     Field raw_load;
     {
         const LowOrderInputs inputs{&low, &low_flux, &closure, &moment_rate, &stabilization_low, &boundary_high,
-                                    &boundary_low, &flux_area, &boundary_bar, &boundary_area, &boundary_inflow, &gamma};
+                                    &boundary_low, &flux_area, &boundary_bar, &boundary_area, &boundary_inflow, &gamma,
+                                    split ? &breaks.high4 : nullptr};
         const long before = stats ? stats->limited_elements + stats->limited_boundary_nodes : 0;
         load = limited_low_load(inputs, stats, debug ? &raw_load : nullptr);
         if (stats) {
@@ -1997,6 +3269,19 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
         }
     }
     clock = seconds();
+    if (split) { // unsplit broken-line face term T = P b^H - (int phi n) . G (the low part sum w (state - u) cancels)
+        split_term_ = Field::Zero(nodes, 4);
+        split_area_ = breaks.area;
+        parallel_for(int(split_nodes_.size()), [&](int k) {
+            const int i = split_nodes_[k];
+            Four t = Four(breaks.high4.row(i).transpose());
+            for (int d = 0; d < dimension; ++d)
+                t -= breaks.flux_area(i, d) * block(closure, i, d);
+            if (options.m1_target)
+                t = Four(breaks.low.row(i).transpose()); // low-order face term only (theta = 0 in the unsplit scheme)
+            split_term_.row(i) = t.transpose();
+        });
+    }
     parallel_for(nodes, [&](int i) {
         set_low(Eigen::Map<Vec>(&high_rate.coeffRef(i, 0), q), Four(load.row(i).transpose()) / lumped[i]);
     });
@@ -2047,10 +3332,8 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
         const int *map = &connectivity_[e * local_nodes];
         thread_local std::vector<Four> ubar, contribution, limited;
         thread_local std::vector<double> copies;
-        thread_local Vec clipped;
         ubar.resize(local_nodes);
         contribution.resize(local_nodes);
-        clipped.resize(local_nodes);
         // Element copies per local node: u (4), F^L (12), G (12), projected high-order rate (4).
         copies.resize(std::size_t(32) * local_nodes);
         for (int l = 0; l < local_nodes; ++l) {
@@ -2061,12 +3344,12 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
             std::copy_n(&moment_rate.coeffRef(map[l], 0), 4, c + 28);
         }
         using Quad = Eigen::Map<const Four>;
-        const Vec &total_viscosity = total_viscosity_;
+        const Vec &total_viscosity = graded_ ? klass(e).total_viscosity : total_viscosity_;
         for (int i = 0; i < local_nodes; ++i) {
             const double *ci = &copies[std::size_t(32) * i];
             const Four ui = Quad(ci), qi = Quad(ci + 28);
             Four weighted = Four::Zero(), fi = Four::Zero();
-            const PairEntry *pairs = &pair_table_[std::size_t(i) * (local_nodes - 1)];
+            const PairEntry *pairs = &(graded_ ? klass(e).pairs : pair_table_)[std::size_t(i) * (local_nodes - 1)];
             for (int k = 0; k < local_nodes - 1; ++k) {
                 const PairEntry &pe = pairs[k];
                 const int j = pe.j;
@@ -2110,22 +3393,8 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
         raw_sum[e] = sum.cwiseAbs().maxCoeff();
         limited = contribution;
         if (options.limit) {
-            // Step 1: clip and scale the zeroth moment.
-            double pos = 0, neg = 0;
-            for (int i = 0; i < local_nodes; ++i) {
-                const double fmin = -2 * total_viscosity[i] * (1 - options.positivity_fraction) * ubar[i][0];
-                clipped[i] = std::max(contribution[i][0], fmin);
-                (clipped[i] > 0 ? pos : neg) += clipped[i];
-            }
-            for (int i = 0; i < local_nodes; ++i) {
-                double value = clipped[i];
-                if (value > 0 && pos + neg > 0)
-                    value *= -neg / pos;
-                else if (value < 0 && pos + neg < 0)
-                    value *= -pos / neg;
-                limited[i][0] = value;
-            }
-            // Step 2: one element factor against the M1 cone.
+            // One element factor against the M1 cone (the former clip-and-scale stage of the density was removed on
+            // 2026-11-17: the cone condition rho >= |J| is sharper and binds first, docs/ELEMENT_WENO.md).
             double factor = 1;
             for (int i = 0; i < local_nodes; ++i) {
                 const Four g = limited[i] / (2 * total_viscosity[i]);
@@ -2175,6 +3444,8 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
                 return;
             Four correction = project(boundary_high.row(boundary_slot_[i]).transpose()) -
                               Four(boundary_low(i, 0), boundary_low(i, 1), boundary_low(i, 2), boundary_low(i, 3));
+            if (in.break_high4) // split_breaks: the domain part only (the broken-line rows go to the second step)
+                correction -= Four(in.break_high4->row(i).transpose());
             for (int d = 0; d < dimension; ++d)
                 correction -= flux_area(i, d) * block(closure, i, d);
             Four bar(boundary_bar(i, 0), boundary_bar(i, 1), boundary_bar(i, 2), boundary_bar(i, 3));
@@ -2185,7 +3456,7 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
                 const Four g = correction / boundary_area[i];
                 if (!exact::cone(bar + g))
                     theta = options.element_theta * segment(bar, g);
-                if (options.vacuum_sign_limit) {
+                if (options.vacuum_sign_limit && vacuum_limit_node_[i]) { // C2: domain boundary nodes only
                     // C2: accepted mass rate B_i = L_i + theta*h_i[0] with the low-order rate
                     //   L_i = A_i (bar_i - u_i)[0] - (int phi_i n).F^L_i[0]   (geometric corner/edge terms included)
                     // must not exceed max(L_i, inflow_i): theta*h_i[0] <= max(0, inflow_i - L_i) =: allowance.
@@ -2255,6 +3526,8 @@ Field ElementWeno::limited_low_load(const LowOrderInputs &in, ElementWenoStats *
     return load;
 }
 Field ElementWeno::linear_operator(const Field &x, double gamma_value) const {
+    const bool saved_adaptive = adaptive_active_;
+    adaptive_active_ = false;
     const int q = x.cols();
     std::array<Field, 3> gradient;
     for (int d = 0; d < dimension; ++d)
@@ -2266,6 +3539,7 @@ Field ElementWeno::linear_operator(const Field &x, double gamma_value) const {
         for (int d = 0; d < dimension; ++d)
             add_flux(flux_t_[d], gradient[d].data() + std::size_t(i) * q, -1., &out.coeffRef(i, 0), q);
     });
+    adaptive_active_ = saved_adaptive;
     return out;
 }
 double ElementWeno::layered_norm(const Field &f) const {
@@ -2302,39 +3576,54 @@ double ElementWeno::operator_probe() const {
     const Field y = linear_operator(x, .5);
     return layered_norm(y);
 }
-double ElementWeno::high_order_step() const {
-    if (spectral_radius_ <= 0) {
-        std::mt19937 rng(12345);
-        std::uniform_real_distribution<double> uniform(-1, 1);
-        double radius = 0;
-        // Norms in a fixed summation order (layered_norm) and the start vector of the same random sequence over the
-        // global node order: the estimate, and so dt, is bitwise independent of the MPI rank and thread count.
-        auto norm = [&](const Field &f) { return layered_norm(f); };
-        for (double gamma_value : {0., 1.}) {
-            Field x(nodes, moments);
-            if (!dist_) {
-                for (int i = 0; i < nodes; ++i)
-                    for (int c = 0; c < moments; ++c)
-                        x(i, c) = uniform(rng);
-            } else
-                distributed_random(x, rng, uniform);
+double ElementWeno::power_radius(int iterations, const std::array<Field, 2> *start, std::array<Field, 2> *end) const {
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<double> uniform(-1, 1);
+    double radius = 0;
+    // Norms in a fixed summation order (layered_norm) and the start vector of the same random sequence over the
+    // global node order: the estimate, and so dt, is bitwise independent of the MPI rank and thread count.
+    auto norm = [&](const Field &f) { return layered_norm(f); };
+    int g = 0;
+    for (double gamma_value : {0., 1.}) {
+        Field x(nodes, moments);
+        if (!dist_) {
+            for (int i = 0; i < nodes; ++i)
+                for (int c = 0; c < moments; ++c)
+                    x(i, c) = uniform(rng);
+        } else
+            distributed_random(x, rng, uniform);
+        x /= norm(x);
+        if (start && (*start)[g].rows() == nodes && (*start)[g].cols() == moments && (*start)[g].norm() > 0) {
+            x = (*start)[g] / norm((*start)[g]) + 1e-2 * x; // dynamic AMR warm start (see ElementWenoGpu)
             x /= norm(x);
-            const int iterations = 60;
-            for (int k = 0; k < iterations; ++k) {
-                Field y = linear_operator(x, gamma_value);
-                const double growth = norm(y);
-                require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed");
-                if (k >= iterations - 15)
-                    radius = std::max(radius, growth);
-                x = y / growth;
-                if (dist_)
-                    dist_->exchange(x);
-            }
         }
-        spectral_radius_ = radius;
+        const int tail = start ? std::max(1, iterations / 2) : 15;
+        for (int k = 0; k < iterations; ++k) {
+            Field y = linear_operator(x, gamma_value);
+            const double growth = norm(y);
+            require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed");
+            if (k >= iterations - tail)
+                radius = std::max(radius, growth);
+            x = y / growth;
+            if (dist_)
+                dist_->exchange(x);
+        }
+        if (end)
+            (*end)[g] = x;
+        ++g;
     }
+    return radius;
+}
+double ElementWeno::high_order_step() const {
+    if (spectral_radius_ <= 0)
+        spectral_radius_ = power_radius(60, nullptr, nullptr);
     // Negative real axis limits: roots of 1 + z + z^2/2 + z^3/6 = -1 and of 1 + z/2 + z^2/6 + z^3/48 = 0.
-    const double limit = options.ssprk43 ? 5.149486147 : 2.512745327;
+    // SSPRK(n^2,3), n = 3, 4, 5: real stability limits 13.2897595, 25.4190392, 41.5302366 (bisection on |R(z)| = 1).
+    const double limit = options.ssp_n == 3   ? 13.289759506
+                         : options.ssp_n == 4 ? 25.419039165
+                         : options.ssp_n == 5 ? 41.530236556
+                         : options.ssprk43    ? 5.149486147
+                                              : 2.512745327;
     return .9 * limit / spectral_radius_;
 }
 Field ElementWeno::angular_filter(const Field &a, double tau) const {
@@ -2460,8 +3749,11 @@ Field ElementWeno::react(const Field &a, double tau, ElementWenoStats *stats, do
         double *o = &out.coeffRef(i, 0);
         const double rho = in[0] / c0;
         o[0] = decay0 * in[0] + c0 * q0 * tau * phi1;
-        for (int k = 1; k < q; ++k)
+        const int qi = (adaptive_active_ && adaptive_plan_) ? adaptive_plan_->tile_q[adaptive_plan_->node_tile(i)] : q;
+        for (int k = 1; k < qi; ++k)
             o[k] = std::exp(-tau * (sa + ss + filter[k])) * in[k];
+        if (qi < q)
+            std::fill_n(o + qi, q - qi, 0.0);
         absorbed[i] = lumped[i] * (-std::expm1(z) * rho + q0 * tau * (1 - phi1));
         injected[i] = lumped[i] * q0 * tau;
     });
@@ -2513,26 +3805,39 @@ Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lu
     return x;
 }
 // r <- old * a + fresh * (x + tau * r), row-parallel (the Eigen expression ran on one thread).
-void combine(Field &r, const Field &x, const Field &a, double old, double fresh, double tau, int nodes) {
+void combine(Field &r, const Field &x, const Field &a, double old, double fresh, double tau, int nodes,
+             const AdaptivePnPlan *plan = nullptr, const std::vector<int> *bnodes = nullptr) {
+    (void)bnodes;
     const int q = r.cols();
     parallel_for(nodes, [&](int i) {
+        const int qi = plan ? plan->tile_q[plan->node_tile(i)] : q;
         double *ri = &r.coeffRef(i, 0);
         const double *xi = &x.coeffRef(i, 0), *ai = &a.coeffRef(i, 0);
         if (old == 0)
-            for (int c = 0; c < q; ++c)
+            for (int c = 0; c < qi; ++c)
                 ri[c] = fresh * (xi[c] + tau * ri[c]);
         else
-            for (int c = 0; c < q; ++c)
+            for (int c = 0; c < qi; ++c)
                 ri[c] = old * ai[c] + fresh * (xi[c] + tau * ri[c]);
+        if (plan && qi < q)
+            std::fill_n(ri + qi, q - qi, 0.0);
     });
 }
 } // namespace
 Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, ElementWenoStats *stats) const {
+    Field adapted_input;
+    const Field *in_ptr = &input;
+    if (adaptive_plan_ && !adaptive_active_) {
+        adapted_input = input;
+        adapt_pn_state(adapted_input, true, stats);
+        in_ptr = &adapted_input;
+    }
+    const AdaptivePnPlan *ap = (adaptive_active_ && adaptive_plan_) ? adaptive_plan_.get() : nullptr;
     // Without filter and reactions the input is used in place (no copy).
-    Field filtered = reacts() ? react(input, .5 * dt, stats, time + .25 * dt) : Field();
+    Field filtered = reacts() ? react(*in_ptr, .5 * dt, stats, time + .25 * dt) : Field();
     if (dist_ && reacts())
         dist_->exchange(filtered); // outer halo nodes: material/FCS node data from partial elements
-    const Field &a = reacts() ? filtered : input;
+    const Field &a = reacts() ? filtered : *in_ptr;
     // Effective weights of the stage rates: u^{n+1} = u^n + dt (L1 + L2 + 4 L3) / 6 (boundary mass ledger).
     auto stage = [&](double t, const Field &x, double old, double fresh, double weight) {
         Field r = rate(t, x, stats);
@@ -2541,7 +3846,7 @@ Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, El
         if (stats)
             stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
         const double combine_start = seconds();
-        combine(r, x, a, old, fresh, dt, nodes);
+        combine(r, x, a, old, fresh, dt, nodes, ap, &boundary_nodes_);
         Field out = admissible_rows(std::move(r), nodes, stats, lumped, owned_);
         if (stats)
             stats->t_ssp_stage += seconds() - combine_start;
@@ -2550,31 +3855,51 @@ Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, El
     const Field first = stage(time, a, 0, 1, 1. / 6);
     const Field second = stage(time + dt, first, .75, .25, 1. / 6);
     Field last = stage(time + .5 * dt, second, 1. / 3, 2. / 3, 2. / 3);
-    if (reacts()) {
-        Field out = react(last, .5 * dt, stats, time + .75 * dt);
-        if (dist_)
-            dist_->exchange(out);
-        return out;
+    Field out = reacts() ? react(last, .5 * dt, stats, time + .75 * dt) : std::move(last);
+    if (dist_ && reacts())
+        dist_->exchange(out);
+    if (ap) {
+        ++adaptive_step_counter_;
+        if (stats) {
+            ++stats->adaptive_steps;
+            stats->adaptive_coeff_sum += ap->active_coeff_fraction;
+            stats->adaptive_order_sum += ap->mean_order;
+            stats->adaptive_last_fraction = ap->active_coeff_fraction;
+            stats->adaptive_last_mean_order = ap->mean_order;
+            stats->adaptive_last_max_order = ap->global_max_order;
+        }
+        const int stride = std::max(1, options.adaptive_stride);
+        if (adaptive_step_counter_ == 1 || (adaptive_step_counter_ % stride == 0))
+            adapt_pn_state(out, false, stats);
     }
-    return last; // no copy (a conditional operator would copy the lvalue)
+    return out;
 }
 // SSPRK(4,3) (Kraaijevanger; Spiteri and Ruuth): four forward Euler stages of dt/2 at times t, t+dt/2, t+dt,
 // t+dt/2; u3 = 2/3 u + 1/3 (u2 + dt/2 L(u2)). Realizable for dt <= 2 dt_bound.
 Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, ElementWenoStats *stats) const {
-    Field filtered = reacts() ? react(input, .5 * dt, stats, time + .25 * dt) : Field();
+    Field adapted_input;
+    const Field *in_ptr = &input;
+    if (adaptive_plan_ && !adaptive_active_) {
+        adapted_input = input;
+        adapt_pn_state(adapted_input, true, stats);
+        in_ptr = &adapted_input;
+    }
+    const AdaptivePnPlan *ap = (adaptive_active_ && adaptive_plan_) ? adaptive_plan_.get() : nullptr;
+    Field filtered = reacts() ? react(*in_ptr, .5 * dt, stats, time + .25 * dt) : Field();
     if (dist_ && reacts())
         dist_->exchange(filtered); // outer halo nodes: material/FCS node data from partial elements
-    const Field &a = reacts() ? filtered : input;
+    const Field &a = reacts() ? filtered : *in_ptr;
     const double half = .5 * dt;
     // Effective weights: u^{n+1} = u^n + dt (L1 + L2 + L3 + 3 L4) / 6.
     auto stage = [&](double t, const Field &x, double old, double fresh, double weight) {
         Field r = rate(t, x, stats);
+        apply_split_breaks(x, r, half, stats); // split_breaks only (experiment)
         if (dist_)
             dist_->exchange(r); // halo rows of the stage = the owners' values (deterministic, no garbage)
         if (stats)
             stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
         const double combine_start = seconds();
-        combine(r, x, a, old, fresh, half, nodes);
+        combine(r, x, a, old, fresh, half, nodes, ap, &boundary_nodes_);
         Field out = admissible_rows(std::move(r), nodes, stats, lumped, owned_);
         if (stats)
             stats->t_ssp_stage += seconds() - combine_start;
@@ -2584,13 +3909,275 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
     const Field second = stage(time + half, first, 0, 1, 1. / 6);
     const Field third = stage(time + dt, second, 2. / 3, 1. / 3, 1. / 6);
     Field last = stage(time + half, third, 0, 1, .5);
-    if (reacts()) {
-        Field out = react(last, .5 * dt, stats, time + .75 * dt);
-        if (dist_)
-            dist_->exchange(out);
-        return out;
+    Field out = reacts() ? react(last, .5 * dt, stats, time + .75 * dt) : std::move(last);
+    if (dist_ && reacts())
+        dist_->exchange(out);
+    if (ap) {
+        ++adaptive_step_counter_;
+        if (stats) {
+            ++stats->adaptive_steps;
+            stats->adaptive_coeff_sum += ap->active_coeff_fraction;
+            stats->adaptive_order_sum += ap->mean_order;
+            stats->adaptive_last_fraction = ap->active_coeff_fraction;
+            stats->adaptive_last_mean_order = ap->mean_order;
+            stats->adaptive_last_max_order = ap->global_max_order;
+        }
+        const int stride = std::max(1, options.adaptive_stride);
+        if (adaptive_step_counter_ == 1 || (adaptive_step_counter_ % stride == 0))
+            adapt_pn_state(out, false, stats);
     }
-    return last; // no copy (a conditional operator would copy the lvalue)
+    return out;
+}
+ElementWeno::SspPlan ElementWeno::ssp_plan(int n) {
+    require(n >= 2 && n <= 5, "SSPRK(n^2,3): 2 <= n <= 5");
+    SspPlan p;
+    p.n = n, p.stages = n * n, p.saved_after = (n - 1) * (n - 2) / 2;
+    const int r = n * n - n;
+    p.tau_fraction = 1. / r, p.wa = double(n) / (2 * n - 1), p.wb = double(n - 1) / (2 * n - 1);
+    // States as coefficient vectors over the stage rates (units of dt), and their times.
+    std::vector<double> cur(p.stages, 0.), ym;
+    double t_cur = 0, t_ym = 0;
+    const int comb = n * (n + 1) / 2 - 1; // index of the combination stage
+    for (int k = 0; k < p.stages; ++k) {
+        if (k == p.saved_after)
+            ym = cur, t_ym = t_cur;
+        SspStage s{k == comb, t_cur, 0.};
+        p.stage.push_back(s);
+        if (k == comb) {
+            for (int j = 0; j < p.stages; ++j)
+                cur[j] = p.wa * ym[j] + p.wb * cur[j];
+            cur[k] += p.wb * p.tau_fraction;
+            t_cur = p.wa * t_ym + p.wb * (t_cur + p.tau_fraction);
+        } else {
+            cur[k] += p.tau_fraction;
+            t_cur += p.tau_fraction;
+        }
+    }
+    for (int k = 0; k < p.stages; ++k)
+        p.stage[k].weight = cur[k];
+    return p;
+}
+Field ElementWeno::advance_ssp_n3(double time, double dt, const Field &input, ElementWenoStats *stats) const {
+    require(!dist_, "SSPRK(n^2,3): serial schemes only (experiment)");
+    static thread_local SspPlan plan;
+    if (plan.n != options.ssp_n)
+        plan = ssp_plan(options.ssp_n);
+    Field cur = reacts() ? react(input, .5 * dt, stats, time + .25 * dt) : input;
+    Field ym;
+    const double tau = dt * plan.tau_fraction;
+    for (int k = 0; k < plan.stages; ++k) {
+        if (k == plan.saved_after)
+            ym = cur;
+        const SspStage &st = plan.stage[k];
+        Field r = rate(time + st.time * dt, cur, stats);
+        apply_split_breaks(cur, r, tau, stats);
+        if (stats)
+            stats->boundary_outflow -= dt * st.weight * stats->last_boundary_mass_rate;
+        const double combine_start = seconds();
+        if (st.combination)
+            combine(r, cur, ym, plan.wa, plan.wb, tau, nodes);
+        else
+            combine(r, cur, cur, 0, 1, tau, nodes);
+        cur = admissible_rows(std::move(r), nodes, stats, lumped, owned_);
+        if (stats)
+            stats->t_ssp_stage += seconds() - combine_start;
+    }
+    if (reacts())
+        return react(cur, .5 * dt, stats, time + .75 * dt);
+    return cur;
+}
+Field ElementWeno::ssprk43_stage_a(double t, double dt, const Field &x, ElementWenoStats *stats) const {
+    require(!dist_, "ssprk43_stage_a: serial schemes only");
+    Field r = rate(t, x, stats);
+    split_prepare(x, r, .5 * dt);
+    return r;
+}
+Field ElementWeno::ssprk43_stage_b(double t, double dt, const Field &x, const Field &a, Field r, double old, double fresh,
+                                   double weight, ElementWenoStats *stats) const {
+    split_finish(r, .5 * dt, stats);
+    if (stats)
+        stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
+    const double combine_start = seconds();
+    combine(r, x, a, old, fresh, .5 * dt, nodes);
+    Field out = admissible_rows(std::move(r), nodes, stats, lumped, owned_);
+    if (stats)
+        stats->t_ssp_stage += seconds() - combine_start;
+    return out;
+}
+Field ElementWeno::ssprk43_stage(double t, double dt, const Field &x, const Field &a, double old, double fresh,
+                                 double weight, ElementWenoStats *stats) const {
+    require(!dist_, "ssprk43_stage: serial schemes only");
+    Field r = rate(t, x, stats);
+    apply_split_breaks(x, r, .5 * dt, stats); // split_breaks only (experiment)
+    if (stats)
+        stats->boundary_outflow -= dt * weight * stats->last_boundary_mass_rate;
+    const double combine_start = seconds();
+    combine(r, x, a, old, fresh, .5 * dt, nodes);
+    Field out = admissible_rows(std::move(r), nodes, stats, lumped, owned_);
+    if (stats)
+        stats->t_ssp_stage += seconds() - combine_start;
+    return out;
+}
+// split_breaks (docs/BREAK_DT.md): the forward Euler stage x + tau r of the broken-line nodes as two convex steps.
+// r holds load/m for the element and domain-boundary terms only (rate() with split_breaks); split_term_ the unsplit
+// broken-line face term T, split_area_ its area A. Step 1: y = u + tau r (convex for tau sum 2 tv <= m); step 2:
+// z = y + tau A/m (Bbar(y) + theta g - y), Bbar(y) the nodal LLF bar states with the partner's y, g = c / A,
+// c = T - A (Bbar(y) - y). theta = 1 reproduces u + tau (E + T)/m exactly; theta < 1 keeps z in the cone. The rate
+// rows of these nodes become (z - u)/tau, so combine() and the SSP stage weights are unchanged.
+void ElementWeno::apply_split_breaks(const Field &x, Field &r, double tau, ElementWenoStats *stats) const {
+    split_prepare(x, r, tau);
+    split_finish(r, tau, stats);
+}
+void ElementWeno::split_prepare(const Field &x, const Field &r, double tau) const {
+    if (!split_active_ || split_nodes_.empty())
+        return;
+    require(options.ssprk43 || options.ssp_n >= 3, "split_breaks: SSPRK(4,3) or SSPRK(n^2,3) only");
+    const int K = int(split_nodes_.size());
+    split_u_.resize(K), split_rate_.resize(K);
+    parallel_for(K, [&](int k) {
+        const int i = split_nodes_[k];
+        split_u_[k] = project(x.row(i).transpose()), split_rate_[k] = project(r.row(i).transpose());
+    });
+    split_compute_y(split_u_, split_rate_, tau);
+}
+void ElementWeno::split_finish(Field &r, double tau, ElementWenoStats *stats) const {
+    if (!split_active_ || split_nodes_.empty())
+        return;
+    const int K = int(split_nodes_.size());
+    split_apply(split_u_, split_rate_, split_term_, split_area_, tau, stats);
+    parallel_for(K, [&](int k) { set_low(Eigen::Map<Vec>(&r.coeffRef(split_nodes_[k], 0), r.cols()), split_rate_[k]); });
+    // Mirror planes: odd moments of the rate vanish there (as at the end of rate()).
+    for (int d = 0; d < dimension; ++d)
+        if (mirror_index_[d] >= 0)
+            for (int i : mirror_nodes_[d])
+                for (int c = 0; c < r.cols(); ++c)
+                    if (reflect_odd_[d][c])
+                        r(i, c) = 0;
+}
+void ElementWeno::split_second_step(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term,
+                                    const Vec &area, double tau, ElementWenoStats *stats) const {
+    split_compute_y(u, rate, tau);
+    split_apply(u, rate, term, area, tau, stats);
+}
+void ElementWeno::split_y_state(int node, const V3 &normal, Four &y, Four &flux_n) const {
+    y = Four(split_ylow_.row(node).transpose());
+    flux_n = Four::Zero();
+    for (int d = 0; d < dimension; ++d)
+        if (normal[d] != 0)
+            flux_n += normal[d] * Four(split_yflux_(node, 4 * d), split_yflux_(node, 4 * d + 1), split_yflux_(node, 4 * d + 2),
+                                      split_yflux_(node, 4 * d + 3));
+}
+void ElementWeno::split_compute_y(const std::vector<Four> &u, const std::vector<Four> &rate, double tau) const {
+    const int K = int(split_nodes_.size());
+    if (split_row_offsets_.empty()) { // first call: broken-line faces and the per-node row lists (CSR)
+        auto &self = const_cast<ElementWeno &>(*this);
+        std::vector<int> slot(nodes, -1);
+        for (int k = 0; k < K; ++k)
+            slot[split_nodes_[k]] = k;
+        std::vector<std::vector<int>> rows(K);
+        for (std::size_t index = 0; index < faces_.size(); ++index) {
+            if (!split_face(index))
+                continue;
+            self.split_faces_.push_back(int(index));
+            const auto &f = faces_[index];
+            const auto &rule = rules_[2 * f.direction + f.side];
+            for (std::size_t n = 0; n < rule.local.size(); ++n) {
+                const int i = connectivity_[f.element * local_nodes + rule.local[n]];
+                require(slot[i] >= 0, "split_breaks: broken-line face node without split slot");
+                rows[slot[i]].push_back(face_row_[index] + int(n));
+            }
+        }
+        self.split_row_offsets_.assign(1, 0);
+        for (int k = 0; k < K; ++k) {
+            self.split_rows_.insert(self.split_rows_.end(), rows[k].begin(), rows[k].end());
+            self.split_row_offsets_.push_back(int(self.split_rows_.size()));
+        }
+        const int face_rows = side_row_start_[6];
+        split_ylow_ = Field::Zero(nodes, 4), split_yflux_ = Field::Zero(nodes, 12);
+        split_L_ = Field::Zero(face_rows, 4), split_BR_ = Field::Zero(face_rows, 4), split_FA_ = Field::Zero(face_rows, 3);
+        split_AR_ = Vec::Zero(face_rows), split_IN_ = Vec::Zero(face_rows);
+    }
+    // Step-1 states y (and their Levermore fluxes) at all broken-line nodes; partners are broken-line nodes too.
+    Field &ylow = split_ylow_, &yflux = split_yflux_;
+    std::vector<Four> &y_of = split_y_of_;
+    y_of.assign(K, Four::Zero());
+    parallel_for(K, [&](int k) {
+        const int i = split_nodes_[k];
+        Four y = u[k] + tau * rate[k];
+        nudge_into_cone(y, "split step 1"); // convex by the dt bound; only rounding is fixed here
+        y_of[k] = y;
+        ylow.row(i) = y.transpose();
+        const Levermore closure_state(y);
+        for (int d = 0; d < dimension; ++d) {
+            V3 n = V3::Zero();
+            n[d] = 1;
+            const Four fl = closure_state.flux(n);
+            for (int c = 0; c < 4; ++c)
+                yflux(i, 4 * d + c) = fl[c];
+        }
+    });
+}
+void ElementWeno::split_apply(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term, const Vec &area,
+                              double tau, ElementWenoStats *stats) const {
+    const int K = int(split_nodes_.size());
+    const Field &ylow = split_ylow_, &yflux = split_yflux_;
+    // Bar states of the broken-line faces with the step-1 states (rows as in add_boundary): rows zeroed, then filled.
+    parallel_for(int(split_faces_.size()), [&](int m) {
+        const int index = split_faces_[m];
+        const auto &f = faces_[index];
+        const int nf = int(rules_[2 * f.direction + f.side].local.size()), r0 = face_row_[index];
+        split_L_.middleRows(r0, nf).setZero(), split_BR_.middleRows(r0, nf).setZero();
+        split_FA_.middleRows(r0, nf).setZero(), split_AR_.segment(r0, nf).setZero(), split_IN_.segment(r0, nf).setZero();
+        if (face_break_[index])
+            broken_face_low(index, ylow, yflux, split_L_, split_BR_, split_FA_, split_AR_, split_IN_);
+        else { // conforming block interface: the partner block's step-1 state (published by its split_compute_y)
+            const int side_id = 2 * f.direction + f.side;
+            const V3 normal = boundaries_[side_id]->n;
+            const FaceRule &rule = rules_[side_id];
+            nodal_face_low(index, ylow, yflux, [&](int n, Four &ext, Four &outer) {
+                const auto [block_id, node] =
+                    options.interface_partner(side_id, f.element, connectivity_[f.element * local_nodes + rule.local[n]]);
+                options.interface_split_y(block_id, node, normal, ext, outer);
+            }, split_L_, split_BR_, split_FA_, split_AR_, split_IN_);
+        }
+    });
+    // Per node: sum of its rows in ascending face index (fixed order, parallel over the nodes).
+    std::vector<Four> bstar(K, Four::Zero());
+    std::vector<double> astar(K, 0.);
+    parallel_for(K, [&](int k) {
+        for (int e = split_row_offsets_[k]; e < split_row_offsets_[k + 1]; ++e) {
+            const int r = split_rows_[e];
+            bstar[k] += Four(split_BR_.row(r).transpose());
+            astar[k] += split_AR_[r];
+        }
+    });
+    std::vector<double> theta_of(K, 1.), defect(K, 0.);
+    parallel_for(K, [&](int k) {
+        const int i = split_nodes_[k];
+        const double A = area[i];
+        if (!(A > 0) || !(astar[k] > 0)) {
+            rate[k] = (split_y_of_[k] - u[k]) / tau;
+            return;
+        }
+        const Four &y = split_y_of_[k];
+        Four bbar = bstar[k] / astar[k];
+        nudge_into_cone(bbar, "split bar");
+        const Four c = Four(term.row(i).transpose()) - A * (bbar - y);
+        const Four g = c / A;
+        double theta = 1;
+        if (options.limit && !exact::cone(bbar + g))
+            theta = options.element_theta * segment(bbar, g);
+        const Four z = y + (tau * A / lumped[i]) * (bbar + theta * g - y);
+        theta_of[k] = theta;
+        defect[k] = tau * (theta - 1) * c[0];
+        rate[k] = (z - u[k]) / tau;
+    });
+    if (stats)
+        for (int k = 0; k < K; ++k) {
+            stats->split_limited += theta_of[k] < 1;
+            stats->min_split_theta = std::min(stats->min_split_theta, theta_of[k]);
+            stats->split_mass += defect[k];
+        }
 }
 Field ElementWeno::admissible_rows_public(Field x, ElementWenoStats *stats) const {
     return admissible_rows(std::move(x), nodes, stats, lumped, owned_);
@@ -2698,8 +4285,8 @@ double ElementWeno::dropped_inflow(double time) const {
         element_origin(f.element, origin);
         for (int point = 0; point < rule.weights.size(); ++point) {
             V3 x = origin;
-            for (int d = 0; d < dimension; ++d)
-                x[d] += h * rule.points(point, d);
+            for (int dd = 0; dd < dimension; ++dd)
+                x[dd] += width(f.element, dd) * rule.points(point, dd);
             const Vec d = b.data(inflow, x, time).d;
             if (d.isZero(0)) // vacuum: nothing dropped or kept (skips a dense q x r product per point)
                 continue;
@@ -2721,19 +4308,19 @@ Field ElementWeno::project_l2(const std::function<Vec(const V3 &)> &f) const {
     int points = 1;
     for (int d = 0; d < dimension; ++d)
         points *= xq.size();
-    const double volume = std::pow(h, dimension);
+    const double uniform_volume = std::pow(h, dimension);
     for (int e = 0; e < cells; ++e) {
         V3 origin;
         element_origin(e, origin);
         for (int p = 0; p < points; ++p) {
             V3 x = origin;
-            double w = volume;
+            double w = graded_ ? volume(e) : uniform_volume;
             Vec ref(dimension);
             int value = p;
             for (int d = 0; d < dimension; ++d, value /= xq.size()) {
                 ref[d] = xq[value % xq.size()];
                 w *= wq[value % xq.size()];
-                x[d] += h * ref[d];
+                x[d] += width(e, d) * ref[d];
             }
             const Vec state = reduce(f(x));
             for (int l = 0; l < local_nodes; ++l) {
@@ -2751,9 +4338,17 @@ Vec ElementWeno::evaluate(const Field &a, const V3 &x) const {
     int element = 0, scale = 1;
     Vec ref(dimension);
     for (int d = 0; d < dimension; ++d) {
-        double s = (x[d] - options.origin[d]) / h - options.element_offset[d];
-        int id = std::min(count[d] - 1, std::max(0, int(std::floor(s))));
-        ref[d] = s - id;
+        int id;
+        if (graded_) {
+            const auto &P = options.planes[d];
+            id = int(std::upper_bound(P.begin(), P.end(), x[d]) - P.begin()) - 1;
+            id = std::min(count[d] - 1, std::max(0, id));
+            ref[d] = (x[d] - P[id]) / axis_width_[d][id];
+        } else {
+            double s = (x[d] - options.origin[d]) / h - options.element_offset[d];
+            id = std::min(count[d] - 1, std::max(0, int(std::floor(s))));
+            ref[d] = s - id;
+        }
         element += id * scale;
         scale *= count[d];
     }
@@ -2771,12 +4366,52 @@ Vec ElementWeno::evaluate(const Field &a, const V3 &x) const {
     }
     return out;
 }
+int ElementWeno::node_near(const V3 &x, const V3 &probe) const {
+    int element = 0, scale = 1;
+    for (int d = 0; d < dimension; ++d) {
+        int id;
+        if (graded_) {
+            const auto &P = options.planes[d];
+            id = int(std::upper_bound(P.begin(), P.end(), probe[d]) - P.begin()) - 1;
+        } else
+            id = int(std::floor((probe[d] - options.origin[d]) / h - options.element_offset[d]));
+        id = std::min(count[d] - 1, std::max(0, id));
+        element += id * scale;
+        scale *= count[d];
+    }
+    int best = -1;
+    double distance = std::numeric_limits<double>::infinity();
+    for (int l = 0; l < local_nodes; ++l) {
+        const int node = connectivity_[element * local_nodes + l];
+        const double r = (node_position(node) - x).norm();
+        if (r < distance)
+            distance = r, best = node;
+    }
+    return best;
+}
+void ElementWeno::for_each_interface_node(const std::function<void(int, int, int)> &visit) const {
+    for (std::size_t i = 0; i < faces_.size(); ++i) {
+        const auto &f = faces_[i];
+        const int side_id = 2 * f.direction + f.side;
+        if (!options.interface_side[side_id] || face_break_[i]) // broken lines are internal, not block interfaces
+            continue;
+        for (int l : rules_[side_id].local)
+            visit(side_id, f.element, connectivity_[f.element * local_nodes + l]);
+    }
+}
+V3 ElementWeno::element_centre(int e) const {
+    V3 c;
+    element_origin(e, c);
+    for (int d = 0; d < dimension; ++d)
+        c[d] += .5 * width(e, d);
+    return c;
+}
 double ElementWeno::l2_density_error(const Field &a, const std::function<double(const V3 &)> &exact_density) const {
     const auto [xq, wq] = unit_gauss(degree + 5);
     int points = 1;
     for (int d = 0; d < dimension; ++d)
         points *= xq.size();
-    const double volume = std::pow(h, dimension);
+    const double uniform_volume = std::pow(h, dimension);
     // The point terms in parallel, summed afterwards in the serial (element, point) order: same result for every
     // thread count.
     std::vector<double> terms(std::size_t(cells) * points);
@@ -2785,10 +4420,10 @@ double ElementWeno::l2_density_error(const Field &a, const std::function<double(
         element_origin(e, origin);
         for (int p = 0; p < points; ++p) {
             V3 x = origin;
-            double w = volume;
+            double w = graded_ ? volume(e) : uniform_volume;
             int value = p;
             for (int d = 0; d < dimension; ++d, value /= xq.size()) {
-                x[d] += h * xq[value % xq.size()];
+                x[d] += width(e, d) * xq[value % xq.size()];
                 w *= wq[value % xq.size()];
             }
             const double difference = project(evaluate(a, x))[0] - exact_density(x);

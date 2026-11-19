@@ -24,6 +24,8 @@ public:
     int points() const { return P_ * A_; }
     // at: active x K (column k = coefficients of node k). out: points() x K, column k = psi of node k.
     void evaluate(const Mat &at, Mat &out) const;
+    // Same as evaluate(), truncating at degree max_order <= N (exact when all coefficients with l > max_order are 0).
+    void evaluate_upto(const Mat &at, Mat &out, int max_order) const;
     double verified_error = 0; // max |separable - dense| / max |dense| over random coefficient vectors
 
 private:

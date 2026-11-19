@@ -23,7 +23,9 @@ Antidiffusive Elementbeiträge:
     f_ij^e = m_ij^e (q̇_i - q̇_j) + d_ij^e (u_i - u_j) + c_ji^e·G_i - c_ij^e·G_j
     f_i^e  = Σ_j f_ij^e - P s_h^e(φ_i, a)
 
-mit `q̇ = P ȧ^H`, `G = F^H - F^L` und dem Limiter aus Bericht §6.
+mit `q̇ = P ȧ^H`, `G = F^H - F^L` und dem Limiter aus Bericht §6.2: ein Elementfaktor gegen den M1-Kegel
+(θ = 0.999). Die frühere erste Stufe (Clip and Scale der Dichte, Bericht §6.1) ist seit 17.11.2026 entfernt, siehe
+Abschnitt „Limiter ohne Clip and Scale“.
 Die Ränder ergänzen `h_i = P b_i^H - b_i^L - (∮φ_i n)·G_i`.
 
 ## Abweichungen von der ursprünglichen Formel
@@ -416,3 +418,31 @@ häufiger aktiv, Abweichungen ≤ 1e-3 an Unstetigkeiten. Die Schwelle ist die k
 EOC 1.83. Der Boden hängt von einer Skala ab und schwächt den Sensor auch an echten Strukturen (Crossing).
 Fürs Paper genügt der Satz: q = 1 verliert auf feinen Gittern an glatten Extrema Ordnung durch eine
 Rückkopplung zwischen Sensor und Stabilisierung, q = 3 beseitigt das.
+
+## Limiter ohne Clip and Scale (Studie 16.11.2026, übernommen 17.11.2026)
+
+Der Elementlimiter hat zwei Stufen (`ElementWeno::rate`, Limiter): (1) Clip and Scale nur für die Dichte der
+antidiffusiven Elementbeiträge (untere Schranke −2 d_i (1−ε) ū_i⁰, ε = 1e-3, danach Reskalierung auf Elementsumme
+null), (2) ein Elementfaktor gegen den M1-Kegel (θ = 0.999). Stufe 2 allein garantiert Kegel und Erhaltung. Studienschalter
+`--element-clip off` (CPU und GPU; Default bitgleich zum Kampagnen-Binary geprüft). tardis, A100, Job 161137, Rohdaten
+`nx/tmp/limiter_noclip/` (nicht versioniert).
+
+| Fall | Größe | Clip an | Clip aus |
+|---|---|---|---|
+| Lattice 2D P21/896², FCS | gegen MC (Masse/Absorption/Rate) | −0.070 / +0.124 / +0.153 % | identisch |
+| | Feld gegen MC (Median / 99 %-Quantil) | 0.43 / 6.76 % | identisch |
+| | limitierte Elementstufen / GPU-Fallbacks | 60.5 Mio. / 424 347 | 59.8 Mio. / 411 060 |
+| Lattice 3D P7/112³ | gegen MC | −8.909 / +2.504 / +0.347 % | −8.910 / +2.504 / +0.346 % |
+| | limitierte Elementstufen | 176.3 Mio. | 170.1 Mio. |
+| Line Source P7/512², FCS | L2 gegen Ganapol (hinter der Front) | 0.1690 | 0.1690 |
+| Crossing P7/256² | limitierte Elementstufen | 25 897 381 | 25 897 379 |
+
+Feldänderung aus gegen an: Lattice 2D Median 2e-7, maximal 3e-3 (nur an der äußeren Front, wo die Dichte vom Boden
+ansteigt; im Inneren < 1e-8); Line Source und Crossing 1–2e-5. Kegelabstand, Nudges und Laufzeit unverändert.
+
+**Bewertung.** Stufe 1 ist in diesen Fällen praktisch wirkungslos: Die Kegelbedingung ρ ≥ |J| ist schärfer als die
+Dichteschranke von Stufe 1 und bindet zuerst. Ohne Stufe 1 limitiert der Elementfaktor sogar etwas seltener (−1 bis
+−3.5 % Elementstufen, 3 % weniger Fallbacks); die Erwartung „mehr Diffusion ohne Clip“ hat sich nicht bestätigt. Stufe 1
+wirkt nur an Fronten mit Dichte nahe dem Boden. Am 16.11. zunächst nicht übernommen; seit 17.11.2026 (Branch `feature/limiter-cone-only`) ist Stufe 1 auf CPU und GPU
+entfernt, ebenso der Parameter ε (`positivity_fraction`). Der Limiter ist damit nur noch der Elementfaktor gegen den
+Kegel; Erhaltung und Kegel garantiert er allein. Der Studienschalter `--element-clip` entfällt.

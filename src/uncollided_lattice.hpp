@@ -76,23 +76,31 @@ struct LatticeUncollidedTable {
     CellLattice2D lattice;
     double dt = .01;
     int M = 0;
+    // Time window (dynamic AMR, docs/DYNAMIC_AMR.md): rows hold the times m dt for m = m0..M only, m0 from start_time
+    // (one time before it, for the cubic stencil). start_time = 0 (m0 = 0) is the full table of [0, final_time].
+    int m0 = 0;
+    double start_time = 0;
     std::vector<V3> points;
-    std::vector<double> table; // points x (M + 1)
+    std::vector<double> table; // points x (M - m0 + 1)
     double build_seconds = 0;
-    double final_time = 0; // set by the driver; build() covers [0, final_time]
+    double final_time = 0; // set by the driver; build() covers [start_time, final_time]
     // Times t_m = m dt, m = 0..M, M from final_time (shared with the device build).
     int times_for(double T) const { return int(std::ceil(T / dt)) + 2; }
+    int first_for(double t0) const { return std::max(0, int(std::floor(t0 / dt)) - 1); }
+    int width() const { return M - m0 + 1; }
     void build(const std::vector<V3> &x, double final_time) {
         const auto start = std::chrono::steady_clock::now();
         points = x;
         M = times_for(final_time);
-        table.assign(points.size() * std::size_t(M + 1), 0.);
+        m0 = first_for(start_time);
+        const int W = width();
+        table.assign(points.size() * std::size_t(W), 0.);
         parallel_for(int(points.size()), [&](int k) {
-            double *row = &table[std::size_t(k) * (M + 1)];
-            for (int m = 1; m <= M; ++m)
-                row[m] = lattice.density(points[k][0], points[k][1], m * dt);
+            double *row = &table[std::size_t(k) * W];
+            for (int m = std::max(m0, 1); m <= M; ++m)
+                row[m - m0] = lattice.density(points[k][0], points[k][1], m * dt);
         });
-        build_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        build_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     }
     bool matches(const std::vector<V3> &x) const {
         if (x.size() != points.size() || x.empty())
@@ -109,7 +117,9 @@ struct LatticeUncollidedTable {
         int i = int(s);
         if (i >= M - 1)
             throw std::runtime_error("LatticeUncollidedTable: time beyond the table");
-        const double f = s - i, *row = &table[k * std::size_t(M + 1)];
+        if (i - (i > 0 ? 1 : 0) < m0)
+            throw std::runtime_error("LatticeUncollidedTable: time before the table window");
+        const double f = s - i, *row = &table[k * std::size_t(width())] - m0;
         // p0..p3 = rho(i-1..i+2); rho(-dt) mirrors as 0 (rho_u = O(t) near zero: use linear extrapolation 2p1 - p2).
         const double p1 = row[i], p2 = row[i + 1], p3 = row[i + 2], p0 = i > 0 ? row[i - 1] : 2 * p1 - p2;
         const double v = p1 + .5 * f * (p2 - p0 + f * (2 * p0 - 5 * p1 + 4 * p2 - p3 + f * (3 * (p1 - p2) + p3 - p0)));
@@ -121,9 +131,11 @@ struct LatticeUncollidedTable {
         out.resize(x.size());
         parallel_for(int(x.size()), [&](int k) { out[k] = value(std::size_t(k), t); });
     }
-    // int_0^t rho_u(x_k, s) ds (composite Simpson on the table, interpolated last panel).
+    // int_0^t rho_u(x_k, s) ds (composite Simpson on the table, interpolated last panel). Needs the full table (m0 = 0).
     double time_integral(std::size_t k, double t) const {
-        const double *row = &table[k * std::size_t(M + 1)];
+        if (m0 != 0)
+            throw std::runtime_error("LatticeUncollidedTable: time_integral from 0 needs the full table");
+        const double *row = &table[k * std::size_t(width())];
         const int n = int(std::floor(t / dt));
         double s = 0;
         for (int m = 0; m < n; ++m) {
@@ -134,6 +146,16 @@ struct LatticeUncollidedTable {
         if (rest > 0) {
             const double a = row[n], b = value(k, t), mid = value(k, n * dt + .5 * rest);
             s += rest / 6 * (a + 4 * mid + b);
+        }
+        return s;
+    }
+    // int_t0^t1 rho_u(x_k, s) ds inside the window (Simpson per table panel, the same rule as time_integral).
+    double window_integral(std::size_t k, double t0, double t1) const {
+        double s = 0;
+        for (int m = int(std::floor(t0 / dt)); m * dt < t1; ++m) {
+            const double a = std::max(t0, m * dt), b = std::min(t1, (m + 1) * dt);
+            if (b > a)
+                s += (b - a) / 6 * (value(k, a) + 4 * value(k, .5 * (a + b)) + value(k, b));
         }
         return s;
     }

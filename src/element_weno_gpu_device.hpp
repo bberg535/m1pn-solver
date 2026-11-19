@@ -2,6 +2,7 @@
 // Device side of the GPU time loop (src/element_weno_gpu.cu). Plain C++ (no Eigen, no CUDA headers), so the host
 // translation unit src/element_weno_gpu.cpp can include it. All fields are row-major (rows x columns) device arrays.
 #include <cstddef>
+#include "adaptive_pn.hpp"
 #include "uncollided_lattice_core.hpp"
 #include "uncollided_lattice3d_core.hpp"
 namespace m1pn {
@@ -17,8 +18,23 @@ struct Setup {
     const int *neighbors = nullptr;    // cells x 2 dimension (-1: none)
     const int *node_offsets = nullptr; // nodes + 1
     const int *node_entries = nullptr; // cells * local, entry = e * local + l
-    const double *stiffness_rows = nullptr;      // local x local
-    const double *convection_t_rows[3] = {};     // local x local each
+    // Graded meshes (docs/GRADED_MESH.md): `classes` size classes; the per-class tables below are stacked (class c
+    // at offset c * size), element_class[e] selects one (null: one class, the uniform mesh), class_viscosity[c] the
+    // stabilization viscosity (null: `viscosity`). WENO extensions per (element, axis, side): ext_list (ext_count x
+    // local x local) indexed by ext_index[e * 2 dimension + 2 d + side] (null: extension[d][side]).
+    int classes = 1;
+    bool structured = true; // node grid = element grid (false with broken lines)
+    // Broken lines, 2D Q1 strip kernel: per axis d and node line k, strip_elem[d][2 k + side] = element line on the
+    // left (side 0) / right (side 1) of node line k that contains it, -1 if none (a node copy on a broken line has
+    // only one side). nullptr: structured mesh (element lines k - 1 and k).
+    const int *strip_elem[2] = {};
+    const int *element_class = nullptr;
+    const double *class_viscosity = nullptr;
+    int ext_count = 0;
+    const double *ext_list = nullptr;
+    const int *ext_index = nullptr;
+    const double *stiffness_rows = nullptr;      // classes x local x local
+    const double *convection_t_rows[3] = {};     // classes x local x local each
     const double *seminorm = nullptr;            // local x local, row-major
     const double *extension[3][2] = {};          // local x local, row-major
     // Banded 1D operators per axis (bandwidth = degree): convection rows (n x (2p+1), entry k-p..k+p, row-major),
@@ -41,15 +57,15 @@ struct Setup {
     const int *flux_outer[3] = {}, *flux_inner[3] = {};
     const double *flux_value[3] = {};
     int flux_nnz[3] = {0, 0, 0};
-    // Limiter pair table: local x (local - 1) entries of (j, d, m, c[3], ct[3]).
+    // Limiter pair table: classes x local x (local - 1) entries of (j, d, m, c[3], ct[3]).
     const int *pair_j = nullptr;
     const double *pair_d = nullptr, *pair_m = nullptr, *pair_c = nullptr, *pair_ct = nullptr; // c, ct: 3 per entry
-    const double *total_viscosity = nullptr; // local
+    const double *total_viscosity = nullptr; // classes x local
     const double *lumped = nullptr;          // nodes
     // Options.
     bool weno = true, stabilize = true, limit = true, outward_bar_rounding = true, scale_invariant_weno = true;
     double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
-    double positivity_fraction = 1e-3, element_theta = .999;
+    double element_theta = .999;
     int fallback_capacity = 1 << 16;
 };
 // Device work arrays and counters; created by create(), freed by destroy().
@@ -72,6 +88,7 @@ Buffers buffers(Context *);
 void upload(void *device, const void *host, std::size_t bytes);
 void download(void *host, const void *device, std::size_t bytes);
 void synchronize();
+void synchronize(Context *); // the context stream only (other contexts keep running)
 // Row gathers/scatters through a device index list (synchronous transfers of the compact rows).
 // rows_soa > 0: the field is column-major with rows_soa rows (low, low_flux, closure, moment_rate, stab_low,
 // element_limited); 0: row-major.
@@ -92,6 +109,9 @@ void gradients(Context *, const double *state);
 void stabilization(Context *, const double *state, double *out, bool want_low, double constant_gamma);
 void add_rows(Context *, double *field, const int *device_index, const double *device_rows, int count); // field[i] += rows
 void mass_solve(Context *, double *field);
+// mass_solve with the PN-row stage combination (rows c >= 4, as combine_pn) fused into the last direction; returns false
+// (and only solves) where the fusion does not apply, then the caller runs combine_pn. M1PN_GPU_FUSE=0: never fuse.
+bool mass_solve_combine(Context *, double *field, const double *x, const double *a, double old, double fresh, double tau);
 // field += -sum_d A_d^T g_d per node, then moment_rate = project(field) (when want_moments).
 void flux_rows(Context *, double *field, bool want_moments);
 void limiter(Context *);
@@ -119,6 +139,8 @@ void reset_counters(Context *);
 // Asynchronous pipeline (default stream): pinned host buffers, events, a counter snapshot.
 void gather_async(Context *, const double *field, int cols, const int *device_index, int count, double *pinned_out,
                   int slot, long long rows_soa = 0);
+void gather_cols_async(Context *, const double *field, int stride_cols, int copy_cols, const int *device_index,
+                       int count, double *pinned_out, int slot);
 void scatter_async(Context *, double *field, int cols, const int *device_index, int count, const double *pinned_in,
                    bool add, int slot, long long rows_soa = 0);
 void upload_async(void *device, const void *pinned, std::size_t bytes);
@@ -154,6 +176,18 @@ void ghost_setup(Context *, const GhostSetup &);
 // flag count and the flagged pair list into pinned host memory.
 void ghost(Context *, const double *state, double *pinned_moments, int *pinned_flags);
 GhostStats ghost_stats(Context *); // cumulative (synchronous)
+// Ghost traces on the device, projections on the host (docs/STATIC_HP_BLOCKS.md): per side s the trace matrix
+// harmonics_s (points_s x q, column-major, ghost filter applied) times the stage input rows of the side's ghost nodes.
+struct GhostTraceSetup {
+    int q = 0;
+    int count[6] = {}, points[6] = {};
+    const int *nodes[6] = {};        // ghost nodes of side s, in ElementWeno::ghost_by_side_ order (host)
+    const double *harmonics[6] = {}; // points_s x q, column-major (host)
+};
+void ghost_traces_setup(Context *, const GhostTraceSetup &);
+// On the aux stream after the work queued so far on the default stream: the traces psi (points_s per ghost node,
+// sides in order 0..5, nodes in setup order) of `state` into pinned host memory; completion is event 2.
+void ghost_traces(Context *, const double *state, double *pinned_out);
 // Exact local reaction (ElementWeno::react): per node rho' = e^{-sa tau} rho + q0 tau phi1(-sa tau),
 // a_k' = e^{-tau (sa + ss + f_k)} a_k (k >= 1), q0 = source + FCS collision source; then the admissible-row nudge.
 struct ReactionSetup {
@@ -175,7 +209,8 @@ Ledger ledger(Context *); // cumulative (synchronous)
 // Lattice FCS (docs/FCS_LATTICE.md): rho_u at the FCS points (cells x fcs_points, the order of ReactionSetup) on
 // t_m = m dt, m = 0..M, built on the device with uncollided::lattice_density (view with host arrays; copied);
 // host_out (points x (M + 1)) receives a copy. react_lattice() then interpolates it at source_time.
-void lattice_table(Context *, const uncollided::LatticeView &host_view, int M, double dt, double *host_out);
+// Rows hold the times m dt, m = m0..M (m0 = 0: full table); a previous lattice table of the context is freed.
+void lattice_table(Context *, const uncollided::LatticeView &host_view, int m0, int M, double dt, double *host_out);
 // lattice-3d: the same with uncollided::lattice3d_row, one thread per point (x, y, z: host arrays of the FCS points).
 void lattice3d_table(Context *, const uncollided::Lattice3dView &host_view, const double *x, const double *y,
                      const double *z, int M, double dt, double *host_out);
@@ -194,15 +229,29 @@ struct BoundaryHighSetup {
     const double *row_mass = nullptr;  // rows x nf: M_side(n, m)
     int side_start[7] = {};            // rows of side s: side_start[s] .. side_start[s + 1]
     const double *flux_t[6] = {};      // q x q column-major (Eigen) boundary_flux_t_, null for sides without boundary
+    // Broken lines: rows break_start[s] .. side_start[s + 1] of side s belong to broken-line faces; their row weights
+    // (nf = twice the face nodes) give M_face (u - u_partner), multiplied by iface_t[s] = .5 (A_n - I)^T.
+    int break_start[6] = {};
+    const double *iface_t[6] = {};
     const int *offsets = nullptr;      // nb + 1
     const int *rows_list = nullptr;    // boundary_rows_
     const int *bnodes = nullptr;       // device: boundary node of slot k
+    const int *row_break = nullptr;    // split_breaks (experiment): rows x {0, 1}, 1 = broken-line row; null: none
 };
 void boundary_high_setup(Context *, const BoundaryHighSetup &);
 // pinned_db: rows x q row-major datum part (null: zero datum). pinned_low4: nb x 4 out (async, stream order).
-void boundary_high(Context *, const double *state, double *out, const double *pinned_db, double *pinned_low4);
+// pinned_low4_break (split_breaks): nb x 4 out, the l <= 1 sums of the broken-line rows only.
+void boundary_high(Context *, const double *state, double *out, const double *pinned_db, double *pinned_low4,
+                   double *pinned_low4_break = nullptr);
 // Device scratch for uploading small index/row lists.
 int *device_ints(Context *, int slot, int count);
 double *device_doubles(Context *, int slot, std::size_t count);
+// Dynamic tile-based adaptive PN on the device (experiment/dynamic-adaptive-pn).
+void adaptive_setup(Context *, const AdaptivePnPlan &plan);
+void adaptive_enable(Context *, bool on);
+// Evaluate per-tile max density, per-degree amplitude and border top-shell amplitude into host arrays.
+void adaptive_sensor(Context *, const double *state, bool initial, double *host_rho, double *host_E, double *host_face_E);
+// Upload updated tile orders/worklists and zero shrunken (tile, c) entries in state and gradient buffers.
+void adaptive_upload_and_zero(Context *, double *state, const AdaptivePnPlan &plan, const std::vector<int> &shrunken);
 } // namespace gpu
 } // namespace m1pn

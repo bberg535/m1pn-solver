@@ -132,3 +132,27 @@ Literaturtabelle sähe der beste Lauf um den Faktor 4 genauer aus (−0.011 %), 
 - FCS verbessert die 3D-Masse um den Faktor 2.8–3.0 bei gleichem Gitter.
 - Laufzeiten (A100): 168³ P7 336 s, 224³ P3 403 s, 112³ P15 432 s; mit FCS kommt die Tabellen- und Ausgabezeit
   dazu (112³: +300 s).
+
+## Dichtefeld (2D, 16.11.2026)
+
+`--field-pixels P --field-output FILE.csv` zählt das Gewicht jeder Historie bei T in das Pixel ihrer Position (nur 2D);
+das ergibt den Pixelmittelwert von ρ(T) mit Standardfehler aus den Batches. Die Pixelsumme mal Pixelfläche ist für
+jede Historie die Masse bei T (geprüft: 1.5e-12 relativ, ctest `lattice_mc`). Lauf: 4e10 Historien, Seed 20261116,
+224² Pixel (Kante 1/32), 393 s auf 64 Kernen (`results/heterogeneous/lattice_mc_20261116/lattice-paul_field224.csv`);
+die globalen Größen sind bitgleich zur Produktion (gleiche Historien). Rauschen ≤ 5 % bis etwa ρ ≈ 1e-6.
+
+Vergleich mit der Kampagne (`scripts/element_weno/lattice_mc_figures.py`, Abbildungen `lattice_density_maps` und
+`lattice_density_diff` in `docs/tex/figures/`): Element-WENO Q1/896 exakt über die 4×4 Elemente je Pixel gemittelt
+(Trapezregel), relative Abweichung auf den Pixeln mit MC-Fehler < 5 % und ρ_MC > 1e-7:
+
+| Lauf (896²) | Median | 90 %-Quantil | 99 %-Quantil | Median in Standardfehlern |
+|---|---:|---:|---:|---:|
+| P15, FCS | 0.52 % | 3.0 % | 7.1 % | 0.97 |
+| P21, FCS | 0.43 % | 2.7 % | 6.8 % | 0.85 |
+| P35, FCS | 0.38 % | 2.6 % | 6.8 % | 0.80 |
+| P21, ohne FCS | 0.61 % | 4.1 % | 11 % | 1.18 |
+
+Mit FCS liegt die Hälfte der Pixel im statistischen Fehler der Referenz; systematisch sind nur PN-Wellen an den
+Absorberrändern, die mit N abnehmen. Ohne FCS zusätzlich Strahlartefakte entlang der Tangenten an die Quellzelle
+(bis −10 %). Hinweis: Mit `--fcs` ist das ausgegebene `u0` in final.csv bereits die Gesamtdichte;
+`rho_uncollided` ist nur informativ (src/fast_main.cpp).

@@ -1,6 +1,6 @@
 // m1pn_fast: the standard M1PN program, element WENO on tensor Bernstein elements (docs/ELEMENT_WENO.md), without
 // MFEM. Cases on generated Cartesian hex meshes (crossing, line/plane source with optional first-collision source,
-// lattice-paul, lattice-3d, shadow-weih, smooth and beam test cases), MPI slabs (docs/ELEMENT_WENO_MPI.md), GPU time
+// lattice-paul, lattice-3d, shadow-weih, kobayashi, smooth and beam test cases), MPI slabs (docs/ELEMENT_WENO_MPI.md), GPU time
 // loop with --gpu (docs/ELEMENT_WENO_GPU.md). The former MFEM paths (mass correction, biharmonic, NN filter) were
 // removed on 2026-11-16; last state with them: tag standard-20261116.
 #include "angular.hpp"
@@ -8,9 +8,12 @@
 #include "uncollided.hpp"
 #include "uncollided_lattice.hpp"
 #include "uncollided_lattice3d.hpp"
+#include "uncollided_box3d.hpp"
 #ifdef M1PN_ELEMENT_GPU
 #include "element_weno_gpu.hpp"
 #endif
+#include "amr.hpp"
+#include <optional>
 #include "element_weno.hpp"
 #include "element_weno_mpi.hpp"
 #include "hardware.hpp"
@@ -43,6 +46,19 @@ struct Options {
     std::string mirror_reduction = "auto";
     double shadow_sigma = 1e7, beam_density = 1;
     int material_subcells = 0, history_stride = 0;
+    int break_every = 0; // broken lines at every k-th element line of each axis (docs/STATIC_HP_BLOCKS.md)
+    // EXPERIMENT (experiment/break-dt, docs/BREAK_DT.md): "high-order" selects dt = cfl * high_order_step and drops
+    // the a-priori realizability bound (Theorem 3.1 then no longer guarantees the stage states).
+    std::string dt_bound = "both";
+    // EXPERIMENT: with --break-units on, only these unit lines (coordinates, both axes) are broken; empty: all.
+    std::vector<int> break_at;
+    // EXPERIMENT: graded mesh with broken unit lines: the element on each side of a broken line gets `break_widen`
+    // times the width (that many cells merged), so the one-sided lumped mass of the line nodes grows.
+    int break_widen = 1;
+    bool split_breaks = false; // EXPERIMENT: two convex steps per stage at broken-line nodes (docs/BREAK_DT.md)
+    int ssp_n = 0;             // EXPERIMENT: SSPRK(n^2,3) for n >= 3 (docs/BIG_REBUILDS.md)
+    bool break_units = false; // broken lines on the unit lines of the box (lattices: the material lines)
+    std::vector<int> cells_per_unit; // graded mesh: elements per unit interval of each axis (docs/GRADED_MESH.md)
     bool skip_fields = false;
     double filter_strength = 0;
     Mesh mesh;
@@ -52,6 +68,7 @@ struct Options {
     std::string thread_policy = "OpenMP maximum";
     double final_time = .01, dt = 0, cfl = kDefaultCfl, sigma_a = 0, sigma_s = 0;
     double pulse_width = .07, background = .001;
+    double plane_width = .05; // plane-source Gaussian width (peak one); default exp(-200 (x - 1/2)^2)
     int degree = 2;
     double weno_linear = 1e-3, weno_q = 1, weno_deadband = 0, weno_floor = 0;
     bool m1_target = false;               // M1 instead of PN target (P1, --mirror-reduction off)
@@ -59,6 +76,20 @@ struct Options {
     bool gpu = false;                     // time loop on the GPU (src/element_weno_gpu.cpp)
     std::string fcs = "off";              // first-collision source (docs/FCS.md, docs/FCS_LATTICE.md)
     bool weno = true, element_limit = true;
+    // Dynamic tile-based adaptive PN (experiment/dynamic-adaptive-pn).
+    bool adaptive_pn = false;
+    double adaptive_tol = 3e-4, adaptive_hysteresis = 0.25;
+    int adaptive_tile = 16, adaptive_stride = 4, adaptive_min_order = 1, adaptive_halo = 1;
+    // Dynamic AMR on graded tensor meshes (experiment/dynamic-amr, docs/DYNAMIC_AMR.md): the given mesh is the base
+    // (coarsest); each base cell of each axis is split into 2^l elements, l in [amr_min_level, amr_levels].
+    bool amr = false;
+    int amr_levels = 2, amr_min_level = 0, amr_buffer = 1;
+    double amr_tol = 3e-3, amr_hysteresis = .25, amr_interval = 0; // interval 0: buffer * smallest base width
+    bool amr_pn_restart = false; // border-triggered adaptive-PN dilation after a remesh (measured: fewer coefficients, worse field)
+    int amr_radius_iterations = 20;
+    double amr_floor = 0;       // coupling B: local relative AMR indicator (0: relative to the global maximum)
+    bool amr_carry_pn = true;   // coupling A: carry the adaptive-PN orders through remeshes (measured: fewer coefficients)
+    double adaptive_floor = 0;  // coupling B: local relative adaptive-PN tolerance (0: global) // warm-started power iteration per remesh (0: cold 60 iterations)
     std::string problem = "smooth", inflow = "vacuum", output = "tmp/run";
 };
 Options parse(int argc, char **argv) {
@@ -74,14 +105,20 @@ Options parse(int argc, char **argv) {
                    " --time T --dt DT --cfl C (default 1) --time-integrator ssprk43|ssprk3 (default ssprk43)\n"
                    " --case smooth|stress|isotropic|vacuum|pure-beam|beam|crossing|plane-source|line-source|\n"
                    "   smooth-beam|vacuum-beam|oblique-beam|crossing-three|crossing-study|crossing-3d|\n"
-                   "   lattice-paul (2D, (0,7)^2)|lattice-3d (3D, (0,7)^3)|shadow-weih (3D, --inflow shadow-beam)\n"
+                   "   lattice-paul (2D, (0,7)^2)|lattice-3d (3D, (0,7)^3)|shadow-weih (3D, --inflow shadow-beam)|\n"
+                   "   kobayashi-1i|1ii|2i|2ii (3D, cm, --elements n per 200 cm, n divisible by 20; docs/KOBAYASHI.md)\n"
                    " --inflow vacuum|isotropic|time-dependent|beam|crossing|matching|smooth-transport|crossing-transport|\n"
                    "   crossing-three-transport|crossing-study-transport|crossing-3d-transport|shadow-beam\n"
-                   " --pulse-width W --background B --sigma-a A --sigma-s S --memory-mib M --threads T --max-steps K\n"
+                   " --pulse-width W --plane-width W --background B --sigma-a A --sigma-s S --memory-mib M --threads T --max-steps K\n"
                    " --weno on|off --weno-linear W --weno-q Q --weno-deadband D --weno-floor F (study, CPU) --element-limit on|off --filter off|constant --filter-strength S\n"
                    " --angular-reduction auto|on|off (1D/2D: drop PN moments odd in the unresolved directions)\n"
                    " --mirror-reduction auto|off (half/quarter/octant domain for mirror-symmetric cases)\n"
                    " --shadow-sigma S --beam-density B --material-subcells K --history-stride S --skip-fields\n"
+                   " --amr on|off --amr-levels L --amr-min-level l --amr-tol T --amr-hysteresis H --amr-buffer B\n"
+                   "   --amr-floor F --amr-carry-pn on|off --adaptive-floor F (coupling, docs/DYNAMIC_AMR.md)\n"
+                   "   --amr-interval DT --amr-radius-iterations K (dynamic AMR on graded tensor meshes, base = given mesh; docs/DYNAMIC_AMR.md)\n"
+                   " --cells-per-unit n0,n1,... (graded mesh, 1D/2D, serial CPU: every axis is split into as many equal\n"
+                   "   segments as entries, entry k = elements in segment k; e.g. lattice: 7 unit segments)\n"
                    " --sample-moments auto|all|low --fcs off|analytic --m1-target on|off --gpu --output DIR\n"
                    " compatibility: --stabilization element-weno, --model r2, --mesh-type hex are accepted\n"
                    "threads: physical cores of one NUMA node unless --threads or OMP_NUM_THREADS is set\n";
@@ -146,6 +183,24 @@ Options parse(int argc, char **argv) {
             o.final_time = real();
         else if (key == "--dt")
             o.dt = real();
+        else if (key == "--dt-bound")
+            o.dt_bound = v; // both | high-order (experiment)
+        else if (key == "--ssp-n") // experiment: SSPRK(n^2,3), n >= 3 (2 = SSPRK(4,3))
+            o.ssp_n = std::stoi(v);
+        else if (key == "--split-breaks") // experiment: on|off
+            o.split_breaks = v == "on";
+        else if (key == "--break-widen") // experiment: merge that many cells next to each broken line
+            o.break_widen = std::stoi(v);
+        else if (key == "--break-at") { // experiment: comma list of unit lines
+            std::stringstream list(v);
+            std::string item;
+            while (std::getline(list, item, ','))
+                o.break_at.push_back(std::stoi(item));
+        }
+        else if (key == "--break-units")
+            o.break_units = v == "on";
+        else if (key == "--break-every")
+            o.break_every = integer();
         else if (key == "--cfl")
             o.cfl = real();
         else if (key == "--sigma-a")
@@ -160,6 +215,8 @@ Options parse(int argc, char **argv) {
             o.max_steps = integer();
         else if (key == "--pulse-width")
             o.pulse_width = real();
+        else if (key == "--plane-width")
+            o.plane_width = real();
         else if (key == "--background")
             o.background = real();
         else if (key == "--threads") {
@@ -176,6 +233,12 @@ Options parse(int argc, char **argv) {
         } else if (key == "--beam-density") {
             o.beam_density = std::stod(v);
             require(o.beam_density >= 0 && std::isfinite(o.beam_density), "Invalid --beam-density");
+        } else if (key == "--cells-per-unit") {
+            std::stringstream list(v);
+            for (std::string item; std::getline(list, item, ',');) {
+                o.cells_per_unit.push_back(std::stoi(item));
+                require(o.cells_per_unit.back() >= 1, "Invalid --cells-per-unit");
+            }
         } else if (key == "--material-subcells") {
             o.material_subcells = std::stoi(v);
             require(o.material_subcells >= 0, "Invalid --material-subcells");
@@ -205,7 +268,49 @@ Options parse(int argc, char **argv) {
         } else if (key == "--weno" || key == "--element-limit") {
             require(v == "on" || v == "off", key + " must be on or off");
             (key == "--weno" ? o.weno : o.element_limit) = v == "on";
-        } else
+        } else if (key == "--adaptive-pn") {
+            require(v == "on" || v == "off", "--adaptive-pn must be on or off");
+            o.adaptive_pn = v == "on";
+        } else if (key == "--adaptive-tol")
+            o.adaptive_tol = real();
+        else if (key == "--adaptive-hysteresis")
+            o.adaptive_hysteresis = real();
+        else if (key == "--adaptive-tile")
+            o.adaptive_tile = integer();
+        else if (key == "--adaptive-stride")
+            o.adaptive_stride = integer();
+        else if (key == "--adaptive-min-order")
+            o.adaptive_min_order = integer();
+        else if (key == "--adaptive-halo")
+            o.adaptive_halo = integer();
+        else if (key == "--amr") {
+            require(v == "on" || v == "off", "--amr must be on or off");
+            o.amr = v == "on";
+        } else if (key == "--amr-levels")
+            o.amr_levels = integer();
+        else if (key == "--amr-min-level")
+            o.amr_min_level = integer();
+        else if (key == "--amr-buffer")
+            o.amr_buffer = integer();
+        else if (key == "--amr-tol")
+            o.amr_tol = real();
+        else if (key == "--amr-hysteresis")
+            o.amr_hysteresis = real();
+        else if (key == "--amr-interval")
+            o.amr_interval = real();
+        else if (key == "--amr-pn-restart") {
+            require(v == "on" || v == "off", "--amr-pn-restart must be on or off");
+            o.amr_pn_restart = v == "on";
+        } else if (key == "--amr-floor")
+            o.amr_floor = real();
+        else if (key == "--adaptive-floor")
+            o.adaptive_floor = real();
+        else if (key == "--amr-carry-pn") {
+            require(v == "on" || v == "off", "--amr-carry-pn must be on or off");
+            o.amr_carry_pn = v == "on";
+        } else if (key == "--amr-radius-iterations")
+            o.amr_radius_iterations = integer();
+        else
             throw std::runtime_error("Unknown option: " + key);
     }
     require(o.filter_strength >= 0, "Negative filter strength");
@@ -213,10 +318,11 @@ Options parse(int argc, char **argv) {
     require(o.weno_linear > 0 && o.weno_linear < .5 && o.weno_q >= 1, "Invalid WENO weights");
     require(o.weno_deadband >= 0 && o.weno_deadband < 1 && o.weno_floor >= 0, "Invalid --weno-deadband/--weno-floor");
     require(!o.gpu || (o.weno_deadband == 0 && o.weno_floor == 0), "--weno-deadband/--weno-floor: CPU only");
-    require(o.final_time >= 0 && o.dt >= 0 && o.cfl > 0 && o.cfl <= 1 && o.threads > 0 && o.max_steps > 0,
+    // EXPERIMENT (experiment/break-dt): CFL up to 2; above 1 the step is capped at the realizability bound.
+    require(o.final_time >= 0 && o.dt >= 0 && o.cfl > 0 && o.cfl <= 2 && o.threads > 0 && o.max_steps > 0,
             "Invalid time/thread configuration");
     require(o.sigma_a >= 0 && o.sigma_s >= 0, "Invalid reaction coefficients");
-    require(o.pulse_width > 0 && o.background >= 0, "Invalid pulse width/background");
+    require(o.pulse_width > 0 && o.plane_width > 0 && o.background >= 0, "Invalid pulse width/background");
     if (o.problem == "line-source")
         require(o.mesh.dimension == 2 && o.inflow == "vacuum", "line-source is 2D with vacuum inflow");
     return o;
@@ -348,7 +454,9 @@ Vec initial_point(const Options &o, const V3 &x, int i, int dimension, const Ang
             a += pulse(x-V3(.5,.32,z)) * harmonics(pn.order, V3::UnitY());
             a += pulse(x-V3(.68,.5,z)) * harmonics(pn.order, -V3::UnitX());
         } else if (o.problem == "plane-source")
-            a[0] = std::exp(-200 * (x[0] - .5) * (x[0] - .5)) / std::sqrt(4 * pi);
+            a[0] = (o.plane_width == .05 ? std::exp(-200 * (x[0] - .5) * (x[0] - .5))
+                                         : std::exp(-(x[0] - .5) * (x[0] - .5) / (2 * o.plane_width * o.plane_width))) /
+                   std::sqrt(4 * pi);
         else if (o.problem == "line-source") {
             // Garrett-Hauck line source: unit-mass Gaussian of width W plus floor B.
             const double r2 = (x[0] - .5) * (x[0] - .5) + (x[1] - .5) * (x[1] - .5);
@@ -357,7 +465,7 @@ Vec initial_point(const Options &o, const V3 &x, int i, int dimension, const Ang
         }
         else if (o.problem == "shadow" || o.problem == "lattice" || o.problem == "lattice-paul")
             a[0] = (o.problem=="lattice-paul"?o.background:.01) / std::sqrt(4 * pi);
-        else if (o.problem == "lattice-3d" || o.problem == "shadow-weih")
+        else if (o.problem == "lattice-3d" || o.problem == "shadow-weih" || o.problem.rfind("kobayashi-", 0) == 0)
             a[0] = o.background / std::sqrt(4 * pi); // isotropic background, no initial beam
         else
             throw std::runtime_error("Unknown case: " + o.problem);
@@ -387,6 +495,17 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     // gathered state with a global scheme (`post`).
     const int ranks = world.size, rank = world.rank;
     const bool distributed = ranks > 1;
+    // Initialization phases (wall seconds since the previous mark) to stderr and summary.json ("init_phases").
+    double init_last = begin;
+    std::string init_phases;
+    auto init_mark = [&](const char *what) {
+        const double now = seconds();
+        if (rank == 0)
+            std::cerr << "init: " << what << " " << now - init_last << " s\n";
+        init_phases += std::string(init_phases.empty() ? "" : ",") + "\"" + what + "\":" + std::to_string(now - init_last);
+        init_last = now;
+    };
+    init_mark("angular basis and options");
 #ifndef M1PN_MPI
     require(!distributed, "element-weno with several ranks needs an MPI build");
 #endif
@@ -408,7 +527,16 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     std::string expected_integrals = "null";
     const bool lattice2d = o.problem == "lattice-paul", lattice3d = o.problem == "lattice-3d",
                shadow = o.problem == "shadow-weih";
-    if (lattice2d || lattice3d || shadow)
+    // Kobayashi benchmarks (docs/KOBAYASHI.md): problem 1 or 2, case i (pure absorber) or ii (scattering ratio 1/2), on
+    // the full mirrored box in cm; the mirror reduction computes the benchmark octant with its reflecting faces.
+    int kobayashi_problem = 0;
+    bool kobayashi_scattering = false;
+    if (o.problem.rfind("kobayashi-", 0) == 0) {
+        const std::string v = o.problem.substr(10);
+        require(v == "1i" || v == "1ii" || v == "2i" || v == "2ii", "Unknown Kobayashi case (kobayashi-1i|1ii|2i|2ii)");
+        kobayashi_problem = v[0] - '0', kobayashi_scattering = v.size() == 3;
+    }
+    if (lattice2d || lattice3d || shadow || kobayashi_problem)
         require(o.sigma_s == 0 && o.sigma_a == 0, "This case owns its material coefficients");
     if (lattice2d) {
         require(dim == 2 && o.mesh.elements % 7 == 0, "lattice-paul is 2D with elements divisible by 7");
@@ -451,6 +579,29 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
           << ",\"sigma_s\":0}";
         expected_integrals = e.str();
     }
+    if (kobayashi_problem) {
+        require(dim == 3 && o.mesh.elements % 20 == 0, "kobayashi is 3D with elements divisible by 20 (h divides 10 cm)");
+        require(o.inflow == "vacuum", "kobayashi uses vacuum inflow (reflecting faces by the mirror reduction)");
+        const auto half = uncollided::kobayashi::box_half(kobayashi_problem);
+        const double hk = 200. / o.mesh.elements; // cm
+        for (int d = 0; d < 3; ++d)
+            counts[d] = int(std::lround(2 * half[d] / hk)), origin[d] = -half[d];
+        length_x = 2 * half[0];
+        material = std::make_shared<ElementWenoMaterial>();
+        const int kp = kobayashi_problem;
+        const double ratio = kobayashi_scattering ? .5 : 0.;
+        using uncollided::kobayashi::Region;
+        material->sigma_a = [kp, ratio](const V3 &x) {
+            return (1 - ratio) * uncollided::kobayashi::sigma_t(uncollided::kobayashi::region(kp, x));
+        };
+        material->sigma_s = [kp, ratio](const V3 &x) {
+            return ratio * uncollided::kobayashi::sigma_t(uncollided::kobayashi::region(kp, x));
+        };
+        material->source = [kp](const V3 &x) {
+            return uncollided::kobayashi::region(kp, x) == Region::source ? 1. : 0.;
+        };
+        material->name = "kobayashi-" + std::to_string(kp) + (kobayashi_scattering ? "ii" : "i");
+    }
     if (material)
         material->subcells = o.material_subcells > 0 ? o.material_subcells : (shadow ? 4 : 1);
     ElementWenoOptions eo;
@@ -459,13 +610,108 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     eo.elements = counts[0];
     eo.elements_per_axis = {counts[0], dim > 1 ? counts[1] : 0, dim > 2 ? counts[2] : 0};
     eo.origin = origin;
+    if (!o.cells_per_unit.empty()) {
+        // Graded mesh: every axis of the box is split into equal segments, one per entry, with the given element
+        // counts (for the lattices: unit segments, so material and source boundaries stay on element boundaries).
+        require(dim <= 2 && !distributed && !o.mesh.periodic && (!o.gpu || dim == 2),
+                "--cells-per-unit: 1D/2D (GPU: 2D), serial, open mesh (docs/GRADED_MESH.md)");
+        const std::array<int, 3> uniform_counts = counts; // the loop overwrites counts[d]; extents use the originals
+        for (int d = 0; d < dim; ++d) {
+            const double extent_d = length_x / uniform_counts[0] * uniform_counts[d];
+            const double segment = extent_d / double(o.cells_per_unit.size());
+            auto &P = eo.planes[d];
+            P.assign(1, origin[d]);
+            for (std::size_t u = 0; u < o.cells_per_unit.size(); ++u)
+                for (int k = 1; k <= o.cells_per_unit[u]; ++k)
+                    P.push_back(origin[d] + segment * (double(u) + double(k) / o.cells_per_unit[u]));
+            if (o.break_widen > 1 && o.break_units)
+                for (std::size_t u = 0; u + 1 < o.cells_per_unit.size(); ++u) {
+                    if (!o.break_at.empty() &&
+                        std::find(o.break_at.begin(), o.break_at.end(), int(u) + 1) == o.break_at.end())
+                        continue;
+                    const double line = origin[d] + segment * double(u + 1);
+                    const auto at = std::find_if(P.begin(), P.end(), [&](double p) { return std::abs(p - line) < 1e-12; });
+                    require(at != P.end(), "--break-widen: unit line not a plane");
+                    const long k = at - P.begin();
+                    // drop the planes k - 1 .. k - (w - 1) and k + 1 .. k + (w - 1)
+                    std::vector<double> Q;
+                    for (long m = 0; m < long(P.size()); ++m)
+                        if (m == k || std::abs(m - k) >= o.break_widen)
+                            Q.push_back(P[m]);
+                    P = std::move(Q);
+                }
+            counts[d] = int(P.size()) - 1;
+        }
+        eo.elements = counts[0];
+        eo.elements_per_axis = {counts[0], dim > 1 ? counts[1] : 0, dim > 2 ? counts[2] : 0};
+        eo.length = length_x;
+    }
     eo.length = length_x;
     eo.material = material;
+    if (o.amr) {
+        // Dynamic AMR (docs/DYNAMIC_AMR.md): the given mesh is the base mesh; it is run as a graded mesh (planes).
+        require(dim <= 2 && !distributed && !o.mesh.periodic && (!o.gpu || dim == 2),
+                "--amr: 1D/2D (GPU: 2D), serial, open mesh (graded tensor meshes)");
+        require(o.amr_levels >= 0 && o.amr_levels <= 6 && o.amr_min_level >= 0 && o.amr_min_level <= o.amr_levels &&
+                    o.amr_buffer >= 0 && o.amr_tol > 0 && o.amr_hysteresis > 0 && o.amr_hysteresis <= 1,
+                "--amr-levels 0..6, 0 <= --amr-min-level <= levels, --amr-buffer >= 0, --amr-tol > 0, hysteresis in (0,1]");
+        require(o.break_widen <= 1, "--amr: no --break-widen");
+        if (eo.planes[0].empty()) {
+            const double hu = length_x / counts[0];
+            for (int d = 0; d < dim; ++d) {
+                eo.planes[d].clear();
+                for (int k = 0; k <= counts[d]; ++k)
+                    eo.planes[d].push_back(origin[d] + hu * k);
+            }
+        }
+    }
+    if (o.break_every > 0 || o.break_units) {
+        require(!distributed && !o.mesh.periodic && !(o.break_every > 0 && o.break_units),
+                "--break-every / --break-units: serial, open mesh, one of the two (docs/STATIC_HP_BLOCKS.md)");
+        require(o.break_units || o.cells_per_unit.empty(), "--break-every needs a uniform mesh (graded: --break-units)");
+        for (int d = 0; d < dim; ++d) {
+            if (o.break_every > 0)
+                for (int k = o.break_every; k < counts[d]; k += o.break_every)
+                    eo.breaks[d].push_back(k);
+            else if (!o.cells_per_unit.empty()) { // graded: the segment lines (experiment: only those in --break-at)
+                const auto &P = eo.planes[d];
+                const double segment = (P.back() - P.front()) / double(o.cells_per_unit.size());
+                for (std::size_t u = 0; u + 1 < o.cells_per_unit.size(); ++u) {
+                    if (!o.break_at.empty() &&
+                        std::find(o.break_at.begin(), o.break_at.end(), int(u) + 1) == o.break_at.end())
+                        continue;
+                    const double line = P.front() + segment * double(u + 1);
+                    const auto at = std::find_if(P.begin(), P.end(), [&](double p) { return std::abs(p - line) < 1e-12; });
+                    require(at != P.end(), "--break-units: unit line not a plane");
+                    eo.breaks[d].push_back(int(at - P.begin()));
+                }
+            }
+            else { // uniform: element lines at the integer coordinates of the box
+                const double hd = length_x / counts[0];
+                for (int k = 1; k < counts[d]; ++k) {
+                    const double xk = origin[d] + k * hd;
+                    if (std::abs(xk - std::round(xk)) < 1e-9 * std::max(1., std::abs(xk)))
+                        eo.breaks[d].push_back(k);
+                }
+            }
+        }
+    }
     eo.periodic = o.mesh.periodic;
+    eo.split_breaks = o.split_breaks;
+    eo.ssp_n = o.ssp_n >= 3 ? o.ssp_n : 0;
+    require(eo.ssp_n == 0 || (o.rk == 4 && !distributed), "--ssp-n: with --time-integrator ssprk43, serial");
     eo.weno = o.weno;
     eo.limit = o.element_limit;
     eo.weno_linear = o.weno_linear;
     eo.m1_target = o.m1_target;
+    eo.adaptive_pn = o.adaptive_pn;
+    eo.adaptive_tol = o.adaptive_tol;
+    eo.adaptive_hysteresis = o.adaptive_hysteresis;
+    eo.adaptive_tile = o.adaptive_tile;
+    eo.adaptive_stride = o.adaptive_stride;
+    eo.adaptive_min_order = o.adaptive_min_order;
+    eo.adaptive_halo = o.adaptive_halo;
+    eo.adaptive_floor = o.adaptive_floor;
     // ---- First-collision source (docs/FCS.md) ----------------------------------------------------------------------
     // The grid carries the collided part psi_c (initially the isotropic floor), the Gaussian pulse is uncollided and
     // known analytically in the homogeneous infinite medium; it feeds sigma_s rho_u into psi_c.
@@ -526,6 +772,29 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             out.resize(x.size());
             parallel_for(int(x.size()), [&](int k) { out[k] = lattice_table->lattice.density(x[k][0], x[k][1], t); });
         };
+    } else if (fcs && kobayashi_problem) {
+        // Kobayashi: the whole source is uncollided; the benchmark is steady, so the collided part gets the steady
+        // uncollided density (t -> infinity, src/uncollided_box3d.hpp) from t = 0 on: same steady state, no time table.
+        auto box = std::make_shared<const uncollided::Box3dGeometry>(uncollided::kobayashi::geometry(kobayashi_problem));
+        material->source = [](const V3 &) { return 0.; };
+        material->name += ", source uncollided (FCS, steady)";
+        auto cache = std::make_shared<std::pair<std::vector<V3>, std::vector<double>>>();
+        eo.uncollided_density = [box, cache](double, const std::vector<V3> &x, std::vector<double> &out) {
+            const bool same = cache->first.size() == x.size() &&
+                              (x.empty() || ((cache->first.front() - x.front()).norm() == 0 &&
+                                             (cache->first.back() - x.back()).norm() == 0));
+            if (!same) {
+                cache->first = x;
+                cache->second.resize(x.size());
+                parallel_for(int(x.size()), [&](int k) { cache->second[k] = box->density(x[k]); });
+            }
+            out = cache->second;
+        };
+        eo.uncollided_points = o.degree + 1;
+        sample_uncollided = [box](double, const std::vector<V3> &x, std::vector<double> &out) {
+            out.resize(x.size());
+            parallel_for(int(x.size()), [&](int k) { out[k] = box->density(x[k]); });
+        };
     } else if (fcs) {
         require(o.problem == "line-source" || o.problem == "plane-source", "--fcs analytic needs line-source or plane-source");
         require(!material && o.inflow == "vacuum", "--fcs analytic needs a homogeneous medium and vacuum inflow");
@@ -535,8 +804,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             pulse.dimension = 2, pulse.width = o.pulse_width, pulse.mass = 1, pulse.centre = V3(.5, .5, 0);
         } else {
             require(dim == 1, "--fcs analytic plane-source is 1D");
-            // initial_point(): rho_0 = exp(-200 (x - 1/2)^2), i.e. width 1/20 and peak one.
-            pulse.dimension = 1, pulse.width = .05, pulse.mass = std::sqrt(2 * pi) * .05, pulse.centre = V3(.5, 0, 0);
+            // initial_point(): rho_0 = exp(-(x - 1/2)^2 / (2 w^2)), peak one (default w = 1/20).
+            pulse.dimension = 1, pulse.width = o.plane_width, pulse.mass = std::sqrt(2 * pi) * o.plane_width,
+            pulse.centre = V3(.5, 0, 0);
         }
         // The analytic pulse assumes an infinite medium: its support (t + 6 width, Gaussian tail < 1e-8) must stay
         // inside the box.
@@ -560,6 +830,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     V3 extent = V3::Zero(), center = V3::Zero();
     for (int d = 0; d < dim; ++d) extent[d] = h * counts[d], center[d] = origin[d] + .5 * extent[d];
     const Inflow inflow = make_inflow(o, dim);
+    init_mark("case and material");
     // ---- Mirror reduction per direction about the box centre ----------------------------------------------------
     // Exact for mirror-symmetric problems (tests/element_weno.cpp, mirror_quarter). Required per direction d:
     // even element count, open mesh, initial data symmetric at every node of the full grid (reflected PN moments),
@@ -567,10 +838,15 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     // inflow data symmetric: density(Rx, t, R w) = density(x, t, w) and atoms(Rx, t) = R atoms(x, t) on all faces.
     std::array<bool, 3> mirror_dir{};
     std::array<std::string, 3> mirror_reason{"", "", ""};
+    std::array<std::vector<double>, 3> full_planes = eo.planes; // graded: planes of the full box (samples)
     double mirror_asymmetry = 0;
     if (distributed && o.mirror_reduction == "auto")
         mirror_reason = {"MPI", "MPI", "MPI"}; // mirror sides and slabs are not combined
-    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed) {
+    // Graded meshes and unit broken lines (docs/STATIC_HP_BLOCKS.md, "Spiegelreduktion"): additionally the planes and
+    // the broken lines must be symmetric about the centre, and no broken line may lie on the mirror plane.
+    if (o.break_every > 0)
+        mirror_reason = {"broken lines (--break-every)", "broken lines (--break-every)", "broken lines (--break-every)"};
+    if (o.mirror_reduction == "auto" && !o.mesh.periodic && !distributed && o.break_every == 0) {
         const int pd = o.degree;
         std::array<int, 3> per{1, 1, 1};
         long total = 1;
@@ -620,6 +896,21 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         for (int d = 0; d < dim; ++d) {
             auto reflect = [&](V3 x) { x[d] = 2 * center[d] - x[d]; return x; };
             if (counts[d] % 2) { mirror_reason[d] = "odd element count"; continue; }
+            if (!eo.planes[d].empty()) {
+                const auto &P = eo.planes[d];
+                const double c = P[counts[d] / 2], tol = 1e-12 * std::max(1., std::abs(c));
+                bool even = true;
+                for (int k = 0; k <= counts[d]; ++k)
+                    even = even && std::abs(P[k] + P[counts[d] - k] - 2 * c) <= tol;
+                if (!even || std::abs(c - center[d]) > tol) { mirror_reason[d] = "graded planes not symmetric"; continue; }
+            }
+            if (!eo.breaks[d].empty()) {
+                const auto &K = eo.breaks[d];
+                bool even = !std::binary_search(K.begin(), K.end(), counts[d] / 2);
+                for (int k : K)
+                    even = even && std::binary_search(K.begin(), K.end(), counts[d] - k);
+                if (!even) { mirror_reason[d] = "broken lines not symmetric or on the mirror plane"; continue; }
+            }
             double asym = 0, scale = 0;
             for (long i = 0; i < total; ++i) {
                 const V3 x = node_x(i);
@@ -680,8 +971,21 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         }
         for (int d = 0; d < dim; ++d)
             if (mirror_dir[d]) {
-                counts[d] /= 2;
+                const int half = counts[d] / 2;
+                counts[d] = half;
                 origin[d] = center[d];
+                if (!eo.planes[d].empty()) { // graded: the upper half of the planes, starting exactly at the origin
+                    std::vector<double> P(eo.planes[d].begin() + half, eo.planes[d].end());
+                    origin[d] = P.front();
+                    eo.planes[d] = std::move(P);
+                }
+                if (!eo.breaks[d].empty()) { // broken lines of the upper half, renumbered
+                    std::vector<int> K;
+                    for (int k : eo.breaks[d])
+                        if (k > half)
+                            K.push_back(k - half);
+                    eo.breaks[d] = std::move(K);
+                }
                 eo.mirror[2 * d] = true;
             }
         eo.origin = origin;
@@ -692,6 +996,123 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     const bool mirrored = mirror_dir[0] || mirror_dir[1] || mirror_dir[2];
     double domain_factor = 1; // full mass / computed mass
     for (int d = 0; d < dim; ++d) if (mirror_dir[d]) domain_factor *= 2;
+    init_mark("mirror check");
+    // ---- Dynamic AMR: base axes and the initial levels ----------------------------------------------------------------
+    std::array<amr::Axis, 3> amr_axes;
+    std::array<Field, 2> amr_eig; // dominant vectors of the power iteration (gamma = 0, 1) on the current mesh
+    double amr_radius = 0, amr_radius_width = 0; // last step estimate and the finest element width it belongs to
+    auto amr_finest = [&]() {
+        double w = std::numeric_limits<double>::infinity();
+        for (int d = 0; d < dim; ++d)
+            for (std::size_t k = 0; k + 1 < eo.planes[d].size(); ++k)
+                w = std::min(w, eo.planes[d][k + 1] - eo.planes[d][k]);
+        return w;
+    };
+    // Warm estimates underestimate the cold 60-step estimate by up to ~0.3 % (validation, docs/DYNAMIC_AMR.md): on
+    // meshes with the same finest width the radius never decreases (the finest cells dominate it).
+    auto amr_track_radius = [&](double r) {
+        const double w = amr_finest();
+        if (amr_radius > 0 && amr_radius_width == w)
+            r = std::max(r, amr_radius);
+        amr_radius = r, amr_radius_width = w;
+        return r;
+    };
+    amr::Settings amr_set;
+    double amr_interval = 0;
+    // Node positions (Greville abscissae of the Bernstein control points, the scheme's node order) of the AMR mesh.
+    auto amr_positions = [&](const std::array<amr::Axis, 3> &axes) {
+        std::array<std::vector<double>, 3> c;
+        std::array<int, 3> n{1, 1, 1};
+        for (int d = 0; d < dim; ++d) {
+            const amr::Line l = axes[d].line();
+            const auto off = l.offsets();
+            n[d] = l.nodes();
+            c[d].assign(n[d], 0.);
+            for (int e = 0; e < l.elements(); ++e)
+                for (int j = 0; j <= l.p; ++j)
+                    c[d][l.node(e, j, off)] = l.planes[e] + (l.planes[e + 1] - l.planes[e]) * j / l.p;
+        }
+        std::vector<V3> x(std::size_t(n[0]) * n[1] * n[2], V3::Zero());
+        for (std::size_t i = 0; i < x.size(); ++i) {
+            std::size_t k = i;
+            for (int d = 0; d < dim; ++d)
+                x[i][d] = c[d][k % n[d]], k /= n[d];
+        }
+        return x;
+    };
+    // Indicator on the total density: low coefficients (nodes x 4) plus, with FCS, the uncollided density at the nodes at
+    // t and at t + interval (the coming window), the larger of the two indicators.
+    auto amr_eta = [&](const std::array<amr::Axis, 3> &axes, const Field &low4, double t) {
+        std::vector<double> times{t};
+        if (fcs && amr_interval > 0)
+            times.push_back(std::min(o.final_time, t + amr_interval));
+        std::array<std::vector<double>, 3> eta;
+        std::vector<V3> x;
+        if (fcs)
+            x = amr_positions(axes);
+        for (double ti : times) {
+            Field u = low4;
+            if (fcs) {
+                std::vector<double> unc;
+                sample_uncollided(ti, x, unc);
+                for (std::size_t i = 0; i < x.size(); ++i)
+                    u(long(i), 0) += unc[i] / std::sqrt(4 * pi);
+            }
+            const double scale = u.col(0).cwiseAbs().maxCoeff();
+            const auto e = amr::indicator(u, dim, axes, scale, o.amr_floor);
+            for (int d = 0; d < dim; ++d) {
+                if (eta[d].empty())
+                    eta[d] = e[d];
+                for (std::size_t b = 0; b < e[d].size(); ++b)
+                    eta[d][b] = std::max(eta[d][b], e[d][b]);
+            }
+        }
+        return eta;
+    };
+    auto amr_apply_mesh = [&](const std::array<amr::Axis, 3> &axes) { // planes and broken lines into eo
+        for (int d = 0; d < dim; ++d) {
+            const amr::Line l = axes[d].line();
+            eo.planes[d] = l.planes, eo.breaks[d] = l.breaks;
+            counts[d] = l.elements();
+        }
+        eo.elements = counts[0];
+        eo.elements_per_axis = {counts[0], dim > 1 ? counts[1] : 0, dim > 2 ? counts[2] : 0};
+    };
+    if (o.amr) {
+        eo.angular_cache = make_angular_cache(); // efficiency iteration 2: angular data shared by all meshes
+        amr_set.max_level = o.amr_levels, amr_set.min_level = o.amr_min_level, amr_set.tol = o.amr_tol;
+        amr_set.hysteresis = o.amr_hysteresis, amr_set.buffer = o.amr_buffer;
+        double smallest = std::numeric_limits<double>::infinity();
+        for (int d = 0; d < dim; ++d) {
+            amr::Axis &A = amr_axes[d];
+            A.p = o.degree;
+            A.base = eo.planes[d];
+            for (int k : eo.breaks[d])
+                A.breaks.push_back(eo.planes[d][k]);
+            A.level.assign(A.base.size() - 1, o.amr_min_level);
+            for (std::size_t b = 0; b + 1 < A.base.size(); ++b)
+                smallest = std::min(smallest, A.base[b + 1] - A.base[b]);
+        }
+        amr_interval = o.amr_interval > 0 ? o.amr_interval : std::max(1, o.amr_buffer) * smallest; // speed 1
+        if (fcs_lattice && !lattice3d) { // time table per window (docs/DYNAMIC_AMR.md, efficiency iteration 1)
+            lattice_table->start_time = 0;
+            lattice_table->final_time = std::min(o.final_time, amr_interval);
+        }
+        // Initial levels from the initial data (analytic, no scheme needed): refine until the indicator is met.
+        for (int it = 0; it <= o.amr_levels + 1; ++it) {
+            const auto x = amr_positions(amr_axes);
+            Field low4(long(x.size()), 4);
+            for (std::size_t i = 0; i < x.size(); ++i) {
+                Vec v = initial_point(o, x[i], int(i), dim, pn);
+                if (fcs)
+                    v.setZero(), v[0] = o.background / std::sqrt(4 * pi);
+                low4.row(long(i)) = v.head<4>().transpose();
+            }
+            if (!amr::update_levels(amr_axes, dim, amr_eta(amr_axes, low4, 0.), amr_set))
+                break;
+        }
+        amr_apply_mesh(amr_axes);
+    }
     // ---- Angular parity reduction (1D/2D) --------------------------------------------------------------------------
     eo.reduce_angular = dim < 3 && o.angular_reduction != "off";
     require(!(o.angular_reduction == "on" && dim == 3), "--angular-reduction on needs dimension 1 or 2");
@@ -714,6 +1135,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         scheme_ptr = std::make_unique<ElementWeno>(pn, eo, inflow);
     };
     build_scheme();
+    init_mark("scheme");
     auto reduce_sum = [&](double v) {
 #ifdef M1PN_MPI
         if (mpi)
@@ -766,16 +1188,15 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             build_scheme();
         }
     }
-    const ElementWeno &scheme = *scheme_ptr;
-    Field a(scheme.nodes, scheme.moments);
-    for (int i = 0; i < scheme.nodes; ++i)
-        a.row(i) = scheme.reduce(initial[i]).transpose();
+    Field a(scheme_ptr->nodes, scheme_ptr->moments);
+    for (int i = 0; i < scheme_ptr->nodes; ++i)
+        a.row(i) = scheme_ptr->reduce(initial[i]).transpose();
     std::vector<Vec>().swap(initial);
     // MPI: global scheme on rank 0 for the sample output, the slices and the material integrals.
     std::unique_ptr<ElementWeno> post;
     if (distributed && rank == 0)
         post = std::make_unique<ElementWeno>(pn, eo, inflow);
-    const ElementWeno &out_scheme = post ? *post : scheme;
+    auto out_scheme = [&]() -> const ElementWeno & { return post ? *post : *scheme_ptr; };
     auto gathered = [&](const Field &f) -> Field { // owned rows of all ranks on rank 0 (global order)
 #ifdef M1PN_MPI
         if (mpi)
@@ -787,51 +1208,105 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     std::unique_ptr<ElementWenoGpu> device;
     double gpu_radius_seconds = 0;
     if (o.gpu) {
-        device = std::make_unique<ElementWenoGpu>(scheme);
+        device = std::make_unique<ElementWenoGpu>(*scheme_ptr);
+        init_mark("gpu setup");
         const double r0 = seconds();
-        scheme.set_spectral_radius(device->spectral_radius());
+        scheme_ptr->set_spectral_radius(o.amr ? amr_track_radius(device->spectral_radius(60, nullptr, &amr_eig))
+                                              : device->spectral_radius());
+        init_mark("gpu spectral radius");
         gpu_radius_seconds = seconds() - r0;
     }
 #else
     require(!o.gpu, "--gpu: built without M1PN_ELEMENT_GPU");
 #endif
-    const double selected = o.dt > 0 ? o.dt : o.cfl * scheme.step_bound();
-    require(selected <= scheme.realizability_step() * (1 + 1e-12), "Requested dt violates the element realizability bound");
-    if (selected > scheme.high_order_step() && rank == 0)
-        std::cerr << "warning: dt exceeds the estimated high-order stability step " << scheme.high_order_step() << "\n";
+    require(o.dt_bound == "both" || o.dt_bound == "high-order", "--dt-bound both|high-order");
+    const bool high_order_only = o.dt_bound == "high-order";
+    if (o.amr && !o.gpu)
+        scheme_ptr->set_spectral_radius(amr_track_radius(scheme_ptr->power_radius(60, nullptr, &amr_eig)));
+    double selected = o.dt > 0 ? o.dt : o.cfl * (high_order_only ? scheme_ptr->high_order_step() : scheme_ptr->step_bound());
+    if (o.dt <= 0 && o.cfl > 1 && !high_order_only) // experiment: CFL > 1 relative to the high-order estimate only
+        selected = std::min(selected, scheme_ptr->realizability_step());
+    require(high_order_only || selected <= scheme_ptr->realizability_step() * (1 + 1e-12),
+            "Requested dt violates the element realizability bound");
+    if (high_order_only && rank == 0)
+        std::cerr << "EXPERIMENT --dt-bound high-order: dt " << selected << ", realizability step "
+                  << scheme_ptr->realizability_step() << " (ratio " << selected / scheme_ptr->realizability_step() << ")\n";
+    if (selected > scheme_ptr->high_order_step() && rank == 0)
+        std::cerr << "warning: dt exceeds the estimated high-order stability step " << scheme_ptr->high_order_step() << "\n";
+    init_mark("dt");
     // ---- Uniform sample grid on the full box (Q1 nodes of count*degree cells per axis) -----------------------------
     std::array<int, 3> cells_axis{1, 1, 1}, points_axis{1, 1, 1};
     long samples = 1;
-    for (int d = 0; d < dim; ++d) {
-        cells_axis[d] = (mirror_dir[d] ? 2 : 1) * counts[d] * o.degree;
-        points_axis[d] = cells_axis[d] + (o.mesh.periodic ? 0 : 1);
-        samples *= points_axis[d];
-    }
     const double hs = h / o.degree;
     V3 full_origin = origin;
-    for (int d = 0; d < dim; ++d) if (mirror_dir[d]) full_origin[d] = center[d] - .5 * extent[d];
-    std::vector<V3> where(samples);
-    Vec sample_mass(samples);
-    for (long s = 0; s < samples; ++s) {
-        V3 x = V3::Zero();
-        double m = 1;
-        long k = s;
+    std::vector<V3> where;
+    Vec sample_mass;
+    std::array<std::vector<double>, 3> axis_coord;
+    // AMR: planes of the full box from the current (half) planes, unfolded at the mirror planes.
+    auto unfold_planes = [&]() {
         for (int d = 0; d < dim; ++d) {
-            const int index = int(k % points_axis[d]);
-            k /= points_axis[d];
-            x[d] = full_origin[d] + hs * index;
-            const bool edge = !o.mesh.periodic && (index == 0 || index == cells_axis[d]);
-            m *= (edge ? .5 : 1.) * hs;
+            const auto &P = eo.planes[d];
+            std::vector<double> F;
+            if (mirror_dir[d])
+                for (std::size_t k = P.size() - 1; k >= 1; --k)
+                    F.push_back(2 * P.front() - P[k]);
+            F.insert(F.end(), P.begin(), P.end());
+            full_planes[d] = F;
         }
-        where[s] = x;
-        sample_mass[s] = m;
-    }
+    };
+    if (o.amr)
+        unfold_planes();
+    auto build_samples = [&]() {
+        samples = 1;
+        for (int d = 0; d < dim; ++d) {
+            cells_axis[d] = (mirror_dir[d] ? 2 : 1) * counts[d] * o.degree;
+            points_axis[d] = cells_axis[d] + (o.mesh.periodic ? 0 : 1);
+            samples *= points_axis[d];
+        }
+        full_origin = origin;
+        for (int d = 0; d < dim; ++d) if (mirror_dir[d]) full_origin[d] = center[d] - .5 * extent[d];
+        where.assign(samples, V3::Zero());
+        sample_mass.resize(samples);
+        // Graded mesh: the samples are the Q1 nodes of the element planes subdivided by the degree, with trapezoid
+        // weights (the uniform branch is unchanged).
+        axis_coord = {};
+        if (!full_planes[0].empty())
+            for (int d = 0; d < dim; ++d) {
+                const auto &P = full_planes[d];
+                for (std::size_t i = 0; i + 1 < P.size(); ++i)
+                    for (int k = 0; k < o.degree; ++k)
+                        axis_coord[d].push_back(P[i] + (P[i + 1] - P[i]) * k / o.degree);
+                axis_coord[d].push_back(P.back());
+                require(int(axis_coord[d].size()) == points_axis[d], "graded sample grid");
+            }
+        for (long s = 0; s < samples; ++s) {
+            V3 x = V3::Zero();
+            double m = 1;
+            long k = s;
+            for (int d = 0; d < dim; ++d) {
+                const int index = int(k % points_axis[d]);
+                k /= points_axis[d];
+                if (!axis_coord[d].empty()) {
+                    const auto &c = axis_coord[d];
+                    x[d] = c[index];
+                    m *= .5 * ((index + 1 < int(c.size()) ? c[index + 1] : c[index]) - (index > 0 ? c[index - 1] : c[index]));
+                    continue;
+                }
+                x[d] = full_origin[d] + hs * index;
+                const bool edge = !o.mesh.periodic && (index == 0 || index == cells_axis[d]);
+                m *= (edge ? .5 : 1.) * hs;
+            }
+            where[s] = x;
+            sample_mass[s] = m;
+        }
+    };
+    build_samples();
     // With FCS the written u0 is the total density (collided + uncollided) and rho_uncollided is appended; the
     // uncollided current is not added (u1..u3 are the collided moments).
     auto write_samples = [&](const std::string &file, const Field &state, double time) {
         std::ofstream f(file);
         require(bool(f), "Cannot write field");
-        const int written = state.cols() == out_scheme.moments ? pn.q : 4;
+        const int written = state.cols() == out_scheme().moments ? pn.q : 4;
         f << std::setprecision(17) << "node,x,y,z";
         for (int k = 0; k < written; ++k) f << ",u" << k;
         if (fcs) f << ",rho_uncollided";
@@ -844,10 +1319,16 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             V3 x = where[s];
             std::array<bool, 3> flip{};
             for (int d = 0; d < dim; ++d)
-                if (mirror_dir[d] && x[d] < center[d]) x[d] = 2 * center[d] - x[d], flip[d] = true;
-            const Vec active_values = out_scheme.evaluate(state, x);
+                if (mirror_dir[d] && x[d] < center[d]) {
+                    x[d] = 2 * center[d] - x[d], flip[d] = true;
+                    // Broken lines: on a line the value is two-sided and evaluate() takes the upper element; the
+                    // reflected point must take the lower one to match the full mesh (one ulp, only broken meshes).
+                    if (!eo.breaks[d].empty())
+                        x[d] = std::nextafter(x[d], -std::numeric_limits<double>::infinity());
+                }
+            const Vec active_values = out_scheme().evaluate(state, x);
             Vec u = Vec::Zero(pn.q);
-            for (int k = 0; k < active_values.size(); ++k) u[out_scheme.active[k]] = active_values[k];
+            for (int k = 0; k < active_values.size(); ++k) u[out_scheme().active[k]] = active_values[k];
             for (int d = 0; d < dim; ++d)
                 if (flip[d]) u = reflect_pn(pn, u, d);
             values.row(s) = u.transpose();
@@ -868,15 +1349,15 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     }
     auto mass_of = [&](const Field &state) { // owned nodes, reduced (all ranks call it)
         double m = 0;
-        for (int i = 0; i < scheme.nodes; ++i)
-            if (scheme.is_owned(i)) m += scheme.lumped[i] * project(state.row(i).transpose())[0];
+        for (int i = 0; i < scheme_ptr->nodes; ++i)
+            if (scheme_ptr->is_owned(i)) m += scheme_ptr->lumped[i] * project(state.row(i).transpose())[0];
         return reduce_sum(m) * domain_factor;
     };
     auto absorption_rate = [&](const Field &state) { // int sigma_a rho dx with nodal sigma_a and lumped mass
         double r = 0;
-        for (int i = 0; i < scheme.nodes; ++i)
-            if (scheme.is_owned(i))
-                r += scheme.lumped[i] * (scheme.node_sigma_a[i] + o.sigma_a) * project(state.row(i).transpose())[0];
+        for (int i = 0; i < scheme_ptr->nodes; ++i)
+            if (scheme_ptr->is_owned(i))
+                r += scheme_ptr->lumped[i] * (scheme_ptr->node_sigma_a[i] + o.sigma_a) * project(state.row(i).transpose())[0];
         return reduce_sum(r) * domain_factor;
     };
     const double initial_mass = mass_of(a);
@@ -901,14 +1382,14 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                << ",\"reaction_model\":" << (material ? "\"nodal_average_int_sigma_phi_over_int_phi\"" : "\"constant\"")
                << ",\"material\":" << std::quoted(material ? material->name : std::string("none"))
                << ",\"material_subcells\":" << (material ? material->subcells : 0)
-               << ",\"material_integrals\":{\"volume\":" << out_scheme.integral_volume * domain_factor
-               << ",\"source\":" << out_scheme.integral_source * domain_factor
-               << ",\"sigma_a\":" << out_scheme.integral_sigma_a * domain_factor
-               << ",\"sigma_s\":" << out_scheme.integral_sigma_s * domain_factor << "}"
+               << ",\"material_integrals\":{\"volume\":" << out_scheme().integral_volume * domain_factor
+               << ",\"source\":" << out_scheme().integral_source * domain_factor
+               << ",\"sigma_a\":" << out_scheme().integral_sigma_a * domain_factor
+               << ",\"sigma_s\":" << out_scheme().integral_sigma_s * domain_factor << "}"
                << ",\"material_expected\":" << expected_integrals
                << ",\"domain_origin\":[" << full_origin[0] << "," << full_origin[1] << "," << full_origin[2] << "]"
                << ",\"domain_extent\":[" << extent[0] << "," << extent[1] << "," << extent[2] << "]"
-               << ",\"cell_size\":" << h
+               << ",\"cell_size\":" << h << ",\"graded\":" << (o.cells_per_unit.empty() ? "false" : "true")
                << ",\"pn_order\":" << pn.order << ",\"Q\":" << pn.q << ",\"dimension\":" << dim
                << ",\"mirror_reduction\":" << (mirrored ? "true" : "false")
                << ",\"mirror_directions\":[" << mirror_dir[0] << "," << mirror_dir[1] << "," << mirror_dir[2] << "]"
@@ -920,21 +1401,22 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                << ",\"computed_counts\":[" << counts[0] << "," << counts[1] << "," << counts[2] << "]"
                << ",\"angular_reduction\":" << (eo.reduce_angular ? "true" : "false")
                << ",\"angular_reduction_mode\":" << std::quoted(o.angular_reduction)
-               << ",\"active_moments\":" << out_scheme.moments << ",\"odd_initial_fraction\":" << odd_initial
+               << ",\"active_moments\":" << out_scheme().moments << ",\"odd_initial_fraction\":" << odd_initial
                << ",\"odd_inflow_fraction\":" << odd_inflow
-               << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << out_scheme.nodes
-               << ",\"spatial_dofs_full_domain\":" << long(std::llround(out_scheme.nodes * domain_factor))
+               << ",\"elements_per_axis\":" << o.mesh.elements << ",\"coefficients\":" << out_scheme().nodes
+               << ",\"spatial_dofs_full_domain\":" << long(std::llround(out_scheme().nodes * domain_factor))
                << ",\"mpi_ranks\":" << ranks << ",\"mpi_halo\":" << (distributed ? 2 : 0)
                << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis[0]
                << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":" << o.rk
-               << ",\"time_integrator\":" << (eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\"")
+               << ",\"time_integrator\":" << (eo.ssp_n >= 3 ? "\"ssprk" + std::to_string(eo.ssp_n * eo.ssp_n) + "3\""
+                                                 : std::string(eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\""))
                << ",\"case\":" << std::quoted(o.problem) << ",\"inflow\":" << std::quoted(o.inflow)
                << ",\"background\":" << o.background << ",\"shadow_sigma\":" << (shadow ? o.shadow_sigma : 0.)
                << ",\"final_time\":" << o.final_time << ",\"dt_requested\":" << o.dt << ",\"dt_selected\":" << selected
                << ",\"thread_policy\":" << std::quoted(o.thread_policy)
-               << ",\"cfl_safety\":" << o.cfl << ",\"element_dt_bound\":" << scheme.dt_bound
-               << ",\"realizability_step\":" << scheme.realizability_step()
-               << ",\"high_order_step\":" << scheme.high_order_step()
+               << ",\"cfl_safety\":" << o.cfl << ",\"element_dt_bound\":" << scheme_ptr->dt_bound
+               << ",\"realizability_step\":" << scheme_ptr->realizability_step()
+               << ",\"high_order_step\":" << scheme_ptr->high_order_step()
                << ",\"gpu\":" << (o.gpu ? "true" : "false")
 
                << ",\"threads\":" << o.threads << beam_metadata(o, dim)
@@ -954,6 +1436,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     double t = 0, solver_seconds = 0, min_density = std::numeric_limits<double>::infinity(), min_margin = min_density;
     double min_margin_steps = min_density;
     int steps = 0;
+    init_mark("samples, initial output");
     const double initialization = seconds() - begin;
     progress("running", t, steps);
     std::ofstream history;
@@ -965,8 +1448,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     // reduced inside the scheme already.
     auto record = [&](int step) { // all ranks (reductions); rank 0 writes
         double mm = std::numeric_limits<double>::infinity();
-        for (int i = 0; i < scheme.nodes; ++i)
-            if (scheme.is_owned(i)) mm = std::min(mm, margin(project(a.row(i).transpose())));
+        for (int i = 0; i < scheme_ptr->nodes; ++i)
+            if (scheme_ptr->is_owned(i)) mm = std::min(mm, margin(project(a.row(i).transpose())));
         mm = reduce_min(mm);
         min_margin_steps = std::min(min_margin_steps, mm);
         const double mass = mass_of(a), rate = absorption_rate(a);
@@ -981,9 +1464,190 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     if (device)
         device->begin(a);
 #endif
+    // ---- Dynamic AMR (docs/DYNAMIC_AMR.md): remesh check at the end of every window of length amr_interval ----------
+    double amr_next = o.amr ? std::min(o.final_time, amr_interval) : std::numeric_limits<double>::infinity();
+    int amr_checks = 0, amr_remeshes = 0;
+    long amr_max_nodes = scheme_ptr->nodes, amr_min_nodes = scheme_ptr->nodes;
+    double amr_mass_defect = 0, amr_node_time = 0, amr_max_defect = 0;
+    const bool amr_radius_check = [] { const char *e = std::getenv("M1PN_AMR_RADIUS_CHECK"); return e && std::atoi(e); }();
+    double amr_radius_ratio = 0; // largest cold / warm radius (validation of the warm start)
+    double t_amr_indicator = 0, t_amr_transfer = 0, t_amr_scheme = 0, t_amr_gpu = 0, t_amr_radius = 0;
+    std::ostringstream amr_log;
+    // Lattice FCS with windowed tables: uncollided absorption int int sigma_a rho_u summed window by window with the FCS
+    // quadrature of the mesh of that window (computed domain; times domain_factor in the summary).
+    const bool amr_windowed = o.amr && fcs_lattice && !lattice3d;
+    double amr_window_start = 0, amr_unc_absorbed = 0, t_amr_table = 0;
+    auto amr_window_absorbed = [&](double t0, double t1) {
+        const auto &xs = scheme_ptr->fcs_points();
+        const auto &ws = scheme_ptr->fcs_weights();
+        std::vector<double> part(xs.size(), 0.);
+        parallel_for(int(xs.size()), [&](int k) {
+            const double sa = material->sigma_a(xs[k]);
+            if (sa > 0)
+                part[k] = ws[k] * sa * lattice_table->window_integral(std::size_t(k), t0, t1);
+        });
+        double sum = 0;
+        for (double v : part)
+            sum += v;
+        return sum;
+    };
+    auto amr_next_window = [&]() { // window [t, t + interval] of the time table, before the scheme/table rebuild
+        if (!amr_windowed)
+            return;
+        amr_unc_absorbed += amr_window_absorbed(amr_window_start, t);
+        amr_window_start = t;
+        lattice_table->start_time = t;
+        lattice_table->final_time = std::min(o.final_time, t + amr_interval);
+        lattice_table->points.clear(); // CPU: rebuilt lazily at the next source evaluation
+    };
+    auto amr_log_mesh = [&]() {
+        amr_log << (amr_log.tellp() > 0 ? "," : "") << "{\"t\":" << t << ",\"nodes\":" << scheme_ptr->nodes
+                << ",\"counts\":[" << counts[0] << "," << counts[1] << "],\"dt\":" << selected << ",\"levels\":[";
+        for (int d = 0; d < dim; ++d) {
+            amr_log << (d ? "," : "") << "[";
+            for (std::size_t b = 0; b < amr_axes[d].level.size(); ++b)
+                amr_log << (b ? "," : "") << amr_axes[d].level[b];
+            amr_log << "]";
+        }
+        amr_log << "]}";
+    };
+    if (o.amr)
+        amr_log_mesh();
+    auto amr_remesh = [&]() {
+        ++amr_checks;
+        double c0 = seconds();
+#ifdef M1PN_ELEMENT_GPU
+        if (device)
+            a = device->state();
+#endif
+        auto next = amr_axes;
+        const bool changed = amr::update_levels(next, dim, amr_eta(amr_axes, Field(a.leftCols(4)), t), amr_set);
+        t_amr_indicator += seconds() - c0;
+        if (!changed) {
+            amr_next_window();
+#ifdef M1PN_ELEMENT_GPU
+            if (device && amr_windowed) {
+                c0 = seconds();
+                device->build_lattice_table();
+                t_amr_table += seconds() - c0;
+            }
+#endif
+            return;
+        }
+        ++amr_remeshes;
+#ifdef M1PN_ELEMENT_GPU
+        std::optional<AdaptivePnPlan> old_gpu_plan;
+        if (device) {
+            a = device->end(stats);
+            if (device->adaptive_plan())
+                old_gpu_plan = *device->adaptive_plan();
+            device.reset(); // holds a reference to the old scheme
+        }
+#endif
+        c0 = seconds();
+        std::array<amr::Rows, 3> T;
+        for (int d = 0; d < dim; ++d)
+            T[d] = amr::transfer(amr_axes[d].line(), next[d].line());
+        const double mass_old = mass_of(a);
+        Field b = amr::apply(a, scheme_ptr->nodes_per_axis, dim, T);
+        for (Field &v : amr_eig) // warm start of the step estimate on the new mesh
+            if (v.rows() == scheme_ptr->nodes)
+                v = amr::apply(v, scheme_ptr->nodes_per_axis, dim, T);
+        t_amr_transfer += seconds() - c0;
+        c0 = seconds();
+        amr_axes = next;
+        amr_apply_mesh(amr_axes);
+        amr_next_window(); // with the old scheme's FCS points (absorption of the closing window)
+        if (fcs_lattice)   // the time table belongs to the FCS points of a mesh
+            (lattice3d ? lattice3_table->points : lattice_table->points).clear();
+        eo.adaptive_restart = o.amr_pn_restart; // efficiency iteration 3
+        eo.adaptive_node_order.clear();
+        if (o.amr_carry_pn && o.adaptive_pn) { // coupling A: node orders of the old mesh, mapped by the transfer support
+            const AdaptivePnPlan *P = scheme_ptr->adaptive_plan();
+#ifdef M1PN_ELEMENT_GPU
+            if (old_gpu_plan)
+                P = &*old_gpu_plan;
+#endif
+            if (P && P->num_tiles > 0) {
+                std::vector<int> order(scheme_ptr->nodes);
+                for (int i = 0; i < scheme_ptr->nodes; ++i)
+                    order[i] = P->tile_order[P->node_tile(i)];
+                eo.adaptive_node_order = amr::apply_max(order, scheme_ptr->nodes_per_axis, dim, T);
+            }
+        }
+        build_scheme();
+        t_amr_scheme += seconds() - c0;
+        c0 = seconds();
+        // Mirror planes: the moments odd under the reflection vanish there (restriction of the mirrored full field).
+        const ElementWeno &S = *scheme_ptr;
+        for (int d = 0; d < dim; ++d) {
+            const bool lo = eo.mirror[2 * d], hi = eo.mirror[2 * d + 1];
+            if (!lo && !hi)
+                continue;
+            const long stride_d = d == 0 ? 1 : (d == 1 ? S.nodes_per_axis[0] : long(S.nodes_per_axis[0]) * S.nodes_per_axis[1]);
+            const int last = S.nodes_per_axis[d] - 1;
+            for (long i = 0; i < S.nodes; ++i) {
+                const long idx = (i / stride_d) % S.nodes_per_axis[d];
+                if ((lo && idx == 0) || (hi && idx == last))
+                    for (int c = 0; c < S.moments; ++c)
+                        if (S.reflect_odd(d, c))
+                            b(i, c) = 0;
+            }
+        }
+        a = std::move(b);
+        const double defect = mass_of(a) - mass_old; // rounding of the conservative transfer (ledger term)
+        amr_mass_defect += defect;
+        amr_max_defect = std::max(amr_max_defect, std::abs(defect) / std::max(std::abs(mass_old), 1e-300));
+        a = S.admissible_rows_public(std::move(a), &stats); // rounding-only cone nudge (counted in the nudge ledger)
+        t_amr_transfer += seconds() - c0;
+#ifdef M1PN_ELEMENT_GPU
+        if (o.gpu) {
+            c0 = seconds();
+            device = std::make_unique<ElementWenoGpu>(S);
+            t_amr_gpu += seconds() - c0;
+            c0 = seconds();
+            const auto *warm = o.amr_radius_iterations > 0 ? &amr_eig : nullptr;
+            const double radius = amr_track_radius(device->spectral_radius(warm ? o.amr_radius_iterations : 60, warm, &amr_eig));
+            S.set_spectral_radius(radius);
+            t_amr_radius += seconds() - c0;
+            if (amr_radius_check) {
+                const double cold = device->spectral_radius();
+                amr_radius_ratio = std::max(amr_radius_ratio, cold / radius);
+                std::cerr << "amr: radius warm " << radius << " cold " << cold << " cold/warm " << cold / radius << "\n";
+            }
+        }
+#endif
+        c0 = seconds();
+        if (!o.gpu) {
+            const auto *warm = o.amr_radius_iterations > 0 ? &amr_eig : nullptr;
+            const double radius = amr_track_radius(S.power_radius(warm ? o.amr_radius_iterations : 60, warm, &amr_eig));
+            S.set_spectral_radius(radius);
+            if (amr_radius_check) {
+                const double cold = S.power_radius(60, nullptr, nullptr);
+                amr_radius_ratio = std::max(amr_radius_ratio, cold / radius);
+                std::cerr << "amr: radius warm " << radius << " cold " << cold << " cold/warm " << cold / radius << "\n";
+            }
+        }
+        selected = o.dt > 0 ? o.dt : o.cfl * (high_order_only ? S.high_order_step() : S.step_bound());
+        if (o.dt <= 0 && o.cfl > 1 && !high_order_only)
+            selected = std::min(selected, S.realizability_step());
+        require(high_order_only || selected <= S.realizability_step() * (1 + 1e-12),
+                "Requested dt violates the element realizability bound (AMR mesh)");
+        if (!o.gpu)
+            t_amr_radius += seconds() - c0;
+#ifdef M1PN_ELEMENT_GPU
+        if (device)
+            device->begin(a);
+#endif
+        amr_max_nodes = std::max<long>(amr_max_nodes, S.nodes), amr_min_nodes = std::min<long>(amr_min_nodes, S.nodes);
+        amr_log_mesh();
+        if (rank == 0)
+            std::cerr << "amr: t " << t << " remesh " << amr_remeshes << " nodes " << S.nodes << " counts " << counts[0]
+                      << "x" << counts[1] << " dt " << selected << " defect " << defect << "\n";
+    };
     while (t < o.final_time) {
         require(steps < o.max_steps, "Maximum step count exceeded");
-        double dt = std::min(selected, o.final_time - t);
+        double dt = std::min({selected, o.final_time - t, amr_next - t});
         const double start = seconds();
 #ifdef M1PN_ELEMENT_GPU
         if (device) {
@@ -991,10 +1655,17 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             device->step(t, dt, next, stats);
         } else
 #endif
-            a = scheme.advance(t, dt, a, &stats);
+            a = scheme_ptr->advance(t, dt, a, &stats);
         solver_seconds += seconds() - start;
         t = (o.final_time - (t + dt) <= 8 * std::numeric_limits<double>::epsilon() * o.final_time) ? o.final_time : t + dt;
         ++steps;
+        amr_node_time += double(scheme_ptr->nodes) * dt;
+        if (o.amr && t < o.final_time && t >= amr_next * (1 - 1e-12)) {
+            const double c0 = seconds();
+            amr_remesh();
+            amr_next = std::min(o.final_time, t + amr_interval);
+            solver_seconds += seconds() - c0; // remeshing is part of the solve time
+        }
         if (steps % 10 == 0) progress("running", t, steps);
         if (o.history_stride > 0 && steps % o.history_stride == 0) {
 #ifdef M1PN_ELEMENT_GPU
@@ -1008,9 +1679,17 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     if (device)
         a = device->end(stats);
 #endif
+    if (o.adaptive_pn && !o.gpu && scheme_ptr->adaptive_plan()) {
+        const AdaptivePnPlan &P = *scheme_ptr->adaptive_plan();
+        parallel_for(scheme_ptr->nodes, [&](int i) {
+            const int qi = P.tile_q[P.node_tile(i)];
+            if (qi < scheme_ptr->moments)
+                std::fill_n(&a.coeffRef(i, qi), scheme_ptr->moments - qi, 0.0);
+        });
+    }
     if (o.history_stride <= 0 || steps % o.history_stride) record(steps);
-    for (int i = 0; i < scheme.nodes; ++i) {
-        if (!scheme.is_owned(i))
+    for (int i = 0; i < scheme_ptr->nodes; ++i) {
+        if (!scheme_ptr->is_owned(i))
             continue;
         const Four u = project(a.row(i).transpose());
         min_density = std::min(min_density, u[0]);
@@ -1019,6 +1698,15 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     min_density = reduce_min(min_density), min_margin = reduce_min(min_margin);
     solver_seconds = reduce_max(solver_seconds);
     // Final state on rank 0 (global order) for the fields and the 3D slices.
+    if (o.amr) { // samples of the final mesh (initial.csv used the initial mesh)
+        unfold_planes();
+        build_samples();
+        if (!o.skip_fields && rank == 0) {
+            std::ofstream masses(o.output + "/nodal_mass.csv");
+            masses << std::setprecision(17) << "node,mass\n";
+            for (long s = 0; s < samples; ++s) masses << s << "," << sample_mass[s] << "\n";
+        }
+    }
     const bool all_moments = o.sample_moments != "low";
     const Field final_global = (!o.skip_fields || dim == 3) ? gathered(all_moments || dim == 3 ? a : Field(a.leftCols(4)))
                                                            : Field();
@@ -1041,9 +1729,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                 V3 y = x;
                 for (int d = 0; d < dim; ++d)
                     if (mirror_dir[d] && y[d] < center[d]) y[d] = 2 * center[d] - y[d];
-                const Vec values = out_scheme.evaluate(final_global, y);
+                const Vec values = out_scheme().evaluate(final_global, y);
                 Vec full = Vec::Zero(pn.q);
-                for (int c = 0; c < values.size(); ++c) full[out_scheme.active[c]] = values[c];
+                for (int c = 0; c < values.size(); ++c) full[out_scheme().active[c]] = values[c];
                 const Four m = project(full);
                 rowsv[k] = {x[0], x[1], x[2], m[0], m.tail<3>().norm()};
             });
@@ -1052,31 +1740,51 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                    << rowsv[k][1] << "," << rowsv[k][2] << "," << rowsv[k][3] << "," << rowsv[k][4] << "\n";
         }
     }
+    if (kobayashi_problem && rank == 0) {
+        // Benchmark detector points (octant, cm): collided density of the final state (Bernstein evaluation) plus the
+        // steady uncollided density at the point itself (with FCS); without FCS the grid carries everything.
+        const auto box = uncollided::kobayashi::geometry(kobayashi_problem);
+        std::ofstream df(o.output + "/detectors.csv");
+        df << std::setprecision(17) << "line,x,y,z,rho_grid,rho_uncollided,rho\n";
+        for (const auto &d : uncollided::kobayashi::detectors(kobayashi_problem)) {
+            V3 y(d.x, d.y, d.z);
+            for (int k = 0; k < dim; ++k)
+                if (mirror_dir[k] && y[k] < center[k]) y[k] = 2 * center[k] - y[k];
+            const Vec values = out_scheme().evaluate(final_global, y);
+            Vec full = Vec::Zero(pn.q);
+            for (int c = 0; c < values.size(); ++c) full[out_scheme().active[c]] = values[c];
+            const double grid = project(full)[0], unc = fcs ? box.density(V3(d.x, d.y, d.z)) : 0.;
+            df << d.line << "," << d.x << "," << d.y << "," << d.z << "," << grid << "," << unc << "," << grid + unc << "\n";
+        }
+    }
     progress("completed", t, steps);
     const double final_mass = mass_of(a);
     const double injected = reduce_sum(stats.injected) * domain_factor, absorbed = reduce_sum(stats.absorbed) * domain_factor,
                  outflow = stats.boundary_outflow * domain_factor, nudge = reduce_sum(stats.nudge_mass) * domain_factor;
-    const double balance = final_mass - initial_mass + outflow + absorbed - injected - nudge;
+    // AMR: the transfer defect (rounding of the conservative transfer) is a ledger term of its own.
+    const double balance = final_mass - initial_mass + outflow + absorbed - injected - nudge - amr_mass_defect; // mass_of is full-domain already
     double uncollided_final = 0; // int rho_u(T) over the computed domain by the FCS quadrature
-    if (fcs) scheme.collided_source(t, &uncollided_final); // owned elements
+    if (fcs) scheme_ptr->collided_source(t, &uncollided_final); // owned elements
     uncollided_final = reduce_sum(uncollided_final);
     // Lattice FCS: uncollided mass, absorption rate and absorbed total (FCS quadrature, time integral of the table),
     // and the totals that compare with the kinetic reference.
     std::string lattice_fcs_json;
     if (fcs_lattice) {
-        const auto &xs = scheme.fcs_points();
-        const auto &ws = scheme.fcs_weights();
-        const int P = scheme.fcs_points_per_element();
+        const auto &xs = scheme_ptr->fcs_points();
+        const auto &ws = scheme_ptr->fcs_weights();
+        const int P = scheme_ptr->fcs_points_per_element();
         double mu = 0, ru = 0, au = 0, table_points = 0;
         for (std::size_t k = 0; k < xs.size(); ++k) {
-            if (!scheme.element_owned(int(k / P)))
+            if (!scheme_ptr->element_owned(int(k / P)))
                 continue; // MPI: owned elements only
             table_points += 1;
             const double sa = material->sigma_a(xs[k]), r = table_value(k, t);
             mu += ws[k] * r, ru += ws[k] * sa * r;
-            if (sa > 0)
+            if (sa > 0 && !amr_windowed)
                 au += ws[k] * sa * table_integral(k, t);
         }
+        if (amr_windowed)
+            au = amr_unc_absorbed + amr_window_absorbed(amr_window_start, t);
         mu = reduce_sum(mu) * domain_factor, ru = reduce_sum(ru) * domain_factor, au = reduce_sum(au) * domain_factor;
         table_points = reduce_sum(table_points);
         const double rc = absorption_rate(a);
@@ -1107,6 +1815,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
 #ifdef M1PN_ELEMENT_GPU
                << (device ? ",\"gpu_timing\":{\"spectral_radius\":" + std::to_string(gpu_radius_seconds) +
                                 ",\"host_boundary\":" + std::to_string(device->t_boundary) +
+                                ",\"host_ghost\":" + std::to_string(device->t_ghost) +
+                                ",\"diag_device\":" + std::to_string(device->t_diag_device) +
+                                ",\"host_fallback\":" + std::to_string(device->t_fallback) +
                                 ",\"host_boundary_high\":" + std::to_string(device->t_boundary_high) +
                                 ",\"host_face_data\":" + std::to_string(device->t_face_data) +
                                 ",\"host_correction\":" + std::to_string(device->t_correction) +
@@ -1115,7 +1826,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                           : std::string())
 #endif
            
-           << ",\"initialization_seconds\":" << initialization << ",\"peak_rss_kib_rank0\":" << usage.ru_maxrss
+           << ",\"initialization_seconds\":" << initialization << ",\"init_phases\":{" << init_phases << "}"
+           << ",\"peak_rss_kib_rank0\":" << usage.ru_maxrss
            << ",\"minimum_coefficient_density\":" << min_density << ",\"minimum_cone_margin\":" << min_margin
            << ",\"minimum_cone_margin_recorded_steps\":" << min_margin_steps
            << ",\"final_density_mass\":" << final_mass << ",\"initial_density_mass\":" << initial_mass
@@ -1124,21 +1836,54 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
            << ",\"balance_relative\":" << balance / balance_scale << "}"
            << ",\"absorption_rate_final\":" << absorption_final
            << ",\"fcs\":" << std::quoted(o.fcs) << ",\"uncollided_mass_final\":" << uncollided_final * domain_factor
-           << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
+           << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice && !kobayashi_problem ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
            << lattice_fcs_json
            << ",\"min_weno_gamma\":" << stats.min_gamma
-           << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << out_scheme.cells
+           << ",\"adaptive_pn\":{\"enabled\":" << (o.adaptive_pn ? "true" : "false")
+           << ",\"tol\":" << o.adaptive_tol << ",\"hysteresis\":" << o.adaptive_hysteresis
+           << ",\"tile\":" << o.adaptive_tile << ",\"stride\":" << o.adaptive_stride
+           << ",\"min_order\":" << o.adaptive_min_order << ",\"halo\":" << o.adaptive_halo
+           << ",\"updates\":" << stats.adaptive_updates
+           << ",\"mean_coeff_fraction\":" << (stats.adaptive_steps ? stats.adaptive_coeff_sum / stats.adaptive_steps : 1.)
+           << ",\"mean_order\":" << (stats.adaptive_steps ? stats.adaptive_order_sum / stats.adaptive_steps : double(pn.order))
+           << ",\"final_coeff_fraction\":" << stats.adaptive_last_fraction
+           << ",\"final_mean_order\":" << stats.adaptive_last_mean_order
+           << ",\"final_max_order\":" << stats.adaptive_last_max_order
+           << ",\"sensor_seconds\":" << stats.t_adaptive_sensor << "}"
+           << ",\"amr\":{\"enabled\":" << (o.amr ? "true" : "false") << ",\"levels\":" << o.amr_levels
+           << ",\"min_level\":" << o.amr_min_level << ",\"tol\":" << o.amr_tol << ",\"hysteresis\":" << o.amr_hysteresis
+           << ",\"buffer\":" << o.amr_buffer << ",\"interval\":" << amr_interval << ",\"checks\":" << amr_checks
+           << ",\"remeshes\":" << amr_remeshes << ",\"mean_nodes\":" << (t > 0 ? amr_node_time / t : 0.)
+           << ",\"min_nodes\":" << amr_min_nodes << ",\"max_nodes\":" << amr_max_nodes
+           << ",\"final_nodes\":" << scheme_ptr->nodes << ",\"mass_defect\":" << amr_mass_defect
+           << ",\"max_relative_defect\":" << amr_max_defect
+           << ",\"seconds\":{\"indicator\":" << t_amr_indicator << ",\"transfer\":" << t_amr_transfer
+           << ",\"scheme\":" << t_amr_scheme << ",\"gpu_setup\":" << t_amr_gpu << ",\"table\":" << t_amr_table << ",\"step_estimate\":" << t_amr_radius
+           << "},\"radius_iterations\":" << o.amr_radius_iterations << ",\"radius_cold_over_warm\":" << amr_radius_ratio
+           << ",\"floor\":" << o.amr_floor << ",\"carry_pn\":" << (o.amr_carry_pn ? "true" : "false")
+           << ",\"adaptive_floor\":" << o.adaptive_floor << ",\"angular_cache_loads\":" << (eo.angular_cache ? angular_cache_loads(*eo.angular_cache) : 0)
+           << ",\"meshes\":[" << amr_log.str() << "]}"
+           << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << out_scheme().cells
            << ",\"mpi_ranks\":" << ranks
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states
+           << ",\"split_limited\":" << stats.split_limited << ",\"split_mass\":" << stats.split_mass
+           << ",\"min_split_theta\":" << stats.min_split_theta
            << ",\"max_limited_zero_sum\":" << stats.max_limited_zero_sum
            << ",\"phase_seconds\":{\"closure\":" << stats.t_closure << ",\"weno\":" << stats.t_weno
            << ",\"stabilization\":" << stats.t_stabilization << ",\"gradient_solve\":" << stats.t_gradient_solve
            << ",\"stab_local\":" << stats.t_stab_local << ",\"residual\":" << stats.t_residual
            << ",\"boundary\":" << stats.t_boundary << ",\"mass\":" << stats.t_mass << ",\"limiter\":" << stats.t_limiter
            << ",\"finish\":" << stats.t_finish << ",\"reaction\":" << stats.t_reaction
-           << ",\"fcs_density\":" << stats.t_fcs_density << ",\"fcs_quadrature\":" << stats.t_fcs_quadrature << "}}\n";
+           << ",\"fcs_density\":" << stats.t_fcs_density << ",\"fcs_quadrature\":" << stats.t_fcs_quadrature << "}"
+           << ",\"projection\":{\"calls\":" << stats.projection.calls << ",\"identities\":" << stats.projection.identities
+           << ",\"augmented\":" << stats.projection.augmented << ",\"diracs\":" << stats.projection.diracs
+           << ",\"certificates\":" << stats.projection.certificates << ",\"failures\":" << stats.projection.failures
+           << ",\"iterations\":" << stats.projection.iterations << ",\"backtracks\":" << stats.projection.backtracks
+           << ",\"max_iterations\":" << stats.projection.max_iterations
+           << ",\"trace_thread_seconds\":" << stats.projection.product_seconds
+           << ",\"solve_thread_seconds\":" << stats.projection.reduce_seconds << "}}\n";
     std::cout << "Completed " << steps << " steps, P" << pn.order << ", element-weno p=" << o.degree << ", "
-              << out_scheme.nodes << " coefficients" << (distributed ? ", " + std::to_string(ranks) + " MPI ranks" : std::string()) << "\n";
+              << out_scheme().nodes << " coefficients" << (distributed ? ", " + std::to_string(ranks) + " MPI ranks" : std::string()) << "\n";
     return 0;
 }
 } // namespace

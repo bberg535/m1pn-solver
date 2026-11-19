@@ -4,8 +4,9 @@
 // Space: tensor-product Bernstein Q_p on a uniform Cartesian mesh of [0,1]^d.
 // Target: PN Galerkin with consistent mass and the CG-WENO term of
 // Kuzmin, Hajduk, Vedral (arXiv:2509.04673v2), equations (6)-(7).
-// Limiter: Section 6 of holo_m1_pn (clip and scale, then one element factor).
+// Limiter: one element factor against the M1 cone (Section 6.2 of holo_m1_pn; without the clip-and-scale stage).
 // See docs/ELEMENT_WENO.md for the formulas and the choices made here.
+#include "adaptive_pn.hpp"
 #include "boundary.hpp"
 #include "m1.hpp"
 #include <random>
@@ -27,6 +28,12 @@ struct Lattice3dUncollidedTable;
 // Nodal values are the positive averages int sigma phi_i / int phi_i (Bernstein phi_i >= 0) by composite
 // Gauss quadrature: `subcells` sub-cells per element and direction, `points` Gauss points per sub-cell and
 // direction (0: degree + 4). Empty functions mean zero.
+// Mesh-independent angular data of the scheme (boundary matrices, hemisphere rules, separable traces, adaptive ghost
+// tiers), shared between schemes that differ only in the mesh (dynamic AMR rebuilds, docs/DYNAMIC_AMR.md). The first
+// scheme constructed with a cache fills it; later ones with the same angular key copy it instead of rebuilding.
+struct ElementWenoAngularCache;
+std::shared_ptr<ElementWenoAngularCache> make_angular_cache();
+long angular_cache_loads(const ElementWenoAngularCache &);
 struct ElementWenoMaterial {
     std::function<double(const V3 &)> sigma_a, sigma_s, source;
     int subcells = 1, points = 0;
@@ -38,7 +45,6 @@ struct ElementWenoOptions {
     bool stabilize = true; // false drops s_h^e altogether
     bool weno = true;      // false fixes gamma_e = 1
     bool limit = true;     // false applies the raw contributions
-    double positivity_fraction = 1e-3; // epsilon of report (25)
     double element_theta = .999;       // theta of report Section 6.2
     double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
     // Study variants of the sensor at the rounding limit (docs/ELEMENT_WENO.md; CPU only, default off = bitwise the
@@ -63,6 +69,10 @@ struct ElementWenoOptions {
     // Time integrator: false = SSPRK3 (Shu-Osher, SSP coefficient 1), true = SSPRK(4,3) (four forward Euler
     // stages of dt/2, SSP coefficient 2). Both are third order; the filter/reaction half steps are the same.
     bool ssprk43 = false;
+    // EXPERIMENT (experiment/big-rebuilds, docs/BIG_REBUILDS.md): SSPRK(n^2,3) of Ketcheson for ssp_n >= 3 (n = 2 is
+    // SSPRK(4,3)); n^2 forward Euler stages of dt/(n^2 - n), SSP coefficient n^2 - n, real stability interval per
+    // stage 1.48 (n = 3), 1.59 (n = 4) against 1.29. Requires ssprk43 (set by the driver).
+    int ssp_n = 0;
     // Angular parity reduction (dimension < 3, docs/ELEMENT_WENO.md): drop the PN moments that are odd under
     // z -> -z and, in 1D, under y -> -y. Exact for even data, because the transport and boundary matrices of
     // the resolved directions never couple even and odd moments (checked at construction). The moments with
@@ -78,6 +88,10 @@ struct ElementWenoOptions {
     // box is origin + [0, h count[0]] x [0, h count[1]] x [0, h count[2]] (e.g. 150 x 50 x 50 for the shadow
     // test). Non-cubic cells are not supported.
     std::array<int, 3> elements_per_axis{0, 0, 0};
+    // Graded tensor mesh (docs/GRADED_MESH.md): element boundaries per axis (count + 1 increasing coordinates,
+    // absolute). Empty: the uniform mesh above (bitwise unchanged). Serial CPU only for now (no MPI, GPU, mirror
+    // sides, periodic meshes); elements are boxes with the widths of their axis intervals.
+    std::array<std::vector<double>, 3> planes;
     // Space-dependent reaction (adds to the constant sigma_s, sigma_a above, which must then be zero).
     std::shared_ptr<const ElementWenoMaterial> material;
     // Mirror sides, index 2 * direction + side (side 0 = low end): specular reflection instead of a physical
@@ -100,6 +114,37 @@ struct ElementWenoOptions {
     // int sigma_s rho_u phi_i / int phi_i by Gauss quadrature (uncollided_points per element and direction,
     // 0: degree + 3), evaluated at the midpoint of each Strang half step (second order in time).
     std::function<void(double, const std::vector<V3> &, std::vector<double> &)> uncollided_density;
+    // Multi-block coupling (docs/STATIC_HP_BLOCKS.md): faces of an interface side couple to a neighbouring block
+    // instead of the kinetic inflow. interface_trace(side, x, v) returns the neighbour's PN coefficients at x in this
+    // scheme's active layout (degrees above the neighbour's order zero). Face term .5 (A_n - I)(u - v) (Rusanov),
+    // limiter bar state with the neighbour's moments as exterior; no C6 ghost on these faces.
+    std::array<bool, 6> interface_side{};
+    // Broken lines (docs/STATIC_HP_BLOCKS.md, "Trennebenen"): per axis the element lines k (0 < k < count) at which
+    // the nodes are doubled. Each side keeps its own continuous space; the faces on a broken line couple by the
+    // interface term (.5 (A_n - I)(u - v), v = the trace of the element across, limiter bar state with its moments).
+    // On the lattice: the material lines, so no node averages absorber and scatterer data. Serial, open mesh.
+    std::array<std::vector<int>, 3> breaks;
+    // EXPERIMENT (experiment/break-dt, docs/BREAK_DT.md, "a) Geteilter Schritt"): each forward Euler stage first
+    // applies the element and domain-boundary terms (y = u + tau/m (E + B_dom)), then the broken-line face terms as
+    // a second convex step from y: z = y + tau A/m (bar(y) + theta c/A - y) with c = T - (Bbar(y) - A y), T the
+    // unsplit face term at u. theta = 1 gives exactly the unsplit stage; theta < 1 only where the cone needs it.
+    // dt_bound then uses min(m / (sum 2 tv + A_dom), m / A_break) per node. Serial CPU only.
+    bool split_breaks = false;
+    std::function<void(int, const V3 &, Vec &)> interface_trace;
+    // Non-conforming interfaces: interface_split(side, face centre, face width) = number of neighbour elements along
+    // each tangential axis of this face (> 1: the face rule is applied on that many sub-faces per axis, so the face
+    // integrals of the piecewise-polynomial neighbour trace stay exact). Null or 1: one rule per face.
+    std::function<int(int, const V3 &, double)> interface_split;
+    // Conforming interfaces (same node positions on both sides): nodal coupling as on broken lines, no point loop.
+    // interface_partner(side, node) = (block, node across); interface_value(block, node, v): that node's coefficients in
+    // this scheme's active layout; interface_low(block, node, n, u, flux_n): its four moments and the M1 normal flux
+    // F(u) n, computed as the owner computes them (so both sides of a face use the same states).
+    std::function<std::pair<int, int>(int, int, int)> interface_partner; // (side, element, node) -> (block, node)
+    std::function<void(int, int, Vec &)> interface_value;
+    std::function<void(int, int, const V3 &, Four &, Four &)> interface_low;
+    // split_breaks at conforming block interfaces (experiment/big-rebuilds): the partner's step-1 state y and its
+    // normal M1 flux F(y) n (ElementWeno::split_y_state of the partner block), read after all blocks computed y.
+    std::function<void(int, int, const V3 &, Four &, Four &)> interface_split_y;
     // The same analytic pulse as an object (GPU path: the device evaluates its radial table, src/element_weno_gpu.cpp).
     std::shared_ptr<const uncollided::GaussianPulse> uncollided_pulse;
     // Lattice FCS (docs/FCS_LATTICE.md): the time table of rho_u at the FCS points; the GPU path builds it on the
@@ -140,6 +185,20 @@ struct ElementWenoOptions {
     // M1 moments (moment consistency of the rule), vanishes for identity projections, and changes the face
     // integrand by -(llf_homogeneous - (A_n + I)/2) delta. Full projection mode only.
     bool projection_high_order = false;
+    // Dynamic tile-based adaptive PN order (experiment/dynamic-adaptive-pn): each spatial tile of size
+    // adaptive_tile^d nodes carries an odd PN order N_T in [adaptive_min_order, pn.order] updated every
+    // adaptive_stride steps by a spectral tail sensor with hysteresis and border-aware wave-front dilation.
+    bool adaptive_pn = false;
+    double adaptive_tol = 3e-4;
+    double adaptive_hysteresis = 0.25;
+    int adaptive_tile = 16;
+    int adaptive_stride = 4;
+    int adaptive_min_order = 1;
+    int adaptive_halo = 1; // 0: off, 1: border-aware neighbor dilation, 2: full 3x3 dilation
+    std::shared_ptr<ElementWenoAngularCache> angular_cache; // optional (see make_angular_cache)
+    bool adaptive_restart = false;
+    double adaptive_floor = 0;                // local relative PN tolerance (AdaptivePnPlan::floor), 0: global
+    std::vector<int> adaptive_node_order;     // carried PN order per node (dynamic AMR), empty: none // adaptive PN on a transferred state (dynamic AMR): border-triggered initial dilation
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -149,6 +208,10 @@ struct ElementWenoStats {
     long rate_calls = 0, unlimited_rate_calls = 0;
     // C1/C2 counters: outward-rounded base bars; boundary nodes whose correction was reduced by the sign condition.
     long outward_bars = 0, sign_limited_nodes = 0;
+    // split_breaks: broken-line nodes whose face correction was reduced (theta < 1), and the mass that this limiting
+    // removed or added (sum m_i (z - unsplit)[0], tau included; not part of the ledger otherwise).
+    long split_limited = 0;
+    double split_mass = 0, min_split_theta = 1;
     double min_sign_factor = 1;
     // Wall seconds per phase of rate(), accumulated over all calls. t_stabilization = t_gradient_solve +
     // t_stab_local. The gradient is a line operator and s_h is gathered node by node, so t_gradient_local,
@@ -169,6 +232,15 @@ struct ElementWenoStats {
     double t_reaction = 0;
     double t_fcs_density = 0, t_fcs_quadrature = 0; // FCS: rho_u evaluation and nodal source quadrature
     PositivityProjectionStats projection;         // positivity projection of the ghost (rate() calls only)
+    // Dynamic adaptive PN diagnostics (experiment/dynamic-adaptive-pn).
+    long adaptive_updates = 0;
+    long adaptive_steps = 0;
+    double adaptive_coeff_sum = 0;
+    double adaptive_order_sum = 0;
+    double adaptive_last_fraction = 1;
+    double adaptive_last_mean_order = 0;
+    int adaptive_last_max_order = 0;
+    double t_adaptive_sensor = 0;
 };
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
@@ -201,6 +273,7 @@ struct DistributedHooks {
 class ElementWeno {
     friend class ElementWenoMpi;
     friend class ElementWenoGpu; // device time loop, src/element_weno_gpu.cpp (experimental)
+    friend struct ElementWenoAngularCache;
 public:
     // Distributed run (null: serial). owned: one flag per local node.
     void set_distributed(const DistributedHooks *hooks, std::vector<char> owned);
@@ -234,12 +307,36 @@ public:
                ElementWenoDebug * = nullptr) const;
     Field advance_ssprk3(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
     Field advance_ssprk43(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
+    // One SSPRK(4,3) stage of advance_ssprk43 for drivers that step several schemes in lockstep (multi-block, serial):
+    // out = old a + fresh (x + dt/2 rate(t, x)), then the admissible-row nudge; `weight` is the stage weight of the
+    // boundary outflow ledger. advance_ssprk43 = react(dt/2), stages (t,0,1,1/6) (t+dt/2,0,1,1/6) (t+dt,2/3,1/3,1/6)
+    // (t+dt/2,0,1,1/2), react(dt/2).
+    Field ssprk43_stage(double t, double dt, const Field &x, const Field &a, double old, double fresh, double weight,
+                        ElementWenoStats * = nullptr) const;
+    bool reacts_public() const { return reacts(); }
     // One step of the integrator selected by options.ssprk43.
     Field advance(double time, double dt, const Field &a, ElementWenoStats *stats = nullptr) const {
+        if (options.ssp_n >= 3)
+            return advance_ssp_n3(time, dt, a, stats);
         return options.ssprk43 ? advance_ssprk43(time, dt, a, stats) : advance_ssprk3(time, dt, a, stats);
     }
     // SSP coefficient of the integrator: every stage is a forward Euler step of size dt / ssp_coefficient().
-    double ssp_coefficient() const { return options.ssprk43 ? 2. : 1.; }
+    double ssp_coefficient() const {
+        return options.ssp_n >= 3 ? double(options.ssp_n * options.ssp_n - options.ssp_n) : (options.ssprk43 ? 2. : 1.);
+    }
+    // SSPRK(n^2,3) stage plan: per stage whether it is the combination stage, its time (fraction of dt), and its weight
+    // in u^{n+1} = u^n + dt sum_k weight_k L_k (boundary outflow ledger). ym is saved after `saved_after` stages.
+    struct SspStage {
+        bool combination;
+        double time, weight;
+    };
+    struct SspPlan {
+        int n = 0, stages = 0, saved_after = 0;
+        double tau_fraction = 0, wa = 0, wb = 0; // tau = dt * tau_fraction; combination: wa ym + wb (x + tau L(x))
+        std::vector<SspStage> stage;
+    };
+    static SspPlan ssp_plan(int n);
+    Field advance_ssp_n3(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
     // Realizability bound of a full step: ssp_coefficient() * dt_bound.
     double realizability_step() const { return ssp_coefficient() * dt_bound; }
     Vec weno_gamma(const Field &a) const;
@@ -270,6 +367,9 @@ public:
     // 5.1495). The largest eigenvalues of the stabilized target are dissipative (close to the negative real
     // axis); the periodic amplification test in tests/element_weno.cpp checks this. Cached per integrator.
     double high_order_step() const;
+    // Power iteration behind high_order_step (60 iterations, random start). Dynamic AMR: warm start from the transferred
+    // dominant vectors of the previous mesh (`start`, gamma = 0 and 1) with fewer iterations; `end` receives the vectors.
+    double power_radius(int iterations, const std::array<Field, 2> *start, std::array<Field, 2> *end) const;
     // Step cache (driver option --step-cache): the norm of one application of linear_operator to a fixed vector
     // identifies the operator (distributed: global norm, collective); set_spectral_radius installs a stored estimate
     // of the same operator, so high_order_step() returns the same value without the power iteration.
@@ -292,6 +392,11 @@ public:
     Field interpolate(const std::function<Vec(const V3 &)> &) const;
     Field project_l2(const std::function<Vec(const V3 &)> &) const;
     Vec evaluate(const Field &a, const V3 &x) const;
+    // Multi-block setup: the node at position x of the element that contains `probe` (closest local node), and the
+    // nodes of all interface faces as (side, element, node).
+    int node_near(const V3 &x, const V3 &probe) const;
+    void for_each_interface_node(const std::function<void(int, int, int)> &visit) const;
+    V3 element_centre(int e) const;
     V3 node_position(int node) const;
     // Diagnostics of the ghost estimators (requires positivity_projection in full mode, i.e. the full-sphere rule):
     // for every ghost pair (boundary node, side) the outgoing half moments of
@@ -309,6 +414,13 @@ public:
     // FCS quadrature points and weights (empty without uncollided_density).
     const std::vector<V3> &fcs_points() const { return fcs_points_; }
     const std::vector<double> &fcs_weights() const { return fcs_weight_; }
+    // Dynamic tile-based adaptive PN (CPU path): adapt tile orders from `a`, zeroing shrunken entries.
+    // Called automatically at the start of a run and every options.adaptive_stride steps by drivers or tests.
+    void adapt_pn_state(Field &a, bool initial = false, ElementWenoStats *stats = nullptr) const;
+    void reset_adaptive_pn() const;
+    const AdaptivePnPlan *adaptive_plan() const { return adaptive_plan_.get(); }
+    // Active moment c is odd under x_d -> -x_d (dynamic AMR: such moments vanish on a mirror plane).
+    bool reflect_odd(int d, int c) const { return d < 3 && !reflect_odd_[d].empty() && reflect_odd_[d][c]; }
 
 private:
     struct FaceRule {
@@ -332,8 +444,10 @@ private:
     bool cached_density_ = false;
     std::vector<BoundaryFace> faces_;
     std::array<FaceRule, 6> rules_;
-    std::unique_ptr<CanonicalC1> canonical_;
-    std::array<std::unique_ptr<Boundary>, 6> boundaries_;
+    std::shared_ptr<CanonicalC1> canonical_;
+    std::array<std::shared_ptr<Boundary>, 6> boundaries_;
+    bool angular_cached_ = false; // angular data copied from options.angular_cache
+    std::string angular_key() const;
     // LDL^T factors of the 1D mass in plain arrays, for row-wise multi-component line solves. `line[r]` is the
     // position on the grid line of factor row r. natural_: all nodes; dirichlet_[d]: without the mirror node.
     struct LineFactor {
@@ -362,17 +476,66 @@ private:
     void element_origin(int element, V3 &origin) const;
     // inflow_rate (optional, nodes): kinetic mass inflow rate int phi_i (-kinetic[0]) >= 0 per boundary node.
     // `high` is indexed by node (nodes rows) or compactly by boundary_slot_ (boundary_nodes_.size() rows).
+    // split_breaks: the broken-line face rows summed per node apart from the domain-boundary rows.
+    struct BreakAggregates {
+        Field high4, low, bar, flux_area; // nodes x 4, 4, 4, 3 (projected PN face load, sum w (state - u), sum w state)
+        Vec area;
+    };
     void add_boundary(double time, const Field &a, const Field &low, const Field &low_flux,
                       Field &high, Field &low_load, Field &node_flux_area, Vec &area,
-                      Field &bar, Vec *inflow_rate = nullptr, PositivityProjectionStats *projection = nullptr) const;
+                      Field &bar, Vec *inflow_rate = nullptr, PositivityProjectionStats *projection = nullptr,
+                      BreakAggregates *breaks = nullptr) const;
     // Inputs of the limited low-order part of rate() (all node-indexed except boundary_high, which has one row per
     // boundary slot and at least the four low coefficient columns).
     struct LowOrderInputs {
         const Field *low, *low_flux, *closure, *moment_rate, *stabilization_low, *boundary_high;
         const Field *boundary_low, *flux_area, *boundary_bar;
         const Vec *boundary_area, *boundary_inflow, *gamma;
+        const Field *break_high4 = nullptr; // split_breaks: projected PN load of the broken-line rows (subtracted)
     };
     Field limited_low_load(const LowOrderInputs &, ElementWenoStats *, Field *raw_out) const;
+    // split_breaks: per node the unsplit broken-line face term T (4 moments) and its area A from the last rate();
+    // apply_split_breaks turns the rate rows of the broken-line nodes into the two-step update (see split_breaks).
+    mutable Field split_term_;
+    mutable Vec split_area_;
+    std::vector<int> split_nodes_; // nodes on broken-line faces
+    // split_breaks: broken-line faces, per split node its face rows (CSR, ascending face index), and persistent
+    // work arrays of split_second_step (only the rows/nodes of the broken lines are written and read).
+    std::vector<int> split_faces_, split_row_offsets_, split_rows_;
+    mutable Field split_ylow_, split_yflux_, split_L_, split_BR_, split_FA_;
+    mutable Vec split_AR_, split_IN_;
+    void apply_split_breaks(const Field &x, Field &r, double tau, ElementWenoStats *stats) const;
+    // Core of apply_split_breaks for split node k (split_nodes_ order): u[k] the stage state, rate[k] the low-order
+    // rate of step 1 (load / m) on input, the rate of the two-step update (z - u) / tau on output. term/area: T and
+    // A per node (node-indexed). Used by the CPU stage and the GPU host phase.
+    void split_second_step(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term, const Vec &area,
+                           double tau, ElementWenoStats *stats) const;
+public:
+    // Split stage in two halves for multi-block drivers: split_compute_y (step 1 state y of all split nodes, published
+    // for the partners) and split_apply (second step); split_second_step = both. split_y_state: y and F(y) n of a node.
+    void split_compute_y(const std::vector<Four> &u, const std::vector<Four> &rate, double tau) const;
+    void split_apply(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term, const Vec &area, double tau,
+                     ElementWenoStats *stats) const;
+    void split_y_state(int node, const V3 &normal, Four &y, Four &flux_n) const;
+    // apply_split_breaks in two halves (prepare: u, step-1 rate and y of the split nodes; finish: second step, rows).
+    void split_prepare(const Field &x, const Field &r, double tau) const;
+    void split_finish(Field &r, double tau, ElementWenoStats *stats) const;
+    bool split_active() const { return split_active_; }
+    // CPU stage halves (ssprk43_stage = a then b): a evaluates the rate and the step-1 states, b the second step,
+    // the stage combination and the admissible rows.
+    Field ssprk43_stage_a(double t, double dt, const Field &x, ElementWenoStats * = nullptr) const;
+    Field ssprk43_stage_b(double t, double dt, const Field &x, const Field &a, Field r, double old, double fresh,
+                          double weight, ElementWenoStats * = nullptr) const;
+private:
+    bool split_active_ = false;
+    bool split_face(std::size_t fi) const {
+        return face_break_[fi] || nodal_interface(2 * faces_[fi].direction + faces_[fi].side);
+    }
+    bool split_row(int r) const {
+        const int side = face_row_side_[r];
+        return r >= break_row_start_[side] || nodal_interface(side);
+    }
+    mutable std::vector<Four> split_y_of_, split_u_, split_rate_; // between the two stage halves
     std::array<Sparse, 3> mass_1d_; // assembled 1D consistent masses (h m1) per axis
     // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state. With the positivity
     // projection the incoming hemisphere follows as rows [outgoing, points) (full sphere); the C6 sums only use the
@@ -390,10 +553,43 @@ private:
     // Separable trace evaluation per side (src/separable_trace.hpp; null: dense out_rules_[side].harmonics) and the
     // ghost pairs of each side.
     std::array<std::shared_ptr<const SeparableTrace>, 6> separable_;
+    // Adaptive PN: low-order quadrature pyramid (e.g. N=3, 7, 15 with rule_n = N+1) so low-order boundary nodes
+    // project on 144/400/1296 points instead of the full PN rule (e.g. 5776 points at P35).
+    struct AdaptiveGhostTier {
+        int max_order = 0;
+        int q_tier = 0;
+        std::array<OutRule, 6> out_rules;
+        std::array<std::shared_ptr<const SeparableTrace>, 6> separable;
+    };
+    std::vector<AdaptiveGhostTier> adaptive_ghost_tiers_;
     std::array<std::vector<int>, 6> ghost_by_side_;
     // Face-row layout of add_boundary (see the constructor).
     std::vector<int> face_row_, face_row_side_, boundary_row_offsets_, boundary_rows_;
     std::array<int, 7> side_row_start_{};
+    // Rows of the faces on broken lines: side_row_start_[s] <= break_row_start_[s] <= side_row_start_[s + 1]
+    // (domain faces first; equal to side_row_start_[s + 1] without broken lines). Their face matrix .5 (A_n - I)^T is
+    // sparse (interface_sparse_t_).
+    std::array<int, 6> break_row_start_{};
+    // Partner node across a broken line of face `index` for its face node n (conforming: same position).
+    int broken_partner_node(int index, int n) const;
+    // Low-order face terms of a broken-line face (rows face_row_[index] .. + nf of L, BR, FA, AR, IN, zeroed by the
+    // caller): bar states node by node with the lumped face weights and the partner's nodal state and flux (shared by
+    // add_boundary and the GPU host path).
+    void broken_face_low(int index, const Field &low, const Field &low_flux, Field &L, Field &BR, Field &FA, Vec &AR,
+                         Vec &IN) const;
+    // The same for a conforming interface face (partner data from interface_partner / interface_low).
+    void interface_face_low(int index, const Field &low, const Field &low_flux, Field &L, Field &BR, Field &FA, Vec &AR,
+                            Vec &IN) const;
+    // V rows (face mass times the partner trace) of a broken-line or conforming interface face.
+    void nodal_partner_rows(int index, const Field &a, Eigen::Ref<Field> rows, int q_cols = -1) const;
+    // Populate tile_floor for non-vacuum inflow walls and per-side max active moments for boundary_high.
+    void init_adaptive_inflow_floor(AdaptivePnPlan &plan) const;
+    void update_adaptive_side_q(AdaptivePnPlan &plan) const;
+    bool nodal_interface(int side_id) const { return options.interface_side[side_id] && bool(options.interface_partner); }
+    void nodal_face_low(int index, const Field &low, const Field &low_flux,
+                        const std::function<void(int, Four &, Four &)> &partner, Field &L, Field &BR, Field &FA, Vec &AR,
+                        Vec &IN) const;
+    std::array<Sparse, 6> interface_sparse_t_;
     // Positivity projection warm start per ghost pair (multiplier and rule of the last accepted projection). Only a
     // starting guess: the projection is unique, so the result does not depend on it beyond the solver tolerance.
     mutable std::vector<PositivityProjectionWarm> projection_warm_;
@@ -413,6 +609,43 @@ private:
         int j;
         double d, m, c[3], ct[3];
     };
+    // Element data per size class (docs/GRADED_MESH.md): one class on the uniform mesh (copies of the members
+    // above), one per occurring width triple on a graded mesh. element_class_ is empty on the uniform mesh.
+    struct ElementClass {
+        V3 width = V3::Ones();
+        double viscosity = 0;
+        Mat mass, stiffness, viscosity_ij;
+        std::array<Mat, 3> convection;
+        std::vector<PairEntry> pairs;
+        Vec total_viscosity, mass_row;
+        std::vector<double> stiffness_rows;              // sum_d f_d K_d (graded: f_d = w_d / w_min, else 1)
+        std::array<std::vector<double>, 3> convection_t_rows; // f_d C_d^T, stabilization only
+    };
+    std::vector<ElementClass> classes_;
+    std::vector<int> element_class_;
+    const ElementClass &klass(int e) const { return element_class_.empty() ? classes_[0] : classes_[element_class_[e]]; }
+    bool graded_ = false;
+    // Graded mesh: element widths per axis (global element index along the axis); per (element, 2d + side) the index
+    // of the WENO extension matrix in extension_list_ (-1: none).
+    std::array<std::vector<double>, 3> axis_width_;
+    std::vector<Mat> extension_list_;
+    std::vector<int> extension_index_;
+    std::vector<double> face_scale_; // per boundary face: physical area / rule area (1 on the uniform mesh)
+    // Width of element e along axis d (h on the uniform mesh) and its volume (h^d on the uniform mesh).
+    double width(int e, int d) const {
+        if (!graded_)
+            return h;
+        int id = e;
+        for (int k = 0; k < d; ++k)
+            id /= count[k];
+        return axis_width_[d][id % count[d]];
+    }
+    double volume(int e) const {
+        double v = 1;
+        for (int d = 0; d < dimension; ++d)
+            v *= width(e, d);
+        return v; // only used on graded meshes (the uniform branches keep std::pow(h, d))
+    }
     std::vector<PairEntry> pair_table_; // limiter pairs (i, j != i), row-major in i // ascending, for the deterministic parallel boundary corrections
     Field gather_load(const Field &local, double scale = 1.) const;
     // M^-1 C_d a along the grid lines of direction d, and the element loads of s_h for given gradients.
@@ -432,15 +665,34 @@ private:
     std::array<Mat, 6> boundary_flux_t_; // (A_n - llf_homogeneous)^T per face side (active moments)
     std::vector<char> parity_odd_;       // odd under the reflections of the angular reduction (full index)
     std::array<Mat, 6> datum_t_;         // llf_datum^T restricted to the active moments (r x moments)
+    bool broken_ = false;                         // options.breaks non-empty
+    std::array<std::vector<int>, 3> break_offset_; // per axis and element: number of broken lines k <= element
+    std::array<std::vector<double>, 3> node_coord_; // per axis and 1D node (broken meshes)
+    std::vector<char> face_break_;                  // per face: on a broken line (partner element across)
+    std::array<Mat, 6> interface_t_;     // .5 (A_n - I)^T on interface sides (neighbour trace term)
     std::array<Mat, 6> exterior_t_;      // (llf_homogeneous - (A_n + I)/2)^T (projection_high_order)
     // Boundary nodes (compact row index of the PN boundary load) and the distinct (side, node) pairs of the
     // C6 ghost state; ghost_of_face_ maps (face, face node) to such a pair.
     std::vector<int> boundary_slot_, boundary_nodes_, ghost_node_, ghost_side_, ghost_of_face_;
+    std::vector<char> vacuum_limit_node_; // per node: on a domain boundary face (C2 applies; not on interfaces only)
     mutable double spectral_radius_ = -1;
     const DistributedHooks *dist_ = nullptr;
     std::vector<char> owned_;
     void distributed_random(Field &x, std::mt19937 &rng, std::uniform_real_distribution<double> &u) const;
     Mat m1_reference_; // 1D reference element mass (the global line factor of the MPI layer is assembled from it)
+    // Dynamic tile-based adaptive PN (CPU): tile plan and natural-order banded 1D LDL^T factors for segmented line solves.
+    mutable std::unique_ptr<AdaptivePnPlan> adaptive_plan_;
+    mutable bool adaptive_active_ = false;
+    mutable long adaptive_step_counter_ = 0;
+    struct BandFactor {
+        int n = 0, p = 0;
+        std::vector<double> lower, invdiag;
+    };
+    std::array<BandFactor, 3> band_natural_, band_dirichlet_;
+    void build_band_factors();
+    void solve_band_segment(const BandFactor &f, double *buf, int width, int k0, int k1) const;
+    void adaptive_solve_lines(Field &b, int d, bool gradient, bool is_grad_segs) const;
+    Field adaptive_projected_gradient(const Field &a, int d) const;
 };
 // PN moments of the reflected distribution psi(R_d omega): moments odd under x_d -> -x_d change sign.
 Vec reflect_pn(const Angular &, const Vec &full, int direction);
