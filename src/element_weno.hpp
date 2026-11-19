@@ -135,6 +135,9 @@ struct ElementWenoOptions {
     std::function<std::pair<int, int>(int, int, int)> interface_partner; // (side, element, node) -> (block, node)
     std::function<void(int, int, Vec &)> interface_value;
     std::function<void(int, int, const V3 &, Four &, Four &)> interface_low;
+    // split_breaks at conforming block interfaces (experiment/big-rebuilds): the partner's step-1 state y and its
+    // normal M1 flux F(y) n (ElementWeno::split_y_state of the partner block), read after all blocks computed y.
+    std::function<void(int, int, const V3 &, Four &, Four &)> interface_split_y;
     // The same analytic pulse as an object (GPU path: the device evaluates its radial table, src/element_weno_gpu.cpp).
     std::shared_ptr<const uncollided::GaussianPulse> uncollided_pulse;
     // Lattice FCS (docs/FCS_LATTICE.md): the time table of rho_u at the FCS points; the GPU path builds it on the
@@ -464,6 +467,32 @@ private:
     // A per node (node-indexed). Used by the CPU stage and the GPU host phase.
     void split_second_step(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term, const Vec &area,
                            double tau, ElementWenoStats *stats) const;
+public:
+    // Split stage in two halves for multi-block drivers: split_compute_y (step 1 state y of all split nodes, published
+    // for the partners) and split_apply (second step); split_second_step = both. split_y_state: y and F(y) n of a node.
+    void split_compute_y(const std::vector<Four> &u, const std::vector<Four> &rate, double tau) const;
+    void split_apply(const std::vector<Four> &u, std::vector<Four> &rate, const Field &term, const Vec &area, double tau,
+                     ElementWenoStats *stats) const;
+    void split_y_state(int node, const V3 &normal, Four &y, Four &flux_n) const;
+    // apply_split_breaks in two halves (prepare: u, step-1 rate and y of the split nodes; finish: second step, rows).
+    void split_prepare(const Field &x, const Field &r, double tau) const;
+    void split_finish(Field &r, double tau, ElementWenoStats *stats) const;
+    bool split_active() const { return split_active_; }
+    // CPU stage halves (ssprk43_stage = a then b): a evaluates the rate and the step-1 states, b the second step,
+    // the stage combination and the admissible rows.
+    Field ssprk43_stage_a(double t, double dt, const Field &x, ElementWenoStats * = nullptr) const;
+    Field ssprk43_stage_b(double t, double dt, const Field &x, const Field &a, Field r, double old, double fresh,
+                          double weight, ElementWenoStats * = nullptr) const;
+private:
+    bool split_active_ = false;
+    bool split_face(std::size_t fi) const {
+        return face_break_[fi] || nodal_interface(2 * faces_[fi].direction + faces_[fi].side);
+    }
+    bool split_row(int r) const {
+        const int side = face_row_side_[r];
+        return r >= break_row_start_[side] || nodal_interface(side);
+    }
+    mutable std::vector<Four> split_y_of_, split_u_, split_rate_; // between the two stage halves
     std::array<Sparse, 3> mass_1d_; // assembled 1D consistent masses (h m1) per axis
     // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state. With the positivity
     // projection the incoming hemisphere follows as rows [outgoing, points) (full sphere); the C6 sums only use the

@@ -532,12 +532,12 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
                 }
             }
         h.offsets = s.boundary_row_offsets_.data(), h.rows_list = s.boundary_rows_.data(), h.bnodes = d_bnodes_;
-        split_ = s.options.split_breaks && s.broken_;
+        split_ = s.split_active(); // broken lines and, in m1pn_blocks, conforming block interfaces
         std::vector<int> row_break;
         if (split_) {
             row_break.assign(std::max(1, face_rows), 0);
             for (int r = 0; r < face_rows; ++r)
-                row_break[r] = r >= s.break_row_start_[s.face_row_side_[r]];
+                row_break[r] = s.split_row(r);
             h.row_break = row_break.data();
             pin_low4b_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(nb_) * 4));
             brk_low_ = Field::Zero(s.nodes, 4), brk_bar_ = Field::Zero(s.nodes, 4), brk_fa_ = Field::Zero(s.nodes, 3);
@@ -977,7 +977,7 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
             brk_low_.row(i).setZero(), brk_bar_.row(i).setZero(), brk_fa_.row(i).setZero(), brk_area_[i] = 0;
         for (int e = s.boundary_row_offsets_[k]; e < s.boundary_row_offsets_[k + 1]; ++e) {
             const int r = s.boundary_rows_[e];
-            if (split_ && r >= s.break_row_start_[s.face_row_side_[r]]) { // split_breaks: broken-line rows apart
+            if (split_ && s.split_row(r)) { // split_breaks: broken-line and interface rows apart
                 brk_low_.row(i) += L_.row(r);
                 brk_bar_.row(i) += BR_.row(r);
                 brk_fa_.row(i) += FA_.row(r);
@@ -1308,7 +1308,7 @@ int ElementWenoGpu::stage_begin(double time, const double *x, double *out, doubl
     return buffer;
 }
 void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double *out, double *u, double old,
-                               double fresh, double tau, double weight, double dt, ElementWenoStats &stats) {
+                               double fresh, double tau, double weight, double dt, ElementWenoStats &stats, bool defer) {
     const int q = s_.moments;
     const gpu::Buffers b = gpu::buffers(ctx_);
     // Phase A: PN boundary load rows, added before the mass solve (device, or host with M1PN_GPU_BOUNDARY_HIGH=0).
@@ -1447,10 +1447,30 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
                 u[k] = Four(low_h_(i, 0), low_h_(i, 1), low_h_(i, 2), low_h_(i, 3));
                 rate[k] = Four(load_b_.row(slot).transpose()) / s_.lumped[i];
             });
-            s_.split_second_step(u, rate, split_term_h_, brk_area_, tau, &stats);
+            split_u_h_ = std::move(u), split_rate_h_ = std::move(rate);
+            s_.split_compute_y(split_u_h_, split_rate_h_, tau);
+        }
+        t_correction += seconds() - t0;
+    }
+    if (defer) {
+        finish_pending_ = true;
+        return;
+    }
+    stage_end_finish(x, out, u, old, fresh, tau, weight, dt, stats);
+}
+void ElementWenoGpu::stage_end_finish(const double *x, double *out, double *u, double old, double fresh, double tau,
+                                      double weight, double dt, ElementWenoStats &stats) {
+    finish_pending_ = false;
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    {
+        const double t0 = seconds();
+        if (split_) { // second step (ElementWeno::split_apply), partners' step-1 states published
+            const auto &nodes = s_.split_nodes_;
+            const int K = int(nodes.size());
+            s_.split_apply(split_u_h_, split_rate_h_, split_term_h_, brk_area_, tau, &stats);
             parallel_for(K, [&](int k) {
                 const int i = nodes[k];
-                load_b_.row(s_.boundary_slot_[i]) = (s_.lumped[i] * rate[k]).transpose();
+                load_b_.row(s_.boundary_slot_[i]) = (s_.lumped[i] * split_rate_h_[k]).transpose();
             });
         }
         std::copy_n(load_b_.data(), std::size_t(nb_) * 4, pin_load_up_);
@@ -1543,6 +1563,28 @@ void ElementWenoGpu::lockstep_begin(int s, double time, double dt) {
     const double *x[4] = {u_, b1_, b2_, b1_};
     double *out[4] = {b1_, b2_, b1_, b2_};
     lockstep_buffer_ = stage_begin(t[s], x[s], out[s], std::numeric_limits<double>::quiet_NaN());
+}
+void ElementWenoGpu::lockstep_end_a(int s, double time, double dt, ElementWenoStats &stats) {
+    const double half = .5 * dt, t[4] = {time, time + half, time + dt, time + half};
+    const double old[4] = {0, 0, 2. / 3, 0}, fresh[4] = {1, 1, 1. / 3, 1}, weight[4] = {1. / 6, 1. / 6, 1. / 6, .5};
+    const double *x[4] = {u_, b1_, b2_, b1_};
+    double *out[4] = {b1_, b2_, b1_, b2_};
+    lockstep_stage_ = s, lockstep_time_ = time, lockstep_dt_ = dt;
+    stage_end(lockstep_buffer_, t[s], x[s], out[s], u_, old[s], fresh[s], half, weight[s], dt, stats, split_);
+    if (!finish_pending_ && s == 3)
+        std::swap(u_, b2_);
+}
+void ElementWenoGpu::lockstep_end_b(ElementWenoStats &stats) {
+    if (!finish_pending_)
+        return;
+    const int s = lockstep_stage_;
+    const double dt = lockstep_dt_, half = .5 * dt;
+    const double old[4] = {0, 0, 2. / 3, 0}, fresh[4] = {1, 1, 1. / 3, 1}, weight[4] = {1. / 6, 1. / 6, 1. / 6, .5};
+    const double *x[4] = {u_, b1_, b2_, b1_};
+    double *out[4] = {b1_, b2_, b1_, b2_};
+    stage_end_finish(x[s], out[s], u_, old[s], fresh[s], half, weight[s], dt, stats);
+    if (s == 3)
+        std::swap(u_, b2_);
 }
 void ElementWenoGpu::lockstep_end(int s, double time, double dt, ElementWenoStats &stats) {
     const double half = .5 * dt, t[4] = {time, time + half, time + dt, time + half};

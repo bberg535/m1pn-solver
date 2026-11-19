@@ -36,6 +36,10 @@ public:
     void lockstep_react(double tau, double source_time, ElementWenoStats &stats) { react(tau, source_time, stats); }
     void lockstep_begin(int s, double time, double dt);
     void lockstep_end(int s, double time, double dt, ElementWenoStats &stats);
+    // Split stage at block interfaces: lockstep_end_a stops after the step-1 states, lockstep_end_b completes it
+    // (lockstep_end = a then b). Without a pending second step, b does nothing.
+    void lockstep_end_a(int s, double time, double dt, ElementWenoStats &stats);
+    void lockstep_end_b(ElementWenoStats &stats);
     const Field &host_state() const { return a_h_; }
     // Spectral radius of high_order_step() (same power iteration, on the device).
     double spectral_radius();
@@ -117,8 +121,16 @@ private:
     void stage(double time, const double *x, double *out, double *u, double old, double fresh, double tau,
                double weight, double dt, ElementWenoStats &stats, double next_time);
     int stage_begin(double time, const double *x, double *out, double next_time);
+    // defer (multi-block split stage): stop after the step-1 states (ElementWeno::split_compute_y); stage_end_finish
+    // completes the stage once all blocks published theirs.
     void stage_end(int buffer, double time, const double *x, double *out, double *u, double old, double fresh,
-                   double tau, double weight, double dt, ElementWenoStats &stats);
+                   double tau, double weight, double dt, ElementWenoStats &stats, bool defer = false);
+    void stage_end_finish(const double *x, double *out, double *u, double old, double fresh, double tau, double weight,
+                          double dt, ElementWenoStats &stats);
+    std::vector<Four> split_u_h_, split_rate_h_;
+    bool finish_pending_ = false;
+    int lockstep_stage_ = 0;
+    double lockstep_time_ = 0, lockstep_dt_ = 0;
     bool interfaces_ = false; // multi-block interface sides: host face work by ElementWeno::add_boundary
     bool nodal_interfaces_ = false; // conforming interface sides: partner term as face datum, regular pipeline
     bool nodal_db_zeroed_ = false;

@@ -281,7 +281,10 @@ int main(int argc, char **argv) {
                             eo.breaks[d].push_back(k2);
                     }
                 }
-            eo.split_breaks = split_breaks && (!eo.breaks[0].empty() || !eo.breaks[1].empty());
+            // Split stage at inner broken lines and, with nodal coupling, at the block interfaces (experiment).
+            bool has_interface = false;
+            for (int s2 = 0; s2 < 4; ++s2) has_interface = has_interface || eo.interface_side[s2];
+            eo.split_breaks = split_breaks && (!eo.breaks[0].empty() || !eo.breaks[1].empty() || (nodal && has_interface));
             if (nodal) {
                 eo.interface_partner = [&, k, key](int side, int element, int node) {
                     const auto it = partner[k].find(key(side, element, node));
@@ -301,6 +304,9 @@ int main(int argc, char **argv) {
                     }
                 };
                 eo.interface_value = map_row;
+                eo.interface_split_y = [&](int pb, int pn, const V3 &normal, Four &u, Four &flux) {
+                    blocks[pb].scheme->split_y_state(pn, normal, u, flux); // published by the partner's first half
+                };
                 eo.interface_low = [map_row](int pb, int pn, const V3 &normal, Four &u, Four &flux) {
                     thread_local Vec v;
                     map_row(pb, pn, v);
@@ -505,7 +511,10 @@ int main(int argc, char **argv) {
                 };
                 for (int s = 0; s < 4; ++s) {
                     each_block([&](Block &b) { clock(b.t_begin, [&] { b.gpu->lockstep_begin(s, t, dt); }); });
-                    each_block([&](Block &b) { clock(b.t_end, [&] { b.gpu->lockstep_end(s, t, dt, b.stats); }); });
+                    // Two halves: all blocks publish their step-1 states before any second step (split stage at the
+                    // block interfaces); blocks without a pending second step finish in the first half.
+                    each_block([&](Block &b) { clock(b.t_end, [&] { b.gpu->lockstep_end_a(s, t, dt, b.stats); }); });
+                    each_block([&](Block &b) { clock(b.t_end, [&] { b.gpu->lockstep_end_b(b.stats); }); });
                 }
                 for (Block &b : blocks)
                     if (b.scheme->reacts_public())
@@ -529,9 +538,12 @@ int main(int argc, char **argv) {
             for (int k = 0; k < B; ++k) x[k] = base[k];
             for (int s = 0; s < 4; ++s) {
                 for (int k = 0; k < B; ++k) current[k] = &x[k];
+                // Two halves with a barrier: every block publishes its step-1 states before any second step reads a
+                // partner's (split stage at block interfaces); without split_breaks this is ssprk43_stage.
+                for_blocks([&](int k) { y[k] = blocks[k].scheme->ssprk43_stage_a(stage_t[s], dt, x[k], &blocks[k].stats); });
                 for_blocks([&](int k) {
-                    y[k] = blocks[k].scheme->ssprk43_stage(stage_t[s], dt, x[k], base[k], stage_old[s], stage_fresh[s],
-                                                           stage_w[s], &blocks[k].stats);
+                    y[k] = blocks[k].scheme->ssprk43_stage_b(stage_t[s], dt, x[k], base[k], std::move(y[k]), stage_old[s],
+                                                             stage_fresh[s], stage_w[s], &blocks[k].stats);
                 });
                 std::swap(x, y);
             }
