@@ -1492,6 +1492,33 @@ void ElementWenoGpu::step(double t, double dt, double next, ElementWenoStats &st
     if (reacts)
         react(.5 * dt, t + .25 * dt, stats);
     double *u = u_, *b1 = b1_, *b2 = b2_;
+    if (s_.options.ssp_n >= 3) { // SSPRK(n^2,3) (experiment): three buffers, ym kept in one of them
+        static thread_local ElementWeno::SspPlan plan;
+        if (plan.n != s_.options.ssp_n)
+            plan = ElementWeno::ssp_plan(s_.options.ssp_n);
+        double *buf[3] = {u_, b1_, b2_};
+        int c = 0, y = -1;
+        const double tau = dt * plan.tau_fraction;
+        for (int k = 0; k < plan.stages; ++k) {
+            if (k == plan.saved_after)
+                y = c;
+            int o = 0;
+            while (o == c || o == y)
+                ++o;
+            const auto &st = plan.stage[k];
+            const double t_next = k + 1 < plan.stages ? t + plan.stage[k + 1].time * dt : next;
+            if (st.combination) {
+                stage(t + st.time * dt, buf[c], buf[o], buf[y], plan.wa, plan.wb, tau, st.weight, dt, stats, t_next);
+                y = -1;
+            } else
+                stage(t + st.time * dt, buf[c], buf[o], buf[c], 0, 1, tau, st.weight, dt, stats, t_next);
+            c = o;
+        }
+        u_ = buf[c], b1_ = buf[(c + 1) % 3], b2_ = buf[(c + 2) % 3];
+        if (reacts)
+            react(.5 * dt, t + .75 * dt, stats);
+        return;
+    }
     if (!four) {
         stage(t, u, b1, u, 0, 1, dt, 1. / 6, dt, stats, t + dt);
         stage(t + dt, b1, b2, u, .75, .25, dt, 1. / 6, dt, stats, t + .5 * dt);
@@ -1510,7 +1537,7 @@ void ElementWenoGpu::step(double t, double dt, double next, ElementWenoStats &st
         react(.5 * dt, t + .75 * dt, stats);
 }
 void ElementWenoGpu::lockstep_begin(int s, double time, double dt) {
-    require(s_.options.ssprk43 && s >= 0 && s < 4, "lockstep: SSPRK(4,3) stages 0..3");
+    require(s_.options.ssprk43 && s_.options.ssp_n < 3 && s >= 0 && s < 4, "lockstep: SSPRK(4,3) stages 0..3");
     const double half = .5 * dt, t[4] = {time, time + half, time + dt, time + half};
     const double *x[4] = {u_, b1_, b2_, b1_};
     double *out[4] = {b1_, b2_, b1_, b2_};

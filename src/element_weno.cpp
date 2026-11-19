@@ -2869,7 +2869,12 @@ double ElementWeno::high_order_step() const {
         spectral_radius_ = radius;
     }
     // Negative real axis limits: roots of 1 + z + z^2/2 + z^3/6 = -1 and of 1 + z/2 + z^2/6 + z^3/48 = 0.
-    const double limit = options.ssprk43 ? 5.149486147 : 2.512745327;
+    // SSPRK(n^2,3), n = 3, 4, 5: real stability limits 13.2897595, 25.4190392, 41.5302366 (bisection on |R(z)| = 1).
+    const double limit = options.ssp_n == 3   ? 13.289759506
+                         : options.ssp_n == 4 ? 25.419039165
+                         : options.ssp_n == 5 ? 41.530236556
+                         : options.ssprk43    ? 5.149486147
+                                              : 2.512745327;
     return .9 * limit / spectral_radius_;
 }
 Field ElementWeno::angular_filter(const Field &a, double tau) const {
@@ -3128,6 +3133,64 @@ Field ElementWeno::advance_ssprk43(double time, double dt, const Field &input, E
     }
     return last; // no copy (a conditional operator would copy the lvalue)
 }
+ElementWeno::SspPlan ElementWeno::ssp_plan(int n) {
+    require(n >= 2 && n <= 5, "SSPRK(n^2,3): 2 <= n <= 5");
+    SspPlan p;
+    p.n = n, p.stages = n * n, p.saved_after = (n - 1) * (n - 2) / 2;
+    const int r = n * n - n;
+    p.tau_fraction = 1. / r, p.wa = double(n) / (2 * n - 1), p.wb = double(n - 1) / (2 * n - 1);
+    // States as coefficient vectors over the stage rates (units of dt), and their times.
+    std::vector<double> cur(p.stages, 0.), ym;
+    double t_cur = 0, t_ym = 0;
+    const int comb = n * (n + 1) / 2 - 1; // index of the combination stage
+    for (int k = 0; k < p.stages; ++k) {
+        if (k == p.saved_after)
+            ym = cur, t_ym = t_cur;
+        SspStage s{k == comb, t_cur, 0.};
+        p.stage.push_back(s);
+        if (k == comb) {
+            for (int j = 0; j < p.stages; ++j)
+                cur[j] = p.wa * ym[j] + p.wb * cur[j];
+            cur[k] += p.wb * p.tau_fraction;
+            t_cur = p.wa * t_ym + p.wb * (t_cur + p.tau_fraction);
+        } else {
+            cur[k] += p.tau_fraction;
+            t_cur += p.tau_fraction;
+        }
+    }
+    for (int k = 0; k < p.stages; ++k)
+        p.stage[k].weight = cur[k];
+    return p;
+}
+Field ElementWeno::advance_ssp_n3(double time, double dt, const Field &input, ElementWenoStats *stats) const {
+    require(!dist_, "SSPRK(n^2,3): serial schemes only (experiment)");
+    static thread_local SspPlan plan;
+    if (plan.n != options.ssp_n)
+        plan = ssp_plan(options.ssp_n);
+    Field cur = reacts() ? react(input, .5 * dt, stats, time + .25 * dt) : input;
+    Field ym;
+    const double tau = dt * plan.tau_fraction;
+    for (int k = 0; k < plan.stages; ++k) {
+        if (k == plan.saved_after)
+            ym = cur;
+        const SspStage &st = plan.stage[k];
+        Field r = rate(time + st.time * dt, cur, stats);
+        apply_split_breaks(cur, r, tau, stats);
+        if (stats)
+            stats->boundary_outflow -= dt * st.weight * stats->last_boundary_mass_rate;
+        const double combine_start = seconds();
+        if (st.combination)
+            combine(r, cur, ym, plan.wa, plan.wb, tau, nodes);
+        else
+            combine(r, cur, cur, 0, 1, tau, nodes);
+        cur = admissible_rows(std::move(r), nodes, stats, lumped, owned_);
+        if (stats)
+            stats->t_ssp_stage += seconds() - combine_start;
+    }
+    if (reacts())
+        return react(cur, .5 * dt, stats, time + .75 * dt);
+    return cur;
+}
 Field ElementWeno::ssprk43_stage(double t, double dt, const Field &x, const Field &a, double old, double fresh,
                                  double weight, ElementWenoStats *stats) const {
     require(!dist_, "ssprk43_stage: serial schemes only");
@@ -3151,7 +3214,7 @@ Field ElementWeno::ssprk43_stage(double t, double dt, const Field &x, const Fiel
 void ElementWeno::apply_split_breaks(const Field &x, Field &r, double tau, ElementWenoStats *stats) const {
     if (!(options.split_breaks && broken_) || split_nodes_.empty())
         return;
-    require(options.ssprk43, "split_breaks: SSPRK(4,3) only");
+    require(options.ssprk43 || options.ssp_n >= 3, "split_breaks: SSPRK(4,3) or SSPRK(n^2,3) only");
     const int K = int(split_nodes_.size());
     std::vector<Four> u(K), rate(K);
     parallel_for(K, [&](int k) {

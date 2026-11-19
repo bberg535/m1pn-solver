@@ -54,6 +54,7 @@ struct Options {
     // times the width (that many cells merged), so the one-sided lumped mass of the line nodes grows.
     int break_widen = 1;
     bool split_breaks = false; // EXPERIMENT: two convex steps per stage at broken-line nodes (docs/BREAK_DT.md)
+    int ssp_n = 0;             // EXPERIMENT: SSPRK(n^2,3) for n >= 3 (docs/BIG_REBUILDS.md)
     bool break_units = false; // broken lines on the unit lines of the box (lattices: the material lines)
     std::vector<int> cells_per_unit; // graded mesh: elements per unit interval of each axis (docs/GRADED_MESH.md)
     bool skip_fields = false;
@@ -165,6 +166,8 @@ Options parse(int argc, char **argv) {
             o.dt = real();
         else if (key == "--dt-bound")
             o.dt_bound = v; // both | high-order (experiment)
+        else if (key == "--ssp-n") // experiment: SSPRK(n^2,3), n >= 3 (2 = SSPRK(4,3))
+            o.ssp_n = std::stoi(v);
         else if (key == "--split-breaks") // experiment: on|off
             o.split_breaks = v == "on";
         else if (key == "--break-widen") // experiment: merge that many cells next to each broken line
@@ -617,6 +620,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     }
     eo.periodic = o.mesh.periodic;
     eo.split_breaks = o.split_breaks;
+    eo.ssp_n = o.ssp_n >= 3 ? o.ssp_n : 0;
+    require(eo.ssp_n == 0 || (o.rk == 4 && !distributed), "--ssp-n: with --time-integrator ssprk43, serial");
     eo.weno = o.weno;
     eo.limit = o.element_limit;
     eo.weno_linear = o.weno_linear;
@@ -1177,7 +1182,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
                << ",\"mpi_ranks\":" << ranks << ",\"mpi_halo\":" << (distributed ? 2 : 0)
                << ",\"sample_points\":" << samples << ",\"sample_cells_per_axis\":" << cells_axis[0]
                << ",\"periodic\":" << (o.mesh.periodic ? "true" : "false") << ",\"rk\":" << o.rk
-               << ",\"time_integrator\":" << (eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\"")
+               << ",\"time_integrator\":" << (eo.ssp_n >= 3 ? "\"ssprk" + std::to_string(eo.ssp_n * eo.ssp_n) + "3\""
+                                                 : std::string(eo.ssprk43 ? "\"ssprk43\"" : "\"ssprk3\""))
                << ",\"case\":" << std::quoted(o.problem) << ",\"inflow\":" << std::quoted(o.inflow)
                << ",\"background\":" << o.background << ",\"shadow_sigma\":" << (shadow ? o.shadow_sigma : 0.)
                << ",\"final_time\":" << o.final_time << ",\"dt_requested\":" << o.dt << ",\"dt_selected\":" << selected

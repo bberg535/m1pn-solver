@@ -62,6 +62,10 @@ struct ElementWenoOptions {
     // Time integrator: false = SSPRK3 (Shu-Osher, SSP coefficient 1), true = SSPRK(4,3) (four forward Euler
     // stages of dt/2, SSP coefficient 2). Both are third order; the filter/reaction half steps are the same.
     bool ssprk43 = false;
+    // EXPERIMENT (experiment/big-rebuilds, docs/BIG_REBUILDS.md): SSPRK(n^2,3) of Ketcheson for ssp_n >= 3 (n = 2 is
+    // SSPRK(4,3)); n^2 forward Euler stages of dt/(n^2 - n), SSP coefficient n^2 - n, real stability interval per
+    // stage 1.48 (n = 3), 1.59 (n = 4) against 1.29. Requires ssprk43 (set by the driver).
+    int ssp_n = 0;
     // Angular parity reduction (dimension < 3, docs/ELEMENT_WENO.md): drop the PN moments that are odd under
     // z -> -z and, in 1D, under y -> -y. Exact for even data, because the transport and boundary matrices of
     // the resolved directions never couple even and odd moments (checked at construction). The moments with
@@ -278,10 +282,27 @@ public:
     bool reacts_public() const { return reacts(); }
     // One step of the integrator selected by options.ssprk43.
     Field advance(double time, double dt, const Field &a, ElementWenoStats *stats = nullptr) const {
+        if (options.ssp_n >= 3)
+            return advance_ssp_n3(time, dt, a, stats);
         return options.ssprk43 ? advance_ssprk43(time, dt, a, stats) : advance_ssprk3(time, dt, a, stats);
     }
     // SSP coefficient of the integrator: every stage is a forward Euler step of size dt / ssp_coefficient().
-    double ssp_coefficient() const { return options.ssprk43 ? 2. : 1.; }
+    double ssp_coefficient() const {
+        return options.ssp_n >= 3 ? double(options.ssp_n * options.ssp_n - options.ssp_n) : (options.ssprk43 ? 2. : 1.);
+    }
+    // SSPRK(n^2,3) stage plan: per stage whether it is the combination stage, its time (fraction of dt), and its weight
+    // in u^{n+1} = u^n + dt sum_k weight_k L_k (boundary outflow ledger). ym is saved after `saved_after` stages.
+    struct SspStage {
+        bool combination;
+        double time, weight;
+    };
+    struct SspPlan {
+        int n = 0, stages = 0, saved_after = 0;
+        double tau_fraction = 0, wa = 0, wb = 0; // tau = dt * tau_fraction; combination: wa ym + wb (x + tau L(x))
+        std::vector<SspStage> stage;
+    };
+    static SspPlan ssp_plan(int n);
+    Field advance_ssp_n3(double time, double dt, const Field &a, ElementWenoStats * = nullptr) const;
     // Realizability bound of a full step: ssp_coefficient() * dt_bound.
     double realizability_step() const { return ssp_coefficient() * dt_bound; }
     Vec weno_gamma(const Field &a) const;
