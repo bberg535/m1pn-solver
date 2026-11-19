@@ -2,6 +2,7 @@
 // Device side of the GPU time loop (src/element_weno_gpu.cu). Plain C++ (no Eigen, no CUDA headers), so the host
 // translation unit src/element_weno_gpu.cpp can include it. All fields are row-major (rows x columns) device arrays.
 #include <cstddef>
+#include "adaptive_pn.hpp"
 #include "uncollided_lattice_core.hpp"
 #include "uncollided_lattice3d_core.hpp"
 namespace m1pn {
@@ -138,6 +139,8 @@ void reset_counters(Context *);
 // Asynchronous pipeline (default stream): pinned host buffers, events, a counter snapshot.
 void gather_async(Context *, const double *field, int cols, const int *device_index, int count, double *pinned_out,
                   int slot, long long rows_soa = 0);
+void gather_cols_async(Context *, const double *field, int stride_cols, int copy_cols, const int *device_index,
+                       int count, double *pinned_out, int slot);
 void scatter_async(Context *, double *field, int cols, const int *device_index, int count, const double *pinned_in,
                    bool add, int slot, long long rows_soa = 0);
 void upload_async(void *device, const void *pinned, std::size_t bytes);
@@ -242,5 +245,12 @@ void boundary_high(Context *, const double *state, double *out, const double *pi
 // Device scratch for uploading small index/row lists.
 int *device_ints(Context *, int slot, int count);
 double *device_doubles(Context *, int slot, std::size_t count);
+// Dynamic tile-based adaptive PN on the device (experiment/dynamic-adaptive-pn).
+void adaptive_setup(Context *, const AdaptivePnPlan &plan);
+void adaptive_enable(Context *, bool on);
+// Evaluate per-tile max density, per-degree amplitude and border top-shell amplitude into host arrays.
+void adaptive_sensor(Context *, const double *state, bool initial, double *host_rho, double *host_E, double *host_face_E);
+// Upload updated tile orders/worklists and zero shrunken (tile, c) entries in state and gradient buffers.
+void adaptive_upload_and_zero(Context *, double *state, const AdaptivePnPlan &plan, const std::vector<int> &shrunken);
 } // namespace gpu
 } // namespace m1pn

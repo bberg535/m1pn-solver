@@ -400,7 +400,7 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
             max_points = std::max(max_points, int(s.out_rules_[side].weight.size()));
     const double ratio = double(s.ghost_node_.size()) * max_points / (double(s.nodes) * s.moments);
     device_ghost_ = (env ? std::atoi(env) != 0 : ratio > .1) && o.fullsphere_ghost && o.positivity_projection &&
-                    !o.projection_half_range && !s.ghost_node_.empty() && !interfaces_;
+                    !o.projection_half_range && !s.ghost_node_.empty() && !interfaces_ && !o.adaptive_pn;
     for (int side = 0; side < 6 && device_ghost_; ++side)
         if (s.boundaries_[side] && s.out_rules_[side].c.size())
             device_ghost_ = false;
@@ -547,6 +547,17 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         gpu::boundary_high_setup(ctx_, h);
         pin_db_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(face_rows) * q));
         pin_low4_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(nb_) * 4));
+    }
+    if (o.adaptive_pn && !o.periodic) {
+        adaptive_enabled_ = true;
+        adaptive_plan_.init(s.dimension, s.nodes_per_axis, s.pn.order, s.active, o.adaptive_tile,
+                            o.adaptive_tol, o.adaptive_hysteresis, o.adaptive_min_order, o.adaptive_halo);
+        s.init_adaptive_inflow_floor(adaptive_plan_);
+        s.update_adaptive_side_q(adaptive_plan_);
+        adaptive_rho_.resize(adaptive_plan_.num_tiles);
+        adaptive_E_.resize(std::size_t(adaptive_plan_.num_tiles) * (adaptive_plan_.max_order + 1));
+        adaptive_face_E_.resize(std::size_t(adaptive_plan_.num_tiles) * 6);
+        gpu::adaptive_setup(ctx_, adaptive_plan_);
     }
 }
 ElementWenoGpu::~ElementWenoGpu() {
@@ -703,9 +714,8 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
     PositivityProjectionOptions popt;
     popt.tolerance = options.projection_tolerance;
     std::vector<PositivityProjectionStats> pstats(project ? std::max(1, omp_threads()) : 0);
-    auto ghost_pair = [&](int k, const Vec &psi) {
+    auto ghost_pair = [&](int k, const Vec &psi, const ElementWeno::OutRule &out) {
         const int side_id = s.ghost_side_[k], node = s.ghost_node_[k];
-        const auto &out = s.out_rules_[side_id];
         const Boundary &b = *s.boundaries_[side_id];
         thread_local Vec z;
         auto positive_part = [&]() {
@@ -812,7 +822,7 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
             if (s.ghost_sigma_.size())
                 coeff = s.ghost_sigma_.cwiseProduct(coeff);
             const Vec psi = s.out_rules_[side].harmonics * coeff;
-            ghost_pair(k, psi);
+            ghost_pair(k, psi, s.out_rules_[side]);
         });
     } else if (ghost) {
         const int ghost_block = std::clamp(int(s.ghost_node_.size()) / std::max(1, 4 * omp_threads()), 4, 32);
@@ -834,7 +844,7 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
                 const double t1 = seconds();
                 for (int j = begin; j < end; ++j) {
                     psi_d = Eigen::Map<const Vec>(pin_traces_ + trace_offset_[side] + std::size_t(j) * points, points);
-                    ghost_pair(list[j], psi_d);
+                    ghost_pair(list[j], psi_d, s.out_rules_[side]);
                 }
                 if (project)
                     pstats[omp_thread()].reduce_seconds += seconds() - t1;
@@ -842,25 +852,101 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
             }
             thread_local Mat at, traces;
             thread_local Vec psi;
-            at.resize(s.moments, end - begin);
-            for (int j = begin; j < end; ++j)
-                at.col(j - begin) = a_h_.row(s.ghost_node_[list[j]]).transpose();
-            if (s.ghost_sigma_.size())
-                at = s.ghost_sigma_.asDiagonal() * at;
-            const double t0 = seconds();
-            if (s.separable_[side])
-                s.separable_[side]->evaluate(at, traces);
-            else
-                traces.noalias() = s.out_rules_[side].harmonics * at;
-            const double t1 = seconds();
+            const bool can_analytic_p1 = adaptive_enabled_ && !options.projection_half_range &&
+                                         s.out_rules_[side].c.size() == 0;
+            const bool use_tiers = adaptive_enabled_ && !s.adaptive_ghost_tiers_.empty();
+            const int ntiers = use_tiers ? int(s.adaptive_ghost_tiers_.size()) : 0;
+            const V3 bn_vec = s.boundaries_[side]->n;
+            thread_local std::vector<std::vector<int>> buckets;
+            thread_local std::vector<int> bmax_ord;
+            buckets.resize(ntiers + 1);
+            bmax_ord.assign(ntiers + 1, 0);
+            for (int b = 0; b <= ntiers; ++b)
+                buckets[b].clear();
             for (int j = begin; j < end; ++j) {
-                psi = traces.col(j - begin);
-                ghost_pair(list[j], psi);
+                const int k = list[j];
+                const int node = s.ghost_node_[k];
+                const int ord = adaptive_enabled_ ? adaptive_plan_.tile_order[adaptive_plan_.node_tile(node)] : s.pn.order;
+                if (can_analytic_p1 && ord == 1) {
+                    const double rho = low(node, 0);
+                    const double jx = low(node, 1), jy = low(node, 2), jz = low(node, 3);
+                    const double jn2 = jx * jx + jy * jy + jz * jz;
+                    // For P1 (all l >= 2 identically zero), psi_1(Omega) = (rho + 3 Omega.J)/(4 pi) >= 0 on the whole
+                    // sphere whenever 3 |J| <= rho; positivity projection is then the exact identity with analytic
+                    // outgoing half-moments m_0 = rho/2 + 3/4 (J.n), m_1:3 = (rho/4) n + J/2.
+                    if (rho <= 0.0 || 9.0 * jn2 <= rho * rho * (1.0 - 2e-12)) {
+                        Four m = Four::Zero();
+                        if (rho > 0.0) {
+                            const double jdotn = bn_vec[0] * jx + bn_vec[1] * jy + bn_vec[2] * jz;
+                            m[0] = 0.5 * rho + 0.75 * jdotn;
+                            m[1] = 0.25 * rho * bn_vec[0] + 0.5 * jx;
+                            m[2] = 0.25 * rho * bn_vec[1] + 0.5 * jy;
+                            m[3] = 0.25 * rho * bn_vec[2] + 0.5 * jz;
+                        }
+                        const double b_node = rho + bn_vec[0] * jx + bn_vec[1] * jy + bn_vec[2] * jz;
+                        const double a_ext = m[0] - bn_vec.dot(m.tail<3>());
+                        if (a_ext > b_node)
+                            m *= b_node > 0 ? b_node / a_ext : 0.;
+                        outgoing_[k] = m;
+                        if (project) {
+                            PositivityProjectionStats &ps = pstats[omp_thread()];
+                            ++ps.calls;
+                            ++ps.identities;
+                            ps.vacuum += !(rho > 0.0);
+                        }
+                        continue;
+                    }
+                }
+                int bi = ntiers;
+                if (use_tiers) {
+                    for (int ti = 0; ti < ntiers; ++ti)
+                        if (ord <= s.adaptive_ghost_tiers_[ti].max_order) {
+                            bi = ti;
+                            break;
+                        }
+                }
+                buckets[bi].push_back(k);
+                bmax_ord[bi] = std::max(bmax_ord[bi], ord);
             }
-            const double t2 = seconds();
-            if (project) { // diagnostics (thread seconds): trace products vs projections
-                PositivityProjectionStats &ps = pstats[omp_thread()];
-                ps.product_seconds += t1 - t0, ps.reduce_seconds += t2 - t1;
+            for (int bi = 0; bi <= ntiers; ++bi) {
+                const auto &bk = buckets[bi];
+                if (bk.empty())
+                    continue;
+                const int nrem = int(bk.size());
+                const int max_ord = bmax_ord[bi];
+                const bool is_tier = bi < ntiers;
+                const int q_tier = is_tier ? s.adaptive_ghost_tiers_[bi].q_tier : s.moments;
+                const int q_block = adaptive_enabled_ ? std::min(q_tier, adaptive_plan_.order_q[max_ord]) : s.moments;
+                at.resize(q_tier, nrem);
+                for (int r = 0; r < nrem; ++r) {
+                    const double *src = &a_h_.coeffRef(s.ghost_node_[bk[r]], 0);
+                    double *dst = at.col(r).data();
+                    std::copy_n(src, q_block, dst);
+                    if (q_block < q_tier)
+                        std::fill_n(dst + q_block, q_tier - q_block, 0.0);
+                }
+                if (s.ghost_sigma_.size())
+                    at.topRows(q_block) = s.ghost_sigma_.head(q_block).asDiagonal() * at.topRows(q_block);
+                const ElementWeno::OutRule &rule_use = is_tier ? s.adaptive_ghost_tiers_[bi].out_rules[side] : s.out_rules_[side];
+                const auto &sep_use = is_tier ? s.adaptive_ghost_tiers_[bi].separable[side] : s.separable_[side];
+                const double t0 = seconds();
+                if (sep_use) {
+                    if (adaptive_enabled_ && max_ord < (is_tier ? s.adaptive_ghost_tiers_[bi].max_order : s.pn.order))
+                        sep_use->evaluate_upto(at, traces, max_ord);
+                    else
+                        sep_use->evaluate(at, traces);
+                } else
+                    traces.noalias() = rule_use.harmonics.leftCols(q_block) * at.topRows(q_block);
+                const double t1 = seconds();
+                for (int r = 0; r < nrem; ++r) {
+                    psi = traces.col(r);
+                    ghost_pair(bk[r], psi, rule_use);
+                }
+                const double t2 = seconds();
+                if (project) { // diagnostics (thread seconds): trace products vs projections
+                    PositivityProjectionStats &ps = pstats[omp_thread()];
+                    ps.product_seconds += t1 - t0, ps.reduce_seconds += t2 - t1;
+                }
             }
         });
     }
@@ -1258,17 +1344,21 @@ int ElementWenoGpu::stage_begin(double time, const double *x, double *out, doubl
     const auto &bn = s_.boundary_nodes_;
     double *fx = pin_fetch_, *fl = fx + std::size_t(nb_) * q, *ff = fl + std::size_t(nb_) * 4,
            *fc = ff + std::size_t(nb_) * 12;
+    const int q_fetch = adaptive_enabled_ ? std::max(4, std::min(q, adaptive_fetch_q_)) : q;
     auto unpack = [&]() {
         parallel_for(nb_, [&](int k) {
             if (k < nf_)
-                std::copy_n(fx + std::size_t(k) * q, q, &a_h_.coeffRef(full_nodes_[k], 0));
+                std::copy_n(fx + std::size_t(k) * q_fetch, q_fetch, &a_h_.coeffRef(full_nodes_[k], 0));
             std::copy_n(fl + std::size_t(k) * 4, 4, &low_h_.coeffRef(bn[k], 0));
             std::copy_n(ff + std::size_t(k) * 12, 12, &low_flux_h_.coeffRef(bn[k], 0));
             std::copy_n(fc + std::size_t(k) * 12, 12, &closure_h_.coeffRef(bn[k], 0));
         });
     };
     auto fetch = [&]() {
-        gpu::gather_async(ctx_, x, q, d_fnodes_, nf_, fx, 0);
+        if (adaptive_enabled_ && q_fetch < q)
+            gpu::gather_cols_async(ctx_, x, q, q_fetch, d_fnodes_, nf_, fx, 0);
+        else
+            gpu::gather_async(ctx_, x, q, d_fnodes_, nf_, fx, 0);
         gpu::gather_async(ctx_, b.low, 4, d_bnodes_, nb_, fl, 1, s_.nodes);
         gpu::gather_async(ctx_, b.low_flux, 12, d_bnodes_, nb_, ff, 2, s_.nodes);
         gpu::gather_async(ctx_, b.closure, 12, d_bnodes_, nb_, fc, 3, s_.nodes);
@@ -1482,6 +1572,32 @@ void ElementWenoGpu::stage_end_finish(const double *x, double *out, double *u, d
     gpu::finish_stage(ctx_, out, x, u, old, fresh, tau, true, true);
     closure_ready_ = true;
 }
+void ElementWenoGpu::adapt_gpu(bool initial, ElementWenoStats *stats) {
+    if (!adaptive_enabled_)
+        return;
+    const double t0 = seconds();
+    gpu::adaptive_sensor(ctx_, u_, initial, adaptive_rho_.data(), adaptive_E_.data(), adaptive_face_E_.data());
+    const bool changed = adaptive_plan_.update_from_energies(adaptive_rho_, adaptive_E_, adaptive_face_E_,
+                                                             initial, adaptive_shrunken_);
+    if (changed) {
+        s_.update_adaptive_side_q(adaptive_plan_);
+        gpu::adaptive_upload_and_zero(ctx_, u_, adaptive_plan_, adaptive_shrunken_);
+        const int old_fq = adaptive_fetch_q_;
+        int new_fq = 4;
+        for (int i : full_nodes_)
+            new_fq = std::max(new_fq, adaptive_plan_.tile_q[adaptive_plan_.node_tile(i)]);
+        if (new_fq < old_fq) {
+            for (int i : full_nodes_)
+                std::fill_n(&a_h_.coeffRef(i, new_fq), old_fq - new_fq, 0.0);
+        }
+        adaptive_fetch_q_ = new_fq;
+    }
+    gpu::adaptive_enable(ctx_, true);
+    if (stats) {
+        ++stats->adaptive_updates;
+        stats->t_adaptive_sensor += seconds() - t0;
+    }
+}
 void ElementWenoGpu::begin(const Field &a) {
     require(a.rows() == s_.nodes && a.cols() == s_.moments, "GPU path: invalid state");
     const gpu::Buffers b = gpu::buffers(ctx_);
@@ -1489,6 +1605,9 @@ void ElementWenoGpu::begin(const Field &a) {
     gpu::upload(u_, a.data(), sizeof(double) * std::size_t(s_.nodes) * s_.moments);
     gpu::reset_counters(ctx_);
     closure_ready_ = false;
+    adaptive_step_ = 0;
+    if (adaptive_enabled_)
+        adapt_gpu(true, nullptr);
 }
 // Exact local reaction over tau on the device state (FCS: radial table of rho_u at source_time from the host).
 void ElementWenoGpu::react(double tau, double source_time, ElementWenoStats &stats) {
@@ -1538,24 +1657,36 @@ void ElementWenoGpu::step(double t, double dt, double next, ElementWenoStats &st
         u_ = buf[c], b1_ = buf[(c + 1) % 3], b2_ = buf[(c + 2) % 3];
         if (reacts)
             react(.5 * dt, t + .75 * dt, stats);
-        return;
-    }
-    if (!four) {
-        stage(t, u, b1, u, 0, 1, dt, 1. / 6, dt, stats, t + dt);
-        stage(t + dt, b1, b2, u, .75, .25, dt, 1. / 6, dt, stats, t + .5 * dt);
-        stage(t + .5 * dt, b2, b1, u, 1. / 3, 2. / 3, dt, 2. / 3, dt, stats, next);
-        std::swap(u, b1);
     } else {
-        const double half = .5 * dt;
-        stage(t, u, b1, u, 0, 1, half, 1. / 6, dt, stats, t + half);
-        stage(t + half, b1, b2, u, 0, 1, half, 1. / 6, dt, stats, t + dt);
-        stage(t + dt, b2, b1, u, 2. / 3, 1. / 3, half, 1. / 6, dt, stats, t + half);
-        stage(t + half, b1, b2, u, 0, 1, half, .5, dt, stats, next);
-        std::swap(u, b2);
+        if (!four) {
+            stage(t, u, b1, u, 0, 1, dt, 1. / 6, dt, stats, t + dt);
+            stage(t + dt, b1, b2, u, .75, .25, dt, 1. / 6, dt, stats, t + .5 * dt);
+            stage(t + .5 * dt, b2, b1, u, 1. / 3, 2. / 3, dt, 2. / 3, dt, stats, next);
+            std::swap(u, b1);
+        } else {
+            const double half = .5 * dt;
+            stage(t, u, b1, u, 0, 1, half, 1. / 6, dt, stats, t + half);
+            stage(t + half, b1, b2, u, 0, 1, half, 1. / 6, dt, stats, t + dt);
+            stage(t + dt, b2, b1, u, 2. / 3, 1. / 3, half, 1. / 6, dt, stats, t + half);
+            stage(t + half, b1, b2, u, 0, 1, half, .5, dt, stats, next);
+            std::swap(u, b2);
+        }
+        u_ = u, b1_ = b1, b2_ = b2;
+        if (reacts)
+            react(.5 * dt, t + .75 * dt, stats);
     }
-    u_ = u, b1_ = b1, b2_ = b2;
-    if (reacts)
-        react(.5 * dt, t + .75 * dt, stats);
+    if (adaptive_enabled_) {
+        ++adaptive_step_;
+        ++stats.adaptive_steps;
+        stats.adaptive_coeff_sum += adaptive_plan_.active_coeff_fraction;
+        stats.adaptive_order_sum += adaptive_plan_.mean_order;
+        stats.adaptive_last_fraction = adaptive_plan_.active_coeff_fraction;
+        stats.adaptive_last_mean_order = adaptive_plan_.mean_order;
+        stats.adaptive_last_max_order = adaptive_plan_.global_max_order;
+        const int stride = std::max(1, s_.options.adaptive_stride);
+        if (adaptive_step_ == 1 || (adaptive_step_ % stride == 0))
+            adapt_gpu(false, &stats);
+    }
 }
 void ElementWenoGpu::lockstep_begin(int s, double time, double dt) {
     require(s_.options.ssprk43 && s_.options.ssp_n < 3 && s >= 0 && s < 4, "lockstep: SSPRK(4,3) stages 0..3");
@@ -1651,6 +1782,8 @@ Field ElementWenoGpu::run(double time, double dt, int steps, const Field &a, Ele
     return end(stats);
 }
 double ElementWenoGpu::spectral_radius() {
+    if (adaptive_enabled_)
+        gpu::adaptive_enable(ctx_, false);
     const int q = s_.moments;
     const gpu::Buffers b = gpu::buffers(ctx_);
     std::mt19937 rng(12345);

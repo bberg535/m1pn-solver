@@ -113,9 +113,17 @@ struct Context {
     struct ReactionDevice *reaction = nullptr;
     struct BoundaryHighDevice *bhigh = nullptr;
     struct GhostTraceDevice *gtrace = nullptr;
+    struct AdaptiveDevice *adaptive = nullptr;
     int flux_nnz[3] = {0, 0, 0};
     DeviceCounters *pinned_counters = nullptr;
 };
+struct ReactionView;
+struct BoundaryHighDevice;
+namespace {
+void react_rows_adaptive_launch(Context *ctx, const ReactionView &r, double *state, double tau, bool fcs);
+bool boundary_high_adaptive_launch(Context *ctx, BoundaryHighDevice *d, const double *state, double *out,
+                                   const double *pinned_db, double *pinned_low4, double *pinned_low4_break);
+} // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
 // Exact M1 cone predicate for the stored binary64 values (same answer as exact::cone in src/cone.hpp): the fast filter
@@ -1371,6 +1379,13 @@ __global__ void k_gather(const double *f, int cols, const int *index, int count,
     const int k = int(t / cols), c = int(t % cols);
     out[t] = f[rows_soa ? std::size_t(c) * rows_soa + index[k] : std::size_t(index[k]) * cols + c];
 }
+__global__ void k_gather_cols(const double *f, int stride_cols, int copy_cols, const int *index, int count, double *out) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(count) * copy_cols)
+        return;
+    const int k = int(t / copy_cols), c = int(t % copy_cols);
+    out[t] = f[std::size_t(index[k]) * stride_cols + c];
+}
 __global__ void k_scatter(double *f, int cols, const int *index, int count, const double *in, bool add,
                           long long rows_soa) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1829,6 +1844,7 @@ struct ReactionView {
     int lM;
     double ldt;
     double *ledger; // absorbed, injected
+    bool has_filter;
 };
 struct ReactionDevice {
     ReactionView r;
@@ -1956,6 +1972,11 @@ void reaction_setup(Context *ctx, const ReactionSetup &s) {
     r.source = s.source ? own(dcopy(s.source, N)) : nullptr;
     r.sa = s.sa, r.ss = s.ss;
     r.filter = own(dcopy(s.filter, std::size_t(v.q)));
+    r.has_filter = false;
+    if (s.filter)
+        for (int k = 0; k < v.q; ++k)
+            if (s.filter[k] != 0.0)
+                r.has_filter = true;
     r.P = s.fcs_points;
     if (r.P) {
         const std::size_t CP = std::size_t(v.cells) * r.P;
@@ -1990,7 +2011,10 @@ void react(Context *ctx, double *state, double tau, const double *host_table, in
         k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
         k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
     }
-    k_react_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, r, state, tau, fcs);
+    if (ctx->adaptive)
+        react_rows_adaptive_launch(ctx, r, state, tau, fcs);
+    else
+        k_react_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, r, state, tau, fcs);
     k_admissible<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
 }
 void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, double dt, double *host_out) {
@@ -2086,7 +2110,10 @@ void react_lattice(Context *ctx, double *state, double tau, double source_time) 
     k_fcs_points_lattice<<<blocks(std::size_t(v.cells) * r.P), 256, 0, ctx->stream>>>(v, r, source_time);
     k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
     k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
-    k_react_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, r, state, tau, true);
+    if (ctx->adaptive)
+        react_rows_adaptive_launch(ctx, r, state, tau, true);
+    else
+        k_react_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, r, state, tau, true);
     k_admissible<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
 }
 Ledger ledger(Context *ctx) {
@@ -2428,6 +2455,8 @@ void boundary_high(Context *ctx, const double *state, double *out, const double 
     const BoundaryHighSetup &s = d->s;
     if (s.rows == 0 || s.nb == 0)
         return;
+    if (ctx->adaptive && boundary_high_adaptive_launch(ctx, d, state, out, pinned_db, pinned_low4, pinned_low4_break))
+        return;
     const std::size_t rq = std::size_t(s.rows) * s.q;
     k_face_traces<<<blocks(rq), 256, 0, ctx->stream>>>(s.q, s.rows, s.nf, d->row_nodes, d->row_mass, state, d->G);
     CK(cudaMemsetAsync(d->H, 0, rq * sizeof(double), ctx->stream));
@@ -2456,11 +2485,988 @@ void boundary_high(Context *ctx, const double *state, double *out, const double 
         CK(cudaMemcpyAsync(pinned_low4_break, d->low4b, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost,
                            ctx->stream));
 }
+// ---------------------------------------------------------------------------------------------------------------
+// Dynamic tile-based adaptive PN kernels (experiment/dynamic-adaptive-pn).
+// ---------------------------------------------------------------------------------------------------------------
+struct AdaptiveDevice {
+    int num_tiles = 0, max_order = 0, L1 = 0;
+    int tb[3] = {1, 1, 1}, nt[3] = {1, 1, 1};
+    int *d_deg_start = nullptr;
+    int *d_tile_order = nullptr;
+    int *d_tile_q = nullptr;
+    int *d_tile_q_prev = nullptr;
+    int *d_shrunken = nullptr;
+    double *d_tile_rho = nullptr;
+    double *d_tile_E = nullptr;
+    double *d_tile_face_E = nullptr;
+    AdaptiveLineSeg *d_segs_grad[3] = {};
+    int segs_grad_n[3] = {}, segs_grad_cap[3] = {};
+    AdaptiveLineSeg *d_segs_mass[3] = {};
+    int segs_mass_n[3] = {}, segs_mass_cap[3] = {};
+    AdaptiveTileChunk *d_tile_chunks = nullptr;
+    int tile_chunks_n = 0, tile_chunks_cap = 0;
+    int global_max_q = 0;
+    int side_q_dom[6] = {};
+    int side_q_brk[6] = {};
+    int bnd_max_q = 4;
+    bool active = false;
+};
+
+namespace {
+__device__ inline void atomic_max_nonneg(double *addr, double val) {
+    if (val <= *addr)
+        return;
+    unsigned long long *uaddr = reinterpret_cast<unsigned long long *>(addr);
+    atomicMax(uaddr, (unsigned long long)__double_as_longlong(val));
+}
+
+__global__ void k_adaptive_sensor(View v, const double *a, bool initial, int tb0, int tb1, int tb2,
+                                  int nt0, int nt1, int max_order, const int *deg_start,
+                                  const int *tile_order, double *out_rho, double *out_E, double *out_face_E) {
+    extern __shared__ double smem[];
+    const int L1 = max_order + 1;
+    double *s_E2 = smem;          // L1
+    double *s_face2 = smem + L1;  // 6
+    double *s_rho = smem + L1 + 6; // 1
+    const int T = blockIdx.x;
+    const int tid = threadIdx.x;
+    for (int k = tid; k < L1 + 7; k += blockDim.x)
+        smem[k] = 0.0;
+    __syncthreads();
+
+    const int tx = T % nt0;
+    const int ty = (T / nt0) % nt1;
+    const int tz = T / (nt0 * nt1);
+    const int x0 = tx * tb0, x1 = min(v.npa[0], x0 + tb0);
+    const int y0 = ty * tb1, y1 = min(v.npa[1], y0 + tb1);
+    const int z0 = tz * tb2, z1 = min(v.npa[2], z0 + tb2);
+    const int wx = x1 - x0, wy = y1 - y0, wz = z1 - z0;
+    const int tnodes = wx * wy * wz;
+    const int ord = initial ? max_order : tile_order[T];
+    const int q = v.q;
+    const int margin = AdaptivePnPlan::kBorderMargin;
+
+    for (int idx = tid; idx < tnodes; idx += blockDim.x) {
+        const int lx = idx % wx;
+        const int ly = (idx / wx) % wy;
+        const int lz = idx / (wx * wy);
+        const int ix = x0 + lx, iy = y0 + ly, iz = z0 + lz;
+        const std::size_t node = std::size_t(iz) * v.stride[2] + std::size_t(iy) * v.stride[1] + ix;
+        const double *row = a + node * q;
+        const double rho = fabs(v.s0 * row[0]);
+        atomic_max_nonneg(s_rho, rho);
+
+        bool on_face[6] = {
+            lx < margin, wx - 1 - lx < margin,
+            v.dimension > 1 && ly < margin, v.dimension > 1 && wy - 1 - ly < margin,
+            v.dimension > 2 && lz < margin, v.dimension > 2 && wz - 1 - lz < margin
+        };
+        double sq_prev = 0.0, sq_hi = 0.0;
+        for (int l = 0; l <= ord; ++l) {
+            const int c0 = deg_start[l], c1 = deg_start[l + 1];
+            double sq = 0.0;
+            for (int c = c0; c < c1; ++c) {
+                const double val = row[c];
+                sq += val * val;
+            }
+            atomic_max_nonneg(&s_E2[l], sq);
+            if (l == ord - 1)
+                sq_prev = sq;
+            if (l == ord)
+                sq_hi = sq;
+        }
+        const double sq_top = (ord == 1) ? sq_hi : (sq_prev + sq_hi);
+        for (int f = 0; f < 2 * v.dimension; ++f)
+            if (on_face[f])
+                atomic_max_nonneg(&s_face2[f], sq_top);
+    }
+    __syncthreads();
+    if (tid == 0)
+        out_rho[T] = *s_rho;
+    for (int l = tid; l < L1; l += blockDim.x)
+        out_E[std::size_t(T) * L1 + l] = l <= ord ? sqrt(s_E2[l]) : 0.0;
+    if (tid < 6)
+        out_face_E[std::size_t(T) * 6 + tid] = sqrt(s_face2[tid]);
+}
+
+__global__ void k_adaptive_zero(View v, double *ba, double *bx, double *br, int tb0, int tb1, int tb2, int nt0, int nt1,
+                                const int *shrunken, int count, const int *tile_q_new, const int *tile_q_old) {
+    if (blockIdx.x >= count)
+        return;
+    const int T = shrunken[blockIdx.x];
+    const int q_new = tile_q_new[T], q_old = tile_q_old[T];
+    const int q_old_pad = q_old <= 4 ? 4 : min(v.q, 4 + ((q_old - 4 + 31) / 32) * 32);
+    const int tx = T % nt0, ty = (T / nt0) % nt1, tz = T / (nt0 * nt1);
+    const int x0 = tx * tb0, x1 = min(v.npa[0], x0 + tb0);
+    const int y0 = ty * tb1, y1 = min(v.npa[1], y0 + tb1);
+    const int z0 = tz * tb2, z1 = min(v.npa[2], z0 + tb2);
+    const int wx = x1 - x0, wy = y1 - y0, wz = z1 - z0;
+    const int tnodes = wx * wy * wz;
+    const int q = v.q;
+    // 1. Zero all three state buffers (a, x, r) on tile T for [q_new, q_old_pad) because SSPRK swaps them!
+    const int span_u = q_old_pad - q_new;
+    if (span_u > 0) {
+        const std::size_t total = std::size_t(tnodes) * span_u;
+        for (std::size_t k = threadIdx.x; k < total; k += blockDim.x) {
+            const int idx = int(k / span_u), c = q_new + int(k % span_u);
+            const int lx = idx % wx, ly = (idx / wx) % wy, lz = idx / (wx * wy);
+            const std::size_t node = std::size_t(z0 + lz) * v.stride[2] + std::size_t(y0 + ly) * v.stride[1] + (x0 + lx);
+            const std::size_t off = node * q + c;
+            ba[off] = 0.0;
+            bx[off] = 0.0;
+            br[off] = 0.0;
+        }
+    }
+    // 2. Zero dead gradient[d] on 1-node padded box of T for [q_new, q_old_pad) so no stale halo entries survive.
+    const int span_g = q_old_pad - q_new;
+    if (span_g > 0) {
+        const int gx0 = max(0, x0 - 1), gx1 = min(v.npa[0], x1 + 1);
+        const int gy0 = v.dimension > 1 ? max(0, y0 - 1) : 0, gy1 = v.dimension > 1 ? min(v.npa[1], y1 + 1) : 1;
+        const int gz0 = v.dimension > 2 ? max(0, z0 - 1) : 0, gz1 = v.dimension > 2 ? min(v.npa[2], z1 + 1) : 1;
+        const int gwx = gx1 - gx0, gwy = gy1 - gy0, gwz = gz1 - gz0;
+        const std::size_t total = std::size_t(gwx) * gwy * gwz * span_g;
+        for (std::size_t k = threadIdx.x; k < total; k += blockDim.x) {
+            const int idx = int(k / span_g), c = q_new + int(k % span_g);
+            const int lx = idx % gwx, ly = (idx / gwx) % gwy, lz = idx / (gwx * gwy);
+            const std::size_t node = std::size_t(gz0 + lz) * v.stride[2] + std::size_t(gy0 + ly) * v.stride[1] + (gx0 + lx);
+            for (int d = 0; d < v.dimension; ++d)
+                v.gradient[d][node * q + c] = 0.0;
+        }
+    }
+}
+
+template <int P, int CH>
+__global__ void k_line_solve_low4(View v, int first, double *field, const double *src) {
+    const int d = first + blockIdx.y;
+    double *f = field ? field : v.gradient[d];
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int n = v.npa[d], s = v.stride[d], lines = v.nodes / n;
+    const int q4 = min(4, v.q);
+    if (t >= std::size_t(lines) * q4)
+        return;
+    const int c = int(t % q4), line = int(t / q4);
+    const int start = (line / s) * (s * n) + line % s;
+    const int mi = v.mirror_index[d];
+    const bool dirichlet = mi >= 0 && bool((v.comp_odd[c] >> d) & 1) != (field == nullptr);
+    const int off = dirichlet && mi == 0 ? 1 : 0, nn = dirichlet ? n - 1 : n;
+    const double *L = dirichlet ? v.dlower[d] : v.lower[d], *ID = dirichlet ? v.dinvdiag[d] : v.invdiag[d];
+    const std::size_t step = std::size_t(s) * v.q;
+    double *row0 = f + std::size_t(start) * v.q + c;
+    double *base = row0 + std::size_t(off) * step;
+    double hist[P > 0 ? P : 1];
+    for (int m = 0; m < P; ++m)
+        hist[m] = 0;
+    const double *sbase = src ? src + std::size_t(start) * v.q + c + std::size_t(off) * step : nullptr;
+    const double *Cb = v.convection_band[d] + std::size_t(off) * (2 * P + 1);
+    double win[2 * P + 1];
+    if (src) {
+#pragma unroll
+        for (int j = 0; j < 2 * P; ++j) {
+            const int kk = j - P;
+            win[j] = kk >= -off && kk < n - off ? sbase[std::ptrdiff_t(kk) * std::ptrdiff_t(step)] : 0.;
+        }
+    }
+    auto load_fwd = [&](int k0, double *buf) {
+#pragma unroll
+        for (int j = 0; j < CH; ++j) {
+            if (src)
+                buf[j] = k0 + j + P < n - off ? sbase[std::size_t(k0 + j + P) * step] : 0.;
+            else
+                buf[j] = k0 + j < nn ? base[std::size_t(k0 + j) * step] : 0.;
+        }
+    };
+    auto fwd = [&](int k0, const double *buf) {
+#pragma unroll
+        for (int j = 0; j < CH; ++j) {
+            const int k = k0 + j;
+            if (k >= nn)
+                break;
+            double y;
+            if (src) {
+                win[2 * P] = buf[j];
+                y = 0;
+#pragma unroll
+                for (int m = 0; m <= 2 * P; ++m)
+                    y += Cb[std::size_t(k) * (2 * P + 1) + m] * win[m];
+#pragma unroll
+                for (int m = 0; m < 2 * P; ++m)
+                    win[m] = win[m + 1];
+            } else
+                y = buf[j];
+#pragma unroll
+            for (int m = 1; m <= P; ++m)
+                if (k - m >= 0)
+                    y -= L[std::size_t(k) * P + m - 1] * hist[m - 1];
+#pragma unroll
+            for (int m = P - 1; m > 0; --m)
+                hist[m] = hist[m - 1];
+            if (P > 0)
+                hist[0] = y;
+            base[std::size_t(k) * step] = y * ID[k];
+        }
+    };
+    double bufA[CH], bufB[CH];
+    load_fwd(0, bufA);
+    for (int k0 = 0; k0 < nn; k0 += 2 * CH) {
+        if (k0 + CH < nn)
+            load_fwd(k0 + CH, bufB);
+        fwd(k0, bufA);
+        if (k0 + CH >= nn)
+            break;
+        if (k0 + 2 * CH < nn)
+            load_fwd(k0 + 2 * CH, bufA);
+        fwd(k0 + CH, bufB);
+    }
+    for (int m = 0; m < P; ++m)
+        hist[m] = 0;
+    auto load_bwd = [&](int k1, double *buf) {
+#pragma unroll
+        for (int j = 0; j < CH; ++j)
+            buf[j] = k1 - j >= 0 ? base[std::size_t(k1 - j) * step] : 0.;
+    };
+    auto bwd = [&](int k1, const double *buf) {
+#pragma unroll
+        for (int j = 0; j < CH; ++j) {
+            const int k = k1 - j;
+            if (k < 0)
+                break;
+            double x = buf[j];
+#pragma unroll
+            for (int m = 1; m <= P; ++m)
+                if (k + m < nn)
+                    x -= L[std::size_t(k + m) * P + m - 1] * hist[m - 1];
+#pragma unroll
+            for (int m = P - 1; m > 0; --m)
+                hist[m] = hist[m - 1];
+            if (P > 0)
+                hist[0] = x;
+            base[std::size_t(k) * step] = x;
+        }
+    };
+    load_bwd(nn - 1, bufA);
+    for (int k1 = nn - 1; k1 >= 0; k1 -= 2 * CH) {
+        if (k1 - CH >= 0)
+            load_bwd(k1 - CH, bufB);
+        bwd(k1, bufA);
+        if (k1 - CH < 0)
+            break;
+        if (k1 - 2 * CH >= 0)
+            load_bwd(k1 - 2 * CH, bufA);
+        bwd(k1 - CH, bufB);
+    }
+    if (dirichlet)
+        row0[std::size_t(mi) * step] = 0.0;
+}
+
+template <int SY>
+__global__ void __launch_bounds__(128, 4) k_stabilization_strip_low4(
+    View v, const double *a, double *result, bool want_low, double constant_gamma) {
+    const int q = v.q, q4 = min(4, q), npx = v.npa[0], npy = v.npa[1], cx = v.count[0], cy = v.count[1];
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= npx * q4)
+        return;
+    const int ix = col / q4, c = col % q4;
+    const int y0 = blockIdx.y * SY, y1 = min(npy, y0 + SY);
+    const double *F[3] = {a, v.gradient[0], v.gradient[1]};
+    double W[3][3][3];
+    auto load_row = [&](int y, int r) {
+#pragma unroll
+        for (int f = 0; f < 3; ++f)
+#pragma unroll
+            for (int dx = 0; dx < 3; ++dx) {
+                const int x = ix + dx - 1;
+                W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx ? F[f][(std::size_t(y) * npx + x) * q + c] : 0.;
+            }
+    };
+    load_row(y0 - 1, 0);
+    load_row(y0, 1);
+    for (int y = y0; y < y1; ++y) {
+        load_row(y + 1, 2);
+        double out = 0;
+#pragma unroll
+        for (int qy = 0; qy < 2; ++qy)
+#pragma unroll
+            for (int qx = 0; qx < 2; ++qx) {
+                const int ex = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+                const int ey = v.strip_elem[1] ? v.strip_elem[1][2 * y + qy] : y - 1 + qy;
+                if (ex < 0 || ex >= cx || ey < 0 || ey >= cy)
+                    continue;
+                const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
+                const int kc = 16 * klass_of(v, e);
+                const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
+                const double weight = -__ldg(v.strip_nu + kc / 16) * g;
+                double stiff = 0, conv = 0;
+#pragma unroll
+                for (int my = 0; my < 2; ++my)
+#pragma unroll
+                    for (int mx = 0; mx < 2; ++mx) {
+                        const int m = mx + 2 * my;
+                        stiff += __ldg(v.strip_kv + kc + 4 * l + m) * W[0][qy + my][qx + mx];
+                        conv += __ldg(v.strip_c0 + kc + 4 * l + m) * W[1][qy + my][qx + mx] +
+                                __ldg(v.strip_c1 + kc + 4 * l + m) * W[2][qy + my][qx + mx];
+                    }
+                const double term = stiff + weight * conv;
+                if (want_low) {
+                    const int slot = c == 0 ? 0 : (c == 1 ? 2 : (c == 2 ? 3 : 1));
+                    v.stab_low[std::size_t(4 * l + slot) * v.cells + e] = (c == 0 ? v.s0 : v.s1) * term;
+                }
+                out -= term;
+            }
+        result[(std::size_t(y) * npx + ix) * q + c] = out;
+#pragma unroll
+        for (int f = 0; f < 3; ++f)
+#pragma unroll
+            for (int dx = 0; dx < 3; ++dx) {
+                W[f][0][dx] = W[f][1][dx];
+                W[f][1][dx] = W[f][2][dx];
+            }
+    }
+}
+
+__global__ void k_stabilization_low4(View v, const double *a, double *result, bool want_low, double constant_gamma) {
+    const int q = v.q, q4 = min(4, q), n = v.local;
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(v.nodes) * q4)
+        return;
+    const int i = int(t / q4), c = int(t % q4);
+    double out = 0;
+    for (int k = v.node_offsets[i]; k < v.node_offsets[i + 1]; ++k) {
+        const int entry = v.node_entries[k], e = entry / n, l = entry % n;
+        const int *map = v.connectivity + std::size_t(e) * n;
+        const int cl = klass_of(v, e);
+        const double nu = v.class_viscosity ? v.class_viscosity[cl] : v.viscosity;
+        const double *K = v.stiffness_rows + (std::size_t(cl) * n + l) * n;
+        double term = 0;
+        for (int m = 0; m < n; ++m)
+            term += K[m] * a[std::size_t(map[m]) * q + c];
+        term *= nu;
+        const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
+        const double weight = -nu * g;
+        if (weight != 0)
+            for (int d = 0; d < v.dimension; ++d) {
+                const double *C = v.convection_t_rows[d] + (std::size_t(cl) * n + l) * n;
+                double cd = 0;
+                for (int m = 0; m < n; ++m)
+                    cd += C[m] * v.gradient[d][std::size_t(map[m]) * q + c];
+                term += weight * cd;
+            }
+        if (want_low) {
+            const int slot = c == 0 ? 0 : (c == 1 ? 2 : (c == 2 ? 3 : 1));
+            v.stab_low[std::size_t(4 * l + slot) * v.cells + e] = (c == 0 ? v.s0 : v.s1) * term;
+        }
+        out -= term;
+    }
+    result[std::size_t(i) * q + c] = out;
+}
+
+__global__ void k_react_low4(View v, ReactionView r, double *a, double tau, bool fcs) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double absorbed = 0.0, injected = 0.0;
+    if (i < v.nodes) {
+        const double sa = r.sigma_a ? r.sigma_a[i] : r.sa, ss = r.sigma_s ? r.sigma_s[i] : r.ss;
+        const double q0 = (r.source ? r.source[i] : 0.) + (fcs ? r.fcs[i] : 0.);
+        const double c0 = 1 / v.s0, z = -sa * tau, decay0 = exp(z), phi1 = z == 0 ? 1. : expm1(z) / z;
+        double *row = a + std::size_t(i) * v.q;
+        const double rho = row[0] / c0;
+        row[0] = decay0 * row[0] + c0 * q0 * tau * phi1;
+        const int q4 = min(4, v.q);
+        if (!r.has_filter) {
+            const double d1 = exp(-tau * (sa + ss));
+            for (int k = 1; k < q4; ++k)
+                row[k] *= d1;
+        } else {
+            for (int k = 1; k < q4; ++k)
+                row[k] *= exp(-tau * (sa + ss + r.filter[k]));
+        }
+        absorbed = v.lumped[i] * (-expm1(z) * rho + q0 * tau * (1 - phi1));
+        injected = v.lumped[i] * q0 * tau;
+    }
+    absorbed = warp_sum(absorbed), injected = warp_sum(injected);
+    if ((threadIdx.x & 31) == 0 && (absorbed != 0.0 || injected != 0.0)) {
+        atomicAdd(&r.ledger[0], absorbed);
+        atomicAdd(&r.ledger[1], injected);
+    }
+}
+
+template <int P, int CH>
+__global__ void k_line_solve_adaptive(View v, int d, double *field, const double *src,
+                                      const AdaptiveLineSeg *segs, int nsegs) {
+    const int seg_id = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (seg_id >= nsegs)
+        return;
+    const AdaptiveLineSeg seg = segs[seg_id];
+    const int c = seg.c0 + (threadIdx.x & 31);
+    if (c >= v.q)
+        return;
+    double *f = field ? field : v.gradient[d];
+    const int n = v.npa[d], s = v.stride[d], line = seg.line;
+    const int start = (line / s) * (s * n) + line % s;
+    const int mi = v.mirror_index[d];
+    const bool dirichlet = mi >= 0 && bool((v.comp_odd[c] >> d) & 1) != (field == nullptr);
+    const int off = dirichlet && mi == 0 ? 1 : 0, nn = dirichlet ? n - 1 : n;
+    const int r_start = max(0, seg.k_start - off);
+    const int r_end = min(nn, seg.k_end - off);
+    const std::size_t step = std::size_t(s) * v.q;
+    double *row0 = f + std::size_t(start) * v.q + c;
+    if (r_start >= r_end) {
+        if (dirichlet && seg.k_start <= mi && mi < seg.k_end)
+            row0[std::size_t(mi) * step] = 0.0;
+        return;
+    }
+    const double *L = dirichlet ? v.dlower[d] : v.lower[d], *ID = dirichlet ? v.dinvdiag[d] : v.invdiag[d];
+    double *base = row0 + std::size_t(off) * step;
+    double hist[P > 0 ? P : 1];
+    for (int m = 0; m < P; ++m)
+        hist[m] = 0;
+    const double *sbase = src ? src + std::size_t(start) * v.q + c + std::size_t(off) * step : nullptr;
+    const double *Cb = v.convection_band[d] + std::size_t(off) * (2 * P + 1);
+    double win[2 * P + 1];
+    if (src) {
+#pragma unroll
+        for (int j = 0; j < 2 * P; ++j) {
+            const int kk = r_start + j - P;
+            win[j] = kk >= -off && kk < n - off ? sbase[std::ptrdiff_t(kk) * std::ptrdiff_t(step)] : 0.;
+        }
+    }
+    auto load_fwd = [&](int k0, double *buf) {
+#pragma unroll
+        for (int j = 0; j < CH; ++j) {
+            if (src)
+                buf[j] = (k0 + j < r_end && k0 + j + P < n - off) ? sbase[std::size_t(k0 + j + P) * step] : 0.;
+            else
+                buf[j] = k0 + j < r_end ? base[std::size_t(k0 + j) * step] : 0.;
+        }
+    };
+    auto fwd = [&](int k0, const double *buf) {
+#pragma unroll
+        for (int j = 0; j < CH; ++j) {
+            const int k = k0 + j;
+            if (k >= r_end)
+                break;
+            double y;
+            if (src) {
+                win[2 * P] = buf[j];
+                y = 0;
+#pragma unroll
+                for (int m = 0; m <= 2 * P; ++m)
+                    y += Cb[std::size_t(k) * (2 * P + 1) + m] * win[m];
+#pragma unroll
+                for (int m = 0; m < 2 * P; ++m)
+                    win[m] = win[m + 1];
+            } else
+                y = buf[j];
+#pragma unroll
+            for (int m = 1; m <= P; ++m)
+                if (k - m >= r_start)
+                    y -= L[std::size_t(k) * P + m - 1] * hist[m - 1];
+#pragma unroll
+            for (int m = P - 1; m > 0; --m)
+                hist[m] = hist[m - 1];
+            if (P > 0)
+                hist[0] = y;
+            base[std::size_t(k) * step] = y * ID[k];
+        }
+    };
+    double bufA[CH], bufB[CH];
+    load_fwd(r_start, bufA);
+    for (int k0 = r_start; k0 < r_end; k0 += 2 * CH) {
+        if (k0 + CH < r_end)
+            load_fwd(k0 + CH, bufB);
+        fwd(k0, bufA);
+        if (k0 + CH >= r_end)
+            break;
+        if (k0 + 2 * CH < r_end)
+            load_fwd(k0 + 2 * CH, bufA);
+        fwd(k0 + CH, bufB);
+    }
+    for (int m = 0; m < P; ++m)
+        hist[m] = 0;
+    auto load_bwd = [&](int k1, double *buf) {
+#pragma unroll
+        for (int j = 0; j < CH; ++j)
+            buf[j] = k1 - j >= r_start ? base[std::size_t(k1 - j) * step] : 0.;
+    };
+    auto bwd = [&](int k1, const double *buf) {
+#pragma unroll
+        for (int j = 0; j < CH; ++j) {
+            const int k = k1 - j;
+            if (k < r_start)
+                break;
+            double x = buf[j];
+#pragma unroll
+            for (int m = 1; m <= P; ++m)
+                if (k + m < r_end)
+                    x -= L[std::size_t(k + m) * P + m - 1] * hist[m - 1];
+#pragma unroll
+            for (int m = P - 1; m > 0; --m)
+                hist[m] = hist[m - 1];
+            if (P > 0)
+                hist[0] = x;
+            base[std::size_t(k) * step] = x;
+        }
+    };
+    load_bwd(r_end - 1, bufA);
+    for (int k1 = r_end - 1; k1 >= r_start; k1 -= 2 * CH) {
+        if (k1 - CH >= r_start)
+            load_bwd(k1 - CH, bufB);
+        bwd(k1, bufA);
+        if (k1 - CH < r_start)
+            break;
+        if (k1 - 2 * CH >= r_start)
+            load_bwd(k1 - 2 * CH, bufA);
+        bwd(k1 - CH, bufB);
+    }
+    if (dirichlet && seg.k_start <= mi && mi < seg.k_end)
+        row0[std::size_t(mi) * step] = 0.0;
+}
+
+__global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
+    View v, const double *a, double *result, bool want_low, double constant_gamma,
+    int tb0, int tb1, const AdaptiveTileChunk *chunks, int nchunks) {
+    if (blockIdx.x >= nchunks)
+        return;
+    const AdaptiveTileChunk tc = chunks[blockIdx.x];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int q = v.q, npx = v.npa[0], npy = v.npa[1], cx = v.count[0], cy = v.count[1];
+    const int c = tc.c0 + lane;
+    if (c >= q)
+        return;
+    const int x0 = tc.tx * tb0, x1 = min(npx, x0 + tb0);
+    const int y0 = tc.ty * tb1, y1 = min(npy, y0 + tb1);
+    const bool active_c = c < tc.q_lim;
+    const double *F[3] = {a, v.gradient[0], v.gradient[1]};
+    for (int ix = x0 + warp; ix < x1; ix += 4) {
+        if (!active_c) {
+            for (int y = y0; y < y1; ++y)
+                result[(std::size_t(y) * npx + ix) * q + c] = 0.0;
+            continue;
+        }
+        double W[3][3][3];
+        auto load_row = [&](int y, int r) {
+#pragma unroll
+            for (int f = 0; f < 3; ++f)
+#pragma unroll
+                for (int dx = 0; dx < 3; ++dx) {
+                    const int x = ix + dx - 1;
+                    W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx ? F[f][(std::size_t(y) * npx + x) * q + c] : 0.;
+                }
+        };
+        load_row(y0 - 1, 0);
+        load_row(y0, 1);
+        for (int y = y0; y < y1; ++y) {
+            load_row(y + 1, 2);
+            double out = 0;
+#pragma unroll
+            for (int qy = 0; qy < 2; ++qy)
+#pragma unroll
+                for (int qx = 0; qx < 2; ++qx) {
+                    const int ex = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+                    const int ey = v.strip_elem[1] ? v.strip_elem[1][2 * y + qy] : y - 1 + qy;
+                    if (ex < 0 || ex >= cx || ey < 0 || ey >= cy)
+                        continue;
+                    const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
+                    const int kc = 16 * klass_of(v, e);
+                    const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
+                    const double weight = -__ldg(v.strip_nu + kc / 16) * g;
+                    double stiff = 0, conv = 0;
+#pragma unroll
+                    for (int my = 0; my < 2; ++my)
+#pragma unroll
+                        for (int mx = 0; mx < 2; ++mx) {
+                            const int m = mx + 2 * my;
+                            stiff += __ldg(v.strip_kv + kc + 4 * l + m) * W[0][qy + my][qx + mx];
+                            conv += __ldg(v.strip_c0 + kc + 4 * l + m) * W[1][qy + my][qx + mx] +
+                                    __ldg(v.strip_c1 + kc + 4 * l + m) * W[2][qy + my][qx + mx];
+                        }
+                    const double term = stiff + weight * conv;
+                    if (want_low && c < 4) {
+                        const int slot = c == 0 ? 0 : (c == 1 ? 2 : (c == 2 ? 3 : 1));
+                        v.stab_low[std::size_t(4 * l + slot) * v.cells + e] = (c == 0 ? v.s0 : v.s1) * term;
+                    }
+                    out -= term;
+                }
+            result[(std::size_t(y) * npx + ix) * q + c] = out;
+#pragma unroll
+            for (int f = 0; f < 3; ++f)
+#pragma unroll
+                for (int dx = 0; dx < 3; ++dx) {
+                    W[f][0][dx] = W[f][1][dx];
+                    W[f][1][dx] = W[f][2][dx];
+                }
+        }
+    }
+}
+
+__global__ void k_stabilization_adaptive(View v, const double *a, double *result, bool want_low, double constant_gamma,
+                                         int tb0, int tb1, int tb2, const AdaptiveTileChunk *chunks, int nchunks) {
+    if (blockIdx.x >= nchunks)
+        return;
+    const AdaptiveTileChunk tc = chunks[blockIdx.x];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int q = v.q, n = v.local;
+    const int c = tc.c0 + lane;
+    if (c >= q)
+        return;
+    const int x0 = tc.tx * tb0, x1 = min(v.npa[0], x0 + tb0);
+    const int y0 = tc.ty * tb1, y1 = min(v.npa[1], y0 + tb1);
+    const int z0 = tc.tz * tb2, z1 = min(v.npa[2], z0 + tb2);
+    const int wx = x1 - x0, wy = y1 - y0, wz = z1 - z0, tnodes = wx * wy * wz;
+    const bool active_c = c < tc.q_lim;
+    for (int idx = warp; idx < tnodes; idx += 4) {
+        const int lx = idx % wx, ly = (idx / wx) % wy, lz = idx / (wx * wy);
+        const int i = (z0 + lz) * v.stride[2] + (y0 + ly) * v.stride[1] + (x0 + lx);
+        if (!active_c) {
+            result[std::size_t(i) * q + c] = 0.0;
+            continue;
+        }
+        double out = 0;
+        for (int k = v.node_offsets[i]; k < v.node_offsets[i + 1]; ++k) {
+            const int entry = v.node_entries[k], e = entry / n, l = entry % n;
+            const int *map = v.connectivity + std::size_t(e) * n;
+            const int cl = klass_of(v, e);
+            const double nu = v.class_viscosity ? v.class_viscosity[cl] : v.viscosity;
+            const double *K = v.stiffness_rows + (std::size_t(cl) * n + l) * n;
+            double term = 0;
+            for (int m = 0; m < n; ++m)
+                term += K[m] * a[std::size_t(map[m]) * q + c];
+            term *= nu;
+            const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
+            const double weight = -nu * g;
+            if (weight != 0)
+                for (int d = 0; d < v.dimension; ++d) {
+                    const double *C = v.convection_t_rows[d] + (std::size_t(cl) * n + l) * n;
+                    double cd = 0;
+                    for (int m = 0; m < n; ++m)
+                        cd += C[m] * v.gradient[d][std::size_t(map[m]) * q + c];
+                    term += weight * cd;
+                }
+            if (want_low && c < 4) {
+                const int slot = c == 0 ? 0 : (c == 1 ? 2 : (c == 2 ? 3 : 1));
+                v.stab_low[std::size_t(4 * l + slot) * v.cells + e] = (c == 0 ? v.s0 : v.s1) * term;
+            }
+            out -= term;
+        }
+        result[std::size_t(i) * q + c] = out;
+    }
+}
+
+__global__ void k_combine_adaptive(View v, double *r, const double *x, const double *a, double old, double fresh,
+                                   double tau, int tb0, int tb1, int tb2, const AdaptiveTileChunk *chunks, int nchunks) {
+    extern __shared__ double shared[];
+    const FluxShared F = stage_flux(v, shared);
+    if (blockIdx.x >= nchunks)
+        return;
+    const AdaptiveTileChunk tc = chunks[blockIdx.x];
+    const int warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5, lane = threadIdx.x & 31;
+    const int q = v.q, c = tc.c0 + lane;
+    if (c < 4 || c >= q)
+        return;
+    const int x0 = tc.tx * tb0, x1 = min(v.npa[0], x0 + tb0);
+    const int y0 = tc.ty * tb1, y1 = min(v.npa[1], y0 + tb1);
+    const int z0 = tc.tz * tb2, z1 = min(v.npa[2], z0 + tb2);
+    const int wx = x1 - x0, wy = y1 - y0, wz = z1 - z0, tnodes = wx * wy * wz;
+    const bool active_c = c < tc.q_lim;
+    for (int idx = warp; idx < tnodes; idx += nwarps) {
+        const int lx = idx % wx, ly = (idx / wx) % wy, lz = idx / (wx * wy);
+        const int i = (z0 + lz) * v.stride[2] + (y0 + ly) * v.stride[1] + (x0 + lx);
+        const std::size_t t = std::size_t(i) * q + c;
+        if (!active_c) {
+            r[t] = 0.0;
+            continue;
+        }
+        double rate = r[t];
+        for (int d = 0; d < v.dimension; ++d) {
+            const double *g = v.gradient[d] + std::size_t(i) * q;
+            rate += -F.row(g, d, c);
+        }
+        if (v.node_mirror && (v.node_mirror[i] & v.comp_odd[c]))
+            rate = 0.0;
+        r[t] = old == 0 ? fresh * (x[t] + tau * rate) : old * a[t] + fresh * (x[t] + tau * rate);
+    }
+}
+
+__global__ void k_react_rows_adaptive(View v, ReactionView r, double *a, double tau, bool fcs,
+                                      int tb0, int tb1, int tb2, const AdaptiveTileChunk *chunks, int nchunks) {
+    (void)fcs;
+    if (blockIdx.x >= nchunks)
+        return;
+    const AdaptiveTileChunk tc = chunks[blockIdx.x];
+    const int warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5, lane = threadIdx.x & 31;
+    const int q = v.q, c = tc.c0 + lane;
+    const bool active_c = (c < tc.q_lim && c < q);
+    const int x0 = tc.tx * tb0, x1 = min(v.npa[0], x0 + tb0);
+    const int y0 = tc.ty * tb1, y1 = min(v.npa[1], y0 + tb1);
+    const int z0 = tc.tz * tb2, z1 = min(v.npa[2], z0 + tb2);
+    const int wx = x1 - x0, wy = y1 - y0, wz = z1 - z0, tnodes = wx * wy * wz;
+    const double fc = active_c && r.has_filter ? r.filter[c] : 0.0;
+    for (int idx = warp; idx < tnodes; idx += nwarps) {
+        const int lx = idx % wx, ly = (idx / wx) % wy, lz = idx / (wx * wy);
+        const int i = (z0 + lz) * v.stride[2] + (y0 + ly) * v.stride[1] + (x0 + lx);
+        const double sa = r.sigma_a ? r.sigma_a[i] : r.sa, ss = r.sigma_s ? r.sigma_s[i] : r.ss;
+        if (!r.has_filter) {
+            // All 32 moments in this warp share the exact same isotropic decay factor exp(-tau * (sa + ss)):
+            // compute ONE FP64 exp() per warp and broadcast via shuffle (32x fewer transcendentals!).
+            double decay = lane == 0 ? exp(-tau * (sa + ss)) : 0.0;
+            decay = __shfl_sync(0xffffffffu, decay, 0);
+            if (active_c)
+                a[std::size_t(i) * q + c] *= decay;
+        } else if (active_c) {
+            a[std::size_t(i) * q + c] *= exp(-tau * (sa + ss + fc));
+        }
+    }
+}
+
+__global__ void k_face_traces_active(int q_stride, int q_eff, int rows, int nf, const int *row_nodes,
+                                     const double *row_mass, const double *x, double *G) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(rows) * q_eff)
+        return;
+    const int r = int(t / q_eff), c = int(t % q_eff);
+    double sum = 0;
+    for (int m = 0; m < nf; ++m)
+        sum += row_mass[std::size_t(r) * nf + m] * x[std::size_t(row_nodes[std::size_t(r) * nf + m]) * q_stride + c];
+    G[std::size_t(r) * q_stride + c] = sum;
+}
+
+__global__ void k_sub_active(int q_stride, int q_eff, int rows, double *a, const double *b) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(rows) * q_eff)
+        return;
+    const int r = int(t / q_eff), c = int(t % q_eff);
+    const std::size_t idx = std::size_t(r) * q_stride + c;
+    a[idx] -= b[idx];
+}
+
+__global__ void k_boundary_rows_add_active(int q_stride, int q_eff, int nb, const int *offsets, const int *rows_list,
+                                           const int *bnodes, const double *H, double *out, double *low4,
+                                           const int *row_break, double *low4b, int dim, int npa0, int npa1,
+                                           int tb0, int tb1, int tb2, int nt0, int nt1, const int *tile_q) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(nb) * q_eff)
+        return;
+    const int k = int(t / q_eff), c = int(t % q_eff);
+    const int bn = bnodes[k];
+    const int ix = bn % npa0;
+    const int iy = dim > 1 ? (bn / npa0) % npa1 : 0;
+    const int iz = dim > 2 ? bn / (npa0 * npa1) : 0;
+    const int T = ((iz / tb2) * nt1 + (iy / tb1)) * nt0 + (ix / tb0);
+    if (c >= tile_q[T])
+        return;
+    double sum = 0;
+    for (int e = offsets[k]; e < offsets[k + 1]; ++e)
+        sum += H[std::size_t(rows_list[e]) * q_stride + c];
+    out[std::size_t(bn) * q_stride + c] += sum;
+    if (c < 4) {
+        low4[std::size_t(k) * 4 + c] = sum;
+        if (row_break) {
+            double part = 0;
+            for (int e = offsets[k]; e < offsets[k + 1]; ++e)
+                if (row_break[rows_list[e]])
+                    part += H[std::size_t(rows_list[e]) * q_stride + c];
+            low4b[std::size_t(k) * 4 + c] = part;
+        }
+    }
+}
+
+void react_rows_adaptive_launch(Context *ctx, const ReactionView &r, double *state, double tau, bool fcs) {
+    AdaptiveDevice *ad = ctx->adaptive;
+    const View &v = ctx->v;
+    if (!ad || !ad->active) {
+        k_react_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, r, state, tau, fcs);
+        return;
+    }
+    k_react_low4<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r, state, tau, fcs);
+    if (ad->tile_chunks_n > 0)
+        k_react_rows_adaptive<<<ad->tile_chunks_n, 256, 0, ctx->stream>>>(
+            v, r, state, tau, fcs, ad->tb[0], ad->tb[1], ad->tb[2], ad->d_tile_chunks, ad->tile_chunks_n);
+}
+
+// Sparse broken-line interface product: H(r, c) = 0.5 * (sgn * (G_r * A_d^T)[c] - G(r, c)) using v.ell_val / v.ell_idx.
+__global__ void k_boundary_interface_sparse(View v, int r_begin, int nrows, int q_eff, int dir, double sgn,
+                                            const double *G, double *H) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t total = std::size_t(nrows) * q_eff;
+    if (t >= total)
+        return;
+    const int r = r_begin + int(t / q_eff);
+    const int c = int(t % q_eff);
+    const double *g_row = G + std::size_t(r) * v.q;
+    const std::size_t off = (std::size_t(dir) * v.q + c) * v.flux_width;
+    double sum = 0.0;
+    for (int w = 0; w < v.flux_width; ++w) {
+        const double val = v.ell_val[off + w];
+        const int idx = v.ell_idx[off + w];
+        if (val != 0.0 && idx < q_eff)
+            sum += val * g_row[idx];
+    }
+    H[std::size_t(r) * v.q + c] = 0.5 * (sgn * sum - g_row[c]);
+}
+
+bool boundary_high_adaptive_launch(Context *ctx, BoundaryHighDevice *d, const double *state, double *out,
+                                   const double *pinned_db, double *pinned_low4, double *pinned_low4_break) {
+    AdaptiveDevice *ad = ctx->adaptive;
+    if (!ad || !ad->active)
+        return false;
+    const BoundaryHighSetup &s = d->s;
+    const View &v = ctx->v;
+    const int q_bnd = std::max(4, std::min(s.q, ad->bnd_max_q));
+    k_face_traces_active<<<blocks(std::size_t(s.rows) * q_bnd), 256, 0, ctx->stream>>>(
+        s.q, q_bnd, s.rows, s.nf, d->row_nodes, d->row_mass, state, d->G);
+    const double one = 1, zero = 0;
+    for (int side = 0; side < 6; ++side) {
+        const int r0 = s.side_start[side], r1 = d->iface_t[side] ? s.break_start[side] : s.side_start[side + 1];
+        if (d->flux_t[side] && r1 > r0) {
+            const int q_s = std::max(4, std::min(q_bnd, ad->side_q_dom[side]));
+            cublas_check(cublasDgemm(d->handle, CUBLAS_OP_T, CUBLAS_OP_N, q_s, r1 - r0, q_s, &one,
+                                     d->flux_t[side], s.q, d->G + std::size_t(r0) * s.q, s.q, &zero,
+                                     d->H + std::size_t(r0) * s.q, s.q),
+                         "dgemm (adaptive)");
+        }
+        const int r2 = s.side_start[side + 1];
+        if (d->iface_t[side] && r2 > r1) {
+            const int q_b = std::max(4, std::min(q_bnd, ad->side_q_brk[side]));
+            const int dir = side / 2;
+            const double sgn = (side & 1) ? 1.0 : -1.0;
+            k_boundary_interface_sparse<<<blocks(std::size_t(r2 - r1) * q_b), 256, 0, ctx->stream>>>(
+                v, r1, r2 - r1, q_b, dir, sgn, d->G, d->H);
+        }
+    }
+    if (pinned_db) {
+        const std::size_t rq = std::size_t(s.rows) * s.q;
+        CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
+        k_sub_active<<<blocks(std::size_t(s.rows) * q_bnd), 256, 0, ctx->stream>>>(s.q, q_bnd, s.rows, d->H, d->db);
+    }
+    k_boundary_rows_add_active<<<blocks(std::size_t(s.nb) * q_bnd), 256, 0, ctx->stream>>>(
+        s.q, q_bnd, s.nb, d->offsets, d->rows_list, s.bnodes, d->H, out, d->low4, d->row_break, d->low4b,
+        v.dimension, v.npa[0], v.npa[1], ad->tb[0], ad->tb[1], ad->tb[2], ad->nt[0], ad->nt[1], ad->d_tile_q);
+    CK(cudaMemcpyAsync(pinned_low4, d->low4, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost, ctx->stream));
+    if (pinned_low4_break && d->low4b)
+        CK(cudaMemcpyAsync(pinned_low4_break, d->low4b, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost,
+                           ctx->stream));
+    return true;
+}
+
+void destroy_adaptive(Context *ctx) {
+    AdaptiveDevice *ad = ctx->adaptive;
+    if (!ad)
+        return;
+    for (void *p : {(void *)ad->d_deg_start, (void *)ad->d_tile_order, (void *)ad->d_tile_q,
+                    (void *)ad->d_tile_q_prev, (void *)ad->d_shrunken, (void *)ad->d_tile_rho,
+                    (void *)ad->d_tile_E, (void *)ad->d_tile_face_E, (void *)ad->d_tile_chunks})
+        cudaFree(p);
+    for (int d = 0; d < 3; ++d) {
+        cudaFree(ad->d_segs_grad[d]);
+        cudaFree(ad->d_segs_mass[d]);
+    }
+    delete ad;
+    ctx->adaptive = nullptr;
+}
+} // namespace
+
+void adaptive_setup(Context *ctx, const AdaptivePnPlan &plan) {
+    destroy_adaptive(ctx);
+    auto *ad = new AdaptiveDevice;
+    ad->num_tiles = plan.num_tiles;
+    ad->max_order = plan.max_order;
+    ad->L1 = plan.max_order + 1;
+    for (int d = 0; d < 3; ++d)
+        ad->tb[d] = plan.tb[d], ad->nt[d] = plan.nt[d];
+    ad->d_deg_start = dcopy(plan.deg_start.data(), plan.deg_start.size());
+    ad->d_tile_order = dcopy(plan.tile_order.data(), plan.tile_order.size());
+    ad->d_tile_q = dcopy(plan.tile_q.data(), plan.tile_q.size());
+    ad->d_tile_q_prev = dcopy(plan.tile_q_prev.data(), plan.tile_q_prev.size());
+    ad->d_shrunken = dalloc<int>(std::max(1, plan.num_tiles));
+    ad->d_tile_rho = dalloc<double>(std::max(1, plan.num_tiles));
+    ad->d_tile_E = dalloc<double>(std::size_t(std::max(1, plan.num_tiles)) * ad->L1);
+    ad->d_tile_face_E = dalloc<double>(std::size_t(std::max(1, plan.num_tiles)) * 6);
+    ad->global_max_q = plan.global_max_q;
+    ad->bnd_max_q = plan.bnd_max_q;
+    for (int s = 0; s < 6; ++s) {
+        ad->side_q_dom[s] = plan.side_q_dom[s];
+        ad->side_q_brk[s] = plan.side_q_brk[s];
+    }
+    ad->active = false;
+    ctx->adaptive = ad;
+}
+
+void adaptive_enable(Context *ctx, bool on) {
+    if (ctx->adaptive)
+        ctx->adaptive->active = on;
+}
+
+void adaptive_sensor(Context *ctx, const double *state, bool initial, double *host_rho, double *host_E,
+                     double *host_face_E) {
+    AdaptiveDevice *ad = ctx->adaptive;
+    const View &v = ctx->v;
+    if (initial) {
+        // Clear stage scratch and gradient buffers (spectral_radius() leaves random data in b.x, b.r, gradient).
+        const std::size_t bytes = sizeof(double) * std::size_t(v.nodes) * v.q;
+        if (ctx->b.a != state) CK(cudaMemsetAsync(ctx->b.a, 0, bytes, ctx->stream));
+        if (ctx->b.x != state) CK(cudaMemsetAsync(ctx->b.x, 0, bytes, ctx->stream));
+        if (ctx->b.r != state) CK(cudaMemsetAsync(ctx->b.r, 0, bytes, ctx->stream));
+        for (int d = 0; d < v.dimension; ++d)
+            CK(cudaMemsetAsync(v.gradient[d], 0, bytes, ctx->stream));
+    }
+    const std::size_t shmem = std::size_t(ad->L1 + 7) * sizeof(double);
+    k_adaptive_sensor<<<ad->num_tiles, 128, shmem, ctx->stream>>>(
+        v, state, initial, ad->tb[0], ad->tb[1], ad->tb[2], ad->nt[0], ad->nt[1],
+        ad->max_order, ad->d_deg_start, ad->d_tile_order, ad->d_tile_rho, ad->d_tile_E, ad->d_tile_face_E);
+    CK(cudaMemcpyAsync(host_rho, ad->d_tile_rho, sizeof(double) * ad->num_tiles, cudaMemcpyDeviceToHost, ctx->stream));
+    CK(cudaMemcpyAsync(host_E, ad->d_tile_E, sizeof(double) * std::size_t(ad->num_tiles) * ad->L1,
+                       cudaMemcpyDeviceToHost, ctx->stream));
+    CK(cudaMemcpyAsync(host_face_E, ad->d_tile_face_E, sizeof(double) * std::size_t(ad->num_tiles) * 6,
+                       cudaMemcpyDeviceToHost, ctx->stream));
+    CK(cudaStreamSynchronize(ctx->stream));
+}
+
+void adaptive_upload_and_zero(Context *ctx, double *state, const AdaptivePnPlan &plan,
+                              const std::vector<int> &shrunken) {
+    (void)state;
+    AdaptiveDevice *ad = ctx->adaptive;
+    const View &v = ctx->v;
+    ad->global_max_q = plan.global_max_q;
+    ad->bnd_max_q = plan.bnd_max_q;
+    for (int s = 0; s < 6; ++s) {
+        ad->side_q_dom[s] = plan.side_q_dom[s];
+        ad->side_q_brk[s] = plan.side_q_brk[s];
+    }
+    CK(cudaMemcpyAsync(ad->d_tile_order, plan.tile_order.data(), sizeof(int) * ad->num_tiles,
+                       cudaMemcpyHostToDevice, ctx->stream));
+    CK(cudaMemcpyAsync(ad->d_tile_q, plan.tile_q.data(), sizeof(int) * ad->num_tiles,
+                       cudaMemcpyHostToDevice, ctx->stream));
+    CK(cudaMemcpyAsync(ad->d_tile_q_prev, plan.tile_q_prev.data(), sizeof(int) * ad->num_tiles,
+                       cudaMemcpyHostToDevice, ctx->stream));
+    if (!shrunken.empty()) {
+        CK(cudaMemcpyAsync(ad->d_shrunken, shrunken.data(), sizeof(int) * shrunken.size(),
+                           cudaMemcpyHostToDevice, ctx->stream));
+        k_adaptive_zero<<<int(shrunken.size()), 128, 0, ctx->stream>>>(
+            v, ctx->b.a, ctx->b.x, ctx->b.r, ad->tb[0], ad->tb[1], ad->tb[2], ad->nt[0], ad->nt[1],
+            ad->d_shrunken, int(shrunken.size()), ad->d_tile_q, ad->d_tile_q_prev);
+    }
+    auto upload_vec = [&](auto *&dptr, int &cap, int &len, const auto &vec) {
+        len = int(vec.size());
+        if (len > cap) {
+            cudaFree(dptr);
+            cap = std::max(len * 2, 64);
+            CK(cudaMalloc(&dptr, sizeof(vec[0]) * cap));
+        }
+        if (len > 0)
+            CK(cudaMemcpyAsync(dptr, vec.data(), sizeof(vec[0]) * len, cudaMemcpyHostToDevice, ctx->stream));
+    };
+    for (int d = 0; d < v.dimension; ++d) {
+        upload_vec(ad->d_segs_grad[d], ad->segs_grad_cap[d], ad->segs_grad_n[d], plan.line_segs_grad[d]);
+        upload_vec(ad->d_segs_mass[d], ad->segs_mass_cap[d], ad->segs_mass_n[d], plan.line_segs_mass[d]);
+    }
+    upload_vec(ad->d_tile_chunks, ad->tile_chunks_cap, ad->tile_chunks_n, plan.tile_chunks);
+    CK(cudaStreamSynchronize(ctx->stream)); // host vectors may be modified after return
+}
+
 void destroy(Context *ctx) {
     if (!ctx)
         return;
     if (ctx->stream)
         cudaStreamSynchronize(ctx->stream);
+    destroy_adaptive(ctx);
     for (void *p : ctx->owned)
         cudaFree(p);
     if (ctx->reaction) {
@@ -2570,13 +3576,69 @@ void line_solve(Context *ctx, int d, int count, double *f, const double *src = n
     default: k_line_solve<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
     }
 }
+void line_solve_low4(Context *ctx, int d, int count, double *f, const double *src = nullptr) {
+    const View &v = ctx->v;
+    const int q4 = std::min(4, v.q);
+    std::size_t work = 0;
+    for (int k = d; k < d + count; ++k)
+        work = std::max(work, std::size_t(v.nodes / v.npa[k]) * q4);
+    const dim3 grid(blocks(work, 64), count);
+    switch (v.degree) {
+    case 1: k_line_solve_low4<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    case 2: k_line_solve_low4<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    case 3: k_line_solve_low4<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    default: k_line_solve_low4<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    }
+}
+void line_solve_adaptive_axis(Context *ctx, int d, double *f, const double *src,
+                              const AdaptiveLineSeg *segs, int nsegs) {
+    if (nsegs <= 0)
+        return;
+    const View &v = ctx->v;
+    const unsigned grid = (unsigned(nsegs) + 1u) / 2u; // 2 warps = 64 threads per block (register-optimal)
+    switch (v.degree) {
+    case 1: k_line_solve_adaptive<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src, segs, nsegs); break;
+    case 2: k_line_solve_adaptive<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src, segs, nsegs); break;
+    case 3: k_line_solve_adaptive<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src, segs, nsegs); break;
+    default: k_line_solve_adaptive<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src, segs, nsegs); break;
+    }
+}
 } // namespace
 void gradients(Context *ctx, const double *state) {
     const View &v = ctx->v;
+    if (ctx->adaptive && ctx->adaptive->active && !v.periodic) {
+        AdaptiveDevice *ad = ctx->adaptive;
+        line_solve_low4(ctx, 0, v.dimension, nullptr, state);
+        for (int d = 0; d < v.dimension; ++d)
+            line_solve_adaptive_axis(ctx, d, nullptr, state, ad->d_segs_grad[d], ad->segs_grad_n[d]);
+        return;
+    }
     line_solve(ctx, 0, v.dimension, nullptr, state);
 }
 void stabilization(Context *ctx, const double *state, double *out, bool want_low, double constant_gamma) {
     const View &v = ctx->v;
+    if (ctx->adaptive && ctx->adaptive->active && constant_gamma < 0 && !v.periodic) {
+        AdaptiveDevice *ad = ctx->adaptive;
+        const bool use_strip = (v.dimension == 2 && v.degree == 1 && v.classes <= max_strip_classes &&
+                                (v.structured || (v.strip_elem[0] && v.strip_elem[1])));
+        if (use_strip) {
+            const int q4 = std::min(4, v.q);
+            const dim3 g4(blocks(std::size_t(v.npa[0]) * q4, 128), (v.npa[1] + 15) / 16);
+            k_stabilization_strip_low4<16><<<g4, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+            if (ad->tile_chunks_n > 0)
+                k_stabilization_strip_adaptive<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                    v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks, ad->tile_chunks_n);
+        } else {
+            const int q4 = std::min(4, v.q);
+            k_stabilization_low4<<<blocks(std::size_t(v.nodes) * q4), 256, 0, ctx->stream>>>(
+                v, state, out, want_low, constant_gamma);
+            if (ad->tile_chunks_n > 0)
+                k_stabilization_adaptive<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                    v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->tb[2],
+                    ad->d_tile_chunks, ad->tile_chunks_n);
+        }
+        return;
+    }
     if (v.dimension == 2 && v.degree == 1 && !v.periodic && v.classes <= max_strip_classes &&
         (v.structured || (v.strip_elem[0] && v.strip_elem[1]))) {
         static const int sy = [] {
@@ -2620,7 +3682,16 @@ void add_rows(Context *ctx, double *field, const int *index, const double *rows,
         k_add_rows<<<blocks(std::size_t(count) * ctx->v.q), 256, 0, ctx->stream>>>(ctx->v.q, field, index, rows, count);
 }
 void mass_solve(Context *ctx, double *field) {
-    for (int d = 0; d < ctx->v.dimension; ++d)
+    const View &v = ctx->v;
+    if (ctx->adaptive && ctx->adaptive->active && !v.periodic) {
+        AdaptiveDevice *ad = ctx->adaptive;
+        for (int d = 0; d < v.dimension; ++d) {
+            line_solve_low4(ctx, d, 1, field);
+            line_solve_adaptive_axis(ctx, d, field, nullptr, ad->d_segs_mass[d], ad->segs_mass_n[d]);
+        }
+        return;
+    }
+    for (int d = 0; d < v.dimension; ++d)
         line_solve(ctx, d, 1, field);
 }
 bool mass_solve_combine(Context *ctx, double *field, const double *x, const double *a, double old, double fresh,
@@ -2633,7 +3704,7 @@ bool mass_solve_combine(Context *ctx, double *field, const double *x, const doub
         const char *e = std::getenv("M1PN_GPU_FUSE");
         return !(e && std::atoi(e) == 1);
     }();
-    if (off || v.periodic || v.mirror_index[last] >= 0 || v.degree != 1) {
+    if (off || v.periodic || v.mirror_index[last] >= 0 || v.degree != 1 || (ctx->adaptive && ctx->adaptive->active)) {
         mass_solve(ctx, field);
         return false; // the caller runs combine_pn
     }
@@ -2696,6 +3767,13 @@ void limiter(Context *ctx) {
 void gather_load(Context *ctx) { k_gather_load<<<blocks(std::size_t(ctx->v.nodes) * 4), 256, 0, ctx->stream>>>(ctx->v); }
 void combine_pn(Context *ctx, double *r, const double *x, const double *a, double old, double fresh, double tau) {
     const View &v = ctx->v;
+    if (ctx->adaptive && ctx->adaptive->active && !v.periodic) {
+        AdaptiveDevice *ad = ctx->adaptive;
+        if (ad->tile_chunks_n > 0)
+            k_combine_adaptive<<<ad->tile_chunks_n, 256, flux_shared(ctx), ctx->stream>>>(
+                v, r, x, a, old, fresh, tau, ad->tb[0], ad->tb[1], ad->tb[2], ad->d_tile_chunks, ad->tile_chunks_n);
+        return;
+    }
     k_combine<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx), ctx->stream>>>(v, r, x, a, old, fresh, tau, true, 1);
 }
 void finish_stage(Context *ctx, double *r, const double *x, const double *a, double old, double fresh, double tau,
@@ -2778,6 +3856,15 @@ void gather_async(Context *ctx, const double *field, int cols, const int *device
     double *buf = device_doubles(ctx, slot, std::size_t(count) * cols);
     k_gather<<<blocks(std::size_t(count) * cols), 256, 0, ctx->stream>>>(field, cols, device_index, count, buf, rows_soa);
     CK(cudaMemcpyAsync(pinned_out, buf, std::size_t(count) * cols * sizeof(double), cudaMemcpyDeviceToHost, ctx->stream));
+}
+void gather_cols_async(Context *ctx, const double *field, int stride_cols, int copy_cols, const int *device_index,
+                       int count, double *pinned_out, int slot) {
+    if (!count || copy_cols <= 0)
+        return;
+    const std::size_t n = std::size_t(count) * copy_cols;
+    double *buf = device_doubles(ctx, slot, n);
+    k_gather_cols<<<blocks(n), 256, 0, ctx->stream>>>(field, stride_cols, copy_cols, device_index, count, buf);
+    CK(cudaMemcpyAsync(pinned_out, buf, n * sizeof(double), cudaMemcpyDeviceToHost, ctx->stream));
 }
 void scatter_async(Context *ctx, double *field, int cols, const int *device_index, int count, const double *pinned_in,
                    bool add, int slot, long long rows_soa) {

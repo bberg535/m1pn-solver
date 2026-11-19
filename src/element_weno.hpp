@@ -6,6 +6,7 @@
 // Kuzmin, Hajduk, Vedral (arXiv:2509.04673v2), equations (6)-(7).
 // Limiter: one element factor against the M1 cone (Section 6.2 of holo_m1_pn; without the clip-and-scale stage).
 // See docs/ELEMENT_WENO.md for the formulas and the choices made here.
+#include "adaptive_pn.hpp"
 #include "boundary.hpp"
 #include "m1.hpp"
 #include <random>
@@ -178,6 +179,16 @@ struct ElementWenoOptions {
     // M1 moments (moment consistency of the rule), vanishes for identity projections, and changes the face
     // integrand by -(llf_homogeneous - (A_n + I)/2) delta. Full projection mode only.
     bool projection_high_order = false;
+    // Dynamic tile-based adaptive PN order (experiment/dynamic-adaptive-pn): each spatial tile of size
+    // adaptive_tile^d nodes carries an odd PN order N_T in [adaptive_min_order, pn.order] updated every
+    // adaptive_stride steps by a spectral tail sensor with hysteresis and border-aware wave-front dilation.
+    bool adaptive_pn = false;
+    double adaptive_tol = 3e-4;
+    double adaptive_hysteresis = 0.25;
+    int adaptive_tile = 16;
+    int adaptive_stride = 4;
+    int adaptive_min_order = 1;
+    int adaptive_halo = 1; // 0: off, 1: border-aware neighbor dilation, 2: full 3x3 dilation
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -211,6 +222,15 @@ struct ElementWenoStats {
     double t_reaction = 0;
     double t_fcs_density = 0, t_fcs_quadrature = 0; // FCS: rho_u evaluation and nodal source quadrature
     PositivityProjectionStats projection;         // positivity projection of the ghost (rate() calls only)
+    // Dynamic adaptive PN diagnostics (experiment/dynamic-adaptive-pn).
+    long adaptive_updates = 0;
+    long adaptive_steps = 0;
+    double adaptive_coeff_sum = 0;
+    double adaptive_order_sum = 0;
+    double adaptive_last_fraction = 1;
+    double adaptive_last_mean_order = 0;
+    int adaptive_last_max_order = 0;
+    double t_adaptive_sensor = 0;
 };
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
@@ -380,6 +400,11 @@ public:
     // FCS quadrature points and weights (empty without uncollided_density).
     const std::vector<V3> &fcs_points() const { return fcs_points_; }
     const std::vector<double> &fcs_weights() const { return fcs_weight_; }
+    // Dynamic tile-based adaptive PN (CPU path): adapt tile orders from `a`, zeroing shrunken entries.
+    // Called automatically at the start of a run and every options.adaptive_stride steps by drivers or tests.
+    void adapt_pn_state(Field &a, bool initial = false, ElementWenoStats *stats = nullptr) const;
+    void reset_adaptive_pn() const;
+    const AdaptivePnPlan *adaptive_plan() const { return adaptive_plan_.get(); }
 
 private:
     struct FaceRule {
@@ -510,6 +535,15 @@ private:
     // Separable trace evaluation per side (src/separable_trace.hpp; null: dense out_rules_[side].harmonics) and the
     // ghost pairs of each side.
     std::array<std::shared_ptr<const SeparableTrace>, 6> separable_;
+    // Adaptive PN: low-order quadrature pyramid (e.g. N=3, 7, 15 with rule_n = N+1) so low-order boundary nodes
+    // project on 144/400/1296 points instead of the full PN rule (e.g. 5776 points at P35).
+    struct AdaptiveGhostTier {
+        int max_order = 0;
+        int q_tier = 0;
+        std::array<OutRule, 6> out_rules;
+        std::array<std::shared_ptr<const SeparableTrace>, 6> separable;
+    };
+    std::vector<AdaptiveGhostTier> adaptive_ghost_tiers_;
     std::array<std::vector<int>, 6> ghost_by_side_;
     // Face-row layout of add_boundary (see the constructor).
     std::vector<int> face_row_, face_row_side_, boundary_row_offsets_, boundary_rows_;
@@ -529,7 +563,10 @@ private:
     void interface_face_low(int index, const Field &low, const Field &low_flux, Field &L, Field &BR, Field &FA, Vec &AR,
                             Vec &IN) const;
     // V rows (face mass times the partner trace) of a broken-line or conforming interface face.
-    void nodal_partner_rows(int index, const Field &a, Eigen::Ref<Field> rows) const;
+    void nodal_partner_rows(int index, const Field &a, Eigen::Ref<Field> rows, int q_cols = -1) const;
+    // Populate tile_floor for non-vacuum inflow walls and per-side max active moments for boundary_high.
+    void init_adaptive_inflow_floor(AdaptivePnPlan &plan) const;
+    void update_adaptive_side_q(AdaptivePnPlan &plan) const;
     bool nodal_interface(int side_id) const { return options.interface_side[side_id] && bool(options.interface_partner); }
     void nodal_face_low(int index, const Field &low, const Field &low_flux,
                         const std::function<void(int, Four &, Four &)> &partner, Field &L, Field &BR, Field &FA, Vec &AR,
@@ -625,6 +662,19 @@ private:
     std::vector<char> owned_;
     void distributed_random(Field &x, std::mt19937 &rng, std::uniform_real_distribution<double> &u) const;
     Mat m1_reference_; // 1D reference element mass (the global line factor of the MPI layer is assembled from it)
+    // Dynamic tile-based adaptive PN (CPU): tile plan and natural-order banded 1D LDL^T factors for segmented line solves.
+    mutable std::unique_ptr<AdaptivePnPlan> adaptive_plan_;
+    mutable bool adaptive_active_ = false;
+    mutable long adaptive_step_counter_ = 0;
+    struct BandFactor {
+        int n = 0, p = 0;
+        std::vector<double> lower, invdiag;
+    };
+    std::array<BandFactor, 3> band_natural_, band_dirichlet_;
+    void build_band_factors();
+    void solve_band_segment(const BandFactor &f, double *buf, int width, int k0, int k1) const;
+    void adaptive_solve_lines(Field &b, int d, bool gradient, bool is_grad_segs) const;
+    Field adaptive_projected_gradient(const Field &a, int d) const;
 };
 // PN moments of the reflected distribution psi(R_d omega): moments odd under x_d -> -x_d change sign.
 Vec reflect_pn(const Angular &, const Vec &full, int direction);

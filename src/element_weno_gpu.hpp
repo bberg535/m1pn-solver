@@ -135,6 +135,14 @@ private:
     bool nodal_interfaces_ = false; // conforming interface sides: partner term as face datum, regular pipeline
     bool nodal_db_zeroed_ = false;
     int lockstep_buffer_ = 0;
+    // Dynamic tile-based adaptive PN (experiment/dynamic-adaptive-pn).
+    bool adaptive_enabled_ = false;
+    AdaptivePnPlan adaptive_plan_;
+    std::vector<double> adaptive_rho_, adaptive_E_, adaptive_face_E_;
+    std::vector<int> adaptive_shrunken_;
+    long adaptive_step_ = 0;
+    int adaptive_fetch_q_ = 0; // max tile_q across full_nodes_ (for truncated D2H fetch)
+    void adapt_gpu(bool initial, ElementWenoStats *stats);
     void closure_fallback(const double *x);
     void limiter_fallback(ElementWenoStats &stats);
     void boundary_correction(ElementWenoStats &stats);

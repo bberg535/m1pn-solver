@@ -74,6 +74,10 @@ struct Options {
     bool gpu = false;                     // time loop on the GPU (src/element_weno_gpu.cpp)
     std::string fcs = "off";              // first-collision source (docs/FCS.md, docs/FCS_LATTICE.md)
     bool weno = true, element_limit = true;
+    // Dynamic tile-based adaptive PN (experiment/dynamic-adaptive-pn).
+    bool adaptive_pn = false;
+    double adaptive_tol = 3e-4, adaptive_hysteresis = 0.25;
+    int adaptive_tile = 16, adaptive_stride = 4, adaptive_min_order = 1, adaptive_halo = 1;
     std::string problem = "smooth", inflow = "vacuum", output = "tmp/run";
 };
 Options parse(int argc, char **argv) {
@@ -249,7 +253,22 @@ Options parse(int argc, char **argv) {
         } else if (key == "--weno" || key == "--element-limit") {
             require(v == "on" || v == "off", key + " must be on or off");
             (key == "--weno" ? o.weno : o.element_limit) = v == "on";
-        } else
+        } else if (key == "--adaptive-pn") {
+            require(v == "on" || v == "off", "--adaptive-pn must be on or off");
+            o.adaptive_pn = v == "on";
+        } else if (key == "--adaptive-tol")
+            o.adaptive_tol = real();
+        else if (key == "--adaptive-hysteresis")
+            o.adaptive_hysteresis = real();
+        else if (key == "--adaptive-tile")
+            o.adaptive_tile = integer();
+        else if (key == "--adaptive-stride")
+            o.adaptive_stride = integer();
+        else if (key == "--adaptive-min-order")
+            o.adaptive_min_order = integer();
+        else if (key == "--adaptive-halo")
+            o.adaptive_halo = integer();
+        else
             throw std::runtime_error("Unknown option: " + key);
     }
     require(o.filter_strength >= 0, "Negative filter strength");
@@ -626,6 +645,13 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     eo.limit = o.element_limit;
     eo.weno_linear = o.weno_linear;
     eo.m1_target = o.m1_target;
+    eo.adaptive_pn = o.adaptive_pn;
+    eo.adaptive_tol = o.adaptive_tol;
+    eo.adaptive_hysteresis = o.adaptive_hysteresis;
+    eo.adaptive_tile = o.adaptive_tile;
+    eo.adaptive_stride = o.adaptive_stride;
+    eo.adaptive_min_order = o.adaptive_min_order;
+    eo.adaptive_halo = o.adaptive_halo;
     // ---- First-collision source (docs/FCS.md) ----------------------------------------------------------------------
     // The grid carries the collided part psi_c (initially the isotropic floor), the Gaussian pulse is uncollided and
     // known analytically in the homogeneous infinite medium; it feeds sigma_s rho_u into psi_c.
@@ -1265,6 +1291,14 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     if (device)
         a = device->end(stats);
 #endif
+    if (o.adaptive_pn && !o.gpu && scheme.adaptive_plan()) {
+        const AdaptivePnPlan &P = *scheme.adaptive_plan();
+        parallel_for(scheme.nodes, [&](int i) {
+            const int qi = P.tile_q[P.node_tile(i)];
+            if (qi < scheme.moments)
+                std::fill_n(&a.coeffRef(i, qi), scheme.moments - qi, 0.0);
+        });
+    }
     if (o.history_stride <= 0 || steps % o.history_stride) record(steps);
     for (int i = 0; i < scheme.nodes; ++i) {
         if (!scheme.is_owned(i))
@@ -1405,6 +1439,17 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
            << ",\"uncollided_mass_exact\":" << (fcs && !fcs_lattice && !kobayashi_problem ? pulse.mass * std::exp(-pulse.sigma_t * t) : 0.)
            << lattice_fcs_json
            << ",\"min_weno_gamma\":" << stats.min_gamma
+           << ",\"adaptive_pn\":{\"enabled\":" << (o.adaptive_pn ? "true" : "false")
+           << ",\"tol\":" << o.adaptive_tol << ",\"hysteresis\":" << o.adaptive_hysteresis
+           << ",\"tile\":" << o.adaptive_tile << ",\"stride\":" << o.adaptive_stride
+           << ",\"min_order\":" << o.adaptive_min_order << ",\"halo\":" << o.adaptive_halo
+           << ",\"updates\":" << stats.adaptive_updates
+           << ",\"mean_coeff_fraction\":" << (stats.adaptive_steps ? stats.adaptive_coeff_sum / stats.adaptive_steps : 1.)
+           << ",\"mean_order\":" << (stats.adaptive_steps ? stats.adaptive_order_sum / stats.adaptive_steps : double(pn.order))
+           << ",\"final_coeff_fraction\":" << stats.adaptive_last_fraction
+           << ",\"final_mean_order\":" << stats.adaptive_last_mean_order
+           << ",\"final_max_order\":" << stats.adaptive_last_max_order
+           << ",\"sensor_seconds\":" << stats.t_adaptive_sensor << "}"
            << ",\"min_element_factor\":" << stats.min_limiter << ",\"limited_element_stages\":" << stats.limited_elements << ",\"rate_calls\":" << stats.rate_calls << ",\"unlimited_rate_calls\":" << stats.unlimited_rate_calls << ",\"cells\":" << out_scheme.cells
            << ",\"mpi_ranks\":" << ranks
            << ",\"limited_boundary_nodes\":" << stats.limited_boundary_nodes << ",\"nudged_states\":" << stats.nudged_states

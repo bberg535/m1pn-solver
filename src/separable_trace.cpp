@@ -105,12 +105,17 @@ SeparableTrace::SeparableTrace(int order, const std::vector<int> &active, const 
 }
 
 void SeparableTrace::evaluate(const Mat &at, Mat &out) const {
+    evaluate_upto(at, out, N_);
+}
+
+void SeparableTrace::evaluate_upto(const Mat &at, Mat &out, int max_order) const {
     const int K = int(at.cols());
-    // b = D^T a in the local full basis, row-major (row index(l, m') contiguous over the K nodes).
+    const int M = std::max(0, std::min(max_order, N_));
+    // b = D^T a in the local full basis up to degree M, row-major (row index(l, m') contiguous over K nodes).
     thread_local Field b, C;
     thread_local Mat R;
-    b.resize((N_ + 1) * (N_ + 1), K);
-    for (int l = 0; l <= N_; ++l) {
+    b.resize((M + 1) * (M + 1), K);
+    for (int l = 0; l <= M; ++l) {
         const int w = 2 * l + 1, cnt = block_count_[l], s0 = block_start_[l];
         for (int r = 0; r < w; ++r) {
             double *row = b.row(l * l + r).data();
@@ -125,17 +130,17 @@ void SeparableTrace::evaluate(const Mat &at, Mat &out) const {
             }
         }
     }
-    // C(m + N, i * K + k) = sum_l Theta_(l,m)(z_i) b_(l,m),k (row-major, contiguous over k).
-    C.resize(2 * N_ + 1, std::size_t(P_) * K);
-    for (int m = -N_; m <= N_; ++m) {
+    // C(m + M, i * K + k) = sum_{l=|m|..M} Theta_(l,m)(z_i) b_(l,m),k (row-major, contiguous over k).
+    C.resize(2 * M + 1, std::size_t(P_) * K);
+    for (int m = -M; m <= M; ++m) {
         const int am = std::abs(m);
         const Mat &t = theta_[m + N_];
-        double *crow = C.row(m + N_).data();
+        double *crow = C.row(m + M).data();
         for (int i = 0; i < P_; ++i) {
             double *dst = crow + std::size_t(i) * K;
             for (int k = 0; k < K; ++k)
                 dst[k] = 0;
-            for (int l = am; l <= N_; ++l) {
+            for (int l = am; l <= M; ++l) {
                 const double th = t(i, l - am);
                 const double *src = b.row(index(l, m)).data();
                 for (int k = 0; k < K; ++k)
@@ -143,8 +148,8 @@ void SeparableTrace::evaluate(const Mat &at, Mat &out) const {
             }
         }
     }
-    // R(j, i * K + k) = psi at (i, j) of node k: one GEMM A x (2N+1) x (P K).
-    R.noalias() = trig_ * C;
+    // R(j, i * K + k) = psi at (i, j) of node k: one GEMM A x (2M+1) x (P K).
+    R.noalias() = trig_.middleCols(N_ - M, 2 * M + 1) * C;
     out.resize(points(), K);
     for (int k = 0; k < K; ++k)
         for (int i = 0; i < P_; ++i)
