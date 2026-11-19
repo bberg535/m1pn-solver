@@ -106,7 +106,21 @@ einheitliches P35 bei gleicher Genauigkeit, wenn der Pilot mitgezählt wird.**
 
 Rauschfeste Karte (`order_map_from_mc.py --significance 3 --mirror-x`): nur Koeffizienten mit |u_lm| > 3·stderr zählen.
 1e8 bei 28 Pixeln weicht dann im Mittel 1,2 Ordnungen von der 1e9-Karte ab (vorher 3,1), Zustandsanteil 0,24 statt
-0,34. Test: Job 162698 (SIGMAPS_FOLGT).
+0,34. Ergebnis (Job 162698, Binary 602d65f):
+
+| Karte (3σ) | Koeff. | Lauf | + Pilot (64 NX-Kerne) | Masse/Absorption/Rate % | Feld L1 |
+|---|---|---|---|---|---|
+| 1e8, 28, 3e-4 | 50 M | 117 s | 129 s | −0,027 / +0,044 / +0,052 | 9,0e-4 |
+| 1e8, 28, 2e-4 | 60 M | 130 s | 142 s | −0,022 / +0,035 / +0,037 | 8,1e-4 |
+| 1e8, 14, 3e-4 | 33 M | 95 s | 107 s | +0,023 / −0,049 / −0,067 | 1,2e-3 |
+| 1e9, 28, 3e-4 | 38 M | 93 s | ≈ 200 s | −0,013 / +0,017 / +0,015 | 7,9e-4 |
+| 1e9, 28, 2e-4 | 48 M | 119 s | ≈ 230 s | −0,013 / +0,018 / +0,006 | 7,7e-4 |
+
+Die Schwelle macht die 1e8-Karten deutlich billiger (117 statt 179 s bei gleicher Genauigkeit der Integrale), mit
+Pilot aber nicht schneller als einheitliches P35 (121 s). Höhere einheitliche Ordnung (Job 162689): P45 198 s,
+−0,021 / +0,033 / +0,032 %, L1 7,0e-4; P63 489 s, −0,018 / +0,028 / +0,022 %, L1 6,8e-4: ab P35 dominiert im Feld der
+Ortsfehler. **Fazit Karten:** auf lattice-paul kein Nettogewinn durch MC-Pilotkarten; einheitliches GB P35 bleibt der
+Standard. Die 1e9-Karten zeigen nur, dass die Integrale mit ~40 % der Koeffizienten genauer werden können als mit P45.
 
 ## 5. CUDA-Kernel
 
