@@ -471,21 +471,35 @@ int main(int argc, char **argv) {
                     return e && std::atoi(e) != 0;
                 }();
                 auto each_block = [&](const std::function<void(Block &)> &work) {
-                    if (serial) {
+                    if (serial || B == 1) {
                         for (Block &b : blocks)
                             work(b);
                         return;
                     }
+                    // Nested: `outer` blocks at a time, each with threads / outer threads for its host phases.
+                    const int outer = std::min(B, threads), inner = std::max(1, threads / outer);
+                    static std::vector<int> by_cost; // largest blocks first (dynamic schedule)
+                    if (int(by_cost.size()) != B) {
+                        by_cost.resize(B);
+                        for (int k = 0; k < B; ++k) by_cost[k] = k;
+                        std::sort(by_cost.begin(), by_cost.end(), [&](int a, int c) {
+                            return double(blocks[a].scheme->nodes) * blocks[a].scheme->moments >
+                                   double(blocks[c].scheme->nodes) * blocks[c].scheme->moments;
+                        });
+                    }
+                    omp_set_max_active_levels(2);
                     std::exception_ptr error;
-#pragma omp parallel for schedule(dynamic, 1)
-                    for (int k = 0; k < B; ++k) {
+#pragma omp parallel for num_threads(outer) schedule(dynamic, 1)
+                    for (int m = 0; m < B; ++m) {
+                        omp_set_num_threads(inner);
                         try {
-                            work(blocks[k]);
+                            work(blocks[by_cost[m]]);
                         } catch (...) {
 #pragma omp critical(m1pn_blocks_gpu_error)
                             if (!error) error = std::current_exception();
                         }
                     }
+                    omp_set_max_active_levels(1);
                     if (error)
                         std::rethrow_exception(error);
                 };
