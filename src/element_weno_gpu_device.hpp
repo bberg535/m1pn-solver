@@ -107,6 +107,9 @@ void gradients(Context *, const double *state);
 void stabilization(Context *, const double *state, double *out, bool want_low, double constant_gamma);
 void add_rows(Context *, double *field, const int *device_index, const double *device_rows, int count); // field[i] += rows
 void mass_solve(Context *, double *field);
+// mass_solve with the PN-row stage combination (rows c >= 4, as combine_pn) fused into the last direction; returns false
+// (and only solves) where the fusion does not apply, then the caller runs combine_pn. M1PN_GPU_FUSE=0: never fuse.
+bool mass_solve_combine(Context *, double *field, const double *x, const double *a, double old, double fresh, double tau);
 // field += -sum_d A_d^T g_d per node, then moment_rate = project(field) (when want_moments).
 void flux_rows(Context *, double *field, bool want_moments);
 void limiter(Context *);

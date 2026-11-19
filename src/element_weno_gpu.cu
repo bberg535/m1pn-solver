@@ -466,7 +466,24 @@ template <int N> __global__ void k_weno(View v, const double *a) {
 // Loads are issued in chunks of CH so their latency overlaps.
 // f == nullptr: direction first + blockIdx.y on its gradient field (independent solves in one launch).
 // src != nullptr (gradients): the right-hand side C_1d src is formed on the fly in the forward sweep (sliding window).
-template <int P, int CH> __global__ void k_line_solve(View v, int first, double *field, const double *src) {
+struct FluxShared {
+    const double *val;
+    const int *idx;
+    int q, width;
+    __device__ double row(const double *g, int d, int j) const {
+        const int base = (d * q + j) * width;
+        double s = 0;
+        for (int w = 0; w < width; ++w)
+            s += val[base + w] * g[idx[base + w]];
+        return s;
+    }
+};
+// FUSE (experiment/big-rebuilds): the last mass-solve direction also forms the stage combination of the PN rows c >= 4
+// (as k_combine part 1, same operations in the same order, so bitwise equal): out = old a + fresh (x + tau rate),
+// rate = solved value - sum_d A_d g_d (row c), zero on mirror planes for odd moments. Rows c < 4 stay the raw solve.
+template <int P, int CH, bool FUSE = false>
+__global__ void k_line_solve(View v, int first, double *field, const double *src, const double *cx = nullptr,
+                             const double *ca = nullptr, double old = 0, double fresh = 1, double tau = 0) {
     const int d = first + blockIdx.y;
     double *f = field ? field : v.gradient[d];
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -574,7 +591,17 @@ template <int P, int CH> __global__ void k_line_solve(View v, int first, double 
                 hist[m] = hist[m - 1];
             if (P > 0)
                 hist[0] = x;
-            base[std::size_t(k) * step] = x;
+            if (FUSE && c >= 4) {
+                const std::size_t node = std::size_t(start) + std::size_t(k + off) * s, t = node * v.q + c;
+                const FluxShared F{v.ell_val, v.ell_idx, v.q, v.flux_width};
+                double rate = x;
+                for (int dd = 0; dd < v.dimension; ++dd)
+                    rate += -F.row(v.gradient[dd] + node * v.q, dd, c);
+                if (v.node_mirror && (v.node_mirror[node] & v.comp_odd[c]))
+                    rate = 0;
+                base[std::size_t(k) * step] = old == 0 ? fresh * (cx[t] + tau * rate) : old * ca[t] + fresh * (cx[t] + tau * rate);
+            } else
+                base[std::size_t(k) * step] = x;
         }
     };
     load_bwd(nn - 1, bufA);
@@ -844,18 +871,7 @@ __global__ void k_add_rows(int q, double *field, const int *index, const double 
 // A_d^T rows in shared memory: values, inner indices, outer offsets per direction (dynamic shared size).
 // A_d^T (active moments) in padded ELL form in shared memory: row j of direction d has `width` entries
 // (value, index), zero-padded after the CSR entries (same summation order; the padding adds +0).
-struct FluxShared {
-    const double *val;
-    const int *idx;
-    int q, width;
-    __device__ double row(const double *g, int d, int j) const {
-        const int base = (d * q + j) * width;
-        double s = 0;
-        for (int w = 0; w < width; ++w)
-            s += val[base + w] * g[idx[base + w]];
-        return s;
-    }
-};
+
 __device__ FluxShared stage_flux(const View &v, double *shared) {
     if (!v.flux_in_shared) // high PN orders (q > ~500 in 2D): read-only global loads (uniform branch)
         return FluxShared{v.ell_val, v.ell_idx, v.q, v.flux_width};
@@ -2561,6 +2577,25 @@ void add_rows(Context *ctx, double *field, const int *index, const double *rows,
 void mass_solve(Context *ctx, double *field) {
     for (int d = 0; d < ctx->v.dimension; ++d)
         line_solve(ctx, d, 1, field);
+}
+bool mass_solve_combine(Context *ctx, double *field, const double *x, const double *a, double old, double fresh,
+                        double tau) {
+    const View &v = ctx->v;
+    const int last = v.dimension - 1;
+    static const bool off = [] {
+        const char *e = std::getenv("M1PN_GPU_FUSE");
+        return e && std::atoi(e) == 0;
+    }();
+    if (off || v.periodic || v.mirror_index[last] >= 0 || v.degree != 1) {
+        mass_solve(ctx, field);
+        return false; // the caller runs combine_pn
+    }
+    for (int d = 0; d < last; ++d)
+        line_solve(ctx, d, 1, field);
+    const dim3 grid(blocks(std::size_t(v.nodes / v.npa[last]) * v.q, 64), 1);
+    k_line_solve<1, LINE_CHUNK, true><<<grid, 64, 0, ctx->stream>>>(v, last, field, nullptr, x, a, old, fresh, tau);
+    CK(cudaGetLastError());
+    return true;
 }
 namespace {
 std::size_t flux_shared(Context *ctx) {

@@ -1376,14 +1376,15 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
         gpu::add_rows(ctx_, out, d_bnodes_, rows, nb_);
         t_boundary_high += seconds() - t0;
     }
-    gpu::mass_solve(ctx_, out);
+    const bool pn_combined = gpu::mass_solve_combine(ctx_, out, x, u, old, fresh, tau);
     gpu::flux_moments(ctx_, out); // the advective term of the PN rows is added in finish_stage
     gpu::limiter(ctx_);
     gpu::gather_load(ctx_);
     gpu::snapshot_counters(ctx_);
     gpu::gather_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_, 5);
     gpu::record(ctx_, 1);
-    gpu::combine_pn(ctx_, out, x, u, old, fresh, tau); // PN rows: independent of the boundary corrections
+    if (!pn_combined)
+        gpu::combine_pn(ctx_, out, x, u, old, fresh, tau); // PN rows: independent of the boundary corrections
     // Diagnostics (M1PN_GPU_DIAG_SERIAL=1, timing only, same results): wait for the device before phase B, so that
     // t_diag_device is the device work that phase B normally overlaps.
     static const bool diag_serial = [] {
