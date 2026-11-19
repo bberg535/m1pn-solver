@@ -102,6 +102,10 @@ struct Context {
     // Ghost projection (ghost_setup).
     struct GhostDevice *ghost = nullptr;
     cudaStream_t aux = nullptr; // non-blocking stream of the ghost kernel (overlaps the volume kernels)
+    // Context stream of all kernels and asynchronous copies (experiment/big-rebuilds): one per scheme, so that several
+    // schemes (multi-block driver) run concurrently. Blocking stream: operations on the legacy default stream that
+    // remain (synchronous copies, upload_async) still order with it.
+    cudaStream_t stream = nullptr;
     struct ReactionDevice *reaction = nullptr;
     struct BoundaryHighDevice *bhigh = nullptr;
     struct GhostTraceDevice *gtrace = nullptr;
@@ -1767,7 +1771,7 @@ void ghost_setup(Context *ctx, const GhostSetup &s) {
 void ghost(Context *ctx, const double *state, double *pinned_moments, int *pinned_flags) {
     GhostView &g = ctx->ghost->g;
     cudaStream_t st = ctx->aux;
-    CK(cudaEventRecord(ctx->events[3], 0));
+    CK(cudaEventRecord(ctx->events[3], ctx->stream));
     CK(cudaStreamWaitEvent(st, ctx->events[3], 0));
     CK(cudaMemsetAsync(&g.stats->flagged, 0, sizeof(int), st));
     const int warps = ctx->ghost->warps;
@@ -1937,12 +1941,12 @@ void react(Context *ctx, double *state, double tau, const double *host_table, in
             CK(cudaMalloc(&r.table, rd->table_size * sizeof(double)));
         }
         CK(cudaMemcpy(r.table, host_table, std::size_t(n + 1) * sizeof(double), cudaMemcpyHostToDevice));
-        k_fcs_points<<<blocks(std::size_t(v.cells) * r.P), 256>>>(v, r, n, dr, cx, cy);
-        k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256>>>(v, r);
-        k_fcs_gather<<<blocks(v.nodes), 256>>>(v, r);
+        k_fcs_points<<<blocks(std::size_t(v.cells) * r.P), 256, 0, ctx->stream>>>(v, r, n, dr, cx, cy);
+        k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
+        k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
     }
-    k_react<<<blocks(v.nodes), 256>>>(v, r, state, tau, fcs);
-    k_admissible<<<blocks(v.nodes), 256>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
+    k_react<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r, state, tau, fcs);
+    k_admissible<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
 }
 void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, double dt, double *host_out) {
     ReactionDevice *rd = ctx->reaction;
@@ -1961,7 +1965,7 @@ void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, doubl
     lv.theta_w = own(dcopy(hv.theta_w, std::size_t(hv.theta_n)));
     const std::size_t points = std::size_t(v.cells) * r.P, total = points * std::size_t(M + 1);
     double *table = own(dalloc<double>(total));
-    k_lattice_table<<<blocks(total, 128), 128>>>(lv, r.fx, r.fy, points, M, dt, table);
+    k_lattice_table<<<blocks(total, 128), 128, 0, ctx->stream>>>(lv, r.fx, r.fy, points, M, dt, table);
     CK(cudaGetLastError());
     if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e)) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -2019,7 +2023,7 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
     CK(cudaDeviceSetLimit(cudaLimitStackSize, 24 * 1024)); // two break lists of lattice3d_max_breaks doubles
     for (std::size_t first = 0; first < points; first += batch) {
         const std::size_t count = std::min(batch, points - first);
-        k_lattice3d_table<<<blocks(count, 64), 64>>>(lv, dx, dy, dz, first, count, M, dt, work, table);
+        k_lattice3d_table<<<blocks(count, 64), 64, 0, ctx->stream>>>(lv, dx, dy, dz, first, count, M, dt, work, table);
         CK(cudaGetLastError());
     }
     CK(cudaDeviceSynchronize());
@@ -2034,11 +2038,11 @@ void react_lattice(Context *ctx, double *state, double tau, double source_time) 
     const View &v = ctx->v;
     if (!r.ltable)
         throw std::runtime_error("react_lattice: no lattice table");
-    k_fcs_points_lattice<<<blocks(std::size_t(v.cells) * r.P), 256>>>(v, r, source_time);
-    k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256>>>(v, r);
-    k_fcs_gather<<<blocks(v.nodes), 256>>>(v, r);
-    k_react<<<blocks(v.nodes), 256>>>(v, r, state, tau, true);
-    k_admissible<<<blocks(v.nodes), 256>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
+    k_fcs_points_lattice<<<blocks(std::size_t(v.cells) * r.P), 256, 0, ctx->stream>>>(v, r, source_time);
+    k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
+    k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
+    k_react<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r, state, tau, true);
+    k_admissible<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
 }
 Ledger ledger(Context *ctx) {
     double h[2];
@@ -2060,6 +2064,7 @@ Context *create(const Setup &s) {
     if (devices < 1)
         throw std::runtime_error("GPU path: no CUDA device");
     Context *ctx = new Context;
+    CK(cudaStreamCreate(&ctx->stream)); // blocking: still ordered with the legacy default stream
     View &v = ctx->v;
     v.dimension = s.dimension, v.degree = s.degree, v.nodes = s.nodes, v.cells = s.cells, v.local = s.local, v.q = s.q;
     for (int d = 0; d < 3; ++d)
@@ -2277,7 +2282,7 @@ void boundary_high_setup(Context *ctx, const BoundaryHighSetup &s) {
         d->low4b = dalloc<double>(std::size_t(std::max(1, s.nb)) * 4);
     }
     cublas_check(cublasCreate(&d->handle), "create");
-    cublas_check(cublasSetStream(d->handle, 0), "set stream"); // legacy default stream, as all kernels here
+    cublas_check(cublasSetStream(d->handle, ctx->stream), "set stream"); // the context stream, as all kernels here
     ctx->bhigh = d;
 }
 // ---------------------------------------------------------------------------------------------------------------
@@ -2326,7 +2331,7 @@ void ghost_traces_setup(Context *ctx, const GhostTraceSetup &s) {
 void ghost_traces(Context *ctx, const double *state, double *pinned_out) {
     GhostTraceDevice *d = ctx->gtrace;
     cudaStream_t st = ctx->aux;
-    CK(cudaEventRecord(ctx->events[3], 0));
+    CK(cudaEventRecord(ctx->events[3], ctx->stream));
     CK(cudaStreamWaitEvent(st, ctx->events[3], 0));
     const double one = 1, zero = 0;
     for (int side = 0; side < 6; ++side) {
@@ -2378,8 +2383,8 @@ void boundary_high(Context *ctx, const double *state, double *out, const double 
     if (s.rows == 0 || s.nb == 0)
         return;
     const std::size_t rq = std::size_t(s.rows) * s.q;
-    k_face_traces<<<blocks(rq), 256>>>(s.q, s.rows, s.nf, d->row_nodes, d->row_mass, state, d->G);
-    CK(cudaMemsetAsync(d->H, 0, rq * sizeof(double), 0));
+    k_face_traces<<<blocks(rq), 256, 0, ctx->stream>>>(s.q, s.rows, s.nf, d->row_nodes, d->row_mass, state, d->G);
+    CK(cudaMemsetAsync(d->H, 0, rq * sizeof(double), ctx->stream));
     const double one = 1, zero = 0;
     for (int side = 0; side < 6; ++side) {
         const int r0 = s.side_start[side], r1 = d->iface_t[side] ? s.break_start[side] : s.side_start[side + 1];
@@ -2395,19 +2400,21 @@ void boundary_high(Context *ctx, const double *state, double *out, const double 
                          "dgemm");
     }
     if (pinned_db) {
-        CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, 0));
-        k_sub<<<blocks(rq), 256>>>(d->H, d->db, rq);
+        CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
+        k_sub<<<blocks(rq), 256, 0, ctx->stream>>>(d->H, d->db, rq);
     }
-    k_boundary_rows_add<<<blocks(std::size_t(s.nb) * s.q), 256>>>(s.q, s.nb, d->offsets, d->rows_list, s.bnodes, d->H,
+    k_boundary_rows_add<<<blocks(std::size_t(s.nb) * s.q), 256, 0, ctx->stream>>>(s.q, s.nb, d->offsets, d->rows_list, s.bnodes, d->H,
                                                                    out, d->low4, d->row_break, d->low4b);
-    CK(cudaMemcpyAsync(pinned_low4, d->low4, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost, 0));
+    CK(cudaMemcpyAsync(pinned_low4, d->low4, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost, ctx->stream));
     if (pinned_low4_break && d->low4b)
         CK(cudaMemcpyAsync(pinned_low4_break, d->low4b, std::size_t(s.nb) * 4 * sizeof(double), cudaMemcpyDeviceToHost,
-                           0));
+                           ctx->stream));
 }
 void destroy(Context *ctx) {
     if (!ctx)
         return;
+    if (ctx->stream)
+        cudaStreamSynchronize(ctx->stream);
     for (void *p : ctx->owned)
         cudaFree(p);
     if (ctx->reaction) {
@@ -2432,6 +2439,8 @@ void destroy(Context *ctx) {
         cudaFree(ctx->scratch_int[k]);
         cudaFree(ctx->scratch_double[k]);
     }
+    if (ctx->stream)
+        cudaStreamDestroy(ctx->stream);
     delete ctx;
 }
 Buffers buffers(Context *ctx) { return ctx->b; }
@@ -2464,17 +2473,17 @@ double *device_doubles(Context *ctx, int slot, std::size_t count) {
     }
     return ctx->scratch_double[slot];
 }
-void closure(Context *ctx, const double *state) { k_closure<<<blocks(ctx->v.nodes), 256>>>(ctx->v, state); }
+void closure(Context *ctx, const double *state) { k_closure<<<blocks(ctx->v.nodes), 256, 0, ctx->stream>>>(ctx->v, state); }
 void weno_gamma(Context *ctx, const double *state) {
     const View &v = ctx->v;
     if (v.local == 4)
-        k_weno<4><<<blocks(v.cells, 128), 128>>>(v, state);
+        k_weno<4><<<blocks(v.cells, 128), 128, 0, ctx->stream>>>(v, state);
     else if (v.local == 8)
-        k_weno<8><<<blocks(v.cells, 128), 128>>>(v, state);
+        k_weno<8><<<blocks(v.cells, 128), 128, 0, ctx->stream>>>(v, state);
     else if (v.local == 9)
-        k_weno<9><<<blocks(v.cells, 128), 128>>>(v, state);
+        k_weno<9><<<blocks(v.cells, 128), 128, 0, ctx->stream>>>(v, state);
     else
-        k_weno<0><<<blocks(v.cells, 128), 128>>>(v, state);
+        k_weno<0><<<blocks(v.cells, 128), 128, 0, ctx->stream>>>(v, state);
 }
 namespace {
 constexpr int LINE_CHUNK = 16;
@@ -2486,18 +2495,18 @@ void line_solve(Context *ctx, int d, int count, double *f, const double *src = n
     const dim3 grid(blocks(work, 64), count);
     if (v.periodic) {
         switch (v.degree) {
-        case 1: k_line_solve_cyclic<1><<<grid, 64>>>(v, d, f, src); break;
-        case 2: k_line_solve_cyclic<2><<<grid, 64>>>(v, d, f, src); break;
-        case 3: k_line_solve_cyclic<3><<<grid, 64>>>(v, d, f, src); break;
-        default: k_line_solve_cyclic<4><<<grid, 64>>>(v, d, f, src); break;
+        case 1: k_line_solve_cyclic<1><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+        case 2: k_line_solve_cyclic<2><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+        case 3: k_line_solve_cyclic<3><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+        default: k_line_solve_cyclic<4><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
         }
         return;
     }
     switch (v.degree) {
-    case 1: k_line_solve<1, LINE_CHUNK><<<grid, 64>>>(v, d, f, src); break;
-    case 2: k_line_solve<2, LINE_CHUNK><<<grid, 64>>>(v, d, f, src); break;
-    case 3: k_line_solve<3, LINE_CHUNK><<<grid, 64>>>(v, d, f, src); break;
-    default: k_line_solve<4, LINE_CHUNK><<<grid, 64>>>(v, d, f, src); break;
+    case 1: k_line_solve<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    case 2: k_line_solve<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    case 3: k_line_solve<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    default: k_line_solve<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
     }
 }
 } // namespace
@@ -2515,39 +2524,39 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
         }();
         const dim3 grid(blocks(std::size_t(v.npa[0]) * v.q, 128), (v.npa[1] + sy - 1) / sy);
         if (sy == 8)
-            k_stabilization_strip<8><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+            k_stabilization_strip<8><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else if (sy == 16)
-            k_stabilization_strip<16><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+            k_stabilization_strip<16><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else if (sy == 64)
-            k_stabilization_strip<64><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+            k_stabilization_strip<64><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else
-            k_stabilization_strip<32><<<grid, 128>>>(v, state, out, want_low, constant_gamma);
+            k_stabilization_strip<32><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
     } else if (v.klass || !v.structured) { // graded / broken: per node (connectivity) instead of the element kernels
-        k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, state, out, want_low, constant_gamma);
+        k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
     } else {
         double *local_out = device_doubles(ctx, 7, std::size_t(v.cells) * v.local * v.q);
         const unsigned g = blocks(std::size_t(v.cells) * v.q, 128);
         const bool d3 = v.dimension == 3;
         if (v.local == 9 && !d3)
-            k_stab_element<9, 2><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+            k_stab_element<9, 2><<<g, 128, 0, ctx->stream>>>(v, state, local_out, want_low, constant_gamma);
         else if (v.local == 16 && !d3)
-            k_stab_element<16, 2><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+            k_stab_element<16, 2><<<g, 128, 0, ctx->stream>>>(v, state, local_out, want_low, constant_gamma);
         else if (v.local == 25 && !d3)
-            k_stab_element<25, 2><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+            k_stab_element<25, 2><<<g, 128, 0, ctx->stream>>>(v, state, local_out, want_low, constant_gamma);
         else if (v.local == 8 && d3)
-            k_stab_element<8, 3><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+            k_stab_element<8, 3><<<g, 128, 0, ctx->stream>>>(v, state, local_out, want_low, constant_gamma);
         else if (v.local == 27 && d3)
-            k_stab_element<27, 3><<<g, 128>>>(v, state, local_out, want_low, constant_gamma);
+            k_stab_element<27, 3><<<g, 128, 0, ctx->stream>>>(v, state, local_out, want_low, constant_gamma);
         else {
-            k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, state, out, want_low, constant_gamma);
+            k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
             return;
         }
-        k_gather_stab<<<blocks(std::size_t(v.nodes) * v.q), 256>>>(v, local_out, out);
+        k_gather_stab<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, local_out, out);
     }
 }
 void add_rows(Context *ctx, double *field, const int *index, const double *rows, int count) {
     if (count)
-        k_add_rows<<<blocks(std::size_t(count) * ctx->v.q), 256>>>(ctx->v.q, field, index, rows, count);
+        k_add_rows<<<blocks(std::size_t(count) * ctx->v.q), 256, 0, ctx->stream>>>(ctx->v.q, field, index, rows, count);
 }
 void mass_solve(Context *ctx, double *field) {
     for (int d = 0; d < ctx->v.dimension; ++d)
@@ -2562,57 +2571,57 @@ std::size_t flux_shared(Context *ctx) {
 } // namespace
 void flux_moments(Context *ctx, const double *field) {
     const View &v = ctx->v;
-    k_flux_rows<<<blocks(std::size_t(v.nodes) * 4), 256, flux_shared(ctx)>>>(v, const_cast<double *>(field), true, true);
+    k_flux_rows<<<blocks(std::size_t(v.nodes) * 4), 256, flux_shared(ctx), ctx->stream>>>(v, const_cast<double *>(field), true, true);
 }
 void flux_rows(Context *ctx, double *field, bool want_moments) {
     const View &v = ctx->v;
-    k_flux_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx)>>>(v, field, want_moments, false);
+    k_flux_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx), ctx->stream>>>(v, field, want_moments, false);
 }
 void limiter(Context *ctx) {
     const View &v = ctx->v;
     const unsigned b4 = blocks(std::size_t(v.cells) * 4, 256), b8 = blocks(std::size_t(v.cells) * 8, 256),
                    b16 = blocks(std::size_t(v.cells) * 16, 256), b32 = blocks(std::size_t(v.cells) * 32, 256);
     if (v.local == 4) {
-        k_limiter_group<4, 4><<<b4, 256>>>(v);
-        k_limiter_segment<4><<<blocks(v.cells, 64), 64>>>(v);
+        k_limiter_group<4, 4><<<b4, 256, 0, ctx->stream>>>(v);
+        k_limiter_segment<4><<<blocks(v.cells, 64), 64, 0, ctx->stream>>>(v);
     } else if (v.local == 8) {
-        k_limiter_group<8, 8><<<b8, 256>>>(v);
-        k_limiter_segment<8><<<blocks(v.cells, 64), 64>>>(v);
+        k_limiter_group<8, 8><<<b8, 256, 0, ctx->stream>>>(v);
+        k_limiter_segment<8><<<blocks(v.cells, 64), 64, 0, ctx->stream>>>(v);
     } else if (v.local == 9) {
-        k_limiter_group<9, 16><<<b16, 256>>>(v);
-        k_limiter_segment<9><<<blocks(v.cells, 64), 64>>>(v);
+        k_limiter_group<9, 16><<<b16, 256, 0, ctx->stream>>>(v);
+        k_limiter_segment<9><<<blocks(v.cells, 64), 64, 0, ctx->stream>>>(v);
     } else if (v.local == 16) {
-        k_limiter_group<16, 16><<<b16, 256>>>(v);
-        k_limiter_segment<16><<<blocks(v.cells, 64), 64>>>(v);
+        k_limiter_group<16, 16><<<b16, 256, 0, ctx->stream>>>(v);
+        k_limiter_segment<16><<<blocks(v.cells, 64), 64, 0, ctx->stream>>>(v);
     } else if (v.local == 25) {
-        k_limiter_group<25, 32><<<b32, 256>>>(v);
-        k_limiter_segment<25><<<blocks(v.cells, 64), 64>>>(v);
+        k_limiter_group<25, 32><<<b32, 256, 0, ctx->stream>>>(v);
+        k_limiter_segment<25><<<blocks(v.cells, 64), 64, 0, ctx->stream>>>(v);
     } else if (v.local == 27) {
-        k_limiter_group<27, 32><<<b32, 256>>>(v);
-        k_limiter_segment<27><<<blocks(v.cells, 64), 64>>>(v);
+        k_limiter_group<27, 32><<<b32, 256, 0, ctx->stream>>>(v);
+        k_limiter_segment<27><<<blocks(v.cells, 64), 64, 0, ctx->stream>>>(v);
     } else {
-        k_limiter<0><<<blocks(v.cells, 128), 128>>>(v);
-        k_limiter_segment<0><<<blocks(v.cells, 64), 64>>>(v);
+        k_limiter<0><<<blocks(v.cells, 128), 128, 0, ctx->stream>>>(v);
+        k_limiter_segment<0><<<blocks(v.cells, 64), 64, 0, ctx->stream>>>(v);
     }
 }
-void gather_load(Context *ctx) { k_gather_load<<<blocks(std::size_t(ctx->v.nodes) * 4), 256>>>(ctx->v); }
+void gather_load(Context *ctx) { k_gather_load<<<blocks(std::size_t(ctx->v.nodes) * 4), 256, 0, ctx->stream>>>(ctx->v); }
 void combine_pn(Context *ctx, double *r, const double *x, const double *a, double old, double fresh, double tau) {
     const View &v = ctx->v;
-    k_combine<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx)>>>(v, r, x, a, old, fresh, tau, true, 1);
+    k_combine<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx), ctx->stream>>>(v, r, x, a, old, fresh, tau, true, 1);
 }
 void finish_stage(Context *ctx, double *r, const double *x, const double *a, double old, double fresh, double tau,
                   bool pn_done, bool closure_next) {
     const View &v = ctx->v;
     if (pn_done)
-        k_combine<<<blocks(std::size_t(v.nodes) * 4), 256>>>(v, r, x, a, old, fresh, tau, false, 2);
+        k_combine<<<blocks(std::size_t(v.nodes) * 4), 256, 0, ctx->stream>>>(v, r, x, a, old, fresh, tau, false, 2);
     else
-        k_combine<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx)>>>(v, r, x, a, old, fresh, tau, true, 0);
-    k_admissible<<<blocks(v.nodes), 256>>>(v, r, closure_next, false, x, a, old, fresh, tau);
+        k_combine<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx), ctx->stream>>>(v, r, x, a, old, fresh, tau, true, 0);
+    k_admissible<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r, closure_next, false, x, a, old, fresh, tau);
 }
 double norm(Context *ctx, const double *field) {
     const std::size_t count = std::size_t(ctx->v.nodes) * ctx->v.q;
     const unsigned grid = std::max(1u, std::min<unsigned>(blocks(count), 1024));
-    k_sumsq<<<grid, 256>>>(field, count, ctx->norm_accumulator);
+    k_sumsq<<<grid, 256, 0, ctx->stream>>>(field, count, ctx->norm_accumulator);
     double partial[1024];
     CK(cudaMemcpy(partial, ctx->norm_accumulator, grid * sizeof(double), cudaMemcpyDeviceToHost));
     double s = 0;
@@ -2622,7 +2631,7 @@ double norm(Context *ctx, const double *field) {
 }
 void divide(Context *ctx, double *dst, const double *src, double divisor) {
     const std::size_t count = std::size_t(ctx->v.nodes) * ctx->v.q;
-    k_divide<<<blocks(count), 256>>>(dst, src, count, divisor);
+    k_divide<<<blocks(count), 256, 0, ctx->stream>>>(dst, src, count, divisor);
 }
 namespace {
 Counters convert(const DeviceCounters &d);
@@ -2657,16 +2666,16 @@ Counters convert(const DeviceCounters &d) {
 }
 } // namespace
 void snapshot_counters(Context *ctx) {
-    CK(cudaMemcpyAsync(ctx->pinned_counters, ctx->v.counters, sizeof(DeviceCounters), cudaMemcpyDeviceToHost, 0));
+    CK(cudaMemcpyAsync(ctx->pinned_counters, ctx->v.counters, sizeof(DeviceCounters), cudaMemcpyDeviceToHost, ctx->stream));
 }
 Counters snapshot(Context *ctx) {
     CK(cudaGetLastError());
     return convert(*ctx->pinned_counters);
 }
 void reset_fallbacks(Context *ctx) {
-    CK(cudaMemsetAsync(&ctx->v.counters->closure_fallbacks, 0, 3 * sizeof(int), 0));
+    CK(cudaMemsetAsync(&ctx->v.counters->closure_fallbacks, 0, 3 * sizeof(int), ctx->stream));
 }
-void record(Context *ctx, int event) { CK(cudaEventRecord(ctx->events[event], 0)); }
+void record(Context *ctx, int event) { CK(cudaEventRecord(ctx->events[event], ctx->stream)); }
 void wait(Context *ctx, int event) { CK(cudaEventSynchronize(ctx->events[event])); }
 void upload_async(void *device, const void *pinned, std::size_t bytes) {
     if (bytes)
@@ -2677,16 +2686,16 @@ void gather_async(Context *ctx, const double *field, int cols, const int *device
     if (!count)
         return;
     double *buf = device_doubles(ctx, slot, std::size_t(count) * cols);
-    k_gather<<<blocks(std::size_t(count) * cols), 256>>>(field, cols, device_index, count, buf, rows_soa);
-    CK(cudaMemcpyAsync(pinned_out, buf, std::size_t(count) * cols * sizeof(double), cudaMemcpyDeviceToHost, 0));
+    k_gather<<<blocks(std::size_t(count) * cols), 256, 0, ctx->stream>>>(field, cols, device_index, count, buf, rows_soa);
+    CK(cudaMemcpyAsync(pinned_out, buf, std::size_t(count) * cols * sizeof(double), cudaMemcpyDeviceToHost, ctx->stream));
 }
 void scatter_async(Context *ctx, double *field, int cols, const int *device_index, int count, const double *pinned_in,
                    bool add, int slot, long long rows_soa) {
     if (!count)
         return;
     double *buf = device_doubles(ctx, slot, std::size_t(count) * cols);
-    CK(cudaMemcpyAsync(buf, pinned_in, std::size_t(count) * cols * sizeof(double), cudaMemcpyHostToDevice, 0));
-    k_scatter<<<blocks(std::size_t(count) * cols), 256>>>(field, cols, device_index, count, buf, add, rows_soa);
+    CK(cudaMemcpyAsync(buf, pinned_in, std::size_t(count) * cols * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
+    k_scatter<<<blocks(std::size_t(count) * cols), 256, 0, ctx->stream>>>(field, cols, device_index, count, buf, add, rows_soa);
 }
 void reset_counters(Context *ctx) {
     DeviceCounters d{};
@@ -2703,7 +2712,7 @@ void gather_device(Context *ctx, const double *field, int cols, const int *devic
     if (!count)
         return;
     double *buf = device_doubles(ctx, 0, std::size_t(count) * cols);
-    k_gather<<<blocks(std::size_t(count) * cols), 256>>>(field, cols, device_index, count, buf, rows_soa);
+    k_gather<<<blocks(std::size_t(count) * cols), 256, 0, ctx->stream>>>(field, cols, device_index, count, buf, rows_soa);
     CK(cudaMemcpy(host_out, buf, std::size_t(count) * cols * sizeof(double), cudaMemcpyDeviceToHost));
 }
 void scatter_device(Context *ctx, double *field, int cols, const int *device_index, int count, const double *host_in,
@@ -2712,7 +2721,7 @@ void scatter_device(Context *ctx, double *field, int cols, const int *device_ind
         return;
     double *buf = device_doubles(ctx, 1, std::size_t(count) * cols);
     CK(cudaMemcpy(buf, host_in, std::size_t(count) * cols * sizeof(double), cudaMemcpyHostToDevice));
-    k_scatter<<<blocks(std::size_t(count) * cols), 256>>>(field, cols, device_index, count, buf, add, rows_soa);
+    k_scatter<<<blocks(std::size_t(count) * cols), 256, 0, ctx->stream>>>(field, cols, device_index, count, buf, add, rows_soa);
 }
 } // namespace gpu
 } // namespace m1pn

@@ -429,11 +429,34 @@ int main(int argc, char **argv) {
                 for (Block &b : blocks)
                     if (b.scheme->reacts_public())
                         clock(b.t_react, [&] { b.gpu->lockstep_react(.5 * dt, t + .25 * dt, b.stats); });
+                // Context streams (experiment/big-rebuilds): the blocks of a phase run side by side from host threads;
+                // all begins finish before any end reads a neighbour's boundary rows. M1PN_BLOCKS_SERIAL=1: one by one.
+                static const bool serial = [] {
+                    const char *e = std::getenv("M1PN_BLOCKS_SERIAL");
+                    return e && std::atoi(e) != 0;
+                }();
+                auto each_block = [&](const std::function<void(Block &)> &work) {
+                    if (serial) {
+                        for (Block &b : blocks)
+                            work(b);
+                        return;
+                    }
+                    std::exception_ptr error;
+#pragma omp parallel for schedule(dynamic, 1)
+                    for (int k = 0; k < B; ++k) {
+                        try {
+                            work(blocks[k]);
+                        } catch (...) {
+#pragma omp critical(m1pn_blocks_gpu_error)
+                            if (!error) error = std::current_exception();
+                        }
+                    }
+                    if (error)
+                        std::rethrow_exception(error);
+                };
                 for (int s = 0; s < 4; ++s) {
-                    for (Block &b : blocks)
-                        clock(b.t_begin, [&] { b.gpu->lockstep_begin(s, t, dt); });
-                    for (Block &b : blocks)
-                        clock(b.t_end, [&] { b.gpu->lockstep_end(s, t, dt, b.stats); });
+                    each_block([&](Block &b) { clock(b.t_begin, [&] { b.gpu->lockstep_begin(s, t, dt); }); });
+                    each_block([&](Block &b) { clock(b.t_end, [&] { b.gpu->lockstep_end(s, t, dt, b.stats); }); });
                 }
                 for (Block &b : blocks)
                     if (b.scheme->reacts_public())
