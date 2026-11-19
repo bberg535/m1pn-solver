@@ -105,6 +105,7 @@ int main(int argc, char **argv) {
         std::string grid_file, h_file, output, fcs = "analytic";
         int per_unit = 0, pn_max = 21, threads = 1, sample_per_unit = 0, merge = 1, use_gpu = 0, break_units = 0;
         int split_breaks = 0; // EXPERIMENT: split Euler stage at broken-line nodes (docs/BREAK_DT.md)
+        int mirror_x = 0;     // EXPERIMENT: half domain x >= 3.5 with a mirror side (lattice-paul is symmetric in x)
         std::string nodal_mode = "auto";
         std::vector<int> cells_per_unit; // EXPERIMENT: graded mesh (as m1pn_fast --cells-per-unit), cut into the blocks
         double final_time = 3.2, cfl = 1., filter_strength = 0.;
@@ -125,6 +126,7 @@ int main(int argc, char **argv) {
             else if (key == "--gpu") use_gpu = v == "on";
             else if (key == "--break-units") break_units = v == "on";
             else if (key == "--split-breaks") split_breaks = v == "on";
+            else if (key == "--mirror-x") mirror_x = v == "on";
             else if (key == "--nodal") nodal_mode = v; // auto|on|off: conforming interfaces node by node
             else if (key == "--cells-per-unit") { // graded mesh, the same planes in x and y (experiment)
                 std::stringstream list(v);
@@ -185,14 +187,26 @@ int main(int argc, char **argv) {
         const double cell = 7. / nb;
         const bool with_fcs = fcs == "analytic";
 
+        // Mirror in x: the order grid must be symmetric; blocks left of x = 3.5 are dropped, blocks across it clipped.
+        const double x_mirror = 3.5;
+        if (mirror_x)
+            for (int j = 0; j < nb; ++j)
+                for (int i = 0; i < nb; ++i)
+                    require(grid[j][i] == grid[j][nb - 1 - i], "--mirror-x: the order grid must be symmetric in x");
         std::vector<Block> blocks;
         for (const Rect &r : rectangles(grid, merge)) {
             Block b;
             b.rect = r;
             b.lo = V3(r.i0 * cell, r.j0 * cell, 0);
             b.hi = V3((r.i0 + r.ni) * cell, (r.j0 + r.nj) * cell, 0);
+            if (mirror_x) {
+                if (b.hi[0] <= x_mirror + 1e-12)
+                    continue;
+                b.lo[0] = std::max(b.lo[0], x_mirror);
+            }
             blocks.push_back(std::move(b));
         }
+        const double domain_factor = mirror_x ? 2. : 1.;
         const int B = int(blocks.size());
         // Neighbour block containing x (on or next to a block face, slightly inside along the outward normal n).
         auto block_at = [&](const V3 &x) {
@@ -241,7 +255,9 @@ int main(int argc, char **argv) {
             eo.dimension = 2;
             const int cells_per_cell = 7 * b.rect.per_unit / nb;
             const double h = 1. / b.rect.per_unit;
-            int cx = b.rect.ni * cells_per_cell, cy = b.rect.nj * cells_per_cell;
+            int cx = int(std::lround((b.hi[0] - b.lo[0]) * b.rect.per_unit)), cy = b.rect.nj * cells_per_cell;
+            require(planes.empty() ? std::abs(cx - (b.hi[0] - b.lo[0]) * b.rect.per_unit) < 1e-9 : true,
+                    "--mirror-x: elements per unit must be even (mirror plane on an element line)");
             if (!planes.empty()) { // graded: the planes of the block's range (block faces lie on planes)
                 for (int d = 0; d < 2; ++d) {
                     auto &P = eo.planes[d];
@@ -267,11 +283,13 @@ int main(int argc, char **argv) {
             eo.filter_strength = filter_strength;
             eo.reduce_angular = true;
             // eo.split_breaks is set below, once the block's broken lines are known (blocks without any ignore it)
+            const double domain_lo[2] = {mirror_x ? x_mirror : 0., 0.};
             for (int d = 0; d < 2; ++d)
                 for (int side = 0; side < 2; ++side) {
                     const double face = side ? b.hi[d] : b.lo[d];
-                    eo.interface_side[2 * d + side] = face > 1e-12 && face < 7 - 1e-12;
+                    eo.interface_side[2 * d + side] = face > domain_lo[d] + 1e-12 && face < 7 - 1e-12;
                 }
+            eo.mirror[0] = mirror_x && std::abs(b.lo[0] - x_mirror) < 1e-12; // mirror side at x = 3.5
             if (break_units)
                 for (int d = 0; d < 2; ++d) {
                     const int cd = d ? cy : cx;
@@ -577,7 +595,10 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        const double balance = mass - initial_mass + outflow + absorbed - injected;
+        // Mirror: full-domain totals (the computed half doubled).
+        mass *= domain_factor, rate_c *= domain_factor, injected *= domain_factor, absorbed *= domain_factor;
+        outflow *= domain_factor, mu *= domain_factor, ru *= domain_factor, au *= domain_factor;
+        const double balance = mass - domain_factor * initial_mass + outflow + absorbed - injected;
         {
             std::ofstream j(output + "/summary.json");
             j << std::setprecision(17) << "{\"driver\":\"m1pn_blocks\",\"blocks\":" << B << ",\"steps\":" << steps
@@ -619,9 +640,15 @@ int main(int argc, char **argv) {
             std::vector<std::array<double, 5>> rows(std::size_t(n) * n);
             parallel_for(n * n, [&](int s) {
                 const V3 xs(7. * (s % n) / (n - 1), 7. * (s / n) / (n - 1), 0);
-                const int k = block_at(xs);
+                V3 xe = xs; // mirror: the reflected point (density is even); on a broken line the side of the full mesh
+                if (mirror_x && xe[0] < x_mirror) {
+                    xe[0] = 2 * x_mirror - xe[0];
+                    if (break_units)
+                        xe[0] = std::nextafter(xe[0], -std::numeric_limits<double>::infinity());
+                }
+                const int k = block_at(xe);
                 const Block &b = blocks[k];
-                const Vec v = b.scheme->evaluate(b.a, xs);
+                const Vec v = b.scheme->evaluate(b.a, xe);
                 double u0 = v[0];
                 double unc = with_fcs ? b.table->lattice.density(xs[0], xs[1], t) : 0.;
                 u0 += unc / std::sqrt(4 * pi);
