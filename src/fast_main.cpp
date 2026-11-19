@@ -70,7 +70,7 @@ struct Options {
     double pulse_width = .07, background = .001;
     double plane_width = .05; // plane-source Gaussian width (peak one); default exp(-200 (x - 1/2)^2)
     int degree = 2;
-    double weno_linear = 1e-3, weno_q = 1, weno_deadband = 0, weno_floor = 0;
+    double weno_linear = 1e-3, weno_q = 3, weno_deadband = 0, weno_floor = 0;
     bool m1_target = false;               // M1 instead of PN target (P1, --mirror-reduction off)
     std::string sample_moments = "auto";  // moments written to initial/final.csv
     bool gpu = false;                     // time loop on the GPU (src/element_weno_gpu.cpp)

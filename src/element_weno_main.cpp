@@ -15,7 +15,7 @@ using namespace m1pn;
 namespace {
 struct Args {
     int pn = 3, degree = 2, dimension = 1, elements = 32;
-    double time = .1, cfl = .9, dt = 0, width = .07, background = .001, weno_linear = 1e-3, weno_q = 1;
+    double time = .1, cfl = .9, dt = 0, width = .07, background = .001, weno_linear = 1e-3, weno_q = 3;
     int sample_grid = 0;
     double filter_strength = 0;
     std::string problem = "smooth", output = "tmp/element_weno";

@@ -46,7 +46,7 @@ struct ElementWenoOptions {
     bool weno = true;      // false fixes gamma_e = 1
     bool limit = true;     // false applies the raw contributions
     double element_theta = .999;       // theta of report Section 6.2
-    double weno_q = 1, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
+    double weno_q = 3, weno_r = 2, weno_epsilon = 1e-6, weno_linear = 1e-3;
     // Study variants of the sensor at the rounding limit (docs/ELEMENT_WENO.md; CPU only, default off = bitwise the
     // standard): soft threshold ratio -> max(0, ratio - d) / (1 - d), and a floor of the sensor denominator
     // |u|_e -> max(|u|_e, f max_i |u_i|) with u_i the density coefficients of the element.
@@ -686,7 +686,8 @@ private:
     mutable long adaptive_step_counter_ = 0;
     struct BandFactor {
         int n = 0, p = 0;
-        std::vector<double> lower, invdiag;
+        std::vector<double> lower, invdiag; // global LDL^T (exact for segments starting at k0 == 0)
+        std::vector<double> diag, sub;      // raw symmetric band of M: diag[k] = M(k,k), sub[k*p + m - 1] = M(k, k-m)
     };
     std::array<BandFactor, 3> band_natural_, band_dirichlet_;
     void build_band_factors();

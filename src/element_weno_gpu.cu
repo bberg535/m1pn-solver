@@ -1889,13 +1889,18 @@ __global__ void k_fcs_points_lattice(View v, ReactionView r, double time) {
 }
 __global__ void k_lattice_table(uncollided::LatticeView lv, const double *x, const double *y, std::size_t points, int m0,
                                 int M, double dt, double *table) {
-    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    __shared__ double s_exp[1024];
     const int W = M - m0 + 1;
-    if (t >= points * std::size_t(W))
+    const double sS = uncollided::lattice_sigma(lv, lv.si, lv.sj);
+    if (W <= 1024) {
+        for (int i = threadIdx.x; i < W; i += blockDim.x)
+            s_exp[i] = exp(-sS * ((m0 + i) * dt));
+        __syncthreads();
+    }
+    const std::size_t k = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (k >= points)
         return;
-    const std::size_t k = t / W;
-    const int m = m0 + int(t % W);
-    table[t] = m == 0 ? 0. : uncollided::lattice_density(lv, x[k], y[k], m * dt);
+    uncollided::lattice_density_row(lv, x[k], y[k], m0, M, dt, table + k * std::size_t(W), W <= 1024 ? s_exp : nullptr);
 }
 __global__ void k_fcs_element(View v, ReactionView r) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2046,7 +2051,7 @@ void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int m0, int 
     const std::size_t points = std::size_t(v.cells) * r.P, total = points * std::size_t(M - m0 + 1);
     double *table = own(dalloc<double>(total));
     rd->lattice_owned.assign(rd->owned.begin() + owned_before, rd->owned.end());
-    k_lattice_table<<<blocks(total, 128), 128, 0, ctx->stream>>>(lv, r.fx, r.fy, points, m0, M, dt, table);
+    k_lattice_table<<<blocks(points, 128), 128, 0, ctx->stream>>>(lv, r.fx, r.fy, points, m0, M, dt, table);
     CK(cudaGetLastError());
     if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e)) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -2515,6 +2520,8 @@ struct AdaptiveDevice {
     int segs_grad_n[3] = {}, segs_grad_cap[3] = {};
     AdaptiveLineSeg *d_segs_mass[3] = {};
     int segs_mass_n[3] = {}, segs_mass_cap[3] = {};
+    int *d_seg_slot[3] = {}, *d_seg_off[3] = {}, *d_dseg_slot[3] = {}, *d_dseg_off[3] = {};
+    double *d_seg_lower[3] = {}, *d_seg_invdiag[3] = {}, *d_dseg_lower[3] = {}, *d_dseg_invdiag[3] = {};
     AdaptiveTileChunk *d_tile_chunks = nullptr;
     int tile_chunks_n = 0, tile_chunks_cap = 0;
     int global_max_q = 0;
@@ -2902,7 +2909,10 @@ __global__ void k_react_low4(View v, ReactionView r, double *a, double tau, bool
 
 template <int P, int CH>
 __global__ void k_line_solve_adaptive(View v, int d, double *field, const double *src,
-                                      const AdaptiveLineSeg *segs, int nsegs) {
+                                      const AdaptiveLineSeg *segs, int nsegs,
+                                      const int *seg_slot, const int *seg_off, const double *seg_lower,
+                                      const double *seg_invdiag, const int *dseg_slot, const int *dseg_off,
+                                      const double *dseg_lower, const double *dseg_invdiag) {
     const int seg_id = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (seg_id >= nsegs)
         return;
@@ -2925,7 +2935,10 @@ __global__ void k_line_solve_adaptive(View v, int d, double *field, const double
             row0[std::size_t(mi) * step] = 0.0;
         return;
     }
-    const double *L = dirichlet ? v.dlower[d] : v.lower[d], *ID = dirichlet ? v.dinvdiag[d] : v.invdiag[d];
+    const int slot = (dirichlet ? dseg_slot : seg_slot)[r_start];
+    const int base_off = (dirichlet ? dseg_off : seg_off)[slot];
+    const double *L = (dirichlet ? dseg_lower : seg_lower) + std::size_t(base_off) * P;
+    const double *ID = (dirichlet ? dseg_invdiag : seg_invdiag) + base_off;
     double *base = row0 + std::size_t(off) * step;
     double hist[P > 0 ? P : 1];
     for (int m = 0; m < P; ++m)
@@ -2970,13 +2983,13 @@ __global__ void k_line_solve_adaptive(View v, int d, double *field, const double
 #pragma unroll
             for (int m = 1; m <= P; ++m)
                 if (k - m >= r_start)
-                    y -= L[std::size_t(k) * P + m - 1] * hist[m - 1];
+                    y -= L[std::size_t(k - r_start) * P + m - 1] * hist[m - 1];
 #pragma unroll
             for (int m = P - 1; m > 0; --m)
                 hist[m] = hist[m - 1];
             if (P > 0)
                 hist[0] = y;
-            base[std::size_t(k) * step] = y * ID[k];
+            base[std::size_t(k) * step] = y * ID[k - r_start];
         }
     };
     double bufA[CH], bufB[CH];
@@ -3008,7 +3021,7 @@ __global__ void k_line_solve_adaptive(View v, int d, double *field, const double
 #pragma unroll
             for (int m = 1; m <= P; ++m)
                 if (k + m < r_end)
-                    x -= L[std::size_t(k + m) * P + m - 1] * hist[m - 1];
+                    x -= L[std::size_t(k + m - r_start) * P + m - 1] * hist[m - 1];
 #pragma unroll
             for (int m = P - 1; m > 0; --m)
                 hist[m] = hist[m - 1];
@@ -3369,20 +3382,41 @@ void destroy_adaptive(Context *ctx) {
     for (int d = 0; d < 3; ++d) {
         cudaFree(ad->d_segs_grad[d]);
         cudaFree(ad->d_segs_mass[d]);
+        cudaFree(ad->d_seg_slot[d]);
+        cudaFree(ad->d_seg_off[d]);
+        cudaFree(ad->d_seg_lower[d]);
+        cudaFree(ad->d_seg_invdiag[d]);
+        cudaFree(ad->d_dseg_slot[d]);
+        cudaFree(ad->d_dseg_off[d]);
+        cudaFree(ad->d_dseg_lower[d]);
+        cudaFree(ad->d_dseg_invdiag[d]);
     }
     delete ad;
     ctx->adaptive = nullptr;
 }
 } // namespace
 
-void adaptive_setup(Context *ctx, const AdaptivePnPlan &plan) {
+void adaptive_setup(Context *ctx, const AdaptivePnPlan &plan, const AdaptiveSegFactorTable &seg_factors) {
     destroy_adaptive(ctx);
     auto *ad = new AdaptiveDevice;
     ad->num_tiles = plan.num_tiles;
     ad->max_order = plan.max_order;
     ad->L1 = plan.max_order + 1;
-    for (int d = 0; d < 3; ++d)
+    for (int d = 0; d < 3; ++d) {
         ad->tb[d] = plan.tb[d], ad->nt[d] = plan.nt[d];
+        if (!seg_factors.slot[d].empty()) {
+            ad->d_seg_slot[d] = dcopy(seg_factors.slot[d].data(), seg_factors.slot[d].size());
+            ad->d_seg_off[d] = dcopy(seg_factors.off[d].data(), seg_factors.off[d].size());
+            ad->d_seg_lower[d] = dcopy(seg_factors.lower[d].data(), seg_factors.lower[d].size());
+            ad->d_seg_invdiag[d] = dcopy(seg_factors.invdiag[d].data(), seg_factors.invdiag[d].size());
+        }
+        if (!seg_factors.dslot[d].empty()) {
+            ad->d_dseg_slot[d] = dcopy(seg_factors.dslot[d].data(), seg_factors.dslot[d].size());
+            ad->d_dseg_off[d] = dcopy(seg_factors.doff[d].data(), seg_factors.doff[d].size());
+            ad->d_dseg_lower[d] = dcopy(seg_factors.dlower[d].data(), seg_factors.dlower[d].size());
+            ad->d_dseg_invdiag[d] = dcopy(seg_factors.dinvdiag[d].data(), seg_factors.dinvdiag[d].size());
+        }
+    }
     ad->d_deg_start = dcopy(plan.deg_start.data(), plan.deg_start.size());
     ad->d_tile_order = dcopy(plan.tile_order.data(), plan.tile_order.size());
     ad->d_tile_q = dcopy(plan.tile_q.data(), plan.tile_q.size());
@@ -3607,12 +3641,29 @@ void line_solve_adaptive_axis(Context *ctx, int d, double *f, const double *src,
     if (nsegs <= 0)
         return;
     const View &v = ctx->v;
+    const AdaptiveDevice *ad = ctx->adaptive;
     const unsigned grid = (unsigned(nsegs) + 1u) / 2u; // 2 warps = 64 threads per block (register-optimal)
     switch (v.degree) {
-    case 1: k_line_solve_adaptive<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src, segs, nsegs); break;
-    case 2: k_line_solve_adaptive<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src, segs, nsegs); break;
-    case 3: k_line_solve_adaptive<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src, segs, nsegs); break;
-    default: k_line_solve_adaptive<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src, segs, nsegs); break;
+    case 1:
+        k_line_solve_adaptive<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+            v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
+            ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
+        break;
+    case 2:
+        k_line_solve_adaptive<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+            v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
+            ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
+        break;
+    case 3:
+        k_line_solve_adaptive<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+            v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
+            ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
+        break;
+    default:
+        k_line_solve_adaptive<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+            v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
+            ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
+        break;
     }
 }
 } // namespace

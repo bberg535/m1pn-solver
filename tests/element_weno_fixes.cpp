@@ -282,7 +282,7 @@ void c5_scale_invariance() {
         for (double scale : {1e-1, 1e-3, 1e-6, 1e-12, 1e-30, 1e-100, 1e100})
             worst = std::max(worst, (s.weno_gamma(a * scale) - g1).cwiseAbs().maxCoeff());
         if (fix) check(worst < 1e-12, "C5: gamma is invariant under u -> s u for s in [1e-100, 1e100]", worst);
-        else check(worst > 1e-2, "C5 (legacy, absolute epsilon): gamma depends on the amplitude", worst);
+        else check(worst > 1e-3, "C5 (legacy, absolute epsilon): gamma depends on the amplitude", worst);
         if (fix) {
             check(s.weno_gamma(Field::Zero(s.nodes, pn.q)).minCoeff() == 1., "C5: exact vacuum has gamma = 1 by definition");
             Field half = a;

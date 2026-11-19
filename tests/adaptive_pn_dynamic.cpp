@@ -192,6 +192,77 @@ void test_graded_broken_cpu_gpu() {
     check(frac_diff < 2e-2, "CPU vs GPU consistent adaptive coefficient fraction", frac_diff);
 #endif
 }
+
+// Regression test for P0 adaptive-PN mass-matrix bug: an active segment [k0, k1) with k0 > 0 must invert the exact
+// principal submatrix M_{[k0, k1)} rather than a slice of the global LDL^T (which gives the Schur complement on the
+// left end and breaks left-right symmetry).
+void test_segment_mass_symmetry() {
+    const Angular pn(5);
+    ElementWenoOptions o;
+    o.dimension = 2;
+    o.elements = 23; // 24 nodes per axis -> 3 symmetric tiles of 8: [0..7], [8..15], [16..23]
+    o.degree = 1;
+    o.length = 2.3;
+    o.periodic = false;
+    o.sigma_a = 0.0;
+    o.sigma_s = 0.5;
+    o.adaptive_pn = true;
+    o.adaptive_tile = 8; // active center tile starts at k0 = 8 > 0
+    o.adaptive_tol = 1e-2;
+    o.adaptive_hysteresis = 0.25;
+    o.adaptive_min_order = 1;
+    o.adaptive_halo = 0; // keep outer tiles strictly at P1 so active segments start at k0 = 8 > 0
+    o.adaptive_stride = 100; // keep tile orders fixed across the 2 steps
+
+    ElementWeno ad(pn, o);
+    Field a0 = Field::Zero(ad.nodes, ad.moments);
+    const double s0 = std::sqrt(4.0 * pi);
+    const int npx = ad.nodes_per_axis[0], npy = ad.nodes_per_axis[1];
+    // Y_2^0 has full-basis index l*l + l = 6; look up its index in ad.active (2D angular reduction drops odd-z modes).
+    int even_l2 = -1;
+    for (int c = 0; c < ad.moments; ++c)
+        if (ad.active[c] == 6)
+            even_l2 = c;
+    check(even_l2 >= 4, "Y_2^0 present in active basis", even_l2);
+    for (int iy = 0; iy < npy; ++iy)
+        for (int ix = 0; ix < npx; ++ix) {
+            const int i = iy * npx + ix;
+            const double dx = ix - 11.5, dy = iy - 11.5;
+            const double w = std::exp(-0.5 * (dx * dx + dy * dy));
+            a0(i, 0) = (1e-6 + 1.0 * w) / s0;
+            if (ix >= 8 && ix <= 15 && iy >= 8 && iy <= 15)
+                a0(i, even_l2) = 0.05 * w;
+        }
+
+    const double dt = 0.5 * ad.step_bound();
+    ElementWenoStats st_cpu;
+    Field a_cpu = ad.advance(0.0, dt, a0, &st_cpu);
+
+    double asym_cpu = 0.0;
+    for (int iy = 0; iy < npy; ++iy)
+        for (int ix = 0; ix < npx; ++ix) {
+            const int i = iy * npx + ix, j = iy * npx + (npx - 1 - ix);
+            asym_cpu = std::max(asym_cpu, std::abs(a_cpu(i, even_l2) - a_cpu(j, even_l2)));
+        }
+    check(ad.adaptive_plan()->tile_order[4] >= 3 && ad.adaptive_plan()->tile_order[3] == 1,
+          "center tile active (k0 = 8 > 0) while outer tiles stay at P1", ad.adaptive_plan()->tile_order[4]);
+    check(asym_cpu < 1e-13, "CPU adaptive segment mass solve preserves x-symmetry (k0 > 0)", asym_cpu);
+
+#ifdef M1PN_ELEMENT_GPU
+    ElementWenoGpu gpu_ad(ad);
+    ElementWenoStats st_gpu;
+    const Field a_gpu = gpu_ad.run(0.0, dt, 1, a0, &st_gpu);
+    double asym_gpu = 0.0;
+    for (int iy = 0; iy < npy; ++iy)
+        for (int ix = 0; ix < npx; ++ix) {
+            const int i = iy * npx + ix, j = iy * npx + (npx - 1 - ix);
+            asym_gpu = std::max(asym_gpu, std::abs(a_gpu(i, even_l2) - a_gpu(j, even_l2)));
+        }
+    check(asym_gpu < 1e-13, "GPU adaptive segment mass solve preserves x-symmetry (k0 > 0)", asym_gpu);
+    const double cg = maxabs(a_cpu - a_gpu);
+    check(cg < 1e-5, "CPU vs GPU adaptive segment mass solve agreement (k0 > 0)", cg);
+#endif
+}
 } // namespace
 
 int main() {
@@ -199,6 +270,7 @@ int main() {
         test_separable_upto();
         test_quadrupole_sensor();
         test_graded_broken_cpu_gpu();
+        test_segment_mass_symmetry();
         if (failures) {
             std::cerr << failures << " test(s) failed\n";
             return 1;

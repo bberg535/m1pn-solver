@@ -1377,16 +1377,21 @@ void ElementWeno::build_band_factors() {
             bf.p = p;
             bf.lower.assign(std::size_t(cnt) * p, 0.);
             bf.invdiag.assign(cnt, 0.);
+            bf.diag.assign(cnt, 0.);
+            bf.sub.assign(std::size_t(cnt) * p, 0.);
             std::vector<double> dg(cnt, 0.);
             auto L = [&](int r, int c) -> double & { return bf.lower[std::size_t(r) * p + (r - c) - 1]; };
             for (int k = 0; k < cnt; ++k) {
+                bf.diag[k] = entry(first + k, first + k);
                 for (int j = std::max(0, k - p); j < k; ++j) {
-                    double v = entry(first + k, first + j);
+                    const double mv = entry(first + k, first + j);
+                    bf.sub[std::size_t(k) * p + (k - j) - 1] = mv;
+                    double v = mv;
                     for (int i = std::max(0, k - p); i < j; ++i)
                         v -= L(k, i) * L(j, i) * dg[i];
                     L(k, j) = v / dg[j];
                 }
-                double v = entry(first + k, first + k);
+                double v = bf.diag[k];
                 for (int j = std::max(0, k - p); j < k; ++j)
                     v -= L(k, j) * L(k, j) * dg[j];
                 require(v > 0, "Adaptive CPU: 1D mass factorization failed");
@@ -1407,12 +1412,35 @@ void ElementWeno::solve_band_segment(const BandFactor &f, double *buf, int width
     const int p = f.p;
     const int len = k1 - k0;
     const double *L = f.lower.data(), *ID = f.invdiag.data();
+    thread_local std::vector<double> loc_l, loc_invd, loc_d;
+    if (k0 > 0) {
+        // Exact LDL^T of the principal submatrix M_{[k0, k1)} (avoids the Schur-complement error of slicing global L, D).
+        loc_l.assign(std::size_t(len) * p, 0.);
+        loc_invd.resize(len);
+        loc_d.resize(len);
+        auto Ll = [&](int r, int c) -> double & { return loc_l[std::size_t(r) * p + (r - c) - 1]; };
+        for (int r = 0; r < len; ++r) {
+            const int k = k0 + r;
+            for (int j = std::max(0, r - p); j < r; ++j) {
+                double v = f.sub[std::size_t(k) * p + (r - j) - 1];
+                for (int i = std::max(0, r - p); i < j; ++i)
+                    v -= Ll(r, i) * Ll(j, i) * loc_d[i];
+                Ll(r, j) = v * loc_invd[j];
+            }
+            double v = f.diag[k];
+            for (int j = std::max(0, r - p); j < r; ++j)
+                v -= Ll(r, j) * Ll(r, j) * loc_d[j];
+            loc_d[r] = v;
+            loc_invd[r] = 1. / v;
+        }
+        L = loc_l.data();
+        ID = loc_invd.data();
+    }
     for (int r = 0; r < len; ++r) {
-        const int k = k0 + r;
         double *yr = buf + std::size_t(r) * width;
         for (int m = 1; m <= p; ++m)
             if (r - m >= 0) {
-                const double lv = L[std::size_t(k) * p + m - 1];
+                const double lv = L[std::size_t(r) * p + m - 1];
                 const double *yp = buf + std::size_t(r - m) * width;
 #pragma omp simd
                 for (int c = 0; c < width; ++c)
@@ -1420,18 +1448,17 @@ void ElementWeno::solve_band_segment(const BandFactor &f, double *buf, int width
             }
     }
     for (int r = 0; r < len; ++r) {
-        const double inv = ID[k0 + r];
+        const double inv = ID[r];
         double *yr = buf + std::size_t(r) * width;
 #pragma omp simd
         for (int c = 0; c < width; ++c)
             yr[c] *= inv;
     }
     for (int r = len - 1; r >= 0; --r) {
-        const int k = k0 + r;
         double *yr = buf + std::size_t(r) * width;
         for (int m = 1; m <= p; ++m)
             if (r + m < len) {
-                const double lv = L[std::size_t(k + m) * p + m - 1];
+                const double lv = L[std::size_t(r + m) * p + m - 1];
                 const double *yn = buf + std::size_t(r + m) * width;
 #pragma omp simd
                 for (int c = 0; c < width; ++c)

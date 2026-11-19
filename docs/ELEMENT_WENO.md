@@ -410,7 +410,7 @@ auf glatten Daten durch die Abschneidung bei ≈ 0.006 (über d). Der Boden wirk
 
 Kegelabstand und Laufzeit unverändert. Alle drei Varianten erhalten die Sensorwirkung an Unstetigkeiten.
 
-**Entscheidung (16.11.2026): Der Standard bleibt q = 1.** Die Studienoptionen `--weno-deadband`/`--weno-floor`
+**Entscheidung (aktualisiert 19.11.2026): Standard auf `q = 3` umgestellt** (zuvor ab 16.11. noch `q = 1`). Die Studienoptionen `--weno-deadband`/`--weno-floor`
 bleiben als abgeschaltete Diagnoseschalter (Default bitgleich zum Tag, geprüft). Bewertung der Varianten: q = 3 ist die sauberste Korrektur: Die
 Sensorfunktion ist bei ratio = 0 glatt mit verschwindender Ableitung, also keine lineare Rückkopplung; volle Ordnung
 Q1–Q4; q ist ein Parameter des Verfahrens von Kuzmin/Hajduk/Vedral (dort als Wahl offen). Kosten: Limiter etwas
