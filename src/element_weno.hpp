@@ -28,6 +28,12 @@ struct Lattice3dUncollidedTable;
 // Nodal values are the positive averages int sigma phi_i / int phi_i (Bernstein phi_i >= 0) by composite
 // Gauss quadrature: `subcells` sub-cells per element and direction, `points` Gauss points per sub-cell and
 // direction (0: degree + 4). Empty functions mean zero.
+// Mesh-independent angular data of the scheme (boundary matrices, hemisphere rules, separable traces, adaptive ghost
+// tiers), shared between schemes that differ only in the mesh (dynamic AMR rebuilds, docs/DYNAMIC_AMR.md). The first
+// scheme constructed with a cache fills it; later ones with the same angular key copy it instead of rebuilding.
+struct ElementWenoAngularCache;
+std::shared_ptr<ElementWenoAngularCache> make_angular_cache();
+long angular_cache_loads(const ElementWenoAngularCache &);
 struct ElementWenoMaterial {
     std::function<double(const V3 &)> sigma_a, sigma_s, source;
     int subcells = 1, points = 0;
@@ -189,6 +195,8 @@ struct ElementWenoOptions {
     int adaptive_stride = 4;
     int adaptive_min_order = 1;
     int adaptive_halo = 1; // 0: off, 1: border-aware neighbor dilation, 2: full 3x3 dilation
+    std::shared_ptr<ElementWenoAngularCache> angular_cache; // optional (see make_angular_cache)
+    bool adaptive_restart = false; // adaptive PN on a transferred state (dynamic AMR): border-triggered initial dilation
 };
 struct ElementWenoStats {
     double min_gamma = 1, min_limiter = 1, min_boundary_limiter = 1;
@@ -263,6 +271,7 @@ struct DistributedHooks {
 class ElementWeno {
     friend class ElementWenoMpi;
     friend class ElementWenoGpu; // device time loop, src/element_weno_gpu.cpp (experimental)
+    friend struct ElementWenoAngularCache;
 public:
     // Distributed run (null: serial). owned: one flag per local node.
     void set_distributed(const DistributedHooks *hooks, std::vector<char> owned);
@@ -356,6 +365,9 @@ public:
     // 5.1495). The largest eigenvalues of the stabilized target are dissipative (close to the negative real
     // axis); the periodic amplification test in tests/element_weno.cpp checks this. Cached per integrator.
     double high_order_step() const;
+    // Power iteration behind high_order_step (60 iterations, random start). Dynamic AMR: warm start from the transferred
+    // dominant vectors of the previous mesh (`start`, gamma = 0 and 1) with fewer iterations; `end` receives the vectors.
+    double power_radius(int iterations, const std::array<Field, 2> *start, std::array<Field, 2> *end) const;
     // Step cache (driver option --step-cache): the norm of one application of linear_operator to a fixed vector
     // identifies the operator (distributed: global norm, collective); set_spectral_radius installs a stored estimate
     // of the same operator, so high_order_step() returns the same value without the power iteration.
@@ -405,6 +417,8 @@ public:
     void adapt_pn_state(Field &a, bool initial = false, ElementWenoStats *stats = nullptr) const;
     void reset_adaptive_pn() const;
     const AdaptivePnPlan *adaptive_plan() const { return adaptive_plan_.get(); }
+    // Active moment c is odd under x_d -> -x_d (dynamic AMR: such moments vanish on a mirror plane).
+    bool reflect_odd(int d, int c) const { return d < 3 && !reflect_odd_[d].empty() && reflect_odd_[d][c]; }
 
 private:
     struct FaceRule {
@@ -428,8 +442,10 @@ private:
     bool cached_density_ = false;
     std::vector<BoundaryFace> faces_;
     std::array<FaceRule, 6> rules_;
-    std::unique_ptr<CanonicalC1> canonical_;
-    std::array<std::unique_ptr<Boundary>, 6> boundaries_;
+    std::shared_ptr<CanonicalC1> canonical_;
+    std::array<std::shared_ptr<Boundary>, 6> boundaries_;
+    bool angular_cached_ = false; // angular data copied from options.angular_cache
+    std::string angular_key() const;
     // LDL^T factors of the 1D mass in plain arrays, for row-wise multi-component line solves. `line[r]` is the
     // position on the grid line of factor row r. natural_: all nodes; dirichlet_[d]: without the mirror node.
     struct LineFactor {

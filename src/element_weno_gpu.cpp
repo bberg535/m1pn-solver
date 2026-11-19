@@ -72,6 +72,13 @@ std::vector<double> row_major(const Mat &m) {
 
 ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     const ElementWenoOptions &o = s.options;
+    const bool gtiming = [] { const char *e = std::getenv("M1PN_CTOR_TIMING"); return e && std::atoi(e); }();
+    double glast = seconds();
+    auto gmark = [&](const char *what) {
+        if (gtiming)
+            std::cerr << "gpu ctor: " << what << " " << seconds() - glast << " s\n";
+        glast = seconds();
+    };
     require(!s.dist_, "GPU path: serial scheme only (no MPI)");
     // Interface sides: node-by-node coupling (nodal_interface, conforming blocks) keeps the regular pipeline (partner
     // term as face datum, node-wise bar states on the host); otherwise the whole face work runs on the host.
@@ -291,6 +298,7 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     g.weno_q = o.weno_q, g.weno_r = o.weno_r, g.weno_epsilon = o.weno_epsilon, g.weno_linear = o.weno_linear;
     g.element_theta = o.element_theta;
     ctx_ = gpu::create(g);
+    gmark("tables and context");
     nb_ = int(s.boundary_nodes_.size());
     d_bnodes_ = gpu::device_ints(ctx_, 3, std::max(1, nb_));
     if (nb_)
@@ -370,25 +378,10 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
             });
             T.build_seconds = seconds() - start;
         }
-        if (lattice_) {
-            // Build the time table on the device and hand the host copy to the shared table object (the host FCS
-            // path then finds it built for the same points).
-            const double start = seconds();
-            uncollided::LatticeUncollidedTable &T = *lattice_;
-            const auto px = uncollided::gauss_legendre(T.lattice.phi_order, 0, 1);
-            const auto tx = uncollided::gauss_legendre(T.lattice.theta_order, 0, 1);
-            const uncollided::LatticeView view = T.lattice.view(px.first, px.second, tx.first, tx.second);
-            T.points = s.fcs_points_;
-            T.M = T.times_for(T.final_time);
-            T.table.assign(T.points.size() * std::size_t(T.M + 1), 0.);
-            const double assigned = seconds();
-            gpu::lattice_table(ctx_, view, T.M, T.dt, T.table.data());
-            T.build_seconds = seconds() - start;
-            if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e))
-                std::cerr << "gpu: lattice table host alloc " << assigned - start << " s, device build + copy "
-                          << seconds() - assigned << " s (" << T.table.size() * 8e-9 << " GB)\n";
-        }
+        if (lattice_)
+            build_lattice_table();
     }
+    gmark("reaction and FCS");
     // Ghost projection on the device (plain full-sphere rule, unweighted); M1PN_GPU_GHOST=0 keeps it on the host.
     // Default: on the device when the boundary work (ghost pairs x rule points) is large against the volume work
     // (nodes x moments); measured break-even ~0.1 (2D P7 512^2: 0.08, host faster; 2D P21 256^2: 0.14 and 3D: device
@@ -467,6 +460,7 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         gpu::ghost_traces_setup(ctx_, g);
         pin_traces_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::max<std::size_t>(1, total)));
     }
+    gmark("ghost setup");
     // Phase A on the device: the per-row trace weights M_side(n, m) and nodes, the side matrices and the node lists.
     const char *high_env = std::getenv("M1PN_GPU_BOUNDARY_HIGH");
     device_high_ = (high_env ? std::atoi(high_env) != 0 : true) && nb_ > 0 && face_rows > 0 && !interfaces_;
@@ -548,10 +542,12 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         pin_db_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(face_rows) * q));
         pin_low4_ = static_cast<double *>(gpu::host_alloc(sizeof(double) * std::size_t(nb_) * 4));
     }
+    gmark("boundary phase A");
     if (o.adaptive_pn && !o.periodic) {
         adaptive_enabled_ = true;
         adaptive_plan_.init(s.dimension, s.nodes_per_axis, s.pn.order, s.active, o.adaptive_tile,
                             o.adaptive_tol, o.adaptive_hysteresis, o.adaptive_min_order, o.adaptive_halo);
+        adaptive_plan_.restart = o.adaptive_restart;
         s.init_adaptive_inflow_floor(adaptive_plan_);
         s.update_adaptive_side_q(adaptive_plan_);
         adaptive_rho_.resize(adaptive_plan_.num_tiles);
@@ -1598,6 +1594,26 @@ void ElementWenoGpu::adapt_gpu(bool initial, ElementWenoStats *stats) {
         stats->t_adaptive_sensor += seconds() - t0;
     }
 }
+// Lattice FCS time table on the device for the window [start_time, final_time] of the shared table object (the host
+// copy is filled too, so the host FCS path finds it built for the same points). Called by the constructor and by the
+// dynamic AMR driver for every new window on an unchanged mesh.
+void ElementWenoGpu::build_lattice_table() {
+    const double start = seconds();
+    uncollided::LatticeUncollidedTable &T = *lattice_;
+    const auto px = uncollided::gauss_legendre(T.lattice.phi_order, 0, 1);
+    const auto tx = uncollided::gauss_legendre(T.lattice.theta_order, 0, 1);
+    const uncollided::LatticeView view = T.lattice.view(px.first, px.second, tx.first, tx.second);
+    T.points = s_.fcs_points_;
+    T.M = T.times_for(T.final_time);
+    T.m0 = T.first_for(T.start_time);
+    T.table.assign(T.points.size() * std::size_t(T.width()), 0.);
+    const double assigned = seconds();
+    gpu::lattice_table(ctx_, view, T.m0, T.M, T.dt, T.table.data());
+    T.build_seconds += seconds() - start;
+    if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e))
+        std::cerr << "gpu: lattice table host alloc " << assigned - start << " s, device build + copy "
+                  << seconds() - assigned << " s (" << T.table.size() * 8e-9 << " GB)\n";
+}
 void ElementWenoGpu::begin(const Field &a) {
     require(a.rows() == s_.nodes && a.cols() == s_.moments, "GPU path: invalid state");
     const gpu::Buffers b = gpu::buffers(ctx_);
@@ -1781,7 +1797,11 @@ Field ElementWenoGpu::run(double time, double dt, int steps, const Field &a, Ele
     }
     return end(stats);
 }
-double ElementWenoGpu::spectral_radius() {
+double ElementWenoGpu::spectral_radius() { return spectral_radius(60, nullptr, nullptr); }
+// Power iteration for gamma = 0 and 1 (60 iterations from a fixed random start: the standard estimate). With `start`
+// (dynamic AMR): the dominant vectors of the previous mesh, transferred, plus a 1e-2 random part, and `iterations`
+// steps; `end` receives the final vectors. The radius is the largest growth of the last 15 (warm: last half) steps.
+double ElementWenoGpu::spectral_radius(int iterations, const std::array<Field, 2> *start, std::array<Field, 2> *end) {
     if (adaptive_enabled_)
         gpu::adaptive_enable(ctx_, false);
     const int q = s_.moments;
@@ -1789,14 +1809,17 @@ double ElementWenoGpu::spectral_radius() {
     std::mt19937 rng(12345);
     std::uniform_real_distribution<double> uniform(-1, 1);
     double radius = 0;
+    int g = 0;
     for (double gamma_value : {0., 1.}) {
         Field x(s_.nodes, q);
         for (int i = 0; i < s_.nodes; ++i)
             for (int c = 0; c < q; ++c)
                 x(i, c) = uniform(rng);
         x /= x.norm();
+        if (start && (*start)[g].rows() == s_.nodes && (*start)[g].cols() == q && (*start)[g].norm() > 0)
+            x = (*start)[g] / (*start)[g].norm() + 1e-2 * x;
         gpu::upload(b.x, x.data(), sizeof(double) * std::size_t(s_.nodes) * q);
-        const int iterations = 60;
+        const int tail = start ? std::max(1, iterations / 2) : 15;
         for (int k = 0; k < iterations; ++k) {
             gpu::gradients(ctx_, b.x);
             gpu::stabilization(ctx_, b.x, b.r, false, gamma_value);
@@ -1804,10 +1827,16 @@ double ElementWenoGpu::spectral_radius() {
             gpu::flux_rows(ctx_, b.r, false);
             const double growth = gpu::norm(ctx_, b.r);
             require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed (GPU)");
-            if (k >= iterations - 15)
+            if (k >= iterations - tail)
                 radius = std::max(radius, growth);
             gpu::divide(ctx_, b.x, b.r, growth);
         }
+        if (end) {
+            gpu::synchronize();
+            (*end)[g].resize(s_.nodes, q);
+            gpu::download((*end)[g].data(), b.x, sizeof(double) * std::size_t(s_.nodes) * q);
+        }
+        ++g;
     }
     gpu::synchronize();
     return radius;

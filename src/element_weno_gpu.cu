@@ -1840,8 +1840,8 @@ struct ReactionView {
     double *local;  // cells x local
     double *fcs;    // nodes
     double *table;  // FCS radial table
-    const double *ltable; // lattice FCS: points x (lM + 1) time table (device)
-    int lM;
+    const double *ltable; // lattice FCS: points x (lM - lm0 + 1) time table (device), times m dt, m = lm0..lM
+    int lM, lm0;
     double ldt;
     double *ledger; // absorbed, injected
     bool has_filter;
@@ -1849,6 +1849,7 @@ struct ReactionView {
 struct ReactionDevice {
     ReactionView r;
     std::vector<void *> owned;
+    std::vector<void *> lattice_owned; // the lattice table and its arrays (freed on a rebuild)
     std::size_t table_size = 0;
 };
 __global__ void k_fcs_points(View v, ReactionView r, int n, double dr, double cx, double cy) {
@@ -1877,20 +1878,23 @@ __global__ void k_fcs_points_lattice(View v, ReactionView r, double time) {
         int i = int(s);
         if (i > r.lM - 2)
             i = r.lM - 2; // the host table checks the range; the driver never asks beyond final_time
-        const double f = s - i, *row = r.ltable + t * std::size_t(r.lM + 1);
+        if (i < r.lm0 + (r.lm0 > 0 ? 1 : 0))
+            i = r.lm0 + (r.lm0 > 0 ? 1 : 0); // never asked before the window (driver)
+        const double f = s - i, *row = r.ltable + t * std::size_t(r.lM - r.lm0 + 1) - r.lm0;
         const double p1 = row[i], p2 = row[i + 1], p3 = row[i + 2], p0 = i > 0 ? row[i - 1] : 2 * p1 - p2;
         const double val = p1 + .5 * f * (p2 - p0 + f * (2 * p0 - 5 * p1 + 4 * p2 - p3 + f * (3 * (p1 - p2) + p3 - p0)));
         rho = fmax(val, 0.);
     }
     r.q[t] = r.fw[t] * r.fss[t] * rho;
 }
-__global__ void k_lattice_table(uncollided::LatticeView lv, const double *x, const double *y, std::size_t points, int M,
-                                double dt, double *table) {
+__global__ void k_lattice_table(uncollided::LatticeView lv, const double *x, const double *y, std::size_t points, int m0,
+                                int M, double dt, double *table) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (t >= points * std::size_t(M + 1))
+    const int W = M - m0 + 1;
+    if (t >= points * std::size_t(W))
         return;
-    const std::size_t k = t / (M + 1);
-    const int m = int(t % (M + 1));
+    const std::size_t k = t / W;
+    const int m = m0 + int(t % W);
     table[t] = m == 0 ? 0. : uncollided::lattice_density(lv, x[k], y[k], m * dt);
 }
 __global__ void k_fcs_element(View v, ReactionView r) {
@@ -1990,7 +1994,7 @@ void reaction_setup(Context *ctx, const ReactionSetup &s) {
     } else
         r.fx = r.fy = r.fw = r.fss = r.fshape = r.fmass = nullptr, r.q = r.local = r.fcs = nullptr;
     r.table = nullptr;
-    r.ltable = nullptr, r.lM = 0, r.ldt = 0;
+    r.ltable = nullptr, r.lM = 0, r.lm0 = 0, r.ldt = 0;
     r.ledger = own(dalloc<double>(2));
     ctx->reaction = rd;
 }
@@ -2017,7 +2021,7 @@ void react(Context *ctx, double *state, double tau, const double *host_table, in
         k_react_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, r, state, tau, fcs);
     k_admissible<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
 }
-void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, double dt, double *host_out) {
+void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int m0, int M, double dt, double *host_out) {
     ReactionDevice *rd = ctx->reaction;
     ReactionView &r = rd->r;
     const View &v = ctx->v;
@@ -2027,14 +2031,22 @@ void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, doubl
         rd->owned.push_back((void *)p);
         return p;
     };
+    // Rebuild (dynamic AMR windows): free the previous table and its lattice arrays.
+    for (void *old : rd->lattice_owned) {
+        rd->owned.erase(std::remove(rd->owned.begin(), rd->owned.end(), old), rd->owned.end());
+        CK(cudaFree(old));
+    }
+    rd->lattice_owned.clear();
+    const std::size_t owned_before = rd->owned.size();
     uncollided::LatticeView lv = hv; // device copies of the arrays
     lv.sigma_t = own(dcopy(hv.sigma_t, std::size_t(hv.nx) * hv.ny));
     lv.phi_x = own(dcopy(hv.phi_x, std::size_t(hv.phi_n))), lv.phi_w = own(dcopy(hv.phi_w, std::size_t(hv.phi_n)));
     lv.theta_x = own(dcopy(hv.theta_x, std::size_t(hv.theta_n)));
     lv.theta_w = own(dcopy(hv.theta_w, std::size_t(hv.theta_n)));
-    const std::size_t points = std::size_t(v.cells) * r.P, total = points * std::size_t(M + 1);
+    const std::size_t points = std::size_t(v.cells) * r.P, total = points * std::size_t(M - m0 + 1);
     double *table = own(dalloc<double>(total));
-    k_lattice_table<<<blocks(total, 128), 128, 0, ctx->stream>>>(lv, r.fx, r.fy, points, M, dt, table);
+    rd->lattice_owned.assign(rd->owned.begin() + owned_before, rd->owned.end());
+    k_lattice_table<<<blocks(total, 128), 128, 0, ctx->stream>>>(lv, r.fx, r.fy, points, m0, M, dt, table);
     CK(cudaGetLastError());
     if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e)) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -2044,7 +2056,7 @@ void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, doubl
     }
     if (host_out)
         CK(cudaMemcpy(host_out, table, total * sizeof(double), cudaMemcpyDeviceToHost));
-    r.ltable = table, r.lM = M, r.ldt = dt;
+    r.ltable = table, r.lM = M, r.lm0 = m0, r.ldt = dt;
 }
 __global__ void k_lattice3d_table(uncollided::Lattice3dView lv, const double *x, const double *y, const double *z,
                                   std::size_t first, std::size_t count, int M, double dt, double *work,
@@ -2100,7 +2112,7 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
     CK(cudaFree(dx)), CK(cudaFree(dy)), CK(cudaFree(dz));
     if (host_out)
         CK(cudaMemcpy(host_out, table, total * sizeof(double), cudaMemcpyDeviceToHost));
-    r.ltable = table, r.lM = M, r.ldt = dt;
+    r.ltable = table, r.lM = M, r.lm0 = 0, r.ldt = dt;
 }
 void react_lattice(Context *ctx, double *state, double tau, double source_time) {
     ReactionView &r = ctx->reaction->r;

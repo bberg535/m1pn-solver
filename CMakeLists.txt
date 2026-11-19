@@ -86,6 +86,7 @@ if(BUILD_TESTING)
   m1pn_test(kobayashi_uncollided tests/kobayashi_uncollided.cpp 1 60)
   m1pn_test(positivity_projection tests/positivity_projection.cpp 1 300)
   m1pn_test(adaptive_pn_dynamic tests/adaptive_pn_dynamic.cpp 2 300)
+  m1pn_test(amr_transfer tests/amr_transfer.cpp 2 120)
   if(ENABLE_MPI)
     # Run with mpirun (not in ctest): mpirun -np 4 m1pn_element_weno_mpi_tests
     add_executable(m1pn_element_weno_mpi_tests tests/element_weno_mpi.cpp)

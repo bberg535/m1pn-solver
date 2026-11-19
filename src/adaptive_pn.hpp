@@ -50,6 +50,9 @@ struct AdaptivePnPlan {
     double tol = 3e-4;
     double hysteresis = 0.25;
     int halo = 1; // 0: off, 1: border-triggered neighbor dilation, 2: full 3x3 dilation
+    // Dynamic AMR restart (docs/DYNAMIC_AMR.md): the initial adaptation of a transferred state dilates only across
+    // borders with significant energy (as later updates), not around every tile above the minimum order.
+    bool restart = false;
 
     std::vector<int> order_q;     // [0..max_order]: number of active moments with degree <= n
     std::vector<int> deg_start;   // [0..max_order+1]: start index of degree l in [0, q_max)
@@ -261,7 +264,7 @@ struct AdaptivePnPlan {
                             const double face_thresh = (ord == 1) ? 0.25 * bound_up : bound_up;
                             bool active_face[6] = {};
                             for (int f = 0; f < 2 * dim; ++f)
-                                active_face[f] = initial ? (ord > min_order) : (fe[f] > face_thresh);
+                                active_face[f] = (initial && !restart) ? (ord > min_order) : (fe[f] > face_thresh);
                             const int step_d[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
                             for (int d = 0; d < dim; ++d) {
                                 for (int s = 0; s < 2; ++s) {

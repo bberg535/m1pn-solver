@@ -214,6 +214,52 @@ Field row_product(const Field &A, const Mat &B) {
 }
 } // namespace
 
+// Angular data shared between schemes on different meshes (dynamic AMR). Keyed by everything the angular block of the
+// constructor reads besides the angular basis itself (same Angular object required).
+struct ElementWenoAngularCache {
+    std::string key;
+    const Angular *pn = nullptr;
+    std::shared_ptr<CanonicalC1> canonical;
+    std::array<std::shared_ptr<Boundary>, 6> boundaries;
+    std::array<Mat, 6> boundary_flux_t, interface_t, exterior_t, datum_t;
+    std::array<Sparse, 6> interface_sparse_t;
+    std::array<ElementWeno::OutRule, 6> out_rules;
+    std::array<std::shared_ptr<const SeparableTrace>, 6> separable;
+    std::array<Field, 6> out_harmonics;
+    std::vector<ElementWeno::AdaptiveGhostTier> tiers;
+    long loads = 0;
+    bool load(ElementWeno &s) const {
+        if (pn != &s.pn || key != s.angular_key())
+            return false;
+        s.canonical_ = canonical, s.boundaries_ = boundaries;
+        s.boundary_flux_t_ = boundary_flux_t, s.interface_t_ = interface_t, s.exterior_t_ = exterior_t;
+        s.datum_t_ = datum_t, s.interface_sparse_t_ = interface_sparse_t, s.out_rules_ = out_rules;
+        s.separable_ = separable, s.out_harmonics_ = out_harmonics, s.adaptive_ghost_tiers_ = tiers;
+        ++const_cast<ElementWenoAngularCache *>(this)->loads;
+        return true;
+    }
+    void store(const ElementWeno &s) {
+        key = s.angular_key(), pn = &s.pn;
+        canonical = s.canonical_, boundaries = s.boundaries_;
+        boundary_flux_t = s.boundary_flux_t_, interface_t = s.interface_t_, exterior_t = s.exterior_t_;
+        datum_t = s.datum_t_, interface_sparse_t = s.interface_sparse_t_, out_rules = s.out_rules_;
+        separable = s.separable_, out_harmonics = s.out_harmonics_, tiers = s.adaptive_ghost_tiers_;
+    }
+};
+std::shared_ptr<ElementWenoAngularCache> make_angular_cache() { return std::make_shared<ElementWenoAngularCache>(); }
+long angular_cache_loads(const ElementWenoAngularCache &c) { return c.loads; }
+std::string ElementWeno::angular_key() const {
+    std::ostringstream k;
+    k << std::setprecision(17) << dimension << ' ' << moments << ' ' << options.reduce_angular << ' '
+      << options.positivity_projection << ' ' << options.projection_rule << ' ' << options.projection_half_range << ' '
+      << options.projection_incoming_weight << ' ' << options.projection_high_order << ' ' << broken_ << ' '
+      << options.adaptive_pn << ' ' << options.fullsphere_ghost << ' ' << options.periodic;
+    for (bool b : options.interface_side)
+        k << b;
+    for (int a : active)
+        k << ' ' << a;
+    return k.str();
+}
 ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, Inflow in)
     : pn(angular), options(o), inflow(std::move(in)), degree(o.degree), dimension(o.dimension),
       elements(o.elements) {
@@ -1043,6 +1089,9 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             }
         }
         ctor_mark("before canonical C1");
+        if (options.angular_cache && options.angular_cache->load(*this))
+            angular_cached_ = true;
+        else {
         canonical_ = std::make_unique<CanonicalC1>(pn);
         ctor_mark("before per-side out rules/separable/facets");
         // The sides are independent (each writes only its own slots): built in parallel, the same data as serially.
@@ -1130,8 +1179,9 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 out_harmonics_[2 * d + side] = out.harmonics;
             }
         });
+        } // angular data built (not from the cache)
     }
-    if (options.adaptive_pn && options.fullsphere_ghost && options.positivity_projection &&
+    if (!angular_cached_ && options.adaptive_pn && options.fullsphere_ghost && options.positivity_projection &&
         options.projection_rule == 0) {
         constexpr int kTierOrders[] = {3, 7, 15};
         std::vector<int> hemispheres{+1};
@@ -1192,6 +1242,8 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             adaptive_ghost_tiers_.push_back(std::move(tier));
         }
     }
+    if (options.angular_cache && !angular_cached_)
+        options.angular_cache->store(*this);
     ctor_mark("before rates");
     // Forward Euler bound of report (19), including the boundary bar states.
     Vec rates = Vec::Zero(nodes);
@@ -1299,6 +1351,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         adaptive_plan_ = std::make_unique<AdaptivePnPlan>();
         adaptive_plan_->init(dimension, nodes_per_axis, pn.order, active, o.adaptive_tile,
                              o.adaptive_tol, o.adaptive_hysteresis, o.adaptive_min_order, o.adaptive_halo);
+        adaptive_plan_->restart = options.adaptive_restart;
         init_adaptive_inflow_floor(*adaptive_plan_);
         update_adaptive_side_q(*adaptive_plan_);
         build_band_factors();
@@ -1446,6 +1499,7 @@ void ElementWeno::reset_adaptive_pn() const {
     adaptive_plan_->init(dimension, nodes_per_axis, pn.order, active, options.adaptive_tile,
                          options.adaptive_tol, options.adaptive_hysteresis, options.adaptive_min_order,
                          options.adaptive_halo);
+    adaptive_plan_->restart = options.adaptive_restart;
     init_adaptive_inflow_floor(*adaptive_plan_);
     update_adaptive_side_q(*adaptive_plan_);
     adaptive_active_ = false;
@@ -3516,37 +3570,47 @@ double ElementWeno::operator_probe() const {
     const Field y = linear_operator(x, .5);
     return layered_norm(y);
 }
-double ElementWeno::high_order_step() const {
-    if (spectral_radius_ <= 0) {
-        std::mt19937 rng(12345);
-        std::uniform_real_distribution<double> uniform(-1, 1);
-        double radius = 0;
-        // Norms in a fixed summation order (layered_norm) and the start vector of the same random sequence over the
-        // global node order: the estimate, and so dt, is bitwise independent of the MPI rank and thread count.
-        auto norm = [&](const Field &f) { return layered_norm(f); };
-        for (double gamma_value : {0., 1.}) {
-            Field x(nodes, moments);
-            if (!dist_) {
-                for (int i = 0; i < nodes; ++i)
-                    for (int c = 0; c < moments; ++c)
-                        x(i, c) = uniform(rng);
-            } else
-                distributed_random(x, rng, uniform);
+double ElementWeno::power_radius(int iterations, const std::array<Field, 2> *start, std::array<Field, 2> *end) const {
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<double> uniform(-1, 1);
+    double radius = 0;
+    // Norms in a fixed summation order (layered_norm) and the start vector of the same random sequence over the
+    // global node order: the estimate, and so dt, is bitwise independent of the MPI rank and thread count.
+    auto norm = [&](const Field &f) { return layered_norm(f); };
+    int g = 0;
+    for (double gamma_value : {0., 1.}) {
+        Field x(nodes, moments);
+        if (!dist_) {
+            for (int i = 0; i < nodes; ++i)
+                for (int c = 0; c < moments; ++c)
+                    x(i, c) = uniform(rng);
+        } else
+            distributed_random(x, rng, uniform);
+        x /= norm(x);
+        if (start && (*start)[g].rows() == nodes && (*start)[g].cols() == moments && (*start)[g].norm() > 0) {
+            x = (*start)[g] / norm((*start)[g]) + 1e-2 * x; // dynamic AMR warm start (see ElementWenoGpu)
             x /= norm(x);
-            const int iterations = 60;
-            for (int k = 0; k < iterations; ++k) {
-                Field y = linear_operator(x, gamma_value);
-                const double growth = norm(y);
-                require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed");
-                if (k >= iterations - 15)
-                    radius = std::max(radius, growth);
-                x = y / growth;
-                if (dist_)
-                    dist_->exchange(x);
-            }
         }
-        spectral_radius_ = radius;
+        const int tail = start ? std::max(1, iterations / 2) : 15;
+        for (int k = 0; k < iterations; ++k) {
+            Field y = linear_operator(x, gamma_value);
+            const double growth = norm(y);
+            require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed");
+            if (k >= iterations - tail)
+                radius = std::max(radius, growth);
+            x = y / growth;
+            if (dist_)
+                dist_->exchange(x);
+        }
+        if (end)
+            (*end)[g] = x;
+        ++g;
     }
+    return radius;
+}
+double ElementWeno::high_order_step() const {
+    if (spectral_radius_ <= 0)
+        spectral_radius_ = power_radius(60, nullptr, nullptr);
     // Negative real axis limits: roots of 1 + z + z^2/2 + z^3/6 = -1 and of 1 + z/2 + z^2/6 + z^3/48 = 0.
     // SSPRK(n^2,3), n = 3, 4, 5: real stability limits 13.2897595, 25.4190392, 41.5302366 (bisection on |R(z)| = 1).
     const double limit = options.ssp_n == 3   ? 13.289759506
