@@ -104,7 +104,9 @@ int main(int argc, char **argv) {
     try {
         std::string grid_file, h_file, output, fcs = "analytic";
         int per_unit = 0, pn_max = 21, threads = 1, sample_per_unit = 0, merge = 1, use_gpu = 0, break_units = 0;
+        int split_breaks = 0; // EXPERIMENT: split Euler stage at broken-line nodes (docs/BREAK_DT.md)
         std::string nodal_mode = "auto";
+        std::vector<int> cells_per_unit; // EXPERIMENT: graded mesh (as m1pn_fast --cells-per-unit), cut into the blocks
         double final_time = 3.2, cfl = 1., filter_strength = 0.;
         for (int k = 1; k + 1 < argc; k += 2) {
             const std::string key = argv[k], v = argv[k + 1];
@@ -122,11 +124,29 @@ int main(int argc, char **argv) {
             else if (key == "--h-grid") h_file = v;
             else if (key == "--gpu") use_gpu = v == "on";
             else if (key == "--break-units") break_units = v == "on";
+            else if (key == "--split-breaks") split_breaks = v == "on";
             else if (key == "--nodal") nodal_mode = v; // auto|on|off: conforming interfaces node by node
+            else if (key == "--cells-per-unit") { // graded mesh, the same planes in x and y (experiment)
+                std::stringstream list(v);
+                std::string item;
+                while (std::getline(list, item, ','))
+                    cells_per_unit.push_back(std::stoi(item));
+                require(cells_per_unit.size() == 7, "--cells-per-unit: seven entries (unit intervals of the lattice)");
+            }
             else throw std::runtime_error("Unknown option " + key);
         }
         require(!grid_file.empty() && !output.empty(), "--order-grid and --output are required");
-        require(per_unit > 0 || !h_file.empty(), "--elements-per-unit or --h-grid");
+        require(per_unit > 0 || !h_file.empty() || !cells_per_unit.empty(), "--elements-per-unit, --h-grid or --cells-per-unit");
+        require(cells_per_unit.empty() || h_file.empty(), "--cells-per-unit and --h-grid exclude each other");
+        // Graded mesh: global planes; every block takes the planes inside its range (conforming block faces).
+        std::vector<double> planes;
+        if (!cells_per_unit.empty()) {
+            planes.assign(1, 0.);
+            for (int u = 0; u < 7; ++u)
+                for (int k = 1; k <= cells_per_unit[u]; ++k)
+                    planes.push_back(u + double(k) / cells_per_unit[u]);
+            per_unit = *std::max_element(cells_per_unit.begin(), cells_per_unit.end()); // samples, merge key only
+        }
         require(fcs == "analytic" || fcs == "off", "--fcs analytic|off");
         require(!std::filesystem::exists(output), "Output directory already exists: " + output);
         std::filesystem::create_directories(output);
@@ -200,6 +220,7 @@ int main(int argc, char **argv) {
         bool same_width = true;
         for (const Block &b : blocks)
             same_width &= b.rect.per_unit == blocks[0].rect.per_unit;
+        same_width = same_width || !planes.empty(); // graded: one plane set, all block faces conforming
         require(nodal_mode == "auto" || nodal_mode == "on" || nodal_mode == "off", "--nodal auto|on|off");
         require(nodal_mode != "on" || same_width, "--nodal on: all blocks need the same width");
         const bool nodal = nodal_mode == "on" || (nodal_mode == "auto" && same_width);
@@ -220,11 +241,23 @@ int main(int argc, char **argv) {
             eo.dimension = 2;
             const int cells_per_cell = 7 * b.rect.per_unit / nb;
             const double h = 1. / b.rect.per_unit;
-            const int cx = b.rect.ni * cells_per_cell, cy = b.rect.nj * cells_per_cell;
+            int cx = b.rect.ni * cells_per_cell, cy = b.rect.nj * cells_per_cell;
+            if (!planes.empty()) { // graded: the planes of the block's range (block faces lie on planes)
+                for (int d = 0; d < 2; ++d) {
+                    auto &P = eo.planes[d];
+                    for (double x : planes)
+                        if (x >= b.lo[d] - 1e-12 && x <= b.hi[d] + 1e-12)
+                            P.push_back(x);
+                    require(P.size() >= 2 && std::abs(P.front() - b.lo[d]) < 1e-12 && std::abs(P.back() - b.hi[d]) < 1e-12,
+                            "--cells-per-unit: block faces must lie on planes");
+                    P.front() = b.lo[d], P.back() = b.hi[d];
+                }
+                cx = int(eo.planes[0].size()) - 1, cy = int(eo.planes[1].size()) - 1;
+            }
             eo.elements = cx;
             eo.elements_per_axis = {cx, cy, 0};
             eo.origin = b.lo;
-            eo.length = cx * h;
+            eo.length = planes.empty() ? cx * h : b.hi[0] - b.lo[0];
             eo.material = material;
             eo.periodic = false; // ElementWenoOptions defaults to a periodic mesh
             eo.weno = true;
@@ -233,6 +266,7 @@ int main(int argc, char **argv) {
             eo.ssprk43 = true;
             eo.filter_strength = filter_strength;
             eo.reduce_angular = true;
+            // eo.split_breaks is set below, once the block's broken lines are known (blocks without any ignore it)
             for (int d = 0; d < 2; ++d)
                 for (int side = 0; side < 2; ++side) {
                     const double face = side ? b.hi[d] : b.lo[d];
@@ -242,11 +276,12 @@ int main(int argc, char **argv) {
                 for (int d = 0; d < 2; ++d) {
                     const int cd = d ? cy : cx;
                     for (int k2 = 1; k2 < cd; ++k2) {
-                        const double xk = b.lo[d] + k2 * h;
+                        const double xk = planes.empty() ? b.lo[d] + k2 * h : eo.planes[d][k2];
                         if (std::abs(xk - std::round(xk)) < 1e-9)
                             eo.breaks[d].push_back(k2);
                     }
                 }
+            eo.split_breaks = split_breaks && (!eo.breaks[0].empty() || !eo.breaks[1].empty());
             if (nodal) {
                 eo.interface_partner = [&, k, key](int side, int element, int node) {
                     const auto it = partner[k].find(key(side, element, node));
