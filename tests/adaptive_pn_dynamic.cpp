@@ -149,13 +149,18 @@ void test_graded_broken_cpu_gpu() {
         u_cpu = uni.advance(s * dt, dt, u_cpu, &st_u);
         a_cpu = ad_cpu.advance(s * dt, dt, a_cpu, &st_a);
     }
-    double diff_ua = 0, norm_u = 0;
+    double diff_ua = 0, norm_u = 0, max_inactive_cpu = 0;
+    const AdaptivePnPlan *plan_cpu = ad_cpu.adaptive_plan();
     for (int i = 0; i < uni.nodes; ++i) {
         const double ru = project(u_cpu.row(i).transpose())[0];
         const double ra = project(a_cpu.row(i).transpose())[0];
         diff_ua = std::max(diff_ua, std::abs(ru - ra));
         norm_u = std::max(norm_u, std::abs(ru));
+        const int qi = plan_cpu->tile_q[plan_cpu->node_tile(i)];
+        for (int c = qi; c < uni.moments; ++c)
+            max_inactive_cpu = std::max(max_inactive_cpu, std::abs(a_cpu(i, c)));
     }
+    check(max_inactive_cpu == 0.0, "CPU adaptive: inactive moments strictly zero everywhere", max_inactive_cpu);
     check(diff_ua / std::max(norm_u, 1e-30) < 2e-3, "graded+broken+mirror CPU adaptive vs uniform",
           diff_ua / std::max(norm_u, 1e-30));
 

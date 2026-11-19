@@ -3682,17 +3682,11 @@ Field ElementWeno::react(const Field &a, double tau, ElementWenoStats *stats, do
         const int qi = (adaptive_active_ && adaptive_plan_) ? adaptive_plan_->tile_q[adaptive_plan_->node_tile(i)] : q;
         for (int k = 1; k < qi; ++k)
             o[k] = std::exp(-tau * (sa + ss + filter[k])) * in[k];
+        if (qi < q)
+            std::fill_n(o + qi, q - qi, 0.0);
         absorbed[i] = lumped[i] * (-std::expm1(z) * rho + q0 * tau * (1 - phi1));
         injected[i] = lumped[i] * q0 * tau;
     });
-    if (adaptive_active_ && adaptive_plan_) {
-        const AdaptivePnPlan &P = *adaptive_plan_;
-        for (int bn : boundary_nodes_) {
-            const int qb = P.tile_q[P.node_tile(bn)];
-            if (qb < q)
-                std::fill_n(&out.coeffRef(bn, qb), q - qb, 0.0);
-        }
-    }
     if (stats) {
         for (int i = 0; i < nodes; ++i)
             if (is_owned(i))
@@ -3743,6 +3737,7 @@ Field admissible_rows(Field x, int nodes, ElementWenoStats *stats, const Vec &lu
 // r <- old * a + fresh * (x + tau * r), row-parallel (the Eigen expression ran on one thread).
 void combine(Field &r, const Field &x, const Field &a, double old, double fresh, double tau, int nodes,
              const AdaptivePnPlan *plan = nullptr, const std::vector<int> *bnodes = nullptr) {
+    (void)bnodes;
     const int q = r.cols();
     parallel_for(nodes, [&](int i) {
         const int qi = plan ? plan->tile_q[plan->node_tile(i)] : q;
@@ -3754,14 +3749,9 @@ void combine(Field &r, const Field &x, const Field &a, double old, double fresh,
         else
             for (int c = 0; c < qi; ++c)
                 ri[c] = old * ai[c] + fresh * (xi[c] + tau * ri[c]);
+        if (plan && qi < q)
+            std::fill_n(ri + qi, q - qi, 0.0);
     });
-    if (plan && bnodes) {
-        for (int bn : *bnodes) {
-            const int qb = plan->tile_q[plan->node_tile(bn)];
-            if (qb < q)
-                std::fill_n(&r.coeffRef(bn, qb), q - qb, 0.0);
-        }
-    }
 }
 } // namespace
 Field ElementWeno::advance_ssprk3(double time, double dt, const Field &input, ElementWenoStats *stats) const {
