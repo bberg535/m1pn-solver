@@ -1893,6 +1893,31 @@ __global__ void k_fcs_gather(View v, ReactionView r) {
         s += r.local[v.node_entries[k]];
     r.fcs[i] = s / r.fmass[i];
 }
+// One thread per (node, moment) (experiment/big-rebuilds): coalesced rows, the same formulas as k_react (bitwise);
+// the moment-0 thread also updates the density and the ledger (diagnostic sums, atomic as before).
+__global__ void k_react_rows(View v, ReactionView r, double *a, double tau, bool fcs) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    double absorbed = 0, injected = 0;
+    if (t < std::size_t(v.nodes) * v.q) {
+        const int i = int(t / v.q), k = int(t % v.q);
+        const double sa = r.sigma_a ? r.sigma_a[i] : r.sa, ss = r.sigma_s ? r.sigma_s[i] : r.ss;
+        if (k == 0) {
+            const double q0 = (r.source ? r.source[i] : 0.) + (fcs ? r.fcs[i] : 0.);
+            const double c0 = 1 / v.s0, z = -sa * tau, decay0 = exp(z), phi1 = z == 0 ? 1. : expm1(z) / z;
+            double *row = a + std::size_t(i) * v.q;
+            const double rho = row[0] / c0;
+            row[0] = decay0 * row[0] + c0 * q0 * tau * phi1;
+            absorbed = v.lumped[i] * (-expm1(z) * rho + q0 * tau * (1 - phi1));
+            injected = v.lumped[i] * q0 * tau;
+        } else
+            a[t] *= exp(-tau * (sa + ss + r.filter[k]));
+    }
+    absorbed = warp_sum(absorbed), injected = warp_sum(injected);
+    if ((threadIdx.x & 31) == 0 && (absorbed != 0 || injected != 0)) {
+        atomicAdd(&r.ledger[0], absorbed);
+        atomicAdd(&r.ledger[1], injected);
+    }
+}
 __global__ void k_react(View v, ReactionView r, double *a, double tau, bool fcs) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     double absorbed = 0, injected = 0;
@@ -1961,7 +1986,7 @@ void react(Context *ctx, double *state, double tau, const double *host_table, in
         k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
         k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
     }
-    k_react<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r, state, tau, fcs);
+    k_react_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, r, state, tau, fcs);
     k_admissible<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
 }
 void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int M, double dt, double *host_out) {
@@ -2057,7 +2082,7 @@ void react_lattice(Context *ctx, double *state, double tau, double source_time) 
     k_fcs_points_lattice<<<blocks(std::size_t(v.cells) * r.P), 256, 0, ctx->stream>>>(v, r, source_time);
     k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
     k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
-    k_react<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r, state, tau, true);
+    k_react_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, r, state, tau, true);
     k_admissible<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, state, false, false, nullptr, nullptr, 0, 0, 0);
 }
 Ledger ledger(Context *ctx) {
