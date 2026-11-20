@@ -2242,8 +2242,21 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         double *d_px = dcopy(px, n_eval), *d_py = dcopy(py, n_eval), *d_pz = dcopy(pz, n_eval);
         int *d_elem = dcopy(elem, n_eval), *d_lk = dcopy(local_k, n_eval), *d_own = dcopy(owned, n_eval);
         double *d_w = dcopy(weight, n_eval), *d_sa = dcopy(sigma_a, n_eval);
-        const std::size_t batch = std::min<std::size_t>(n_eval, 1 << 14);
         const std::size_t work_stride = uncollided::lattice3d_work_size(hv, M);
+        // Batch size: as many points as fit in about a third of the free device memory (work + rows per point), so
+        // that one launch fills the GPU and the slow points near S overlap with the cheap ones. M1PN_FCS3D_BATCH
+        // overrides (benchmarks).
+        std::size_t batch;
+        {
+            std::size_t free_b = 0, total_b = 0;
+            CK(cudaMemGetInfo(&free_b, &total_b));
+            const std::size_t per_point = (work_stride + W + 3) * sizeof(double);
+            batch = std::max<std::size_t>(std::size_t(1) << 14, free_b / 3 / per_point);
+            batch = std::min<std::size_t>(batch, std::size_t(1) << 20);
+            if (const char *e = std::getenv("M1PN_FCS3D_BATCH"))
+                batch = std::max<std::size_t>(1, std::size_t(std::atoll(e)));
+            batch = std::min<std::size_t>(batch, n_eval);
+        }
         double *work = dalloc<double>(batch * work_stride);
         double *batch_rows = dalloc<double>(batch * W);
         double *batch_sum = dalloc<double>(batch * 3);
