@@ -2483,6 +2483,9 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         // Batch size: as many points as fit in about a third of the free device memory (work + rows per point), so
         // that one launch fills the GPU and the slow points near S overlap with the cheap ones. M1PN_FCS3D_BATCH
         // overrides (benchmarks).
+        // Stack reserve first: it is taken from device memory for all resident threads, and the batch below claims a
+        // third of what is free (P15 on 168^3 failed in cudaDeviceSetLimit after the batch allocation).
+        CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
         std::size_t batch;
         {
             std::size_t free_b = 0, total_b = 0;
@@ -2498,7 +2501,6 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         double *batch_rows = dalloc<double>(batch * W);
         double *batch_sum = dalloc<double>(batch * 3);
         std::vector<double> h_sum(batch * 3);
-        CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
         for (std::size_t first = 0; first < n_eval; first += batch) {
             const std::size_t count = std::min(batch, n_eval - first);
             k_lattice3d_eval_batch<<<blocks(count, 64), 64, 0, ctx->stream>>>(
@@ -4239,13 +4241,15 @@ void gradients(Context *ctx, const double *state) {
     }
     line_solve(ctx, 0, v.dimension, nullptr, state);
 }
-// 3D Q1 node strip kernel instead of element kernel + gather (M1PN_GPU_STRIP3=0: previous path).
-static bool strip3_enabled() {
-    static const bool on = [] {
+// 3D Q1 node strip kernel on graded / broken meshes instead of the per-node connectivity kernel. On the uniform mesh
+// the element kernel + gather stays faster on the A100 (U112 P7 solver 58.8 vs 67.4 s; graded G3H 123.4 -> 91.1 s,
+// broken 177.4 -> 148.6 s). M1PN_GPU_STRIP3=0: never, 2: also on uniform meshes.
+static bool strip3_enabled(const View &v) {
+    static const int mode = [] {
         const char *e = std::getenv("M1PN_GPU_STRIP3");
-        return !e || std::atoi(e) != 0;
+        return e ? std::atoi(e) : 1;
     }();
-    return on;
+    return mode == 2 || (mode == 1 && (v.klass || !v.structured));
 }
 void stabilization(Context *ctx, const double *state, double *out, bool want_low, double constant_gamma) {
     const View &v = ctx->v;
@@ -4308,7 +4312,7 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
             k_stabilization_strip<64><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else
             k_stabilization_strip<32><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
-    } else if (v.dimension == 3 && v.degree == 1 && !v.periodic && v.local == 8 && v.strip3_ok && strip3_enabled() &&
+    } else if (v.dimension == 3 && v.degree == 1 && !v.periodic && v.local == 8 && v.strip3_ok && strip3_enabled(v) &&
                (v.structured || (v.strip_elem[0] && v.strip_elem[1] && v.strip_elem[2]))) {
         static const int sz = [] {
             const char *e = std::getenv("M1PN_GPU_STRIP3_SZ");
