@@ -267,3 +267,19 @@ dem aux-Stream gebildet; `k_ghost` kopiert nur noch seine Spalte. Die Projektion
 Absorptionsrate in allen Stellen gleich. Linienquelle Q1/128 P21 (FCS): 17.3 → 12.0 s, Masse 2e-13. lattice-3d 28³
 P7: gleich. Auf der A2000 ist bei 224² P21 die Host-Projektion schneller (9.2 gegen 12.4 s); die Schwelle wird auf der
 A100 neu bestimmt (`scripts/element_weno/tardis_perf_profile.sbatch`).
+
+**A100 (Job 164267, `nx/tmp/tardis_perf_20261120`, Lattice wie Kampagne Block A, T = 3.2).**
+
+| Lauf (uniform, Spiegel, FCS, gebrochene Linien + Split) | Solver alt [s] | Solver DGEMM [s] | Ghost-Warten alt → neu [s] |
+|---|---:|---:|---|
+| GBQ P35 | 20.26 | 2.79 | – → 1.5 |
+| GBH P35 | 84.33 | 16.10 | 81.9 → 9.0 |
+| GB P35 (Host-Ghost, Verhältnis < 0.1) | 94.81 | 94.48 | Host 47 s, unverändert |
+
+Masse GBH P35: 1.29911036774 (DGEMM) gegen 1.29911036639 (alt), relativ 1e-9 (Summationsreihenfolge, Projektion
+auf Toleranz). Uniform 896² P21 (t = 0.8, kein Spiegel): Host 74.5 s, Device mit DGEMM 78.9 s, Device alt 92.6 s; die
+automatische Wahl (Host, Verhältnis < 0.1) bleibt dort richtig.
+
+**Folge.** Der Abstand adaptiv–uniform schrumpft auf GBQ/GBH (P35: 2.79 gegen 1.32–1.98 s auf GBQ, 16.10 gegen
+5.95–8.54 s auf GBH). Die adaptiven Läufe selbst nutzen den Host-Ghost mit Ordnungsstufen und werden nicht schneller.
+Die Spektralradius-Schätzung (60 Potenziterationen des vollen Operators, einmal am Anfang) kostet auf GB P35 3.4 s.
