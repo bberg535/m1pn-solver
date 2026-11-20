@@ -110,6 +110,11 @@ struct Context {
     // schemes (multi-block driver) run concurrently. Blocking stream: operations on the legacy default stream that
     // remain (synchronous copies, upload_async) still order with it.
     cudaStream_t stream = nullptr;
+    // Fork/join streams of the adaptive path: the low-moment (c < 4) line solves and stabilization and the per-axis
+    // high-chunk line solves touch disjoint coefficients (or fields) and are latency bound with few threads each, so
+    // they run concurrently (M1PN_GPU_OVERLAP=0: all on `stream`).
+    cudaStream_t side[2] = {};
+    cudaEvent_t fork_event = nullptr, join_event[2] = {};
     struct ReactionDevice *reaction = nullptr;
     struct BoundaryHighDevice *bhigh = nullptr;
     struct GhostTraceDevice *gtrace = nullptr;
@@ -3639,6 +3644,14 @@ void destroy(Context *ctx) {
     }
     if (ctx->aux)
         cudaStreamDestroy(ctx->aux);
+    for (int i = 0; i < 2; ++i) {
+        if (ctx->side[i])
+            cudaStreamDestroy(ctx->side[i]);
+        if (ctx->join_event[i])
+            cudaEventDestroy(ctx->join_event[i]);
+    }
+    if (ctx->fork_event)
+        cudaEventDestroy(ctx->fork_event);
     destroy_boundary_high(ctx);
     destroy_ghost_traces(ctx);
     if (ctx->ghost) {
@@ -3741,48 +3754,79 @@ void line_solve(Context *ctx, int d, int count, double *f, const double *src = n
     default: k_line_solve<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
     }
 }
-void line_solve_low4(Context *ctx, int d, int count, double *f, const double *src = nullptr) {
+void line_solve_low4(Context *ctx, int d, int count, double *f, const double *src = nullptr,
+                     cudaStream_t st = nullptr) {
     const View &v = ctx->v;
+    if (!st)
+        st = ctx->stream;
     const int q4 = std::min(4, v.q);
     std::size_t work = 0;
     for (int k = d; k < d + count; ++k)
         work = std::max(work, std::size_t(v.nodes / v.npa[k]) * q4);
     const dim3 grid(blocks(work, 64), count);
     switch (v.degree) {
-    case 1: k_line_solve_low4<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
-    case 2: k_line_solve_low4<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
-    case 3: k_line_solve_low4<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
-    default: k_line_solve_low4<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    case 1: k_line_solve_low4<1, LINE_CHUNK><<<grid, 64, 0, st>>>(v, d, f, src); break;
+    case 2: k_line_solve_low4<2, LINE_CHUNK><<<grid, 64, 0, st>>>(v, d, f, src); break;
+    case 3: k_line_solve_low4<3, LINE_CHUNK><<<grid, 64, 0, st>>>(v, d, f, src); break;
+    default: k_line_solve_low4<4, LINE_CHUNK><<<grid, 64, 0, st>>>(v, d, f, src); break;
     }
 }
 void line_solve_adaptive_axis(Context *ctx, int d, double *f, const double *src,
-                              const AdaptiveLineSeg *segs, int nsegs) {
+                              const AdaptiveLineSeg *segs, int nsegs, cudaStream_t st = nullptr) {
     if (nsegs <= 0)
         return;
+    if (!st)
+        st = ctx->stream;
     const View &v = ctx->v;
     const AdaptiveDevice *ad = ctx->adaptive;
     const unsigned grid = (unsigned(nsegs) + 1u) / 2u; // 2 warps = 64 threads per block (register-optimal)
     switch (v.degree) {
     case 1:
-        k_line_solve_adaptive<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+        k_line_solve_adaptive<1, LINE_CHUNK><<<grid, 64, 0, st>>>(
             v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
             ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
         break;
     case 2:
-        k_line_solve_adaptive<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+        k_line_solve_adaptive<2, LINE_CHUNK><<<grid, 64, 0, st>>>(
             v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
             ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
         break;
     case 3:
-        k_line_solve_adaptive<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+        k_line_solve_adaptive<3, LINE_CHUNK><<<grid, 64, 0, st>>>(
             v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
             ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
         break;
     default:
-        k_line_solve_adaptive<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+        k_line_solve_adaptive<4, LINE_CHUNK><<<grid, 64, 0, st>>>(
             v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
             ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
         break;
+    }
+}
+bool overlap_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("M1PN_GPU_OVERLAP");
+        return e ? std::atoi(e) != 0 : true;
+    }();
+    return on;
+}
+// Side streams start after the work queued on ctx->stream; join makes ctx->stream wait for them.
+void fork_streams(Context *ctx, int n) {
+    if (!ctx->fork_event) {
+        CK(cudaEventCreateWithFlags(&ctx->fork_event, cudaEventDisableTiming));
+        for (int i = 0; i < 2; ++i) {
+            CK(cudaStreamCreateWithFlags(&ctx->side[i], cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&ctx->join_event[i], cudaEventDisableTiming));
+        }
+    }
+    CK(cudaEventRecord(ctx->fork_event, ctx->stream));
+    for (int i = 0; i < n; ++i)
+        CK(cudaStreamWaitEvent(ctx->side[i], ctx->fork_event, 0));
+}
+void join_streams(Context *ctx, int n) {
+    for (int i = 0; i < n; ++i) {
+        CK(cudaEventRecord(ctx->join_event[i], ctx->side[i]));
+        CK(cudaStreamWaitEvent(ctx->stream, ctx->join_event[i], 0));
     }
 }
 } // namespace
@@ -3790,6 +3834,17 @@ void gradients(Context *ctx, const double *state) {
     const View &v = ctx->v;
     if (ctx->adaptive && ctx->adaptive->active && !v.periodic) {
         AdaptiveDevice *ad = ctx->adaptive;
+        if (overlap_enabled() && v.dimension <= 3) {
+            // low4 (all axes) on side 0; axis 0 on ctx->stream, axis 1 on side 1, axis 2 on ctx->stream after axis 0:
+            // each axis writes its own gradient field, low4 only the coefficients c < 4 of all of them.
+            fork_streams(ctx, 2);
+            line_solve_low4(ctx, 0, v.dimension, nullptr, state, ctx->side[0]);
+            for (int d = 0; d < v.dimension; ++d)
+                line_solve_adaptive_axis(ctx, d, nullptr, state, ad->d_segs_grad[d], ad->segs_grad_n[d],
+                                         d == 1 ? ctx->side[1] : ctx->stream);
+            join_streams(ctx, 2);
+            return;
+        }
         line_solve_low4(ctx, 0, v.dimension, nullptr, state);
         for (int d = 0; d < v.dimension; ++d)
             line_solve_adaptive_axis(ctx, d, nullptr, state, ad->d_segs_grad[d], ad->segs_grad_n[d]);
@@ -3806,11 +3861,17 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
         if (use_strip) {
             const int q4 = std::min(4, v.q);
             const dim3 g4(blocks(std::size_t(v.npa[0]) * q4, 128), (v.npa[1] + 15) / 16);
-            k_stabilization_strip_low4<16><<<g4, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+            const bool ov = overlap_enabled() && ad->tile_chunks_n > 0; // low4 writes c < 4, the chunks c >= 4
+            if (ov)
+                fork_streams(ctx, 1);
+            k_stabilization_strip_low4<16><<<g4, 128, 0, ov ? ctx->side[0] : ctx->stream>>>(v, state, out, want_low,
+                                                                                            constant_gamma);
             if (ad->tile_chunks_n > 0)
                 k_stabilization_strip_adaptive<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
                     v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks, ad->tile_chunks_n,
                     ad->d_tile_q, ad->nt[0]);
+            if (ov)
+                join_streams(ctx, 1);
         } else {
             const int q4 = std::min(4, v.q);
             k_stabilization_low4<<<blocks(std::size_t(v.nodes) * q4), 256, 0, ctx->stream>>>(
@@ -3869,8 +3930,13 @@ void mass_solve(Context *ctx, double *field) {
     if (ctx->adaptive && ctx->adaptive->active && !v.periodic) {
         AdaptiveDevice *ad = ctx->adaptive;
         for (int d = 0; d < v.dimension; ++d) {
-            line_solve_low4(ctx, d, 1, field);
+            const bool ov = overlap_enabled(); // axis d: low4 (c < 4) and chunks (c >= 4) of the same field
+            if (ov)
+                fork_streams(ctx, 1);
+            line_solve_low4(ctx, d, 1, field, nullptr, ov ? ctx->side[0] : ctx->stream);
             line_solve_adaptive_axis(ctx, d, field, nullptr, ad->d_segs_mass[d], ad->segs_mass_n[d]);
+            if (ov)
+                join_streams(ctx, 1);
         }
         return;
     }
