@@ -142,3 +142,73 @@ diesen Gittern noch nicht konvergiert (eine Quellzelle hat bei 14³ nur 2³ Elem
 Verdopplung um etwa die Hälfte weniger als ohne FCS. `lattice-3d` ist ein eigener Fall ohne Literaturreferenz.
 Seit 16.11.2026 gibt es eine eigene Monte-Carlo-Referenz für beide Lattice-Fälle; Abweichungen dagegen in
 [LATTICE_MC.md](LATTICE_MC.md) (3D mit FCS, P3: 28³ −15.9 %, 56³ −7.6 % in der Masse).
+
+## 3D: Polar-Regel der Zeittabelle (20.11.2026, Branch `feature/fcs3d-table`, Option)
+
+**Befund zur kartesischen Regel.** Test 5 (Standard gegen doppelte Teilung, 2.6e-8) zieht Zufallspunkte, die kaum nahe
+an S liegen. Für Punkte im Abstand h vor einer Fläche von S ist der Kern h/r³ fast singulär: Fehler (max über t, gegen
+eine sinh-transformierte Referenz 10×64) 6e-5 bei h = 0.3, 1.1e-3 bei h = 0.026 (Gauß-Punkte von 56³), 3.2e-3 bei
+0.013 (112³), 9.5e-3 bei 0.0066 (G3B), 4e-2 bei 0.003. Auf die Summen wirkt das kaum (56³ P3: Masse, Absorption und
+Rate ändern sich gegen genauere Regeln um ≤ 0.03 %), weil nur wenige Punkte betroffen sind. Kosten: im Mittel 50 000
+Strahlen je Punkt (8×8-Unterteilung je Stück wegen der Frontknicke, 6×6 Gauß).
+
+**Polar-Regel** (`lattice3d_row_polar`, `src/uncollided_lattice3d_core.hpp`, Host und Device). Polarkoordinaten (ρ, φ)
+um den Fußpunkt von x auf der Fläche, s = √(h² + ρ²): dΩ = (h/s²) ds dφ, beschränkt (Hayami, PART). Außerhalb von S ist
+s = s_in, die Front s_in = t liegt bei festem s für alle t; mit Chebyshev-Stammfunktionen je radialem Panel (8 Knoten)
+ist ρ_u(t_m) = ∫dφ [G₀(t_m) − e^{−σ_S t_m} G₁(t_m)] exakt in s an jeder Tabellenzeit (Sättigung nach s_out knotenweise wie
+bisher). In S: s = s_out, analog. Bruchstellen radial: Gitterkantenkreuzungen längs der radialen Linie, geometrisch
+(ρ = h·2^k) am Fußpunkt; in φ: Flächenecken, projizierte Gitterecken, Schnitte projizierter Kanten mit dem Flächenrand.
+Adaptiv: Panels und φ-Stücke werden halbiert, bis die letzten zwei Chebyshev-Koeffizienten (von A in s, vom radialen
+Integral Q in φ) unter `polar_tol`·max + `polar_floor` liegen (1e-4, 1e-9); ein φ-Stück wird in einer temporären Zeile
+akkumuliert und nur bei Annahme übernommen (fester Stack, Tiefensuche). Arbeitsspeicher 10 (M + 2) je Punkt.
+
+Schalter (Experiment): `M1PN_FCS3D_RULE=polar`, `M1PN_FCS3D_TOL`. Standard bleibt kartesisch.
+
+| 300 Zufallspunkte außerhalb S, Referenz sinh 10×64 | Strahlen/Punkt | ms/Punkt CPU | max Fehler / max | Zeitintegral global | je Punkt Median / p90 |
+|---|---:|---:|---:|---:|---|
+| kartesisch 6×8 | 49 700 | 8.5 | 1.3e-2 | 2.5e-3 | 1.9e-7 / 3.6e-6 |
+| polar adaptiv (1e-4, 1e-9) | 8 100 | 3.0 (Prototyp; Kern 3.7× schneller als kartesisch) | 8.9e-5 | 1.8e-7 | 1.0e-6 / 5.2e-5 |
+
+Lauf 56³ P3 FCS T = 3.2 (A2000): Tabelle 616 → 351 s (1.75×), Masse/Absorption/Rate gegen MC −7.501/+0.234/−1.234 % →
+−7.497/+0.241/−1.226 %. CPU gegen GPU (28³) 2e-11, FCS-Integrale 4e-11. Test 8 in `tests/uncollided_lattice3d.cpp`.
+
+**Offen.** (1) Auf der GPU nur 1.75× bei 6× weniger Strahlen: die adaptive Tiefe divergiert zwischen benachbarten
+Threads (ein Thread je Punkt); Abhilfe: Arbeit je φ-Stück verteilen. (2) Läuft der Frontkreis über den Flächenrand, hat
+das radiale Teilintegral in φ einen Knick bei einem zeitabhängigen Winkel, den die Adaptivität nicht teilt: bis 8e-4 des
+Zeilenmaximums kurz nach Ankunft (Punkt (3.4, 3.6, 0.8)), Zeitintegral 2e-6; 2D teilt dort je Zeit. (3) Speicher
+unverändert (U168 mit FCS und P15 auf 112³ passen nicht auf die A100).
+
+**Verworfen** (56³ P3, gegen 8 Gauß-Punkte je Element): Zeilen nur an den Knoten und Q1-Interpolation auf die
+Gauß-Punkte (Tabelle 8× billiger) ergibt Absorption +41 % statt +0.24 %; ein Gauß-Punkt je Element −11.5 %. In den
+Absorbern ist ein Element 1.25 freie Weglängen dick (σ = 10, h = 1/8), ρ_u ändert sich im Element um den Faktor drei;
+die 2×2×2-Regel ist dort nötig.
+
+### 3D: Knotentabelle (FP32), schneller Polar-Kern & adaptive Raumquadratur (20.11.2026)
+
+Um 3D-FCS auf großen Gittern (G3B, U168) speicher- und laufzeittauglich zu machen, ergänzt `feature/fcs3d-table` drei
+Bausteine (Host und Device, `src/uncollided_lattice3d*.hpp`, `src/element_weno_gpu.cu`, `src/element_weno.cpp`):
+
+1. **Knoten-FCS-Tabelle + Streaming-Summary (8×–16× weniger VRAM/RAM, exakt):** `k_fcs_element` + `k_fcs_gather`
+   bilden die Gauß-Punkt-Tabelle linear und zeitunabhängig auf Knotenwerte `fcs[node](t)` ab. Statt `cells * 8 * (M+1)`
+   `double`s (U168: ~98 GB) im Speicher zu halten, werden die Zeilen batchweise direkt in `node_table[node, m]`
+   reduziert (FP32: **16× kleiner**, U168 **~6.1 GB**; FP64: 8×) und die skalaren Summen (`uncollided_mass_final`,
+   `uncollided_absorption_rate_final`, `uncollided_absorbed`) sowie eine 1D-Massentabelle `mass_table[0..M]` im selben
+   Pass aufsummiert (kein Full-Table-Copy GPU → Host). Im Zeitschritt ersetzt ein einzelner Kernel
+   (`k_fcs_nodes_lattice_f`/`d`) die drei bisherigen FCS-Kernel. Test 9 in `tests/uncollided_lattice3d.cpp`: gegen die
+   Punkt-Tabelle 2.8e-16 (FP64), 3.1e-8 (FP32), Summary 4.0e-16.
+2. **Polar-Kern optimiert (`lattice3d_row_polar`):** Horizont-Culling ($s \le M\Delta t$ pro Fläche und Strahl),
+   Compile-Time-Chebyshev-Tabellen (keine Laufzeit-`cos`), Bounding-Box- und Materialwechsel-Pruning in
+   `lattice3d_edge_breaks`, Early-Exit bei $\tau > \tau_{\max}$ in `lattice3d_depth`, 3-Ebenen-Austrittstest
+   (`lattice3d_exit_S`) und verkleinerte Break-Puffer (`192`/`96` statt `1024`; GPU-Stack `48 → 16 KB`). CPU-Kern
+   noch einmal **1.43×** schneller bei identischer Genauigkeit.
+3. **Adaptive Raumquadratur (1 vs. 8 Gauß-Punkte):** Elemente mit uniformem Material, $\sigma_t h \le 0.25$ und
+   Abstand $\ge 1.0$ zu $S$ nutzen einen Mittelpunkt-Strahl statt 8 Gauß-Punkten (Absorber und $S$-Umgebung bleiben bei
+   8 Punkten). Auf 28³ P3 (T = 3.2, 2 CPU-Kerne): Tabelle `72.47 s → 33.67 s` (**2.15×**, `127 952 → 60 333`
+   ausgewertete Punkte), QoI-Änderung Masse `+0.0082 %`, Absorption `+0.0013 %`, Rate `+0.0054 %`. Auf 14³ P3 gegen
+   kartesisch + Punkt-Tabelle: `27.15 s → 7.87 s` (**3.45×**), RSS `76.6 → 28.9 MB`, QoI-Abweichung ≤ 0.014 %.
+
+**Schalter (`src/fast_main.cpp`, Defaults auf `feature/fcs3d-table`):** `M1PN_FCS3D_RULE=polar|cartesian` (Default
+`polar`), `M1PN_FCS3D_LAYOUT=nodal|points` (Default `nodal`), `M1PN_FCS3D_FP64=0|1` (Default `0` = FP32),
+`M1PN_FCS3D_ADAPTIVE_QUAD=1|0` (Default `1`), `M1PN_FCS3D_ADAPTIVE_TAU` (Default `0.25`), `M1PN_FCS3D_ADAPTIVE_DIST`
+(Default `1.0`).
+

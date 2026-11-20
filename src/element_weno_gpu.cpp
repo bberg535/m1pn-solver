@@ -363,19 +363,45 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         }
         gpu::reaction_setup(ctx_, r);
         if (lattice3_) {
-            // lattice-3d: time table on the device (one thread per point), host copy for the summary.
             const double start = seconds();
             uncollided::Lattice3dUncollidedTable &T = *lattice3_;
-            T.points = s.fcs_points_;
             T.M = T.times_for(T.final_time);
-            T.table.assign(T.points.size() * std::size_t(T.M + 1), 0.);
-            std::vector<double> px(T.points.size()), py(px.size()), pz(px.size());
-            for (std::size_t k = 0; k < px.size(); ++k)
-                px[k] = T.points[k][0], py[k] = T.points[k][1], pz[k] = T.points[k][2];
-            T.lattice.with_view([&](const uncollided::Lattice3dView &view) {
-                gpu::lattice3d_table(ctx_, view, px.data(), py.data(), pz.data(), T.M, T.dt, T.table.data());
-                return 0;
-            });
+            if (T.nodal) {
+                auto sigma_a_of = [&](const V3 &x) {
+                    return o.material && o.material->sigma_a ? o.material->sigma_a(x) : o.sigma_a;
+                };
+                const uncollided::Lattice3dEvalPlan plan = T.plan_eval_points(
+                    s.cells, s.fcs_per_element_, s.fcs_points_, s.fcs_weight_, s.fcs_sigma_s_,
+                    [&](int e) { return s.element_owned(e); }, sigma_a_of, T.M);
+                T.nodes = s.nodes;
+                T.summary_points = plan.summary_points;
+                T.evaluated_points = plan.size();
+                T.adaptive_elements = plan.adaptive_elements;
+                T.mass_table.assign(std::size_t(T.M + 1), 0.);
+                gpu::Lattice3dNodalSummary sum{};
+                T.lattice.with_view([&](const uncollided::Lattice3dView &view) {
+                    sum = gpu::lattice3d_table_nodal(ctx_, view, plan.px.data(), plan.py.data(), plan.pz.data(),
+                                                     plan.elem.data(), plan.local_k.data(), plan.weight.data(),
+                                                     plan.sigma_a.data(), plan.owned.data(), plan.size(), T.M, T.dt,
+                                                     T.final_time, T.nodal_fp32, T.mass_table.data());
+                    return 0;
+                });
+                T.summary_mass = sum.mass;
+                T.summary_abs_rate = sum.abs_rate;
+                T.summary_absorbed = sum.absorbed;
+                T.nodal_built = true;
+            } else {
+                // Legacy point-major table on the device (one thread per point), host copy for the summary.
+                T.points = s.fcs_points_;
+                T.table.assign(T.points.size() * std::size_t(T.M + 1), 0.);
+                std::vector<double> px(T.points.size()), py(px.size()), pz(px.size());
+                for (std::size_t k = 0; k < px.size(); ++k)
+                    px[k] = T.points[k][0], py[k] = T.points[k][1], pz[k] = T.points[k][2];
+                T.lattice.with_view([&](const uncollided::Lattice3dView &view) {
+                    gpu::lattice3d_table(ctx_, view, px.data(), py.data(), pz.data(), T.M, T.dt, T.table.data());
+                    return 0;
+                });
+            }
             T.build_seconds = seconds() - start;
         }
         if (lattice_)

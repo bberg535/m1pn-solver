@@ -1969,6 +1969,8 @@ struct ReactionView {
     double *fcs;    // nodes
     double *table;  // FCS radial table
     const double *ltable; // lattice FCS: points x (lM - lm0 + 1) time table (device), times m dt, m = lm0..lM
+    const float *lnode_f;  // lattice-3d nodal FCS table (FP32): nodes x (lM + 1)
+    const double *lnode_d; // lattice-3d nodal FCS table (FP64): nodes x (lM + 1)
     int lM, lm0;
     double ldt;
     double *ledger; // absorbed, injected
@@ -2127,7 +2129,7 @@ void reaction_setup(Context *ctx, const ReactionSetup &s) {
     } else
         r.fx = r.fy = r.fw = r.fss = r.fshape = r.fmass = nullptr, r.q = r.local = r.fcs = nullptr;
     r.table = nullptr;
-    r.ltable = nullptr, r.lM = 0, r.lm0 = 0, r.ldt = 0;
+    r.ltable = nullptr, r.lnode_f = nullptr, r.lnode_d = nullptr, r.lM = 0, r.lm0 = 0, r.ldt = 0;
     r.ledger = own(dalloc<double>(2));
     ctx->reaction = rd;
 }
@@ -2193,7 +2195,7 @@ void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int m0, int 
 }
 __global__ void k_lattice3d_table(uncollided::Lattice3dView lv, const double *x, const double *y, const double *z,
                                   std::size_t first, std::size_t count, int M, double dt, double *work,
-                                  double *table) {
+                                  std::size_t work_stride, double *table) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= count)
         return;
@@ -2209,7 +2211,7 @@ __global__ void k_lattice3d_table(uncollided::Lattice3dView lv, const double *x,
             table[k * std::size_t(M + 1) + m] = 0;
         return;
     }
-    uncollided::lattice3d_row(lv, p, dt, M, work + t * 3 * std::size_t(M + 2), table + k * std::size_t(M + 1));
+    uncollided::lattice3d_row(lv, p, dt, M, work + t * work_stride, table + k * std::size_t(M + 1));
 }
 void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const double *hx, const double *hy,
                      const double *hz, int M, double dt, double *host_out) {
@@ -2231,13 +2233,16 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
     lv.inner_w = own(dcopy(hv.inner_w, std::size_t(hv.inner_n)));
     double *dx = dcopy(hx, points), *dy = dcopy(hy, points), *dz = dcopy(hz, points);
     double *table = own(dalloc<double>(total));
-    // Batches bound the work arrays (3 (M + 2) doubles per point); the per-thread break lists live in local memory.
+    // Batches bound the work arrays (lattice3d_work_size doubles per point: 3 (M + 2) Cartesian, 10 (M + 2) polar);
+    // the per-thread break lists live in local memory (polar: three lists and the stacks).
     const std::size_t batch = std::min<std::size_t>(points, 1 << 16);
-    double *work = dalloc<double>(batch * 3 * std::size_t(M + 2));
-    CK(cudaDeviceSetLimit(cudaLimitStackSize, 24 * 1024)); // two break lists of lattice3d_max_breaks doubles
+    const std::size_t work_stride = uncollided::lattice3d_work_size(hv, M);
+    double *work = dalloc<double>(batch * work_stride);
+    CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
     for (std::size_t first = 0; first < points; first += batch) {
         const std::size_t count = std::min(batch, points - first);
-        k_lattice3d_table<<<blocks(count, 64), 64, 0, ctx->stream>>>(lv, dx, dy, dz, first, count, M, dt, work, table);
+        k_lattice3d_table<<<blocks(count, 64), 64, 0, ctx->stream>>>(lv, dx, dy, dz, first, count, M, dt, work,
+                                                                    work_stride, table);
         CK(cudaGetLastError());
     }
     CK(cudaDeviceSynchronize());
@@ -2245,16 +2250,185 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
     CK(cudaFree(dx)), CK(cudaFree(dy)), CK(cudaFree(dz));
     if (host_out)
         CK(cudaMemcpy(host_out, table, total * sizeof(double), cudaMemcpyDeviceToHost));
-    r.ltable = table, r.lM = M, r.lm0 = 0, r.ldt = dt;
+    r.ltable = table, r.lnode_f = nullptr, r.lnode_d = nullptr, r.lM = M, r.lm0 = 0, r.ldt = dt;
+}
+__global__ void k_fcs_nodes_lattice_f(View v, ReactionView r, double time) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= v.nodes)
+        return;
+    r.fcs[i] = uncollided::lattice3d_eval_row(r.lnode_f + std::size_t(i) * std::size_t(r.lM + 1), r.lM, r.ldt, time);
+}
+__global__ void k_fcs_nodes_lattice_d(View v, ReactionView r, double time) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= v.nodes)
+        return;
+    r.fcs[i] = uncollided::lattice3d_eval_row(r.lnode_d + std::size_t(i) * std::size_t(r.lM + 1), r.lM, r.ldt, time);
+}
+__global__ void k_lattice3d_eval_batch(uncollided::Lattice3dView lv, const double *px, const double *py,
+                                       const double *pz, const double *weight, const double *sigma_a, const int *owned,
+                                       std::size_t first, std::size_t count, int M, double dt, double final_time,
+                                       double *work, std::size_t work_stride, double *batch_rows, double *batch_sum) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= count)
+        return;
+    const std::size_t q = first + t;
+    const double p[3] = {px[q], py[q], pz[q]};
+    double *row = batch_rows + t * std::size_t(M + 1);
+    uncollided::lattice3d_row(lv, p, dt, M, work + t * work_stride, row);
+    if (owned[q]) {
+        const double w = weight[q], sa = sigma_a[q];
+        const double rT = uncollided::lattice3d_eval_row(row, M, dt, final_time);
+        batch_sum[3 * t + 0] = w * rT;
+        batch_sum[3 * t + 1] = w * sa * rT;
+        batch_sum[3 * t + 2] = sa > 0 ? w * sa * uncollided::lattice3d_time_integral_row(row, M, dt, final_time) : 0.;
+    } else {
+        batch_sum[3 * t + 0] = 0, batch_sum[3 * t + 1] = 0, batch_sum[3 * t + 2] = 0;
+    }
+}
+__global__ void k_lattice3d_scatter_batch(View v, ReactionView r, const int *elem, const int *local_k,
+                                          const double *weight, const int *owned, std::size_t first, std::size_t count,
+                                          int W, const double *batch_rows, double *node_acc, double *mass_acc) {
+    const std::size_t idx = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= count * std::size_t(W))
+        return;
+    const std::size_t t = idx / std::size_t(W), m = idx % std::size_t(W);
+    const double val = batch_rows[idx];
+    if (val == 0)
+        return;
+    const std::size_t q = first + t;
+    const int e = elem[q], lk = local_k[q];
+    const std::size_t base = std::size_t(e) * r.P;
+    for (int l = 0; l < v.local; ++l) {
+        double c = 0;
+        if (lk >= 0) {
+            c = r.fshape[std::size_t(l) * r.P + lk] * r.fw[base + lk] * r.fss[base + lk];
+        } else {
+            for (int k = 0; k < r.P; ++k)
+                c += r.fshape[std::size_t(l) * r.P + k] * r.fw[base + k] * r.fss[base + k];
+        }
+        if (c == 0)
+            continue;
+        const int node = v.connectivity[std::size_t(e) * v.local + l];
+        atomicAdd(&node_acc[std::size_t(node) * std::size_t(W) + m], (c / r.fmass[node]) * val);
+    }
+    if (owned[q])
+        atomicAdd(&mass_acc[m], weight[q] * val);
+}
+__global__ void k_cast_d2f(const double *src, float *dst, std::size_t n) {
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n)
+        dst[i] = float(src[i]);
+}
+Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Lattice3dView &hv, const double *px,
+                                            const double *py, const double *pz, const int *elem, const int *local_k,
+                                            const double *weight, const double *sigma_a, const int *owned,
+                                            std::size_t n_eval, int M, double dt, double final_time, bool fp32,
+                                            double *host_mass_table) {
+    ReactionDevice *rd = ctx->reaction;
+    ReactionView &r = rd->r;
+    const View &v = ctx->v;
+    if (!r.P)
+        throw std::runtime_error("lattice3d_table_nodal: no FCS points");
+    auto own = [&](auto *p) {
+        rd->owned.push_back((void *)p);
+        return p;
+    };
+    const std::size_t W = std::size_t(M + 1), total_nodes = std::size_t(v.nodes) * W;
+    double *node_acc = dalloc<double>(total_nodes);
+    double *mass_acc = dalloc<double>(W);
+    CK(cudaMemset(node_acc, 0, total_nodes * sizeof(double)));
+    CK(cudaMemset(mass_acc, 0, W * sizeof(double)));
+    Lattice3dNodalSummary sum{};
+    if (n_eval > 0) {
+        uncollided::Lattice3dView lv = hv;
+        double *d_sigma_t = dcopy(hv.sigma_t, std::size_t(hv.n[0]) * hv.n[1] * hv.n[2]);
+        double *d_ox = hv.outer_n ? dcopy(hv.outer_x, std::size_t(hv.outer_n)) : nullptr;
+        double *d_ow = hv.outer_n ? dcopy(hv.outer_w, std::size_t(hv.outer_n)) : nullptr;
+        double *d_ix = hv.inner_n ? dcopy(hv.inner_x, std::size_t(hv.inner_n)) : nullptr;
+        double *d_iw = hv.inner_n ? dcopy(hv.inner_w, std::size_t(hv.inner_n)) : nullptr;
+        lv.sigma_t = d_sigma_t, lv.outer_x = d_ox, lv.outer_w = d_ow, lv.inner_x = d_ix, lv.inner_w = d_iw;
+        double *d_px = dcopy(px, n_eval), *d_py = dcopy(py, n_eval), *d_pz = dcopy(pz, n_eval);
+        int *d_elem = dcopy(elem, n_eval), *d_lk = dcopy(local_k, n_eval), *d_own = dcopy(owned, n_eval);
+        double *d_w = dcopy(weight, n_eval), *d_sa = dcopy(sigma_a, n_eval);
+        const std::size_t work_stride = uncollided::lattice3d_work_size(hv, M);
+        // Batch size: as many points as fit in about a third of the free device memory (work + rows per point), so
+        // that one launch fills the GPU and the slow points near S overlap with the cheap ones. M1PN_FCS3D_BATCH
+        // overrides (benchmarks).
+        std::size_t batch;
+        {
+            std::size_t free_b = 0, total_b = 0;
+            CK(cudaMemGetInfo(&free_b, &total_b));
+            const std::size_t per_point = (work_stride + W + 3) * sizeof(double);
+            batch = std::max<std::size_t>(std::size_t(1) << 14, free_b / 3 / per_point);
+            batch = std::min<std::size_t>(batch, std::size_t(1) << 20);
+            if (const char *e = std::getenv("M1PN_FCS3D_BATCH"))
+                batch = std::max<std::size_t>(1, std::size_t(std::atoll(e)));
+            batch = std::min<std::size_t>(batch, n_eval);
+        }
+        double *work = dalloc<double>(batch * work_stride);
+        double *batch_rows = dalloc<double>(batch * W);
+        double *batch_sum = dalloc<double>(batch * 3);
+        std::vector<double> h_sum(batch * 3);
+        CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
+        for (std::size_t first = 0; first < n_eval; first += batch) {
+            const std::size_t count = std::min(batch, n_eval - first);
+            k_lattice3d_eval_batch<<<blocks(count, 64), 64, 0, ctx->stream>>>(
+                lv, d_px, d_py, d_pz, d_w, d_sa, d_own, first, count, M, dt, final_time, work, work_stride, batch_rows,
+                batch_sum);
+            CK(cudaGetLastError());
+            k_lattice3d_scatter_batch<<<blocks(count * W, 256), 256, 0, ctx->stream>>>(
+                v, r, d_elem, d_lk, d_w, d_own, first, count, int(W), batch_rows, node_acc, mass_acc);
+            CK(cudaGetLastError());
+            CK(cudaMemcpyAsync(h_sum.data(), batch_sum, count * 3 * sizeof(double), cudaMemcpyDeviceToHost,
+                               ctx->stream));
+            CK(cudaStreamSynchronize(ctx->stream));
+            for (std::size_t t = 0; t < count; ++t)
+                sum.mass += h_sum[3 * t + 0], sum.abs_rate += h_sum[3 * t + 1], sum.absorbed += h_sum[3 * t + 2];
+        }
+        CK(cudaFree(work)), CK(cudaFree(batch_rows)), CK(cudaFree(batch_sum));
+        CK(cudaFree(d_px)), CK(cudaFree(d_py)), CK(cudaFree(d_pz));
+        CK(cudaFree(d_elem)), CK(cudaFree(d_lk)), CK(cudaFree(d_own)), CK(cudaFree(d_w)), CK(cudaFree(d_sa));
+        CK(cudaFree(d_sigma_t));
+        if (d_ox)
+            CK(cudaFree(d_ox));
+        if (d_ow)
+            CK(cudaFree(d_ow));
+        if (d_ix)
+            CK(cudaFree(d_ix));
+        if (d_iw)
+            CK(cudaFree(d_iw));
+    }
+    if (host_mass_table)
+        CK(cudaMemcpy(host_mass_table, mass_acc, W * sizeof(double), cudaMemcpyDeviceToHost));
+    CK(cudaFree(mass_acc));
+    if (fp32) {
+        float *node_f = own(dalloc<float>(total_nodes));
+        k_cast_d2f<<<blocks(total_nodes, 256), 256, 0, ctx->stream>>>(node_acc, node_f, total_nodes);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(node_acc));
+        r.lnode_f = node_f, r.lnode_d = nullptr;
+    } else {
+        own(node_acc);
+        r.lnode_d = node_acc, r.lnode_f = nullptr;
+    }
+    r.ltable = nullptr, r.lM = M, r.lm0 = 0, r.ldt = dt;
+    return sum;
 }
 void react_lattice(Context *ctx, double *state, double tau, double source_time) {
     ReactionView &r = ctx->reaction->r;
     const View &v = ctx->v;
-    if (!r.ltable)
-        throw std::runtime_error("react_lattice: no lattice table");
-    k_fcs_points_lattice<<<blocks(std::size_t(v.cells) * r.P), 256, 0, ctx->stream>>>(v, r, source_time);
-    k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
-    k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
+    if (r.lnode_f) {
+        k_fcs_nodes_lattice_f<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r, source_time);
+    } else if (r.lnode_d) {
+        k_fcs_nodes_lattice_d<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r, source_time);
+    } else {
+        if (!r.ltable)
+            throw std::runtime_error("react_lattice: no lattice table");
+        k_fcs_points_lattice<<<blocks(std::size_t(v.cells) * r.P), 256, 0, ctx->stream>>>(v, r, source_time);
+        k_fcs_element<<<blocks(std::size_t(v.cells) * v.local), 256, 0, ctx->stream>>>(v, r);
+        k_fcs_gather<<<blocks(v.nodes), 256, 0, ctx->stream>>>(v, r);
+    }
     if (ctx->adaptive)
         react_rows_adaptive_launch(ctx, r, state, tau, true);
     else

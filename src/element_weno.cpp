@@ -1,6 +1,7 @@
 #include "element_weno.hpp"
 #include "base_bar.hpp"
 #include "parallel.hpp"
+#include "uncollided_lattice3d.hpp"
 #include <iostream>
 #include <algorithm>
 #include <atomic>
@@ -3688,6 +3689,33 @@ Vec ElementWeno::collided_source(double t, double *uncollided_mass, ElementWenoS
         return Vec::Zero(nodes);
     }
     const double start = seconds();
+    if (options.uncollided_lattice3d && options.uncollided_lattice3d->nodal) {
+        auto &T = *options.uncollided_lattice3d;
+        if (!T.nodal_built) {
+            std::vector<double> shape_rm(std::size_t(local_nodes) * fcs_per_element_);
+            for (int l = 0; l < local_nodes; ++l)
+                for (int k = 0; k < fcs_per_element_; ++k)
+                    shape_rm[std::size_t(l) * fcs_per_element_ + k] = fcs_shape_(l, k);
+            auto sigma_a_of = [&](const V3 &x) {
+                return options.material && options.material->sigma_a ? options.material->sigma_a(x) : options.sigma_a;
+            };
+            T.build_nodal(cells, nodes, local_nodes, fcs_per_element_, connectivity_, fcs_points_, fcs_weight_,
+                          fcs_sigma_s_, shape_rm.data(), fcs_node_mass_.data(),
+                          [&](int e) { return element_owned(e); }, sigma_a_of, T.final_time);
+        }
+        if (uncollided_mass)
+            *uncollided_mass = T.nodal_mass(t);
+        if (T.node_table_f.empty() && T.node_table_d.empty()) {
+            if (stats)
+                stats->t_fcs_density += seconds() - start;
+            return Vec::Zero(nodes);
+        }
+        Vec out(nodes);
+        parallel_for(nodes, [&](int i) { out[i] = T.nodal_value(i, t); });
+        if (stats)
+            stats->t_fcs_density += seconds() - start;
+        return out;
+    }
     std::vector<double> rho;
     options.uncollided_density(t, fcs_points_, rho);
     const double evaluated = seconds();
