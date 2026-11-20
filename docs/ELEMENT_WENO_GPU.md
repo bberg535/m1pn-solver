@@ -322,6 +322,6 @@ geschätzt 1.2–1.4× bei Umbau aller Kernel und des Speicherlayouts.
 
 **Lokale Zeitschritte (Abschätzung, nicht umgesetzt).** Auf Tensorgittern ist der Schritt eines Elements durch
 min(h_x, h_y[, h_z]) begrenzt; jedes Element, das in *einer* Achse im feinen Zentrum liegt, braucht den feinen
-Schritt. Ideales LTS (Stufen 2^k) brächte als Arbeitsanteil: GB/GBH/GBQ 2D 0.941, 3D 0.972 (gleiche Grading-Muster),
-also 6 % bzw. 3 % – den Aufwand (Positivität und Realisierbarkeit an Stufengrenzen) nicht wert. Lohnend nur auf
+Schritt. Ideales LTS (Stufen 2^k) brächte als Arbeitsanteil: GB/GBH/GBQ 2D 0.941, 3D 0.981 (gleiche Grading-Muster),
+also 6 % bzw. 2 % – den Aufwand (Positivität und Realisierbarkeit an Stufengrenzen) nicht wert. Lohnend nur auf
 hierarchischen (Quadtree-)Gittern.
