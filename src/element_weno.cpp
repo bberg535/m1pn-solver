@@ -1100,7 +1100,11 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 const int d = side_id / 2, side = side_id % 2;
                 V3 normal = V3::Zero();
                 normal[d] = side ? 1 : -1;
+                const double tb0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
                 boundaries_[2 * d + side] = std::make_unique<Boundary>(pn, *canonical_, normal, false, false);
+                const double tb1 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (ctor_timing)
+                    std::fprintf(stderr, "ctor:   side %d Boundary %.3f s\n", side_id, tb1 - tb0);
                 // Face integrand .5 (A_n - I)(u - exterior(u, datum)) = (A_n - llf_homogeneous) u - llf_datum datum.
                 boundary_flux_t_[2 * d + side] =
                     restrict_square(pn.normal(normal) - boundaries_[2 * d + side]->llf_homogeneous, "boundary flux").transpose();
@@ -1157,8 +1161,12 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 std::vector<int> hemispheres{+1};
                 if (options.positivity_projection && !options.projection_half_range)
                     hemispheres.push_back(-1);
+                const double ts0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
                 separable_[2 * d + side] = std::make_shared<SeparableTrace>(
                     pn.order, active, boundaries_[2 * d + side]->frame, rule_n, hemispheres);
+                const double ts1 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (ctor_timing)
+                    std::fprintf(stderr, "ctor:   side %d rest-before-separable %.3f separable %.3f s\n", side_id, ts0 - tb1, ts1 - ts0);
                 if (options.positivity_projection) {
                     std::vector<double> rings;
                     for (int h : hemispheres) {

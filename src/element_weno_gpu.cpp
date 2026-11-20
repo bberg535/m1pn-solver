@@ -1955,6 +1955,8 @@ double ElementWenoGpu::spectral_radius(int iterations, const std::array<Field, 2
             require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed (GPU)");
             if (k >= iterations - tail)
                 radius = std::max(radius, growth);
+            if (std::getenv("M1PN_RADIUS_TRACE"))
+                std::fprintf(stderr, "radius: gamma %g it %d growth %.10g\n", gamma_value, k, growth);
             gpu::divide(ctx_, b.x, b.r, growth);
         }
         if (end) {

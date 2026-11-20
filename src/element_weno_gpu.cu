@@ -3666,6 +3666,7 @@ void upload(void *device, const void *host, std::size_t bytes) {
 void download(void *host, const void *device, std::size_t bytes) {
     CK(cudaMemcpy(host, device, bytes, cudaMemcpyDeviceToHost));
 }
+void warm_up() { CK(cudaFree(nullptr)); }
 void synchronize() { CK(cudaDeviceSynchronize()); }
 void synchronize(Context *ctx) { CK(cudaStreamSynchronize(ctx->stream)); }
 void *host_alloc(std::size_t bytes) {

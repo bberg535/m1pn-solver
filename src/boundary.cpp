@@ -2,6 +2,7 @@
 #include "boundary.hpp"
 #include "cone.hpp"
 #include <Eigen/SVD>
+#include <Eigen/Sparse>
 #include <Eigen/Eigenvalues>
 namespace m1pn {
 Four copied_velocity_exterior(double density, const Four &interior,
@@ -83,13 +84,25 @@ Boundary::Boundary(const Angular &a, const CanonicalC1 &c, const V3 &normal, boo
     frame.col(1) = n.cross(frame.col(0));
     frame.col(2) = n;
     D = pn.rotation(frame);
-    Rplus = D * c.Rplus;
-    Rminus = D * c.Rminus;
-    require(maxabs(pn.normal(n) - D * pn.normal(V3::UnitZ()) * D.transpose()) < 2e-11,
-            "PN rotation covariance failed");
-    homogeneous = Rplus * c.sigma.asDiagonal() * Rplus.transpose();
-    if (!c0)
-        homogeneous.noalias() -= Rminus * c.sigma.asDiagonal() * c.reflection * Rplus.transpose();
+    // D is block diagonal in l and the normal matrices couple only l +- 1 (a few entries per row): sparse products
+    // (P35: q = 1296, ~28 GFLOP dense per side before, the largest part of the scheme setup).
+    const Eigen::SparseMatrix<double> Ds = D.sparseView();
+    Rplus = Ds * c.Rplus;
+    Rminus = Ds * c.Rminus;
+    const Mat normal_matrix = pn.normal(n);
+    const Eigen::SparseMatrix<double> Ns = normal_matrix.sparseView(), Zs = pn.normal(V3::UnitZ()).sparseView();
+    {
+        const Mat DZ = Ds * Mat(Zs);                     // q x q
+        const Mat rotated = DZ * Ds.transpose();          // dense x sparse
+        require(maxabs(normal_matrix - rotated) < 2e-11, "PN rotation covariance failed");
+    }
+    // The homogeneous trace action is only read by flux() (path B, norms = true): skipped otherwise (2 dense q x q
+    // products, P35 ~3 GFLOP per side).
+    if (norms) {
+        homogeneous = Rplus * c.sigma.asDiagonal() * Rplus.transpose();
+        if (!c0)
+            homogeneous.noalias() -= Rminus * c.sigma.asDiagonal() * c.reflection * Rplus.transpose();
+    }
     norm = llf_norm = std::numeric_limits<double>::quiet_NaN(); // set below unless norms == false
     if (norms) {
         Eigen::JacobiSVD<Mat> normsolve(homogeneous);
@@ -97,9 +110,9 @@ Boundary::Boundary(const Angular &a, const CanonicalC1 &c, const V3 &normal, boo
     }
     const Mat exterior_map = Mat::Identity(pn.q,pn.q) +
         Rminus * (c.reflection * Rplus.transpose() - Rminus.transpose());
-    const Mat normal_matrix = pn.normal(n);
+    // (N - I) E = N E - E with N sparse.
     llf_homogeneous = .5 * (normal_matrix + Mat::Identity(pn.q,pn.q)) +
-        .5 * (normal_matrix - Mat::Identity(pn.q,pn.q)) * exterior_map;
+        .5 * (Mat(Ns * exterior_map) - exterior_map);
     if (norms) {
         Eigen::JacobiSVD<Mat> llf_svd(llf_homogeneous);
         llf_norm = llf_svd.singularValues()[0];
@@ -111,8 +124,8 @@ Boundary::Boundary(const Angular &a, const CanonicalC1 &c, const V3 &normal, boo
         const Mat z = c.solve.solve(load);
         require(((Mat::Identity(c.r, c.r) + c.S) * z - load).norm() < 2e-12 * std::max(1., load.norm()),
                 "C1 SPD true residual failed for datum map");
-        llf_datum = .5 * (normal_matrix - Mat::Identity(pn.q, pn.q)) *
-                    (Rminus * (c.root.cwiseInverse().asDiagonal() * z));
+        const Mat Rz = Rminus * (c.root.cwiseInverse().asDiagonal() * z);
+        llf_datum = .5 * (Mat(Ns * Rz) - Rz);
     }
     rule = sphere_rule(pn.order + 2, -1);
     odd_basis.resize(rule.size(), c.r);
@@ -204,6 +217,7 @@ Incoming Boundary::data(const Inflow &in, const V3 &x, double time) const {
 }
 Vec Boundary::flux(const Vec &u, const Vec &d) const {
     // The homogeneous trace action is cached. Only physical datum solves remain.
+    require(homogeneous.size() != 0, "Boundary::flux needs the boundary built with norms = true");
     Vec g = homogeneous * u;
     if (!c0 && d.squaredNorm() != 0) {
         Vec h = canonical.incoming(Vec::Zero(canonical.r), d);

@@ -14,6 +14,7 @@
 #endif
 #include "amr.hpp"
 #include <optional>
+#include <thread>
 #include "element_weno.hpp"
 #include "element_weno_mpi.hpp"
 #include "hardware.hpp"
@@ -495,6 +496,24 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     // gathered state with a global scheme (`post`).
     const int ranks = world.size, rank = world.rank;
     const bool distributed = ranks > 1;
+#ifdef M1PN_ELEMENT_GPU
+    // The CUDA context (~1-2 s on the A100) is created while the host builds the scheme; joined before the device.
+    std::thread gpu_warm_up;
+    if (o.gpu)
+        gpu_warm_up = std::thread([] {
+            try {
+                gpu::warm_up();
+            } catch (...) { // the device constructor reports errors
+            }
+        });
+    struct JoinWarmUp {
+        std::thread &t;
+        ~JoinWarmUp() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_warm_up{gpu_warm_up};
+#endif
     // Initialization phases (wall seconds since the previous mark) to stderr and summary.json ("init_phases").
     double init_last = begin;
     std::string init_phases;
@@ -1208,6 +1227,9 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     std::unique_ptr<ElementWenoGpu> device;
     double gpu_radius_seconds = 0;
     if (o.gpu) {
+        if (gpu_warm_up.joinable())
+            gpu_warm_up.join();
+        init_mark("gpu context (overlapped)");
         device = std::make_unique<ElementWenoGpu>(*scheme_ptr);
         init_mark("gpu setup");
         const double r0 = seconds();
