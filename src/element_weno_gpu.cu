@@ -489,6 +489,17 @@ struct FluxShared {
             s += val[base + w] * g[idx[base + w]];
         return s;
     }
+    // Adaptive PN: only gradient columns < lim (as ElementWeno::rate, which sums col < qpad).
+    __device__ double row_upto(const double *g, int d, int j, int lim) const {
+        const int base = (d * q + j) * width;
+        double s = 0;
+        for (int w = 0; w < width; ++w) {
+            const int col = idx[base + w];
+            if (col < lim)
+                s += val[base + w] * g[col];
+        }
+        return s;
+    }
 };
 // FUSE (experiment/big-rebuilds): the last mass-solve direction also forms the stage combination of the PN rows c >= 4
 // (as k_combine part 1, same operations in the same order, so bitwise equal): out = old a + fresh (x + tau rate),
@@ -898,7 +909,10 @@ __device__ FluxShared stage_flux(const View &v, double *shared) {
 }
 // moments_only: one thread per (node, j < 4), moment_rate = project(field + flux) without writing field; otherwise
 // field += flux for all entries (and moment_rate when want_moments).
-__global__ void k_flux_rows(View v, double *field, bool want_moments, bool moments_only) {
+// Adaptive PN (tile_q != nullptr): gradient columns < qpad of the node only, as ElementWeno::rate (the padded gradient
+// segments leave nonzero entries above the node's order).
+__global__ void k_flux_rows(View v, double *field, bool want_moments, bool moments_only, const int *tile_q = nullptr,
+                            int tb0 = 1, int tb1 = 1, int tb2 = 1, int nt0 = 1, int nt1 = 1) {
     extern __shared__ double shared[];
     const FluxShared F = stage_flux(v, shared);
     const int q = v.q;
@@ -909,9 +923,15 @@ __global__ void k_flux_rows(View v, double *field, bool want_moments, bool momen
     const std::size_t at = std::size_t(i) * q + j;
     // Same order as the host: field + (-s_0) + (-s_1) ...
     double value = field[at];
+    int lim = q;
+    if (tile_q) {
+        const int px = i % v.npa[0], py = (i / v.npa[0]) % v.npa[1], pz = i / (v.npa[0] * v.npa[1]);
+        const int qi = tile_q[((pz / tb2) * nt1 + py / tb1) * nt0 + px / tb0];
+        lim = qi <= 4 ? min(4, q) : min(q, 4 + ((qi - 4 + 31) / 32) * 32);
+    }
     for (int d = 0; d < v.dimension; ++d) {
         const double *g = v.gradient[d] + std::size_t(i) * q;
-        value += -F.row(g, d, j);
+        value += -F.row_upto(g, d, j, lim);
     }
     if (!moments_only)
         field[at] = value;
@@ -3047,7 +3067,7 @@ __global__ void k_line_solve_adaptive(View v, int d, double *field, const double
 
 __global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
     View v, const double *a, double *result, bool want_low, double constant_gamma,
-    int tb0, int tb1, const AdaptiveTileChunk *chunks, int nchunks) {
+    int tb0, int tb1, const AdaptiveTileChunk *chunks, int nchunks, const int *tile_q, int nt0) {
     if (blockIdx.x >= nchunks)
         return;
     const AdaptiveTileChunk tc = chunks[blockIdx.x];
@@ -3073,7 +3093,11 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
 #pragma unroll
                 for (int dx = 0; dx < 3; ++dx) {
                     const int x = ix + dx - 1;
-                    W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx ? F[f][(std::size_t(y) * npx + x) * q + c] : 0.;
+                    // As ElementWeno::stabilization_residual (cm_of): neighbour node contributions only for moments
+                    // active at that node; the padded gradient segments leave nonzero inactive gradient entries.
+                    W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx && c < tile_q[(y / tb1) * nt0 + x / tb0]
+                                      ? F[f][(std::size_t(y) * npx + x) * q + c]
+                                      : 0.;
                 }
         };
         load_row(y0 - 1, 0);
@@ -3123,7 +3147,8 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
 }
 
 __global__ void k_stabilization_adaptive(View v, const double *a, double *result, bool want_low, double constant_gamma,
-                                         int tb0, int tb1, int tb2, const AdaptiveTileChunk *chunks, int nchunks) {
+                                         int tb0, int tb1, int tb2, const AdaptiveTileChunk *chunks, int nchunks,
+                                         const int *tile_q, int nt0, int nt1) {
     if (blockIdx.x >= nchunks)
         return;
     const AdaptiveTileChunk tc = chunks[blockIdx.x];
@@ -3151,9 +3176,17 @@ __global__ void k_stabilization_adaptive(View v, const double *a, double *result
             const int cl = klass_of(v, e);
             const double nu = v.class_viscosity ? v.class_viscosity[cl] : v.viscosity;
             const double *K = v.stiffness_rows + (std::size_t(cl) * n + l) * n;
+            // As ElementWeno::stabilization_residual (cm_of): neighbour contributions only for moments active there.
+            bool act[27];
+            for (int m = 0; m < n; ++m) {
+                const int node = map[m], px = node % v.npa[0], py = (node / v.npa[0]) % v.npa[1];
+                const int pz = node / (v.npa[0] * v.npa[1]);
+                act[m] = c < tile_q[((pz / tb2) * nt1 + py / tb1) * nt0 + px / tb0];
+            }
             double term = 0;
             for (int m = 0; m < n; ++m)
-                term += K[m] * a[std::size_t(map[m]) * q + c];
+                if (act[m])
+                    term += K[m] * a[std::size_t(map[m]) * q + c];
             term *= nu;
             const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
             const double weight = -nu * g;
@@ -3162,7 +3195,8 @@ __global__ void k_stabilization_adaptive(View v, const double *a, double *result
                     const double *C = v.convection_t_rows[d] + (std::size_t(cl) * n + l) * n;
                     double cd = 0;
                     for (int m = 0; m < n; ++m)
-                        cd += C[m] * v.gradient[d][std::size_t(map[m]) * q + c];
+                        if (act[m])
+                            cd += C[m] * v.gradient[d][std::size_t(map[m]) * q + c];
                     term += weight * cd;
                 }
             if (want_low && c < 4) {
@@ -3191,6 +3225,7 @@ __global__ void k_combine_adaptive(View v, double *r, const double *x, const dou
     const int z0 = tc.tz * tb2, z1 = min(v.npa[2], z0 + tb2);
     const int wx = x1 - x0, wy = y1 - y0, wz = z1 - z0, tnodes = wx * wy * wz;
     const bool active_c = c < tc.q_lim;
+    const int qpad = tc.q_lim <= 4 ? min(4, q) : min(q, 4 + ((tc.q_lim - 4 + 31) / 32) * 32);
     for (int idx = warp; idx < tnodes; idx += nwarps) {
         const int lx = idx % wx, ly = (idx / wx) % wy, lz = idx / (wx * wy);
         const int i = (z0 + lz) * v.stride[2] + (y0 + ly) * v.stride[1] + (x0 + lx);
@@ -3202,7 +3237,7 @@ __global__ void k_combine_adaptive(View v, double *r, const double *x, const dou
         double rate = r[t];
         for (int d = 0; d < v.dimension; ++d) {
             const double *g = v.gradient[d] + std::size_t(i) * q;
-            rate += -F.row(g, d, c);
+            rate += -F.row_upto(g, d, c, qpad);
         }
         if (v.node_mirror && (v.node_mirror[i] & v.comp_odd[c]))
             rate = 0.0;
@@ -3690,7 +3725,8 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
             k_stabilization_strip_low4<16><<<g4, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
             if (ad->tile_chunks_n > 0)
                 k_stabilization_strip_adaptive<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
-                    v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks, ad->tile_chunks_n);
+                    v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks, ad->tile_chunks_n,
+                    ad->d_tile_q, ad->nt[0]);
         } else {
             const int q4 = std::min(4, v.q);
             k_stabilization_low4<<<blocks(std::size_t(v.nodes) * q4), 256, 0, ctx->stream>>>(
@@ -3698,7 +3734,7 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
             if (ad->tile_chunks_n > 0)
                 k_stabilization_adaptive<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
                     v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->tb[2],
-                    ad->d_tile_chunks, ad->tile_chunks_n);
+                    ad->d_tile_chunks, ad->tile_chunks_n, ad->d_tile_q, ad->nt[0], ad->nt[1]);
         }
         return;
     }
@@ -3794,11 +3830,17 @@ std::size_t flux_shared(Context *ctx) {
 } // namespace
 void flux_moments(Context *ctx, const double *field) {
     const View &v = ctx->v;
-    k_flux_rows<<<blocks(std::size_t(v.nodes) * 4), 256, flux_shared(ctx), ctx->stream>>>(v, const_cast<double *>(field), true, true);
+    const AdaptiveDevice *ad = ctx->adaptive && ctx->adaptive->active && !v.periodic ? ctx->adaptive : nullptr;
+    k_flux_rows<<<blocks(std::size_t(v.nodes) * 4), 256, flux_shared(ctx), ctx->stream>>>(
+        v, const_cast<double *>(field), true, true, ad ? ad->d_tile_q : nullptr, ad ? ad->tb[0] : 1, ad ? ad->tb[1] : 1,
+        ad ? ad->tb[2] : 1, ad ? ad->nt[0] : 1, ad ? ad->nt[1] : 1);
 }
 void flux_rows(Context *ctx, double *field, bool want_moments) {
     const View &v = ctx->v;
-    k_flux_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx), ctx->stream>>>(v, field, want_moments, false);
+    const AdaptiveDevice *ad = ctx->adaptive && ctx->adaptive->active && !v.periodic ? ctx->adaptive : nullptr;
+    k_flux_rows<<<blocks(std::size_t(v.nodes) * v.q), 256, flux_shared(ctx), ctx->stream>>>(
+        v, field, want_moments, false, ad ? ad->d_tile_q : nullptr, ad ? ad->tb[0] : 1, ad ? ad->tb[1] : 1,
+        ad ? ad->tb[2] : 1, ad ? ad->nt[0] : 1, ad ? ad->nt[1] : 1);
 }
 void limiter(Context *ctx) {
     const View &v = ctx->v;

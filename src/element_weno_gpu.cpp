@@ -1633,6 +1633,9 @@ void ElementWenoGpu::adapt_gpu(bool initial, ElementWenoStats *stats) {
     const bool changed = adaptive_plan_.update_from_energies(adaptive_rho_, adaptive_E_, adaptive_face_E_,
                                                              initial, adaptive_shrunken_);
     if (changed) {
+        // The closure / low flux of the next stage were formed from the state before the update (finish_stage with
+        // closure_next); the update zeroes moments of shrunken tiles (l = 2 enters the low flux), so recompute them.
+        closure_ready_ = false;
         s_.update_adaptive_side_q(adaptive_plan_);
         gpu::adaptive_upload_and_zero(ctx_, u_, adaptive_plan_, adaptive_shrunken_);
         const int old_fq = adaptive_fetch_q_;
@@ -1798,6 +1801,68 @@ void ElementWenoGpu::lockstep_end(int s, double time, double dt, ElementWenoStat
     stage_end(lockstep_buffer_, t[s], x[s], out[s], u_, old[s], fresh[s], half, weight[s], dt, stats);
     if (s == 3)
         std::swap(u_, b2_);
+}
+std::array<Field, 3> ElementWenoGpu::debug_gradients() {
+    gpu::gradients(ctx_, u_);
+    gpu::synchronize(ctx_);
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    std::array<Field, 3> g;
+    for (int d = 0; d < s_.dimension; ++d) {
+        g[d].resize(s_.nodes, s_.moments);
+        gpu::download(g[d].data(), b.gradient[d], sizeof(double) * std::size_t(s_.nodes) * s_.moments);
+    }
+    return g;
+}
+Field ElementWenoGpu::debug_stage(double time, double dt) {
+    ElementWenoStats st;
+    double *scratch = (u_ == b1_) ? b2_ : b1_;
+    stage(time, u_, scratch, u_, 0, 1, .5 * dt, 1. / 6, dt, st, std::numeric_limits<double>::quiet_NaN());
+    gpu::synchronize(ctx_);
+    Field out(s_.nodes, s_.moments);
+    gpu::download(out.data(), scratch, sizeof(double) * std::size_t(s_.nodes) * s_.moments);
+    return out;
+}
+Field ElementWenoGpu::debug_moment_rate() {
+    gpu::synchronize(ctx_);
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    std::vector<double> raw(std::size_t(4) * s_.nodes);
+    gpu::download(raw.data(), b.moment_rate, sizeof(double) * raw.size());
+    Field out(s_.nodes, 4);
+    for (int i = 0; i < s_.nodes; ++i)
+        for (int r = 0; r < 4; ++r)
+            out(i, r) = raw[std::size_t(r) * s_.nodes + i];
+    return out;
+}
+Field ElementWenoGpu::debug_load() {
+    gpu::synchronize(ctx_);
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    Field out(s_.nodes, 4);
+    gpu::download(out.data(), b.load, sizeof(double) * std::size_t(4) * s_.nodes);
+    for (int i = 0; i < s_.nodes; ++i)
+        out.row(i) /= s_.lumped[i];
+    return out;
+}
+Field ElementWenoGpu::debug_stab_low() {
+    gpu::synchronize(ctx_);
+    const gpu::Buffers b = gpu::buffers(ctx_);
+    const int n = s_.local_nodes;
+    std::vector<double> raw(std::size_t(4) * n * s_.cells);
+    gpu::download(raw.data(), b.stab_low, sizeof(double) * raw.size());
+    Field out(s_.cells, 4 * n);
+    for (int e = 0; e < s_.cells; ++e)
+        for (int k = 0; k < 4 * n; ++k)
+            out(e, k) = raw[std::size_t(k) * s_.cells + e];
+    return out;
+}
+Field ElementWenoGpu::debug_mass_solve(const Field &rhs) {
+    require(rhs.rows() == s_.nodes && rhs.cols() == s_.moments, "debug_mass_solve: size");
+    double *scratch = (u_ == b1_) ? b2_ : b1_;
+    gpu::upload(scratch, rhs.data(), sizeof(double) * std::size_t(s_.nodes) * s_.moments);
+    gpu::mass_solve(ctx_, scratch);
+    gpu::synchronize(ctx_);
+    Field out(s_.nodes, s_.moments);
+    gpu::download(out.data(), scratch, sizeof(double) * std::size_t(s_.nodes) * s_.moments);
+    return out;
 }
 Field ElementWenoGpu::state() {
     gpu::synchronize();
