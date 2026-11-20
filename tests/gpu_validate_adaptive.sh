@@ -61,6 +61,23 @@ L3="--case lattice-3d --dimension 3 --inflow vacuum --background 1e-10 --mirror-
 LS="--case line-source --dimension 2 --inflow vacuum --pulse-width .01 --background .0009 --sigma-s 3 --time 0.02"
 CR="--case crossing-study --inflow crossing-study-transport --dimension 2 --pulse-width .07 --background .001 --time 0.05"
 
+# pair0 TAG TOL ARGS...: CPU and GPU both with --dt 0 (dynamic AMR re-estimates dt after every remesh, so the CPU
+# step of the first mesh cannot be passed on; the power iteration is deterministic on both).
+pair0() {
+  local tag=$1 tol=$2; shift 2
+  rm -rf "$OUT/${tag}_cpu" "$OUT/${tag}_gpu"
+  echo "$tag"
+  # shellcheck disable=SC2086
+  if ! "$B" $EW "$@" --output "$OUT/${tag}_cpu" > "$OUT/${tag}_cpu.log" 2>&1; then
+    echo "  FAIL: cpu run failed"; tail -3 "$OUT/${tag}_cpu.log"; FAILED=$((FAILED+1)); FAILED_CASES+=" $tag"; return
+  fi
+  # shellcheck disable=SC2086
+  if ! "$B" $EW "$@" --gpu --output "$OUT/${tag}_gpu" > "$OUT/${tag}_gpu.log" 2>&1; then
+    echo "  FAIL: gpu run failed"; tail -3 "$OUT/${tag}_gpu.log"; FAILED=$((FAILED+1)); FAILED_CASES+=" $tag"; return
+  fi
+  python3 "$CMP" "$OUT/${tag}_cpu" "$OUT/${tag}_gpu" --max-rel "$tol" || { FAILED=$((FAILED+1)); FAILED_CASES+=" $tag"; }
+}
+
 # both TAG ARGS...: the same configuration uniform (TAG_uni) and with adaptive PN (TAG_adapt)
 both() { local tag=$1; shift; pair "${tag}_uni" 1e-8 "$@"; pair "${tag}_adapt" 1e-8 "$@" $AD; }
 
@@ -82,7 +99,17 @@ both l3d_14_P3            $L3 --elements 14 --degree 1 --pn-order 3 --time 0.1
 both l3d_14_P7            $L3 --elements 14 --degree 1 --pn-order 7 --time 0.1
 both l3d_q2_14_P3         $L3 --elements 14 --degree 2 --pn-order 3 --time 0.1
 both l3d_fcs_28_P3        $L3 --elements 28 --degree 1 --pn-order 3 --time 0.5 --fcs analytic
-# graded meshes are 1D/2D only (--cells-per-unit); 3D: broken lines + split stage + FCS on the uniform mesh
+# 3D graded meshes (--cells-per-unit, since 20.11.2026) with the 2D improvements: FCS, broken lines + split, adaptive
+G3="--elements 7 --cells-per-unit 1,2,4,4,4,2,1"
+both l3d_graded_P3        $L3 $G3 --degree 1 --pn-order 3 --time 0.1
+both l3d_graded_P7        $L3 $G3 --degree 1 --pn-order 7 --time 0.1
+both l3d_graded_q2_P3     $L3 --elements 7 --cells-per-unit 1,1,2,2,2,1,1 --degree 2 --pn-order 3 --time 0.1
+both l3d_graded_full_P7   $L3 $G3 --degree 1 --pn-order 7 --time 0.3 --fcs analytic --break-units on --split-breaks on
+# 3D dynamic AMR (graded base mesh, one remesh 512 -> 24389 nodes), uniform PN and adaptive PN
+AMR3="--elements 7 --cells-per-unit 1,1,1,1,1,1,1 --degree 1 --time 0.5 --amr on --amr-levels 2 --amr-interval 0.1"
+pair0 l3d_amr_P3          1e-8 $L3 $AMR3 --pn-order 3
+pair0 l3d_amr_ad_P7       1e-8 $L3 $AMR3 --pn-order 7 $AD
+# uniform 3D mesh: broken lines + split stage + FCS
 both l3d_brk_split_fcs_P3 $L3 --elements 14 --degree 1 --pn-order 3 --time 0.1 --break-units on --split-breaks on \
      --fcs analytic
 
