@@ -41,6 +41,19 @@ public:
     void lockstep_end_a(int s, double time, double dt, ElementWenoStats &stats);
     void lockstep_end_b(ElementWenoStats &stats);
     const Field &host_state() const { return a_h_; }
+    // Diagnostics (tests/adaptive_cpu_gpu_debug.cpp): device results of single operators on the current device state
+    // (after begin()), downloaded to the host. debug_gradients: M^-1 C_d u per direction (the gradient kernels of a
+    // stage). debug_mass_solve: M^-1 rhs with the stage mass solve (rhs uploaded into a scratch buffer).
+    std::array<Field, 3> debug_gradients();
+    Field debug_mass_solve(const Field &rhs);
+    // debug_stage: the first SSPRK(4,3) stage u + dt/2 rate(time, u) of the current device state (state unchanged).
+    Field debug_stage(double time, double dt);
+    // debug_moment_rate: device moment_rate of the last stage, nodes x 4 in project() order (rho, J0, J1, J2).
+    Field debug_moment_rate();
+    // debug_load: device low-order load / lumped of the last stage (nodes x 4, project() order).
+    Field debug_load();
+    // debug_stab_low: device stab_low of the last stage as cells x 4 n (element-local node l, project() order).
+    Field debug_stab_low();
     // Spectral radius of high_order_step() (same power iteration, on the device).
     double spectral_radius();
     double spectral_radius(int iterations, const std::array<Field, 2> *start, std::array<Field, 2> *end);

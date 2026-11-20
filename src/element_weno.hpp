@@ -244,6 +244,7 @@ struct ElementWenoStats {
 };
 struct ElementWenoDebug {
     Field unlimited_rate, ho_moment_rate; // N x 4
+    Field stabilization_low;              // cells x 4 n (projected element stabilization loads), diagnostics
 };
 class ElementWenoMpi;
 class ElementWenoGpu;

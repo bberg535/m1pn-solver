@@ -221,3 +221,30 @@ Kampagnen mit `skip_fields` sind davon nicht betroffen.
 
 Die frühere Auffälligkeit der tardis-Lattice-Kampagne (P35 224² kaum schneller als 448²) tritt in Einzelläufen nicht
 auf (T = 1: 25.6 s gegen 174.7 s); sie kam vermutlich von parallelen Aufgaben im damaligen Job.
+
+## Adaptive PN: CPU und GPU gleich (20.11.2026, Branch `fix/gpu-adaptive-consistency`)
+
+Die dynamische Tile-adaptive PN (`--adaptive-pn on`) wich auf der GPU von der CPU ab (Dichte max-rel bis 1.8e-6 bei
+Graded Mesh + Broken Lines, 8e-8 im 2D-Lattice 56² P7 T = 0.2), nur bei gemischten Tile-Ordnungen. Uniform und bei
+einheitlicher Ordnung (Toleranz 1 oder 1e-30) stimmten beide bis auf Rundung. Zwei GPU-Fehler:
+
+1. **Stabilisierung an Ordnungsgrenzen.** Die Gradienten-Segmente reichen einen Knoten in das Tile niedrigerer Ordnung;
+   dort sind Gradienten von Momenten, die an diesem Knoten inaktiv sind, ungleich null. Die CPU
+   (`stabilization_residual`, `cm_of`) nimmt Beiträge eines Nachbarknotens nur für dort aktive Momente,
+   `k_stabilization_adaptive` und `k_stabilization_strip_adaptive` nahmen alle. Jetzt maskiert (Tile-Ordnung des
+   Nachbarknotens). Ebenso summieren `k_combine_adaptive` und `k_flux_rows` die Flusszeilen nur über Gradientenspalten
+   unter `qpad` des Knotens, wie `ElementWeno::rate`.
+2. **Closure nach dem Update.** Closure und Low-Flux der ersten Stufe eines Schritts entstehen schon in der letzten
+   Stufe des vorigen (`closure_ready_`). Das Update nullt danach Momente geschrumpfter Tiles (l = 2 geht in den
+   Low-Flux ein); `adapt_gpu` setzt jetzt `closure_ready_ = false`, wenn sich eine Tile-Ordnung ändert.
+
+Gefunden mit `m1pn_adaptive_cpu_gpu_debug` (`tests/adaptive_cpu_gpu_debug.cpp`, nur GPU-Build): vergleicht Init-Update,
+Gradienten, Massensolve, eine Stufe, PN-Momentenrate, `stab_low`, Low-Order-Last und mehrere Schritte operatorweise
+(`ElementWenoGpu::debug_*`). Validierung: `tests/gpu_validate_adaptive.sh` (2D-Lattice Feature für Feature, Line Source
+mit FCS + Mirror, Crossing Q1/Q2, 3D-Lattice inkl. FCS und Broken Lines + Split-Breaks; jeweils uniform und adaptiv),
+alle 31 Fälle PASS (1e-17 … 1e-11, FCS-Fälle 4.9e-10 wie uniform); vorher 15 FAIL. `tests/gpu_validate.sh` PASS.
+`adaptive_pn_dynamic` prüft CPU gegen GPU jetzt relativ zur uniformen Abweichung derselben Konfiguration (vorher 5e-4).
+
+Offen (CPU und GPU gleich): Der Massensolve läuft je 32er-Moment-Chunk über Segmente, die auch Knoten enthalten, an
+denen einzelne Momente des Chunks inaktiv sind; Einträge ungleich null an diesen Stellen der rechten Seite wirken auf
+die aktiven Ergebnisse. Bei exakten Nullen harmlos, aber kein exakter Submatrix-Solve je Moment.

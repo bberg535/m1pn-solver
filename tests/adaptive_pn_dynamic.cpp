@@ -176,6 +176,13 @@ void test_graded_broken_cpu_gpu() {
     const Field f_gpu = gpu_ad_full.run(0.0, dt, steps, a0, &st_gf);
     const Field a_gpu = gpu_ad.run(0.0, dt, steps, a0, &st_ga);
 
+    // Reference: the uniform scheme's own CPU vs GPU deviation in this configuration (~1e-8: graded + broken +
+    // split + mirror + material over 20 steps); adaptive PN must not add to it.
+    double diff_uni_cg = 0;
+    for (int i = 0; i < uni.nodes; ++i)
+        diff_uni_cg = std::max(diff_uni_cg,
+                               std::abs(project(u_cpu.row(i).transpose())[0] - project(u_gpu.row(i).transpose())[0]));
+    diff_uni_cg /= std::max(norm_u, 1e-30);
     double diff_full = maxabs(u_gpu - f_gpu);
     check(diff_full < 1e-14, "GPU adaptive(min=max) matches uniform GPU bitwise", diff_full);
 
@@ -185,7 +192,8 @@ void test_graded_broken_cpu_gpu() {
         const double rg = project(a_gpu.row(i).transpose())[0];
         diff_cg = std::max(diff_cg, std::abs(rc - rg));
     }
-    check(diff_cg / std::max(norm_u, 1e-30) < 5e-4, "CPU vs GPU adaptive density agreement",
+    // Not further apart than the uniform scheme (the former bound 5e-4 hid two GPU-only adaptive bugs, 20.11.2026).
+    check(diff_cg / std::max(norm_u, 1e-30) <= 2 * diff_uni_cg + 1e-12, "CPU vs GPU adaptive density agreement (<= 2x uniform)",
           diff_cg / std::max(norm_u, 1e-30));
     const double frac_diff = std::abs(st_a.adaptive_coeff_sum / st_a.adaptive_steps -
                                       st_ga.adaptive_coeff_sum / st_ga.adaptive_steps);

@@ -3326,6 +3326,7 @@ Field ElementWeno::rate(double time, const Field &a, ElementWenoStats *stats,
     timing.t_rate += seconds() - finite_start;
     if (debug) {
         debug->ho_moment_rate = moment_rate;
+        debug->stabilization_low = stabilization_low;
         debug->unlimited_rate = raw_load;
         for (int i = 0; i < nodes; ++i)
             debug->unlimited_rate.row(i) /= lumped[i];

@@ -87,6 +87,11 @@ if(BUILD_TESTING)
   m1pn_test(positivity_projection tests/positivity_projection.cpp 1 300)
   m1pn_test(adaptive_pn_dynamic tests/adaptive_pn_dynamic.cpp 2 300)
   m1pn_test(amr_transfer tests/amr_transfer.cpp 2 120)
+  if(M1PN_ELEMENT_GPU)
+    # Diagnostic (not a ctest): CPU vs GPU adaptive PN operator by operator.
+    add_executable(m1pn_adaptive_cpu_gpu_debug tests/adaptive_cpu_gpu_debug.cpp)
+    target_link_libraries(m1pn_adaptive_cpu_gpu_debug PRIVATE m1pn_element)
+  endif()
   if(ENABLE_MPI)
     # Run with mpirun (not in ctest): mpirun -np 4 m1pn_element_weno_mpi_tests
     add_executable(m1pn_element_weno_mpi_tests tests/element_weno_mpi.cpp)
