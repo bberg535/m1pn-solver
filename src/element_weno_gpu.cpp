@@ -397,6 +397,10 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     for (int side = 0; side < 6 && device_ghost_; ++side)
         if (s.boundaries_[side] && s.out_rules_[side].c.size())
             device_ghost_ = false;
+    if (std::getenv("M1PN_GPU_GHOST_WHY"))
+        std::fprintf(stderr, "ghost: ratio %.3f full %d proj %d half %d empty %d interfaces %d adaptive %d -> device %d\n",
+                     ratio, int(o.fullsphere_ghost), int(o.positivity_projection), int(o.projection_half_range),
+                     int(s.ghost_node_.empty()), int(interfaces_), int(o.adaptive_pn), int(device_ghost_));
     if (device_ghost_) {
         gpu::GhostSetup g;
         g.pairs = int(s.ghost_node_.size());
@@ -1951,6 +1955,8 @@ double ElementWenoGpu::spectral_radius(int iterations, const std::array<Field, 2
             require(std::isfinite(growth) && growth > 0, "High-order spectral estimate failed (GPU)");
             if (k >= iterations - tail)
                 radius = std::max(radius, growth);
+            if (std::getenv("M1PN_RADIUS_TRACE"))
+                std::fprintf(stderr, "radius: gamma %g it %d growth %.10g\n", gamma_value, k, growth);
             gpu::divide(ctx_, b.x, b.r, growth);
         }
         if (end) {

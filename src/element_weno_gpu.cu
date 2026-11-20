@@ -110,6 +110,11 @@ struct Context {
     // schemes (multi-block driver) run concurrently. Blocking stream: operations on the legacy default stream that
     // remain (synchronous copies, upload_async) still order with it.
     cudaStream_t stream = nullptr;
+    // Fork/join streams of the adaptive path: the low-moment (c < 4) line solves and stabilization and the per-axis
+    // high-chunk line solves touch disjoint coefficients (or fields) and are latency bound with few threads each, so
+    // they run concurrently (M1PN_GPU_OVERLAP=0: all on `stream`).
+    cudaStream_t side[2] = {};
+    cudaEvent_t fork_event = nullptr, join_event[2] = {};
     struct ReactionDevice *reaction = nullptr;
     struct BoundaryHighDevice *bhigh = nullptr;
     struct GhostTraceDevice *gtrace = nullptr;
@@ -819,24 +824,46 @@ constexpr int max_strip_classes = 64; // graded 2D Q1: size classes held in cons
 // 2D Q1: the gathered residual of node i only involves its 3 x 3 neighbourhood. One thread per (x, component) walks a
 // strip of SY rows in y with a sliding 3 x 3 window of a, g_0, g_1 in registers (9 loads per output); the four elements
 // around a node are visited as quadrants with compile-time local indices.
-template <int SY>
-__global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const double *a, double *result, bool want_low, double constant_gamma) {
+template <int SY, int MINB = 4>
+__global__ void __launch_bounds__(128, MINB) k_stabilization_strip(View v, const double *a, double *result, bool want_low, double constant_gamma) {
     const int q = v.q, npx = v.npa[0], npy = v.npa[1], cx = v.count[0], cy = v.count[1];
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= npx * q)
         return;
     const int ix = col / q, c = col % q;
     const int y0 = blockIdx.y * SY, y1 = min(npy, y0 + SY);
-    const double *F[3] = {a, v.gradient[0], v.gradient[1]};
+    // Row pointers (column ix, moment c) advanced by one node row per y; x neighbours at -q / +q. The element columns
+    // ex of the two quadrants depend only on ix. Same loads and the same FMA order as before (fewer integer ops:
+    // the 64-bit index products per load dominated the issued instructions).
+    const std::size_t row = std::size_t(npx) * q;
+    const bool xm = ix > 0, xp = ix + 1 < npx;
+    const double *P0 = a + std::size_t(ix) * q + c, *P1 = v.gradient[0] + std::size_t(ix) * q + c,
+                 *P2 = v.gradient[1] + std::size_t(ix) * q + c;
+    int exq[2];
+    bool exok[2];
+#pragma unroll
+    for (int qx = 0; qx < 2; ++qx) {
+        exq[qx] = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+        exok[qx] = exq[qx] >= 0 && exq[qx] < cx;
+    }
     double W[3][3][3];
     auto load_row = [&](int y, int r) {
+        if (y < 0 || y >= npy) {
 #pragma unroll
-        for (int f = 0; f < 3; ++f)
+            for (int f = 0; f < 3; ++f)
 #pragma unroll
-            for (int dx = 0; dx < 3; ++dx) {
-                const int x = ix + dx - 1;
-                W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx ? F[f][(std::size_t(y) * npx + x) * q + c] : 0.;
-            }
+                for (int dx = 0; dx < 3; ++dx)
+                    W[f][r][dx] = 0.;
+            return;
+        }
+        const std::size_t off = std::size_t(y) * row;
+        const double *B[3] = {P0 + off, P1 + off, P2 + off};
+#pragma unroll
+        for (int f = 0; f < 3; ++f) {
+            W[f][r][0] = xm ? B[f][-q] : 0.;
+            W[f][r][1] = B[f][0];
+            W[f][r][2] = xp ? B[f][q] : 0.;
+        }
     };
     load_row(y0 - 1, 0);
     load_row(y0, 1);
@@ -847,9 +874,9 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
         for (int qy = 0; qy < 2; ++qy)
 #pragma unroll
             for (int qx = 0; qx < 2; ++qx) {
-                const int ex = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+                const int ex = exq[qx];
                 const int ey = v.strip_elem[1] ? v.strip_elem[1][2 * y + qy] : y - 1 + qy;
-                if (ex < 0 || ex >= cx || ey < 0 || ey >= cy)
+                if (!exok[qx] || ey < 0 || ey >= cy)
                     continue;
                 const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
                 const int kc = 16 * klass_of(v, e);
@@ -873,7 +900,7 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
                 }
                 out -= term;
             }
-        result[(std::size_t(y) * npx + ix) * q + c] = out;
+        result[std::size_t(y) * row + std::size_t(ix) * q + c] = out;
 #pragma unroll
         for (int f = 0; f < 3; ++f)
 #pragma unroll
@@ -1441,11 +1468,22 @@ struct GhostView {
     double *moments;  // pairs x 4: outgoing ghost moments
     int *flag_list;   // flagged pairs (host)
     GhostDeviceStats *stats;
+    const double *Y;          // traces from the per-side DGEMM (nullptr: k_ghost forms them itself)
+    const std::size_t *ycol;  // pairs: offset of the trace column of pair k in Y
 };
 struct GhostDevice {
     GhostView g;
     int warps = 4; // warps per block of k_ghost (dynamic shared memory: warps x max_points doubles)
     std::vector<void *> owned;
+    // Traces as one DGEMM per side, Y_s = H_s^T A_s (points x pairs of the side): H_s is read once per call instead of
+    // once per pair (P35: 29 MB per side and pair, the bottleneck of uniform high-order runs). M1PN_GPU_GHOST_GEMM=0
+    // keeps the per-warp dot products.
+    bool gemm = false;
+    int count[6] = {};
+    int *nodes[6] = {};
+    std::size_t offset[6] = {};
+    double *A = nullptr, *Y = nullptr;
+    cublasHandle_t handle = nullptr;
 };
 __device__ inline double warp_sum(double v) {
 #pragma unroll
@@ -1652,12 +1690,18 @@ __global__ void __launch_bounds__(128) k_ghost(View v, GhostView g, const double
     const double *ox = g.ox[sd], *oy = g.oy[sd], *oz = g.oz[sd], *w = g.w[sd];
     const double *row = a + std::size_t(node) * q;
     // PN trace at the rule points (filtered coefficients if a ghost filter is set).
-    for (int j = lane; j < P; j += 32) {
-        const double *Hj = g.harmonics[sd] + std::size_t(j) * q;
-        double s = 0;
-        for (int c = 0; c < q; ++c)
-            s += Hj[c] * (g.sigma ? g.sigma[c] * row[c] : row[c]);
-        y[j] = s;
+    if (g.Y) {
+        const double *Yk = g.Y + g.ycol[k];
+        for (int j = lane; j < P; j += 32)
+            y[j] = Yk[j];
+    } else {
+        for (int j = lane; j < P; j += 32) {
+            const double *Hj = g.harmonics[sd] + std::size_t(j) * q;
+            double s = 0;
+            for (int c = 0; c < q; ++c)
+                s += Hj[c] * (g.sigma ? g.sigma[c] * row[c] : row[c]);
+            y[j] = s;
+        }
     }
     __syncwarp();
     double U[4];
@@ -1766,6 +1810,19 @@ __global__ void __launch_bounds__(128) k_ghost(View v, GhostView g, const double
         for (int c = 0; c < 4; ++c)
             g.moments[std::size_t(k) * 4 + c] = m[c];
 }
+inline void cublas_ok(cublasStatus_t e, const char *what) {
+    if (e != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(std::string("cuBLAS: ") + what + " failed (" + std::to_string(int(e)) + ")");
+}
+__global__ void k_gather_ghost_rows_sigma(int q, int count, const int *nodes, const double *state, const double *sigma,
+                                          double *A) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(count) * q)
+        return;
+    const int j = int(t / q), c = int(t % q);
+    const double v = state[std::size_t(nodes[j]) * q + c];
+    A[t] = sigma ? sigma[c] * v : v;
+}
 void ghost_setup(Context *ctx, const GhostSetup &s) {
     GhostDevice *gd = new GhostDevice;
     GhostView &g = gd->g;
@@ -1816,10 +1873,43 @@ void ghost_setup(Context *ctx, const GhostSetup &s) {
     const double one = 1;
     std::memcpy(&st.min_active_bits, &one, 8);
     CK(cudaMemcpy(g.stats, &st, sizeof st, cudaMemcpyHostToDevice));
+    g.Y = nullptr, g.ycol = nullptr;
     ctx->ghost = gd;
     int least = 0, greatest = 0; // numerically larger = lower priority
     CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
     CK(cudaStreamCreateWithPriority(&ctx->aux, cudaStreamNonBlocking, least));
+    {
+        const char *e = std::getenv("M1PN_GPU_GHOST_GEMM");
+        gd->gemm = e ? std::atoi(e) != 0 : true;
+    }
+    if (gd->gemm) {
+        std::array<std::vector<int>, 6> nodes;
+        std::vector<std::size_t> ycol(std::size_t(s.pairs));
+        std::array<std::vector<int>, 6> members;
+        for (int k = 0; k < s.pairs; ++k)
+            members[s.side[k]].push_back(k);
+        std::size_t total = 0;
+        int max_count = 0;
+        for (int sd = 0; sd < 6; ++sd) {
+            gd->offset[sd] = total;
+            gd->count[sd] = int(members[sd].size());
+            if (!gd->count[sd])
+                continue;
+            for (std::size_t j = 0; j < members[sd].size(); ++j) {
+                nodes[sd].push_back(s.node[members[sd][j]]);
+                ycol[members[sd][j]] = total + j * std::size_t(s.points[sd]);
+            }
+            gd->nodes[sd] = own(dcopy(nodes[sd].data(), nodes[sd].size()));
+            total += std::size_t(s.points[sd]) * gd->count[sd];
+            max_count = std::max(max_count, gd->count[sd]);
+        }
+        gd->A = own(dalloc<double>(std::max<std::size_t>(1, std::size_t(max_count) * g.q)));
+        gd->Y = own(dalloc<double>(std::max<std::size_t>(1, total)));
+        g.Y = gd->Y;
+        g.ycol = own(dcopy(ycol.data(), ycol.size()));
+        cublas_ok(cublasCreate(&gd->handle), "create (ghost)");
+        cublas_ok(cublasSetStream(gd->handle, ctx->aux), "set stream (ghost)");
+    }
 }
 // On the aux stream after the work queued so far on the default stream (event 3); completion is event 2.
 void ghost(Context *ctx, const double *state, double *pinned_moments, int *pinned_flags) {
@@ -1828,6 +1918,24 @@ void ghost(Context *ctx, const double *state, double *pinned_moments, int *pinne
     CK(cudaEventRecord(ctx->events[3], ctx->stream));
     CK(cudaStreamWaitEvent(st, ctx->events[3], 0));
     CK(cudaMemsetAsync(&g.stats->flagged, 0, sizeof(int), st));
+    if (ctx->ghost->gemm) {
+        GhostDevice *gd = ctx->ghost;
+        const double one = 1, zero = 0;
+        for (int sd = 0; sd < 6; ++sd) {
+            const int n = gd->count[sd], p = g.points[sd];
+            if (!n)
+                continue;
+            // A_s (q x n, column-major) = filtered state rows of the side's ghost nodes; the gather buffer is reused,
+            // the DGEMM of the previous side is ordered before it on the stream.
+            k_gather_ghost_rows_sigma<<<blocks(std::size_t(n) * g.q), 256, 0, st>>>(g.q, n, gd->nodes[sd], state,
+                                                                                    g.sigma, gd->A);
+            // harmonics[sd] is q x P column-major (row j of the rule = column j): Y_s = H^T A_s, P x n.
+            cublas_ok(cublasDgemm(gd->handle, CUBLAS_OP_T, CUBLAS_OP_N, p, n, g.q, &one, g.harmonics[sd], g.q,
+                                     gd->A, g.q, &zero, gd->Y + gd->offset[sd], p),
+                         "dgemm (ghost)");
+        }
+        CK(cudaGetLastError());
+    }
     const int warps = ctx->ghost->warps;
     k_ghost<<<(g.pairs + warps - 1) / warps, 32 * warps, std::size_t(warps) * g.max_points * sizeof(double), st>>>(
         ctx->v, g, state);
@@ -2806,16 +2914,38 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_low4(
         return;
     const int ix = col / q4, c = col % q4;
     const int y0 = blockIdx.y * SY, y1 = min(npy, y0 + SY);
-    const double *F[3] = {a, v.gradient[0], v.gradient[1]};
+    // Row pointers (column ix, moment c) advanced by one node row per y; x neighbours at -q / +q. The element columns
+    // ex of the two quadrants depend only on ix. Same loads and the same FMA order as before (fewer integer ops:
+    // the 64-bit index products per load dominated the issued instructions).
+    const std::size_t row = std::size_t(npx) * q;
+    const bool xm = ix > 0, xp = ix + 1 < npx;
+    const double *P0 = a + std::size_t(ix) * q + c, *P1 = v.gradient[0] + std::size_t(ix) * q + c,
+                 *P2 = v.gradient[1] + std::size_t(ix) * q + c;
+    int exq[2];
+    bool exok[2];
+#pragma unroll
+    for (int qx = 0; qx < 2; ++qx) {
+        exq[qx] = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+        exok[qx] = exq[qx] >= 0 && exq[qx] < cx;
+    }
     double W[3][3][3];
     auto load_row = [&](int y, int r) {
+        if (y < 0 || y >= npy) {
 #pragma unroll
-        for (int f = 0; f < 3; ++f)
+            for (int f = 0; f < 3; ++f)
 #pragma unroll
-            for (int dx = 0; dx < 3; ++dx) {
-                const int x = ix + dx - 1;
-                W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx ? F[f][(std::size_t(y) * npx + x) * q + c] : 0.;
-            }
+                for (int dx = 0; dx < 3; ++dx)
+                    W[f][r][dx] = 0.;
+            return;
+        }
+        const std::size_t off = std::size_t(y) * row;
+        const double *B[3] = {P0 + off, P1 + off, P2 + off};
+#pragma unroll
+        for (int f = 0; f < 3; ++f) {
+            W[f][r][0] = xm ? B[f][-q] : 0.;
+            W[f][r][1] = B[f][0];
+            W[f][r][2] = xp ? B[f][q] : 0.;
+        }
     };
     load_row(y0 - 1, 0);
     load_row(y0, 1);
@@ -2826,9 +2956,9 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_low4(
         for (int qy = 0; qy < 2; ++qy)
 #pragma unroll
             for (int qx = 0; qx < 2; ++qx) {
-                const int ex = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+                const int ex = exq[qx];
                 const int ey = v.strip_elem[1] ? v.strip_elem[1][2 * y + qy] : y - 1 + qy;
-                if (ex < 0 || ex >= cx || ey < 0 || ey >= cy)
+                if (!exok[qx] || ey < 0 || ey >= cy)
                     continue;
                 const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
                 const int kc = 16 * klass_of(v, e);
@@ -2851,7 +2981,7 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_low4(
                 }
                 out -= term;
             }
-        result[(std::size_t(y) * npx + ix) * q + c] = out;
+        result[std::size_t(y) * row + std::size_t(ix) * q + c] = out;
 #pragma unroll
         for (int f = 0; f < 3; ++f)
 #pragma unroll
@@ -3065,7 +3195,8 @@ __global__ void k_line_solve_adaptive(View v, int d, double *field, const double
         row0[std::size_t(mi) * step] = 0.0;
 }
 
-__global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
+template <int MINB>
+__global__ void __launch_bounds__(128, MINB) k_stabilization_strip_adaptive(
     View v, const double *a, double *result, bool want_low, double constant_gamma,
     int tb0, int tb1, const AdaptiveTileChunk *chunks, int nchunks, const int *tile_q, int nt0) {
     if (blockIdx.x >= nchunks)
@@ -3079,26 +3210,48 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
     const int x0 = tc.tx * tb0, x1 = min(npx, x0 + tb0);
     const int y0 = tc.ty * tb1, y1 = min(npy, y0 + tb1);
     const bool active_c = c < tc.q_lim;
-    const double *F[3] = {a, v.gradient[0], v.gradient[1]};
+    const std::size_t row = std::size_t(npx) * q;
     for (int ix = x0 + warp; ix < x1; ix += 4) {
         if (!active_c) {
             for (int y = y0; y < y1; ++y)
-                result[(std::size_t(y) * npx + ix) * q + c] = 0.0;
+                result[std::size_t(y) * row + std::size_t(ix) * q + c] = 0.0;
             continue;
         }
+        // Row pointers as in k_stabilization_strip. As ElementWeno::stabilization_residual (cm_of): neighbour node
+        // contributions only for moments active at that node (the padded gradient segments leave nonzero inactive
+        // gradient entries); rows y0-1 .. y1 lie in the tile rows ty-1, ty, ty+1, so the activity of the three columns
+        // is looked up once per column (same values as c < tile_q[(y / tb1) * nt0 + x / tb0]).
+        bool act[3][3];
+#pragma unroll
+        for (int dx = 0; dx < 3; ++dx) {
+            const int x = ix + dx - 1;
+            const bool xin = x >= 0 && x < npx;
+            const int tx = xin ? x / tb0 : 0;
+            act[0][dx] = xin && y0 > 0 && c < tile_q[((y0 - 1) / tb1) * nt0 + tx];
+            act[1][dx] = xin && c < tile_q[tc.ty * nt0 + tx];
+            act[2][dx] = xin && y1 < npy && c < tile_q[(y1 / tb1) * nt0 + tx];
+        }
+        const double *P0 = a + std::size_t(ix) * q + c, *P1 = v.gradient[0] + std::size_t(ix) * q + c,
+                     *P2 = v.gradient[1] + std::size_t(ix) * q + c;
         double W[3][3][3];
         auto load_row = [&](int y, int r) {
+            const int band = y < y0 ? 0 : (y < y1 ? 1 : 2);
+            if (y < 0 || y >= npy) {
 #pragma unroll
-            for (int f = 0; f < 3; ++f)
+                for (int f = 0; f < 3; ++f)
 #pragma unroll
-                for (int dx = 0; dx < 3; ++dx) {
-                    const int x = ix + dx - 1;
-                    // As ElementWeno::stabilization_residual (cm_of): neighbour node contributions only for moments
-                    // active at that node; the padded gradient segments leave nonzero inactive gradient entries.
-                    W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx && c < tile_q[(y / tb1) * nt0 + x / tb0]
-                                      ? F[f][(std::size_t(y) * npx + x) * q + c]
-                                      : 0.;
-                }
+                    for (int dx = 0; dx < 3; ++dx)
+                        W[f][r][dx] = 0.;
+                return;
+            }
+            const std::size_t off = std::size_t(y) * row;
+            const double *B[3] = {P0 + off, P1 + off, P2 + off};
+#pragma unroll
+            for (int f = 0; f < 3; ++f) {
+                W[f][r][0] = act[band][0] ? B[f][-q] : 0.;
+                W[f][r][1] = act[band][1] ? B[f][0] : 0.;
+                W[f][r][2] = act[band][2] ? B[f][q] : 0.;
+            }
         };
         load_row(y0 - 1, 0);
         load_row(y0, 1);
@@ -3134,7 +3287,7 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
                     }
                     out -= term;
                 }
-            result[(std::size_t(y) * npx + ix) * q + c] = out;
+            result[std::size_t(y) * row + std::size_t(ix) * q + c] = out;
 #pragma unroll
             for (int f = 0; f < 3; ++f)
 #pragma unroll
@@ -3558,9 +3711,19 @@ void destroy(Context *ctx) {
     }
     if (ctx->aux)
         cudaStreamDestroy(ctx->aux);
+    for (int i = 0; i < 2; ++i) {
+        if (ctx->side[i])
+            cudaStreamDestroy(ctx->side[i]);
+        if (ctx->join_event[i])
+            cudaEventDestroy(ctx->join_event[i]);
+    }
+    if (ctx->fork_event)
+        cudaEventDestroy(ctx->fork_event);
     destroy_boundary_high(ctx);
     destroy_ghost_traces(ctx);
     if (ctx->ghost) {
+        if (ctx->ghost->handle)
+            cublasDestroy(ctx->ghost->handle);
         for (void *p : ctx->ghost->owned)
             cudaFree(p);
         delete ctx->ghost;
@@ -3583,6 +3746,7 @@ void upload(void *device, const void *host, std::size_t bytes) {
 void download(void *host, const void *device, std::size_t bytes) {
     CK(cudaMemcpy(host, device, bytes, cudaMemcpyDeviceToHost));
 }
+void warm_up() { CK(cudaFree(nullptr)); }
 void synchronize() { CK(cudaDeviceSynchronize()); }
 void synchronize(Context *ctx) { CK(cudaStreamSynchronize(ctx->stream)); }
 void *host_alloc(std::size_t bytes) {
@@ -3657,48 +3821,88 @@ void line_solve(Context *ctx, int d, int count, double *f, const double *src = n
     default: k_line_solve<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
     }
 }
-void line_solve_low4(Context *ctx, int d, int count, double *f, const double *src = nullptr) {
+void line_solve_low4(Context *ctx, int d, int count, double *f, const double *src = nullptr,
+                     cudaStream_t st = nullptr) {
     const View &v = ctx->v;
+    if (!st)
+        st = ctx->stream;
     const int q4 = std::min(4, v.q);
     std::size_t work = 0;
     for (int k = d; k < d + count; ++k)
         work = std::max(work, std::size_t(v.nodes / v.npa[k]) * q4);
     const dim3 grid(blocks(work, 64), count);
     switch (v.degree) {
-    case 1: k_line_solve_low4<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
-    case 2: k_line_solve_low4<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
-    case 3: k_line_solve_low4<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
-    default: k_line_solve_low4<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(v, d, f, src); break;
+    case 1: k_line_solve_low4<1, LINE_CHUNK><<<grid, 64, 0, st>>>(v, d, f, src); break;
+    case 2: k_line_solve_low4<2, LINE_CHUNK><<<grid, 64, 0, st>>>(v, d, f, src); break;
+    case 3: k_line_solve_low4<3, LINE_CHUNK><<<grid, 64, 0, st>>>(v, d, f, src); break;
+    default: k_line_solve_low4<4, LINE_CHUNK><<<grid, 64, 0, st>>>(v, d, f, src); break;
     }
 }
 void line_solve_adaptive_axis(Context *ctx, int d, double *f, const double *src,
-                              const AdaptiveLineSeg *segs, int nsegs) {
+                              const AdaptiveLineSeg *segs, int nsegs, cudaStream_t st = nullptr) {
     if (nsegs <= 0)
         return;
+    if (!st)
+        st = ctx->stream;
     const View &v = ctx->v;
     const AdaptiveDevice *ad = ctx->adaptive;
     const unsigned grid = (unsigned(nsegs) + 1u) / 2u; // 2 warps = 64 threads per block (register-optimal)
     switch (v.degree) {
     case 1:
-        k_line_solve_adaptive<1, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+        k_line_solve_adaptive<1, LINE_CHUNK><<<grid, 64, 0, st>>>(
             v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
             ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
         break;
     case 2:
-        k_line_solve_adaptive<2, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+        k_line_solve_adaptive<2, LINE_CHUNK><<<grid, 64, 0, st>>>(
             v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
             ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
         break;
     case 3:
-        k_line_solve_adaptive<3, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+        k_line_solve_adaptive<3, LINE_CHUNK><<<grid, 64, 0, st>>>(
             v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
             ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
         break;
     default:
-        k_line_solve_adaptive<4, LINE_CHUNK><<<grid, 64, 0, ctx->stream>>>(
+        k_line_solve_adaptive<4, LINE_CHUNK><<<grid, 64, 0, st>>>(
             v, d, f, src, segs, nsegs, ad->d_seg_slot[d], ad->d_seg_off[d], ad->d_seg_lower[d], ad->d_seg_invdiag[d],
             ad->d_dseg_slot[d], ad->d_dseg_off[d], ad->d_dseg_lower[d], ad->d_dseg_invdiag[d]);
         break;
+    }
+}
+// Minimum resident blocks of the 2D strip stabilization kernels (__launch_bounds__): 4 (default, ~120 registers),
+// 6 or 8 trade registers for occupancy (M1PN_GPU_STRIP_MINB; measurement on the A100).
+int strip_min_blocks() {
+    static const int mb = [] {
+        const char *e = std::getenv("M1PN_GPU_STRIP_MINB");
+        return e ? std::atoi(e) : 4;
+    }();
+    return mb;
+}
+bool overlap_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("M1PN_GPU_OVERLAP");
+        return e ? std::atoi(e) != 0 : true;
+    }();
+    return on;
+}
+// Side streams start after the work queued on ctx->stream; join makes ctx->stream wait for them.
+void fork_streams(Context *ctx, int n) {
+    if (!ctx->fork_event) {
+        CK(cudaEventCreateWithFlags(&ctx->fork_event, cudaEventDisableTiming));
+        for (int i = 0; i < 2; ++i) {
+            CK(cudaStreamCreateWithFlags(&ctx->side[i], cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&ctx->join_event[i], cudaEventDisableTiming));
+        }
+    }
+    CK(cudaEventRecord(ctx->fork_event, ctx->stream));
+    for (int i = 0; i < n; ++i)
+        CK(cudaStreamWaitEvent(ctx->side[i], ctx->fork_event, 0));
+}
+void join_streams(Context *ctx, int n) {
+    for (int i = 0; i < n; ++i) {
+        CK(cudaEventRecord(ctx->join_event[i], ctx->side[i]));
+        CK(cudaStreamWaitEvent(ctx->stream, ctx->join_event[i], 0));
     }
 }
 } // namespace
@@ -3706,6 +3910,17 @@ void gradients(Context *ctx, const double *state) {
     const View &v = ctx->v;
     if (ctx->adaptive && ctx->adaptive->active && !v.periodic) {
         AdaptiveDevice *ad = ctx->adaptive;
+        if (overlap_enabled() && v.dimension <= 3) {
+            // low4 (all axes) on side 0; axis 0 on ctx->stream, axis 1 on side 1, axis 2 on ctx->stream after axis 0:
+            // each axis writes its own gradient field, low4 only the coefficients c < 4 of all of them.
+            fork_streams(ctx, 2);
+            line_solve_low4(ctx, 0, v.dimension, nullptr, state, ctx->side[0]);
+            for (int d = 0; d < v.dimension; ++d)
+                line_solve_adaptive_axis(ctx, d, nullptr, state, ad->d_segs_grad[d], ad->segs_grad_n[d],
+                                         d == 1 ? ctx->side[1] : ctx->stream);
+            join_streams(ctx, 2);
+            return;
+        }
         line_solve_low4(ctx, 0, v.dimension, nullptr, state);
         for (int d = 0; d < v.dimension; ++d)
             line_solve_adaptive_axis(ctx, d, nullptr, state, ad->d_segs_grad[d], ad->segs_grad_n[d]);
@@ -3722,11 +3937,28 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
         if (use_strip) {
             const int q4 = std::min(4, v.q);
             const dim3 g4(blocks(std::size_t(v.npa[0]) * q4, 128), (v.npa[1] + 15) / 16);
-            k_stabilization_strip_low4<16><<<g4, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
-            if (ad->tile_chunks_n > 0)
-                k_stabilization_strip_adaptive<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
-                    v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks, ad->tile_chunks_n,
-                    ad->d_tile_q, ad->nt[0]);
+            const bool ov = overlap_enabled() && ad->tile_chunks_n > 0; // low4 writes c < 4, the chunks c >= 4
+            if (ov)
+                fork_streams(ctx, 1);
+            k_stabilization_strip_low4<16><<<g4, 128, 0, ov ? ctx->side[0] : ctx->stream>>>(v, state, out, want_low,
+                                                                                            constant_gamma);
+            if (ad->tile_chunks_n > 0) {
+                const int mb = strip_min_blocks();
+                if (mb == 8)
+                    k_stabilization_strip_adaptive<8><<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                        v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks,
+                        ad->tile_chunks_n, ad->d_tile_q, ad->nt[0]);
+                else if (mb == 6)
+                    k_stabilization_strip_adaptive<6><<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                        v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks,
+                        ad->tile_chunks_n, ad->d_tile_q, ad->nt[0]);
+                else
+                    k_stabilization_strip_adaptive<4><<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                        v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks,
+                        ad->tile_chunks_n, ad->d_tile_q, ad->nt[0]);
+            }
+            if (ov)
+                join_streams(ctx, 1);
         } else {
             const int q4 = std::min(4, v.q);
             k_stabilization_low4<<<blocks(std::size_t(v.nodes) * q4), 256, 0, ctx->stream>>>(
@@ -3747,6 +3979,10 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
         const dim3 grid(blocks(std::size_t(v.npa[0]) * v.q, 128), (v.npa[1] + sy - 1) / sy);
         if (sy == 8)
             k_stabilization_strip<8><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+        else if (sy == 16 && strip_min_blocks() == 8)
+            k_stabilization_strip<16, 8><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+        else if (sy == 16 && strip_min_blocks() == 6)
+            k_stabilization_strip<16, 6><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else if (sy == 16)
             k_stabilization_strip<16><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else if (sy == 64)
@@ -3785,8 +4021,13 @@ void mass_solve(Context *ctx, double *field) {
     if (ctx->adaptive && ctx->adaptive->active && !v.periodic) {
         AdaptiveDevice *ad = ctx->adaptive;
         for (int d = 0; d < v.dimension; ++d) {
-            line_solve_low4(ctx, d, 1, field);
+            const bool ov = overlap_enabled(); // axis d: low4 (c < 4) and chunks (c >= 4) of the same field
+            if (ov)
+                fork_streams(ctx, 1);
+            line_solve_low4(ctx, d, 1, field, nullptr, ov ? ctx->side[0] : ctx->stream);
             line_solve_adaptive_axis(ctx, d, field, nullptr, ad->d_segs_mass[d], ad->segs_mass_n[d]);
+            if (ov)
+                join_streams(ctx, 1);
         }
         return;
     }

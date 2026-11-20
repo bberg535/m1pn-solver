@@ -8,6 +8,8 @@
 namespace m1pn {
 namespace gpu {
 struct Context;
+// Creates the CUDA primary context (cudaFree(0)); called on a helper thread while the host builds the scheme.
+void warm_up();
 }
 namespace uncollided {
 struct GaussianPulse;

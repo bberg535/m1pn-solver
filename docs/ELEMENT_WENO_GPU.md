@@ -248,3 +248,80 @@ alle 31 Fälle PASS (1e-17 … 1e-11, FCS-Fälle 4.9e-10 wie uniform); vorher 15
 Offen (CPU und GPU gleich): Der Massensolve läuft je 32er-Moment-Chunk über Segmente, die auch Knoten enthalten, an
 denen einzelne Momente des Chunks inaktiv sind; Einträge ungleich null an diesen Stellen der rechten Seite wirken auf
 die aktiven Ergebnisse. Bei exakten Nullen harmlos, aber kein exakter Submatrix-Solve je Moment.
+
+## Ghost-Spuren als DGEMM (20.11.2026, Branch `perf/solver-202611`)
+
+**Befund.** Bei uniformem hohem N war nicht der Volumenteil, sondern die Ghost-Projektion am Vakuumrand der Engpass:
+GBH P35 auf der A100 (Kampagne `tardis_paper_20261120`) verbringt 82 der 84 s Solverzeit mit Warten auf `k_ghost`.
+Der Kernel bildet die PN-Spur je Ghost-Paar mit einem Warp, der die ganze Harmonischen-Matrix seiner Seite liest
+(P35: ~5500 Regelpunkte × 666 Momente = 29 MB). Die Matrix wird so einmal je Paar aus dem globalen Speicher gestreamt
+(GBH: ~2300 Paare, ~67 GB je Stufe). Der Speedup des adaptiven PN auf GBQ/GBH (10–15×) kam vor allem daher, dass der
+adaptive Pfad die Ghost-Projektion auf dem Host mit Ordnungsstufen (3, 7, 15) und analytischem P1-Ghost rechnet.
+
+**Änderung.** Je Seite werden die (gefilterten) Ghost-Zeilen gesammelt und `Y_s = H_sᵀ A_s` als eine cuBLAS-DGEMM auf
+dem aux-Stream gebildet; `k_ghost` kopiert nur noch seine Spalte. Die Projektion selbst ist unverändert.
+`M1PN_GPU_GHOST_GEMM=0` stellt die alten Spuren her, `M1PN_GPU_GHOST_WHY=1` gibt aus, warum der Device-Pfad
+(nicht) gewählt wird (Verhältnis Randarbeit/Volumenarbeit, Schwelle 0.1; adaptiv und mit Interfaces immer Host).
+
+**Lokal (RTX A2000, FP64-schwach).** GBH P35 bis t = 0.4: Solver 85.4 → 39.2 s (Ghost 63 → 21 s), Masse und
+Absorptionsrate in allen Stellen gleich. Linienquelle Q1/128 P21 (FCS): 17.3 → 12.0 s, Masse 2e-13. lattice-3d 28³
+P7: gleich. Auf der A2000 ist bei 224² P21 die Host-Projektion schneller (9.2 gegen 12.4 s); die Schwelle wird auf der
+A100 neu bestimmt (`scripts/element_weno/tardis_perf_profile.sbatch`).
+
+**A100 (Job 164267, `nx/tmp/tardis_perf_20261120`, Lattice wie Kampagne Block A, T = 3.2).**
+
+| Lauf (uniform, Spiegel, FCS, gebrochene Linien + Split) | Solver alt [s] | Solver DGEMM [s] | Ghost-Warten alt → neu [s] |
+|---|---:|---:|---|
+| GBQ P35 | 20.26 | 2.79 | – → 1.5 |
+| GBH P35 | 84.33 | 16.10 | 81.9 → 9.0 |
+| GB P35 (Host-Ghost, Verhältnis < 0.1) | 94.81 | 94.48 | Host 47 s, unverändert |
+
+Masse GBH P35: 1.29911036774 (DGEMM) gegen 1.29911036639 (alt), relativ 1e-9 (Summationsreihenfolge, Projektion
+auf Toleranz). Uniform 896² P21 (t = 0.8, kein Spiegel): Host 74.5 s, Device mit DGEMM 78.9 s, Device alt 92.6 s; die
+automatische Wahl (Host, Verhältnis < 0.1) bleibt dort richtig.
+
+**Folge.** Der Abstand adaptiv–uniform schrumpft auf GBQ/GBH (P35: 2.79 gegen 1.32–1.98 s auf GBQ, 16.10 gegen
+5.95–8.54 s auf GBH). Die adaptiven Läufe selbst nutzen den Host-Ghost mit Ordnungsstufen und werden nicht schneller.
+Die Spektralradius-Schätzung (60 Potenziterationen des vollen Operators, einmal am Anfang) kostet auf GB P35 3.4 s.
+
+## Profil und weitere Beschleunigung (20.11.2026, Branch `perf/solver-202611`)
+
+**Kernel-Profil (nsys, A100, GB P35, T = 3.2, `nx/tmp/tardis_perf_20261120/nsys`).** Uniform (Device-Ghost) gegen
+adaptiv (1e-4, Kachel 8, 28.8 % aktive Koeffizienten), Summe über den Lauf: Line-Solve 41.9 → 14.0 s (3.0×),
+Strip-Stabilisierung 33.7 → 15.0 s (2.25×), Combine 16.2 → 6.1 s (2.65×); ideal wäre 3.5×. Die Low4-Kernel
+(Momente c < 4, ein Thread je Linie und Moment) sind latenzgebunden (GB: ~2300 Threads je Achse, ~110 GB/s).
+Die „GB-Anomalie“ (adaptiv nur 2× auf GB, 11× auf GBH) war keine: pro Zelle und Schritt ist die adaptive
+Device-Arbeit auf allen Gittern ~2.4× kleiner; der große Faktor auf GBQ/GBH kam von der Ghost-Projektion (oben).
+
+**Änderungen.**
+1. Initialisierung: dünne Produkte in `Boundary` (D blockdiagonal in l, Normalenmatrix mit ~6 Einträgen je Zeile),
+   die ungenutzte Matrix `homogeneous` nur mit `norms = true`; CUDA-Kontext auf einem Hilfsthread während des
+   Schema-Aufbaus. Rundungsgleich (GBH P35: Masse 5e-11, Rate 3e-8 relativ).
+2. Adaptiver Pfad: Low4- und High-Chunk-Line-Solves sowie die Strip-Stabilisierung auf Fork-Join-Streams
+   (`M1PN_GPU_OVERLAP=0` seriell). Bitgleich.
+3. Strip-Stabilisierung (uniform, low4, adaptiv): Zeilenzeiger statt 64-Bit-Indexprodukt je Ladevorgang
+   (ncu A2000: Integer-Befehle 6.4e9 → 4.5e9, Warp-Befehle −18 %), `M1PN_GPU_STRIP_MINB` = 4/6/8 für die
+   Launch-Bounds. Bitgleich.
+
+**A100 (Job 164279, Block-A-Konfigurationen, gegen `tardis_paper_20261120`).**
+
+| Lauf | gesamt alt → neu [s] | Init alt → neu [s] | Solver alt → neu [s] |
+|---|---|---|---|
+| GBQ P35 adaptiv 1e-4 | 8.5 → 6.3 | 6.4 → 4.4 | 1.65 → 1.53 |
+| GBH P35 adaptiv 1e-4 | 16.7 → 14.3 | 8.3 → 6.2 | 7.32 → 7.07 |
+| GB P35 adaptiv 1e-4 | 65.8 → 63.2 | 15.3 → 13.4 | 46.81 → 46.58 |
+| GBQ P35 uniform | 26.9 → 7.4 | 6.3 → 4.2 | 20.26 → 2.79 |
+| GBH P35 uniform | 93.6 → 23.1 | 8.1 → 6.0 | 84.46 → 16.11 |
+
+Überlappung allein (`_serial` gegen Standard): GBQ 1.64 → 1.53 s, GBH 7.31 → 7.07 s, GB unverändert.
+
+**Nicht geändert.** Spektralradius (60 Potenziterationen, bei 60 noch nicht konvergiert: GBH 768.7, +0.08 je
+Iteration): weniger Iterationen oder ein anderer Startvektor ändern Δt und damit alle Ergebnisse; Gewinn 2–5 %.
+Gemischte Genauigkeit nach ℓ: nur `k_combine` ist speichergebunden (~1.4 TB/s), Line-Solve ~0.55, Strip ~0.46 TB/s;
+geschätzt 1.2–1.4× bei Umbau aller Kernel und des Speicherlayouts.
+
+**Lokale Zeitschritte (Abschätzung, nicht umgesetzt).** Auf Tensorgittern ist der Schritt eines Elements durch
+min(h_x, h_y[, h_z]) begrenzt; jedes Element, das in *einer* Achse im feinen Zentrum liegt, braucht den feinen
+Schritt. Ideales LTS (Stufen 2^k) brächte als Arbeitsanteil: GB/GBH/GBQ 2D 0.941, 3D 0.981 (gleiche Grading-Muster),
+also 6 % bzw. 2 % – den Aufwand (Positivität und Realisierbarkeit an Stufengrenzen) nicht wert. Lohnend nur auf
+hierarchischen (Quadtree-)Gittern.
