@@ -737,6 +737,11 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             const V3 c(i + .5, j + .5, k + .5);
             return cases::lattice3d_sigma_a(c) + cases::lattice3d_sigma_s(c);
         });
+        // EXPERIMENT (feature/fcs3d-table): M1PN_FCS3D_RULE=polar selects the adaptive polar rule of the time table.
+        if (const char *e = std::getenv("M1PN_FCS3D_RULE"))
+            lattice3_table->lattice.polar = std::string(e) == "polar";
+        if (const char *e = std::getenv("M1PN_FCS3D_TOL"))
+            lattice3_table->lattice.polar_tol = std::atof(e);
         material->source = [](const V3 &) { return 0.; };
         material->name += ", source uncollided (FCS)";
         const std::string from = "\"source\":1,";

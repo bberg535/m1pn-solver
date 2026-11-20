@@ -18,6 +18,9 @@ struct CellLattice3D {
     // exact to 1e-10; the front kinks give ~1e-5 relative (1e-4 right after arrival) with 8 sub-panels, ~5 ms per point.
     int outer_order = 6, inner_order = 6, inside_panels = 8, outside_panels = 8;
     double tau_max = 40;
+    // Polar rule (lattice3d_row_polar, docs/FCS_LATTICE.md): adaptive polar quadrature about the foot point.
+    bool polar = false;
+    double polar_tol = 1e-4, polar_floor = 1e-9;
 
     Lattice3dView view(const std::vector<double> &ox, const std::vector<double> &ow, const std::vector<double> &ix,
                        const std::vector<double> &iw) const {
@@ -30,6 +33,7 @@ struct CellLattice3D {
         v.outer_n = int(ox.size()), v.inner_n = int(ix.size());
         v.outer_x = ox.data(), v.outer_w = ow.data(), v.inner_x = ix.data(), v.inner_w = iw.data();
         v.inside_panels = inside_panels, v.outside_panels = outside_panels, v.tau_max = tau_max;
+        v.polar = polar, v.polar_tol = polar_tol, v.polar_floor = polar_floor;
         if (!(lattice3d_sigma(v, source[0], source[1], source[2]) > 0))
             throw std::runtime_error("CellLattice3D: sigma_t of the source cell must be positive");
         return v;
@@ -90,7 +94,7 @@ struct Lattice3dUncollidedTable {
             if (lattice.distance(points[k]) >= M * dt)
                 return; // the front does not reach x within the table
             thread_local std::vector<double> work;
-            work.resize(3 * std::size_t(M + 2));
+            work.resize((lattice.polar ? 10 : 3) * std::size_t(M + 2));
             const double p[3] = {points[k][0], points[k][1], points[k][2]};
             lattice.with_view([&](const Lattice3dView &v) {
                 lattice3d_row(v, p, dt, M, work.data(), &table[std::size_t(k) * (M + 1)]);

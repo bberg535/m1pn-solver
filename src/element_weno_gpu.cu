@@ -2085,7 +2085,7 @@ void lattice_table(Context *ctx, const uncollided::LatticeView &hv, int m0, int 
 }
 __global__ void k_lattice3d_table(uncollided::Lattice3dView lv, const double *x, const double *y, const double *z,
                                   std::size_t first, std::size_t count, int M, double dt, double *work,
-                                  double *table) {
+                                  std::size_t work_stride, double *table) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= count)
         return;
@@ -2101,7 +2101,7 @@ __global__ void k_lattice3d_table(uncollided::Lattice3dView lv, const double *x,
             table[k * std::size_t(M + 1) + m] = 0;
         return;
     }
-    uncollided::lattice3d_row(lv, p, dt, M, work + t * 3 * std::size_t(M + 2), table + k * std::size_t(M + 1));
+    uncollided::lattice3d_row(lv, p, dt, M, work + t * work_stride, table + k * std::size_t(M + 1));
 }
 void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const double *hx, const double *hy,
                      const double *hz, int M, double dt, double *host_out) {
@@ -2123,13 +2123,16 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
     lv.inner_w = own(dcopy(hv.inner_w, std::size_t(hv.inner_n)));
     double *dx = dcopy(hx, points), *dy = dcopy(hy, points), *dz = dcopy(hz, points);
     double *table = own(dalloc<double>(total));
-    // Batches bound the work arrays (3 (M + 2) doubles per point); the per-thread break lists live in local memory.
+    // Batches bound the work arrays (lattice3d_work_size doubles per point: 3 (M + 2) Cartesian, 10 (M + 2) polar);
+    // the per-thread break lists live in local memory (polar: three lists and the stacks).
     const std::size_t batch = std::min<std::size_t>(points, 1 << 16);
-    double *work = dalloc<double>(batch * 3 * std::size_t(M + 2));
-    CK(cudaDeviceSetLimit(cudaLimitStackSize, 24 * 1024)); // two break lists of lattice3d_max_breaks doubles
+    const std::size_t work_stride = uncollided::lattice3d_work_size(hv, M);
+    double *work = dalloc<double>(batch * work_stride);
+    CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 48 : 24) * 1024));
     for (std::size_t first = 0; first < points; first += batch) {
         const std::size_t count = std::min(batch, points - first);
-        k_lattice3d_table<<<blocks(count, 64), 64, 0, ctx->stream>>>(lv, dx, dy, dz, first, count, M, dt, work, table);
+        k_lattice3d_table<<<blocks(count, 64), 64, 0, ctx->stream>>>(lv, dx, dy, dz, first, count, M, dt, work,
+                                                                    work_stride, table);
         CK(cudaGetLastError());
     }
     CK(cudaDeviceSynchronize());

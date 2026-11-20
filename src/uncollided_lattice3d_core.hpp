@@ -22,6 +22,7 @@
 // dependence is exact per ray (lattice3d_rays emits (weight, tau_in, s_in, s_out)); only the front s_in = t and
 // s_out = t, kinks of the integrand at fixed t, are not resolved by the panels (second order there).
 #include <math.h>
+#include <cstddef>
 #if defined(__CUDACC__)
 #define M1PN_HD3 __host__ __device__
 #else
@@ -40,6 +41,11 @@ struct Lattice3dView {
     int inside_panels = 4;  // panels per face direction for x inside S (no breakpoints needed there)
     int outside_panels = 1; // equal sub-panels per piece and direction for x outside S (front kinks, see above)
     double tau_max = 40;   // rays with tau_in above are dropped (< e^-40 q0)
+    // Polar rule (lattice3d_row_polar): polar coordinates about the foot point of x on each face, radial variable =
+    // distance s, adaptive Chebyshev panels in s and phi. polar_tol: relative Chebyshev tail, polar_floor: absolute.
+    bool polar = false;
+    double polar_tol = 1e-4, polar_floor = 1e-9, polar_max_dphi = 0.4, polar_max_ds = 0.25, polar_near_ratio = 2;
+    int polar_depth = 10;
 };
 M1PN_HD3 inline double lattice3d_sigma(const Lattice3dView &v, int i, int j, int k) {
     return v.sigma_t[i + v.n[0] * (j + v.n[1] * k)];
@@ -274,8 +280,8 @@ M1PN_HD3 inline double lattice3d_density(const Lattice3dView &v, const double x[
 // Row rho_u(x, m dt), m = 0..M, of the time table: every ray adds its exact time dependence through three
 // difference arrays (P: constant part, E: part times exp(-sigma_S t), C: saturated part after s_out); work of size
 // 3 (M + 2), row of size M + 1. One pass over the rays for all times.
-M1PN_HD3 inline void lattice3d_row(const Lattice3dView &v, const double x[3], double dt, int M, double *work,
-                                   double *row) {
+M1PN_HD3 inline void lattice3d_row_cartesian(const Lattice3dView &v, const double x[3], double dt, int M,
+                                             double *work, double *row) {
     const double sS = lattice3d_sigma(v, v.s[0], v.s[1], v.s[2]);
     double *P = work, *E = work + (M + 2), *C = work + 2 * (M + 2);
     for (int m = 0; m < 3 * (M + 2); ++m)
@@ -301,6 +307,369 @@ M1PN_HD3 inline void lattice3d_row(const Lattice3dView &v, const double x[3], do
         const double val = p - exp(-sS * m * dt) * e + cc;
         row[m] = val > 0 ? val : 0;
     }
+}
+
+// ---- Polar rule ------------------------------------------------------------------------------------------------------
+// Face F in the plane x_a = c at distance h, foot point (x_b, x_e). y = foot + rho (cos phi, sin phi) and
+// s = sqrt(h^2 + rho^2) give dOmega = h / s^3 dA = (h / s^2) ds dphi (bounded: the near-singular kernel h / r^3 of the
+// Cartesian rule disappears). Outside S, s is the entry distance s_in, so the front s_in = t lies at constant s for every
+// t: with A(s, phi) = q0/(4 pi) h/s^2 e^{-tau_in}/sigma_S and Chebyshev antiderivatives on each radial panel,
+//   rho_u(t) = int dphi [ G0(t) - e^{-sigma_S t} G1(t) ] + (saturation after s_out, node-wise),
+//   G0(t) = int_{s<t} A ds, G1(t) = int_{s<t} A e^{sigma_S s} ds,
+// exact in s at every table time. Inside S (s = s_out, s_in = tau = 0):
+//   rho_u(t) = int dphi [ G2(t) + (1 - e^{-sigma_S t}) (I3 - G3(t)) ], G2 = int_{s<t} A (1 - e^{-sigma_S s}), G3 = int A.
+// Radial breaks: lattice edge crossings along the radial line (kinks of tau_in and of the exit face), geometric breaks
+// rho = h r^k near the foot; phi breaks: face corners, projected lattice vertices, projected edge lines on the face
+// boundary. Panels and phi pieces are split adaptively until the last two Chebyshev coefficients (of A in s, of the
+// radial integral Q(phi) in phi) fall below polar_tol * max + polar_floor; a phi piece is accumulated in a temporary
+// row and added only when accepted (depth-first stack, one temporary). work: lattice3d_work_size doubles.
+constexpr int lattice3d_cheb_n = 8;
+constexpr int lattice3d_stack = 64;
+struct Lattice3dCheb {
+    double x[lattice3d_cheb_n], wq[lattice3d_cheb_n], cosjk[lattice3d_cheb_n * lattice3d_cheb_n];
+    M1PN_HD3 Lattice3dCheb() {
+        const double pi = 3.14159265358979323846;
+        const int n = lattice3d_cheb_n;
+        for (int j = 0; j < n; ++j) {
+            const double th = pi * (j + .5) / n;
+            x[j] = cos(th);
+            double s = 0;
+            for (int k = 1; k <= n / 2; ++k)
+                s += cos(2 * k * th) / (4. * k * k - 1);
+            wq[j] = 2. / n * (1 - 2 * s);
+            for (int k = 0; k < n; ++k)
+                cosjk[k * n + j] = cos(k * th);
+        }
+    }
+    // Chebyshev coefficients c_0..c_{n-1} of the interpolant (f = c_0/2 + sum c_k T_k).
+    M1PN_HD3 void coeffs(const double *f, double *c) const {
+        const int n = lattice3d_cheb_n;
+        for (int k = 0; k < n; ++k) {
+            double s = 0;
+            for (int j = 0; j < n; ++j)
+                s += f[j] * cosjk[k * n + j];
+            c[k] = 2. / n * s;
+        }
+    }
+    M1PN_HD3 double tail(const double *f) const {
+        double c[lattice3d_cheb_n];
+        coeffs(f, c);
+        return fabs(c[lattice3d_cheb_n - 1]) + fabs(c[lattice3d_cheb_n - 2]);
+    }
+    // Antiderivative (C_0..C_n) in x of the interpolant, zero at x = -1.
+    M1PN_HD3 void antider(const double *f, double *C) const {
+        const int n = lattice3d_cheb_n;
+        double c[lattice3d_cheb_n + 2];
+        coeffs(f, c);
+        c[n] = c[n + 1] = 0;
+        double s = 0;
+        for (int k = 1; k <= n; ++k) {
+            C[k] = (c[k - 1] - c[k + 1]) / (2. * k);
+            s += (k & 1) ? -C[k] : C[k];
+        }
+        C[0] = -s;
+    }
+    M1PN_HD3 static double eval(const double *C, double x) { // sum_{k=0}^{n} C_k T_k(x)
+        double b1 = 0, b2 = 0;
+        for (int k = lattice3d_cheb_n; k >= 1; --k) {
+            const double b0 = C[k] + 2 * x * b1 - b2;
+            b2 = b1, b1 = b0;
+        }
+        return C[0] + x * b1 - b2;
+    }
+};
+M1PN_HD3 inline std::size_t lattice3d_work_size(const Lattice3dView &v, int M) {
+    return (v.polar ? 10 : 3) * std::size_t(M + 2);
+}
+M1PN_HD3 inline double lattice3d_angle(double du, double dv, double ref) {
+    const double pi = 3.14159265358979323846;
+    double p = atan2(dv, du) - ref;
+    while (p <= -pi)
+        p += 2 * pi;
+    while (p > pi)
+        p -= 2 * pi;
+    return p;
+}
+// Accumulators: 0 P (constant, difference), 1 E (times e^{-sS t}, difference), 2 C (saturated, difference),
+// 3 D (constant, direct), 4 D1 (times e^{-sS t}, direct); each M + 2 long.
+M1PN_HD3 inline void lattice3d_row_polar(const Lattice3dView &v, const double x[3], double dt, int M, double *work,
+                                         double *row) {
+    const double pi = 3.14159265358979323846;
+    const int n = lattice3d_cheb_n;
+    const std::size_t L = std::size_t(M + 2);
+    const double scale = v.q0 / (4 * pi);
+    const double sS = lattice3d_sigma(v, v.s[0], v.s[1], v.s[2]);
+    const Lattice3dCheb ch;
+    double *Acc = work, *Tmp = work + 5 * L;
+    for (std::size_t m = 0; m < 10 * L; ++m)
+        work[m] = 0;
+    bool inside = true;
+    for (int a = 0; a < 3; ++a)
+        inside = inside && x[a] >= v.s[a] && x[a] <= v.s[a] + 1;
+    double brk[lattice3d_max_breaks];
+    for (int a = 0; a < 3; ++a)
+        for (int side = 0; side < 2; ++side) {
+            const double c = v.s[a] + side, h = fabs(x[a] - c);
+            if (h < 1e-14)
+                continue;
+            if (!inside && (side == 0 ? x[a] >= c : x[a] <= c))
+                continue;
+            const int b = (a + 1) % 3, e = (a + 2) % 3;
+            const double u0 = v.s[b], u1 = v.s[b] + 1., v0 = v.s[e], v1 = v.s[e] + 1.;
+            const double Fu = x[b], Fv = x[e];
+            const bool foot_in = Fu > u0 && Fu < u1 && Fv > v0 && Fv < v1;
+            const double ref = foot_in ? 0. : atan2(v0 + .5 - Fv, u0 + .5 - Fu);
+            // phi breaks
+            int np = 0;
+            const double cu[4] = {u0, u1, u1, u0}, cv[4] = {v0, v0, v1, v1};
+            for (int k = 0; k < 4; ++k)
+                brk[np++] = lattice3d_angle(cu[k] - Fu, cv[k] - Fv, ref);
+            double plo = brk[0], phi_hi = brk[0];
+            for (int k = 1; k < 4; ++k)
+                plo = fmin(plo, brk[k]), phi_hi = fmax(phi_hi, brk[k]);
+            if (foot_in) {
+                plo = -pi, phi_hi = pi;
+                brk[np++] = -pi, brk[np++] = pi;
+            }
+            if (!inside) {
+                for (int i = 0; i <= v.n[0]; ++i)
+                    for (int j = 0; j <= v.n[1]; ++j)
+                        for (int k = 0; k <= v.n[2]; ++k) {
+                            const double P[3] = {double(i), double(j), double(k)};
+                            const double da = P[a] - x[a], dc = c - x[a];
+                            const bool of_S = (i == v.s[0] || i == v.s[0] + 1) && (j == v.s[1] || j == v.s[1] + 1) &&
+                                              (k == v.s[2] || k == v.s[2] + 1);
+                            if (fabs(da) < 1e-300 || da / dc <= 0 || (da / dc >= 1 && !of_S))
+                                continue;
+                            const double f = dc / da, pu = x[b] + f * (P[b] - x[b]), pv = x[e] + f * (P[e] - x[e]);
+                            if (pu > u0 && pu < u1 && pv > v0 && pv < v1 && np < lattice3d_max_breaks)
+                                brk[np++] = lattice3d_angle(pu - Fu, pv - Fv, ref);
+                        }
+                double tmp[lattice3d_max_breaks];
+                for (int sv = 0; sv < 2; ++sv) { // projected edge lines crossing v = v0 / v1 (parameter u)
+                    double D0[3], Dd[3] = {0, 0, 0};
+                    D0[a] = c - x[a], D0[b] = -x[b], D0[e] = (sv ? v1 : v0) - x[e];
+                    Dd[b] = 1;
+                    int nt = 0;
+                    lattice3d_edge_breaks(v, x, D0, Dd, u0, u1, tmp, nt);
+                    for (int q = 0; q < nt && np < lattice3d_max_breaks; ++q)
+                        brk[np++] = lattice3d_angle(tmp[q] - Fu, (sv ? v1 : v0) - Fv, ref);
+                }
+                for (int su = 0; su < 2; ++su) { // ... crossing u = u0 / u1 (parameter v)
+                    double D0[3], Dd[3] = {0, 0, 0};
+                    D0[a] = c - x[a], D0[b] = (su ? u1 : u0) - x[b], D0[e] = -x[e];
+                    Dd[e] = 1;
+                    int nt = 0;
+                    lattice3d_edge_breaks(v, x, D0, Dd, v0, v1, tmp, nt);
+                    for (int q = 0; q < nt && np < lattice3d_max_breaks; ++q)
+                        brk[np++] = lattice3d_angle((su ? u1 : u0) - Fu, tmp[q] - Fv, ref);
+                }
+            }
+            lattice3d_sort(brk, np);
+            // radial integration along one phi; writes weight * contributions into Tmp, returns Q = int A ds (or I3)
+            auto radial = [&](double phi, double weight, int &mlo, int &mhi) -> double {
+                const double du = cos(phi), dv = sin(phi);
+                double rlo = 0, rhi = 1e300;
+                bool empty = false;
+                auto slab = [&](double F, double d, double lo, double hi) {
+                    if (fabs(d) < 1e-300) {
+                        if (F < lo || F > hi)
+                            empty = true;
+                        return;
+                    }
+                    double t0 = (lo - F) / d, t1 = (hi - F) / d;
+                    if (t0 > t1) {
+                        const double w = t0;
+                        t0 = t1, t1 = w;
+                    }
+                    rlo = fmax(rlo, t0), rhi = fmin(rhi, t1);
+                };
+                slab(Fu, du, u0, u1), slab(Fv, dv, v0, v1);
+                if (empty || !(rhi > rlo + 1e-14))
+                    return 0.;
+                double rb[lattice3d_max_breaks];
+                int nr = 0;
+                rb[nr++] = rlo, rb[nr++] = rhi;
+                if (!inside) {
+                    double D0[3], Dd[3];
+                    D0[a] = c - x[a], D0[b] = 0, D0[e] = 0;
+                    Dd[a] = 0, Dd[b] = du, Dd[e] = dv;
+                    lattice3d_edge_breaks(v, x, D0, Dd, rlo, rhi, rb, nr);
+                }
+                for (double r = h; r < rhi && nr < lattice3d_max_breaks; r *= v.polar_near_ratio)
+                    if (r > rlo)
+                        rb[nr++] = r;
+                lattice3d_sort(rb, nr);
+                double Q = 0;
+                double st_a[lattice3d_stack], st_z[lattice3d_stack];
+                int st_d[lattice3d_stack];
+                double sprev = -1;
+                for (int ir = 0; ir < nr; ++ir) {
+                    const double s_next = sqrt(h * h + rb[ir] * rb[ir]);
+                    if (sprev >= 0 && s_next - sprev > 1e-14) {
+                        // initial panels of length <= polar_max_ds, then adaptive bisection (stack, depth-first)
+                        const int nsub = int(ceil((s_next - sprev) / v.polar_max_ds)) > 1 ?
+                                             int(ceil((s_next - sprev) / v.polar_max_ds)) : 1;
+                        for (int ks = nsub - 1; ks >= 0; --ks) {
+                            int top = 0;
+                            st_a[top] = sprev + (s_next - sprev) * ks / nsub;
+                            st_z[top] = sprev + (s_next - sprev) * (ks + 1) / nsub;
+                            st_d[top++] = 0;
+                            while (top > 0) {
+                                --top;
+                                const double sa = st_a[top], sz = st_z[top];
+                                const int depth = st_d[top];
+                                const double mid = .5 * (sa + sz), half = .5 * (sz - sa);
+                                double A[lattice3d_cheb_n], so[lattice3d_cheb_n], sj[lattice3d_cheb_n];
+                                bool any = false;
+                                double amax = 0;
+                                for (int j = 0; j < n; ++j) {
+                                    const double s = mid + half * ch.x[j];
+                                    sj[j] = s;
+                                    const double r = sqrt(fmax(0., s * s - h * h));
+                                    double d[3];
+                                    d[a] = (c - x[a]) / s, d[b] = r * du / s, d[e] = r * dv / s;
+                                    if (inside) {
+                                        A[j] = scale * h / (s * s) / sS, so[j] = s, any = true;
+                                    } else {
+                                        double si, sout;
+                                        if (!lattice3d_hit(v, x, d, si, sout)) {
+                                            A[j] = 0, so[j] = s;
+                                        } else {
+                                            const double tau = lattice3d_depth(v, x, d, s);
+                                            A[j] = tau <= v.tau_max ? scale * h / (s * s) * exp(-tau) / sS : 0.;
+                                            so[j] = sout;
+                                            any = any || A[j] != 0;
+                                        }
+                                    }
+                                    amax = fmax(amax, A[j]);
+                                }
+                                if (!any)
+                                    continue;
+                                if (depth < v.polar_depth && top + 2 <= lattice3d_stack &&
+                                    ch.tail(A) > v.polar_tol * amax + v.polar_floor) {
+                                    st_a[top] = mid, st_z[top] = sz, st_d[top++] = depth + 1;
+                                    st_a[top] = sa, st_z[top] = mid, st_d[top++] = depth + 1;
+                                    continue;
+                                }
+                                const int m_a = int(floor(sa / dt)) + 1, m_b = int(ceil(sz / dt));
+                                double f0[lattice3d_cheb_n], f1[lattice3d_cheb_n], ca[lattice3d_cheb_n + 1],
+                                    cb[lattice3d_cheb_n + 1];
+                                const int m_lo = m_a < 1 ? 1 : m_a;
+                                if (!inside) {
+                                    for (int j = 0; j < n; ++j)
+                                        f0[j] = A[j], f1[j] = A[j] * exp(sS * sj[j]);
+                                    ch.antider(f0, ca), ch.antider(f1, cb);
+                                    const double I0 = half * Lattice3dCheb::eval(ca, 1.);
+                                    Q += I0;
+                                    for (int m = m_lo; m < m_b && m <= M; ++m) {
+                                        const double xx = (m * dt - mid) / half;
+                                        Tmp[3 * L + m] += weight * half * Lattice3dCheb::eval(ca, xx);
+                                        Tmp[4 * L + m] += weight * half * Lattice3dCheb::eval(cb, xx);
+                                        mlo = m < mlo ? m : mlo, mhi = m > mhi ? m : mhi;
+                                    }
+                                    if (m_b <= M) {
+                                        Tmp[m_b] += weight * I0;
+                                        Tmp[L + m_b] += weight * half * Lattice3dCheb::eval(cb, 1.);
+                                        mlo = m_b < mlo ? m_b : mlo, mhi = m_b > mhi ? m_b : mhi;
+                                    }
+                                    for (int j = 0; j < n; ++j) { // saturation after s_out (node-wise)
+                                        if (A[j] == 0)
+                                            continue;
+                                        int m_out = int(ceil(so[j] / dt));
+                                        m_out = m_out < m_lo ? m_lo : m_out;
+                                        if (m_out > M)
+                                            continue;
+                                        const double wj = weight * half * ch.wq[j] * A[j];
+                                        Tmp[L + m_out] -= wj * exp(sS * sj[j]);
+                                        Tmp[2 * L + m_out] -= wj * exp(-sS * (so[j] - sj[j]));
+                                        mlo = m_out < mlo ? m_out : mlo, mhi = m_out > mhi ? m_out : mhi;
+                                    }
+                                } else {
+                                    for (int j = 0; j < n; ++j)
+                                        f0[j] = A[j] * -expm1(-sS * sj[j]), f1[j] = A[j];
+                                    ch.antider(f0, ca), ch.antider(f1, cb);
+                                    const double I3 = half * Lattice3dCheb::eval(cb, 1.);
+                                    Q += I3;
+                                    const int m_end = m_lo < M + 1 ? m_lo : M + 1;
+                                    if (1 < m_end) { // t < sa: (1 - e^{-sS t}) I3
+                                        Tmp[1] += weight * I3, Tmp[L + 1] += weight * I3;
+                                        Tmp[m_end] -= weight * I3, Tmp[L + m_end] -= weight * I3;
+                                        mlo = 1 < mlo ? 1 : mlo, mhi = m_end > mhi ? m_end : mhi;
+                                    }
+                                    for (int m = m_lo; m < m_b && m <= M; ++m) {
+                                        const double t = m * dt, xx = (t - mid) / half;
+                                        Tmp[3 * L + m] += weight * (half * Lattice3dCheb::eval(ca, xx) +
+                                                                    -expm1(-sS * t) *
+                                                                        (I3 - half * Lattice3dCheb::eval(cb, xx)));
+                                        mlo = m < mlo ? m : mlo, mhi = m > mhi ? m : mhi;
+                                    }
+                                    if (m_b <= M) {
+                                        Tmp[2 * L + m_b] += weight * half * Lattice3dCheb::eval(ca, 1.);
+                                        mlo = m_b < mlo ? m_b : mlo, mhi = m_b > mhi ? m_b : mhi;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    sprev = s_next;
+                }
+                return Q;
+            };
+            // phi pieces: initial pieces between breaks (width <= polar_max_dphi), adaptive bisection (stack)
+            double pst_a[lattice3d_stack], pst_z[lattice3d_stack];
+            int pst_d[lattice3d_stack];
+            for (int ip = np - 2; ip >= 0; --ip) {
+                const double ba = fmax(brk[ip], plo), bz = fmin(brk[ip + 1], phi_hi);
+                if (!(bz - ba > 1e-13))
+                    continue;
+                const int sub = int(ceil((bz - ba) / v.polar_max_dphi)) > 1 ? int(ceil((bz - ba) / v.polar_max_dphi)) : 1;
+                for (int sp = sub - 1; sp >= 0; --sp) {
+                    int top = 0;
+                    pst_a[top] = ba + (bz - ba) * sp / sub, pst_z[top] = ba + (bz - ba) * (sp + 1) / sub;
+                    pst_d[top++] = 0;
+                    while (top > 0) {
+                        --top;
+                        const double pa = pst_a[top], pz = pst_z[top];
+                        const int depth = pst_d[top];
+                        const double mid = .5 * (pa + pz), half = .5 * (pz - pa);
+                        int mlo = M + 2, mhi = -1;
+                        double Qn[lattice3d_cheb_n], qmax = 0;
+                        for (int j = 0; j < n; ++j) {
+                            Qn[j] = radial(mid + half * ch.x[j] + ref, half * ch.wq[j], mlo, mhi);
+                            qmax = fmax(qmax, fabs(Qn[j]));
+                        }
+                        const bool split = depth < v.polar_depth && top + 2 <= lattice3d_stack &&
+                                           ch.tail(Qn) > v.polar_tol * qmax + v.polar_floor;
+                        for (int q = 0; q < 5; ++q)
+                            for (int m = mlo; m <= mhi; ++m) {
+                                if (!split)
+                                    Acc[q * L + m] += Tmp[q * L + m];
+                                Tmp[q * L + m] = 0;
+                            }
+                        if (split) {
+                            pst_a[top] = mid, pst_z[top] = pz, pst_d[top++] = depth + 1;
+                            pst_a[top] = pa, pst_z[top] = mid, pst_d[top++] = depth + 1;
+                        }
+                    }
+                }
+            }
+        }
+    double p = 0, ee = 0, cc = 0;
+    row[0] = 0;
+    for (int m = 1; m <= M; ++m) {
+        p += Acc[m], ee += Acc[L + m], cc += Acc[2 * L + m];
+        const double val = p + Acc[3 * L + m] - exp(-sS * m * dt) * (ee + Acc[4 * L + m]) + cc;
+        row[m] = val > 0 ? val : 0;
+    }
+}
+// Row of the time table with the rule selected in the view (work: lattice3d_work_size(v, M) doubles).
+M1PN_HD3 inline void lattice3d_row(const Lattice3dView &v, const double x[3], double dt, int M, double *work,
+                                   double *row) {
+    if (v.polar)
+        lattice3d_row_polar(v, x, dt, M, work, row);
+    else
+        lattice3d_row_cartesian(v, x, dt, M, work, row);
 }
 } // namespace uncollided
 } // namespace m1pn

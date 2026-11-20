@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <random>
 using namespace m1pn;
@@ -152,6 +153,34 @@ int main(int argc, char **argv) {
         for (int k = 0; k < n; ++k)
             e = std::max(e, err[k]), scale = std::max(scale, val[k]);
         check(e / scale < 2e-5, "5. default rule against 2x panels, 8 points (rel. to max)", e / scale);
+    }
+    // 8. Polar rule (adaptive, about the foot point) against fine Cartesian tables: max over t relative to the row
+    //    maximum and the time integral. The near point (h = 0.0066 above a face of S) needs 64 Cartesian panels.
+    {
+        struct Case { V3 x; int panels; };
+        const Case cases[] = {{V3(2.3, 4.1, 3.3), 16}, {V3(5.2, 1.4, 2.6), 16}, {V3(3.4, 3.6, 0.8), 16},
+                              {V3(1.3, 2.2, 4.7), 16}, {V3(3.5, 3.5, 3.5), 16}, {V3(3.37, 3.61, 4.0066), 64}};
+        double emax = 0, eint = 0;
+        for (const Case &c : cases) {
+            uncollided::Lattice3dUncollidedTable P, F;
+            P.lattice = L, P.lattice.polar = true;
+            F.lattice = L, F.lattice.outer_order = F.lattice.inner_order = 8;
+            F.lattice.inside_panels = F.lattice.outside_panels = c.panels;
+            P.build({c.x}, 3.2), F.build({c.x}, 3.2);
+            double mx = 0, e = 0, a = 0, b = 0;
+            for (int m = 0; m <= F.M; ++m) {
+                const double p = P.table[m], f = F.table[m];
+                mx = std::max(mx, f), e = std::max(e, std::abs(p - f)), a += p, b += f;
+            }
+            if (std::getenv("M1PN_TEST_VERBOSE"))
+                std::printf("   8. x = (%.4f %.4f %.4f): max %.2e int %.2e\n", c.x[0], c.x[1], c.x[2], e / mx, std::abs(a - b) / b);
+            emax = std::max(emax, e / mx), eint = std::max(eint, std::abs(a - b) / b);
+        }
+        // 8a: the largest deviation (8e-4, x = (3.4, 3.6, 0.8), foot inside the face) comes from the front circle
+        // crossing the face boundary: a kink of the partial radial integral in phi at a time-dependent angle that the
+        // adaptive rule does not split (docs/FCS_LATTICE.md, polar rule, open point). Time integrals stay at 1e-6.
+        check(emax < 1e-3, "8a. polar rule against fine Cartesian tables (max over t, rel. to row max)", emax);
+        check(eint < 2e-5, "8b. polar rule against fine Cartesian tables (time integral, relative)", eint);
     }
     if (full) {
         // 6. Volume integral with the lattice (kinks): the reference converges with sub and steps.
