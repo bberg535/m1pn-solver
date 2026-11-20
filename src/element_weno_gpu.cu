@@ -1441,11 +1441,22 @@ struct GhostView {
     double *moments;  // pairs x 4: outgoing ghost moments
     int *flag_list;   // flagged pairs (host)
     GhostDeviceStats *stats;
+    const double *Y;          // traces from the per-side DGEMM (nullptr: k_ghost forms them itself)
+    const std::size_t *ycol;  // pairs: offset of the trace column of pair k in Y
 };
 struct GhostDevice {
     GhostView g;
     int warps = 4; // warps per block of k_ghost (dynamic shared memory: warps x max_points doubles)
     std::vector<void *> owned;
+    // Traces as one DGEMM per side, Y_s = H_s^T A_s (points x pairs of the side): H_s is read once per call instead of
+    // once per pair (P35: 29 MB per side and pair, the bottleneck of uniform high-order runs). M1PN_GPU_GHOST_GEMM=0
+    // keeps the per-warp dot products.
+    bool gemm = false;
+    int count[6] = {};
+    int *nodes[6] = {};
+    std::size_t offset[6] = {};
+    double *A = nullptr, *Y = nullptr;
+    cublasHandle_t handle = nullptr;
 };
 __device__ inline double warp_sum(double v) {
 #pragma unroll
@@ -1652,12 +1663,18 @@ __global__ void __launch_bounds__(128) k_ghost(View v, GhostView g, const double
     const double *ox = g.ox[sd], *oy = g.oy[sd], *oz = g.oz[sd], *w = g.w[sd];
     const double *row = a + std::size_t(node) * q;
     // PN trace at the rule points (filtered coefficients if a ghost filter is set).
-    for (int j = lane; j < P; j += 32) {
-        const double *Hj = g.harmonics[sd] + std::size_t(j) * q;
-        double s = 0;
-        for (int c = 0; c < q; ++c)
-            s += Hj[c] * (g.sigma ? g.sigma[c] * row[c] : row[c]);
-        y[j] = s;
+    if (g.Y) {
+        const double *Yk = g.Y + g.ycol[k];
+        for (int j = lane; j < P; j += 32)
+            y[j] = Yk[j];
+    } else {
+        for (int j = lane; j < P; j += 32) {
+            const double *Hj = g.harmonics[sd] + std::size_t(j) * q;
+            double s = 0;
+            for (int c = 0; c < q; ++c)
+                s += Hj[c] * (g.sigma ? g.sigma[c] * row[c] : row[c]);
+            y[j] = s;
+        }
     }
     __syncwarp();
     double U[4];
@@ -1766,6 +1783,19 @@ __global__ void __launch_bounds__(128) k_ghost(View v, GhostView g, const double
         for (int c = 0; c < 4; ++c)
             g.moments[std::size_t(k) * 4 + c] = m[c];
 }
+inline void cublas_ok(cublasStatus_t e, const char *what) {
+    if (e != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(std::string("cuBLAS: ") + what + " failed (" + std::to_string(int(e)) + ")");
+}
+__global__ void k_gather_ghost_rows_sigma(int q, int count, const int *nodes, const double *state, const double *sigma,
+                                          double *A) {
+    const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= std::size_t(count) * q)
+        return;
+    const int j = int(t / q), c = int(t % q);
+    const double v = state[std::size_t(nodes[j]) * q + c];
+    A[t] = sigma ? sigma[c] * v : v;
+}
 void ghost_setup(Context *ctx, const GhostSetup &s) {
     GhostDevice *gd = new GhostDevice;
     GhostView &g = gd->g;
@@ -1816,10 +1846,43 @@ void ghost_setup(Context *ctx, const GhostSetup &s) {
     const double one = 1;
     std::memcpy(&st.min_active_bits, &one, 8);
     CK(cudaMemcpy(g.stats, &st, sizeof st, cudaMemcpyHostToDevice));
+    g.Y = nullptr, g.ycol = nullptr;
     ctx->ghost = gd;
     int least = 0, greatest = 0; // numerically larger = lower priority
     CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
     CK(cudaStreamCreateWithPriority(&ctx->aux, cudaStreamNonBlocking, least));
+    {
+        const char *e = std::getenv("M1PN_GPU_GHOST_GEMM");
+        gd->gemm = e ? std::atoi(e) != 0 : true;
+    }
+    if (gd->gemm) {
+        std::array<std::vector<int>, 6> nodes;
+        std::vector<std::size_t> ycol(std::size_t(s.pairs));
+        std::array<std::vector<int>, 6> members;
+        for (int k = 0; k < s.pairs; ++k)
+            members[s.side[k]].push_back(k);
+        std::size_t total = 0;
+        int max_count = 0;
+        for (int sd = 0; sd < 6; ++sd) {
+            gd->offset[sd] = total;
+            gd->count[sd] = int(members[sd].size());
+            if (!gd->count[sd])
+                continue;
+            for (std::size_t j = 0; j < members[sd].size(); ++j) {
+                nodes[sd].push_back(s.node[members[sd][j]]);
+                ycol[members[sd][j]] = total + j * std::size_t(s.points[sd]);
+            }
+            gd->nodes[sd] = own(dcopy(nodes[sd].data(), nodes[sd].size()));
+            total += std::size_t(s.points[sd]) * gd->count[sd];
+            max_count = std::max(max_count, gd->count[sd]);
+        }
+        gd->A = own(dalloc<double>(std::max<std::size_t>(1, std::size_t(max_count) * g.q)));
+        gd->Y = own(dalloc<double>(std::max<std::size_t>(1, total)));
+        g.Y = gd->Y;
+        g.ycol = own(dcopy(ycol.data(), ycol.size()));
+        cublas_ok(cublasCreate(&gd->handle), "create (ghost)");
+        cublas_ok(cublasSetStream(gd->handle, ctx->aux), "set stream (ghost)");
+    }
 }
 // On the aux stream after the work queued so far on the default stream (event 3); completion is event 2.
 void ghost(Context *ctx, const double *state, double *pinned_moments, int *pinned_flags) {
@@ -1828,6 +1891,24 @@ void ghost(Context *ctx, const double *state, double *pinned_moments, int *pinne
     CK(cudaEventRecord(ctx->events[3], ctx->stream));
     CK(cudaStreamWaitEvent(st, ctx->events[3], 0));
     CK(cudaMemsetAsync(&g.stats->flagged, 0, sizeof(int), st));
+    if (ctx->ghost->gemm) {
+        GhostDevice *gd = ctx->ghost;
+        const double one = 1, zero = 0;
+        for (int sd = 0; sd < 6; ++sd) {
+            const int n = gd->count[sd], p = g.points[sd];
+            if (!n)
+                continue;
+            // A_s (q x n, column-major) = filtered state rows of the side's ghost nodes; the gather buffer is reused,
+            // the DGEMM of the previous side is ordered before it on the stream.
+            k_gather_ghost_rows_sigma<<<blocks(std::size_t(n) * g.q), 256, 0, st>>>(g.q, n, gd->nodes[sd], state,
+                                                                                    g.sigma, gd->A);
+            // harmonics[sd] is q x P column-major (row j of the rule = column j): Y_s = H^T A_s, P x n.
+            cublas_ok(cublasDgemm(gd->handle, CUBLAS_OP_T, CUBLAS_OP_N, p, n, g.q, &one, g.harmonics[sd], g.q,
+                                     gd->A, g.q, &zero, gd->Y + gd->offset[sd], p),
+                         "dgemm (ghost)");
+        }
+        CK(cudaGetLastError());
+    }
     const int warps = ctx->ghost->warps;
     k_ghost<<<(g.pairs + warps - 1) / warps, 32 * warps, std::size_t(warps) * g.max_points * sizeof(double), st>>>(
         ctx->v, g, state);
@@ -3561,6 +3642,8 @@ void destroy(Context *ctx) {
     destroy_boundary_high(ctx);
     destroy_ghost_traces(ctx);
     if (ctx->ghost) {
+        if (ctx->ghost->handle)
+            cublasDestroy(ctx->ghost->handle);
         for (void *p : ctx->ghost->owned)
             cudaFree(p);
         delete ctx->ghost;

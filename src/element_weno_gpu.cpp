@@ -397,6 +397,10 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     for (int side = 0; side < 6 && device_ghost_; ++side)
         if (s.boundaries_[side] && s.out_rules_[side].c.size())
             device_ghost_ = false;
+    if (std::getenv("M1PN_GPU_GHOST_WHY"))
+        std::fprintf(stderr, "ghost: ratio %.3f full %d proj %d half %d empty %d interfaces %d adaptive %d -> device %d\n",
+                     ratio, int(o.fullsphere_ghost), int(o.positivity_projection), int(o.projection_half_range),
+                     int(s.ghost_node_.empty()), int(interfaces_), int(o.adaptive_pn), int(device_ghost_));
     if (device_ghost_) {
         gpu::GhostSetup g;
         g.pairs = int(s.ghost_node_.size());
