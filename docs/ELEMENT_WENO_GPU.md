@@ -319,3 +319,9 @@ Device-Arbeit auf allen Gittern ~2.4× kleiner; der große Faktor auf GBQ/GBH ka
 Iteration): weniger Iterationen oder ein anderer Startvektor ändern Δt und damit alle Ergebnisse; Gewinn 2–5 %.
 Gemischte Genauigkeit nach ℓ: nur `k_combine` ist speichergebunden (~1.4 TB/s), Line-Solve ~0.55, Strip ~0.46 TB/s;
 geschätzt 1.2–1.4× bei Umbau aller Kernel und des Speicherlayouts.
+
+**Lokale Zeitschritte (Abschätzung, nicht umgesetzt).** Auf Tensorgittern ist der Schritt eines Elements durch
+min(h_x, h_y[, h_z]) begrenzt; jedes Element, das in *einer* Achse im feinen Zentrum liegt, braucht den feinen
+Schritt. Ideales LTS (Stufen 2^k) brächte als Arbeitsanteil: GB/GBH/GBQ 2D 0.941, 3D 0.972 (gleiche Grading-Muster),
+also 6 % bzw. 3 % – den Aufwand (Positivität und Realisierbarkeit an Stufengrenzen) nicht wert. Lohnend nur auf
+hierarchischen (Quadtree-)Gittern.
