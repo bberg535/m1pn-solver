@@ -410,22 +410,30 @@ struct Lattice3dCheb {
             0.98078528040323043, -0.83146961230254501, 0.55557023301960151, -0.19509032201612858};
         return t[k * 8 + j];
     }
-    // Chebyshev coefficients c_0..c_{n-1} of the interpolant (f = c_0/2 + sum c_k T_k).
+    // Chebyshev coefficients c_0..c_{n-1} of the interpolant (f = c_0/2 + sum c_k T_k), even/odd folded.
     M1PN_HD3 static void coeffs(const double *f, double *c) {
-        const int n = lattice3d_cheb_n;
-        for (int k = 0; k < n; ++k) {
-            double s = 0;
-            for (int j = 0; j < n; ++j)
-                s += f[j] * cosjk(k, j);
-            c[k] = 2. / n * s;
-        }
+        const double e0 = f[0] + f[7], e1 = f[1] + f[6], e2 = f[2] + f[5], e3 = f[3] + f[4];
+        const double o0 = f[0] - f[7], o1 = f[1] - f[6], o2 = f[2] - f[5], o3 = f[3] - f[4];
+        c[0] = 0.25 * (e0 + e1 + e2 + e3);
+        c[2] = 0.25 * ((e0 - e3) * 0.92387953251128674 + (e1 - e2) * 0.38268343236508984);
+        c[4] = 0.25 * 0.70710678118654757 * (e0 - e1 - e2 + e3);
+        c[6] = 0.25 * ((e0 - e3) * 0.38268343236508984 + (e2 - e1) * 0.92387953251128674);
+        c[1] = 0.25 * (o0 * 0.98078528040323043 + o1 * 0.83146961230254524 + o2 * 0.55557023301960229 +
+                       o3 * 0.19509032201612833);
+        c[3] = 0.25 * (o0 * 0.83146961230254524 - o1 * 0.19509032201612833 - o2 * 0.98078528040323043 -
+                       o3 * 0.55557023301960229);
+        c[5] = 0.25 * (o0 * 0.55557023301960229 - o1 * 0.98078528040323043 + o2 * 0.19509032201612833 +
+                       o3 * 0.83146961230254524);
+        c[7] = 0.25 * (o0 * 0.19509032201612833 - o1 * 0.55557023301960229 + o2 * 0.83146961230254524 -
+                       o3 * 0.98078528040323043);
     }
     M1PN_HD3 static double tail(const double *f) {
-        const int n = lattice3d_cheb_n;
-        double s1 = 0, s2 = 0;
-        for (int j = 0; j < n; ++j)
-            s1 += f[j] * cosjk(n - 1, j), s2 += f[j] * cosjk(n - 2, j);
-        return (2. / n) * (fabs(s1) + fabs(s2));
+        const double e0 = f[0] + f[7], e1 = f[1] + f[6], e2 = f[2] + f[5], e3 = f[3] + f[4];
+        const double o0 = f[0] - f[7], o1 = f[1] - f[6], o2 = f[2] - f[5], o3 = f[3] - f[4];
+        const double c6 = (e0 - e3) * 0.38268343236508984 + (e2 - e1) * 0.92387953251128674;
+        const double c7 = o0 * 0.19509032201612833 - o1 * 0.55557023301960229 + o2 * 0.83146961230254524 -
+                          o3 * 0.98078528040323043;
+        return 0.25 * (fabs(c6) + fabs(c7));
     }
     // Antiderivative (C_0..C_n) in x of the interpolant, zero at x = -1.
     M1PN_HD3 static void antider(const double *f, double *C) {
@@ -616,15 +624,16 @@ M1PN_HD3 inline void lattice3d_row_polar(const Lattice3dView &v, const double x[
                                 for (int j = 0; j < n; ++j) {
                                     const double s = mid + half * Lattice3dCheb::x(j);
                                     sj[j] = s;
+                                    const double inv_s = 1.0 / s;
                                     const double r = sqrt(fmax(0., s * s - h * h));
                                     double d[3];
-                                    d[a] = (c - x[a]) / s, d[b] = r * du / s, d[e] = r * dv / s;
+                                    d[a] = (c - x[a]) * inv_s, d[b] = r * du * inv_s, d[e] = r * dv * inv_s;
                                     if (inside) {
-                                        A[j] = scale * h / (s * s) / sS, so[j] = s, any = true;
+                                        A[j] = scale * h * inv_s * inv_s / sS, so[j] = s, any = true;
                                     } else {
                                         const double tau = lattice3d_depth(v, x, d, s);
                                         if (tau <= v.tau_max) {
-                                            A[j] = scale * h / (s * s) * exp(-tau) / sS;
+                                            A[j] = scale * h * inv_s * inv_s * exp(-tau) / sS;
                                             so[j] = lattice3d_exit_S(v, x, d);
                                             any = true;
                                         } else {
@@ -642,24 +651,37 @@ M1PN_HD3 inline void lattice3d_row_polar(const Lattice3dView &v, const double x[
                                     continue;
                                 }
                                 const int m_a = int(floor(sa / dt)) + 1, m_b = int(ceil(sz / dt));
-                                double f0[lattice3d_cheb_n], f1[lattice3d_cheb_n], ca[lattice3d_cheb_n + 1],
-                                    cb[lattice3d_cheb_n + 1];
                                 const int m_lo = m_a < 1 ? 1 : m_a;
+                                const int m_hi_in = m_b < M + 1 ? m_b : M + 1;
+                                const double wh = weight * half;
                                 if (!inside) {
-                                    for (int j = 0; j < n; ++j)
-                                        f0[j] = A[j], f1[j] = A[j] * exp(sS * sj[j]);
-                                    Lattice3dCheb::antider(f0, ca), Lattice3dCheb::antider(f1, cb);
-                                    const double I0 = half * Lattice3dCheb::eval(ca, 1.);
+                                    double f1[lattice3d_cheb_n], esj[lattice3d_cheb_n];
+                                    double sum0 = 0, sum1 = 0;
+                                    for (int j = 0; j < n; ++j) {
+                                        const double e_j = exp(sS * sj[j]);
+                                        esj[j] = e_j;
+                                        f1[j] = A[j] * e_j;
+                                        const double wq = Lattice3dCheb::wq(j);
+                                        sum0 += wq * A[j];
+                                        sum1 += wq * f1[j];
+                                    }
+                                    const double I0 = half * sum0, I1 = half * sum1;
                                     Q += I0;
-                                    for (int m = m_lo; m < m_b && m <= M; ++m) {
-                                        const double xx = (m * dt - mid) / half;
-                                        Tmp[3 * L + m] += weight * half * Lattice3dCheb::eval(ca, xx);
-                                        Tmp[4 * L + m] += weight * half * Lattice3dCheb::eval(cb, xx);
-                                        mlo = m < mlo ? m : mlo, mhi = m > mhi ? m : mhi;
+                                    if (m_lo < m_hi_in) {
+                                        double ca[lattice3d_cheb_n + 1], cb[lattice3d_cheb_n + 1];
+                                        Lattice3dCheb::antider(A, ca), Lattice3dCheb::antider(f1, cb);
+                                        const double inv_half = 1.0 / half;
+                                        for (int m = m_lo; m < m_hi_in; ++m) {
+                                            const double xx = (m * dt - mid) * inv_half;
+                                            Tmp[3 * L + m] += wh * Lattice3dCheb::eval(ca, xx);
+                                            Tmp[4 * L + m] += wh * Lattice3dCheb::eval(cb, xx);
+                                        }
+                                        mlo = m_lo < mlo ? m_lo : mlo;
+                                        mhi = (m_hi_in - 1) > mhi ? (m_hi_in - 1) : mhi;
                                     }
                                     if (m_b <= M) {
                                         Tmp[m_b] += weight * I0;
-                                        Tmp[L + m_b] += weight * half * Lattice3dCheb::eval(cb, 1.);
+                                        Tmp[L + m_b] += weight * I1;
                                         mlo = m_b < mlo ? m_b : mlo, mhi = m_b > mhi ? m_b : mhi;
                                     }
                                     for (int j = 0; j < n; ++j) { // saturation after s_out (node-wise)
@@ -669,16 +691,21 @@ M1PN_HD3 inline void lattice3d_row_polar(const Lattice3dView &v, const double x[
                                         m_out = m_out < m_lo ? m_lo : m_out;
                                         if (m_out > M)
                                             continue;
-                                        const double wj = weight * half * Lattice3dCheb::wq(j) * A[j];
-                                        Tmp[L + m_out] -= wj * exp(sS * sj[j]);
+                                        const double wj = wh * Lattice3dCheb::wq(j) * A[j];
+                                        Tmp[L + m_out] -= wj * esj[j];
                                         Tmp[2 * L + m_out] -= wj * exp(-sS * (so[j] - sj[j]));
                                         mlo = m_out < mlo ? m_out : mlo, mhi = m_out > mhi ? m_out : mhi;
                                     }
                                 } else {
-                                    for (int j = 0; j < n; ++j)
-                                        f0[j] = A[j] * -expm1(-sS * sj[j]), f1[j] = A[j];
-                                    Lattice3dCheb::antider(f0, ca), Lattice3dCheb::antider(f1, cb);
-                                    const double I3 = half * Lattice3dCheb::eval(cb, 1.);
+                                    double f0[lattice3d_cheb_n];
+                                    double sum0 = 0, sum1 = 0;
+                                    for (int j = 0; j < n; ++j) {
+                                        f0[j] = A[j] * -expm1(-sS * sj[j]);
+                                        const double wq = Lattice3dCheb::wq(j);
+                                        sum0 += wq * f0[j];
+                                        sum1 += wq * A[j];
+                                    }
+                                    const double I2 = half * sum0, I3 = half * sum1;
                                     Q += I3;
                                     const int m_end = m_lo < M + 1 ? m_lo : M + 1;
                                     if (1 < m_end) { // t < sa: (1 - e^{-sS t}) I3
@@ -686,15 +713,21 @@ M1PN_HD3 inline void lattice3d_row_polar(const Lattice3dView &v, const double x[
                                         Tmp[m_end] -= weight * I3, Tmp[L + m_end] -= weight * I3;
                                         mlo = 1 < mlo ? 1 : mlo, mhi = m_end > mhi ? m_end : mhi;
                                     }
-                                    for (int m = m_lo; m < m_b && m <= M; ++m) {
-                                        const double t = m * dt, xx = (t - mid) / half;
-                                        Tmp[3 * L + m] += weight * (half * Lattice3dCheb::eval(ca, xx) +
-                                                                    -expm1(-sS * t) *
-                                                                        (I3 - half * Lattice3dCheb::eval(cb, xx)));
-                                        mlo = m < mlo ? m : mlo, mhi = m > mhi ? m : mhi;
+                                    if (m_lo < m_hi_in) {
+                                        double ca[lattice3d_cheb_n + 1], cb[lattice3d_cheb_n + 1];
+                                        Lattice3dCheb::antider(f0, ca), Lattice3dCheb::antider(A, cb);
+                                        const double inv_half = 1.0 / half;
+                                        for (int m = m_lo; m < m_hi_in; ++m) {
+                                            const double t = m * dt, xx = (t - mid) * inv_half;
+                                            Tmp[3 * L + m] += weight * (half * Lattice3dCheb::eval(ca, xx) +
+                                                                        -expm1(-sS * t) *
+                                                                            (I3 - half * Lattice3dCheb::eval(cb, xx)));
+                                        }
+                                        mlo = m_lo < mlo ? m_lo : mlo;
+                                        mhi = (m_hi_in - 1) > mhi ? (m_hi_in - 1) : mhi;
                                     }
                                     if (m_b <= M) {
-                                        Tmp[2 * L + m_b] += weight * half * Lattice3dCheb::eval(ca, 1.);
+                                        Tmp[2 * L + m_b] += weight * I2;
                                         mlo = m_b < mlo ? m_b : mlo, mhi = m_b > mhi ? m_b : mhi;
                                     }
                                 }
