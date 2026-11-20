@@ -283,3 +283,39 @@ automatische Wahl (Host, Verhältnis < 0.1) bleibt dort richtig.
 **Folge.** Der Abstand adaptiv–uniform schrumpft auf GBQ/GBH (P35: 2.79 gegen 1.32–1.98 s auf GBQ, 16.10 gegen
 5.95–8.54 s auf GBH). Die adaptiven Läufe selbst nutzen den Host-Ghost mit Ordnungsstufen und werden nicht schneller.
 Die Spektralradius-Schätzung (60 Potenziterationen des vollen Operators, einmal am Anfang) kostet auf GB P35 3.4 s.
+
+## Profil und weitere Beschleunigung (20.11.2026, Branch `perf/solver-202611`)
+
+**Kernel-Profil (nsys, A100, GB P35, T = 3.2, `nx/tmp/tardis_perf_20261120/nsys`).** Uniform (Device-Ghost) gegen
+adaptiv (1e-4, Kachel 8, 28.8 % aktive Koeffizienten), Summe über den Lauf: Line-Solve 41.9 → 14.0 s (3.0×),
+Strip-Stabilisierung 33.7 → 15.0 s (2.25×), Combine 16.2 → 6.1 s (2.65×); ideal wäre 3.5×. Die Low4-Kernel
+(Momente c < 4, ein Thread je Linie und Moment) sind latenzgebunden (GB: ~2300 Threads je Achse, ~110 GB/s).
+Die „GB-Anomalie“ (adaptiv nur 2× auf GB, 11× auf GBH) war keine: pro Zelle und Schritt ist die adaptive
+Device-Arbeit auf allen Gittern ~2.4× kleiner; der große Faktor auf GBQ/GBH kam von der Ghost-Projektion (oben).
+
+**Änderungen.**
+1. Initialisierung: dünne Produkte in `Boundary` (D blockdiagonal in l, Normalenmatrix mit ~6 Einträgen je Zeile),
+   die ungenutzte Matrix `homogeneous` nur mit `norms = true`; CUDA-Kontext auf einem Hilfsthread während des
+   Schema-Aufbaus. Rundungsgleich (GBH P35: Masse 5e-11, Rate 3e-8 relativ).
+2. Adaptiver Pfad: Low4- und High-Chunk-Line-Solves sowie die Strip-Stabilisierung auf Fork-Join-Streams
+   (`M1PN_GPU_OVERLAP=0` seriell). Bitgleich.
+3. Strip-Stabilisierung (uniform, low4, adaptiv): Zeilenzeiger statt 64-Bit-Indexprodukt je Ladevorgang
+   (ncu A2000: Integer-Befehle 6.4e9 → 4.5e9, Warp-Befehle −18 %), `M1PN_GPU_STRIP_MINB` = 4/6/8 für die
+   Launch-Bounds. Bitgleich.
+
+**A100 (Job 164279, Block-A-Konfigurationen, gegen `tardis_paper_20261120`).**
+
+| Lauf | gesamt alt → neu [s] | Init alt → neu [s] | Solver alt → neu [s] |
+|---|---|---|---|
+| GBQ P35 adaptiv 1e-4 | 8.5 → 6.3 | 6.4 → 4.4 | 1.65 → 1.53 |
+| GBH P35 adaptiv 1e-4 | 16.7 → 14.3 | 8.3 → 6.2 | 7.32 → 7.07 |
+| GB P35 adaptiv 1e-4 | 65.8 → 63.2 | 15.3 → 13.4 | 46.81 → 46.58 |
+| GBQ P35 uniform | 26.9 → 7.4 | 6.3 → 4.2 | 20.26 → 2.79 |
+| GBH P35 uniform | 93.6 → 23.1 | 8.1 → 6.0 | 84.46 → 16.11 |
+
+Überlappung allein (`_serial` gegen Standard): GBQ 1.64 → 1.53 s, GBH 7.31 → 7.07 s, GB unverändert.
+
+**Nicht geändert.** Spektralradius (60 Potenziterationen, bei 60 noch nicht konvergiert: GBH 768.7, +0.08 je
+Iteration): weniger Iterationen oder ein anderer Startvektor ändern Δt und damit alle Ergebnisse; Gewinn 2–5 %.
+Gemischte Genauigkeit nach ℓ: nur `k_combine` ist speichergebunden (~1.4 TB/s), Line-Solve ~0.55, Strip ~0.46 TB/s;
+geschätzt 1.2–1.4× bei Umbau aller Kernel und des Speicherlayouts.
