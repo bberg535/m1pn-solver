@@ -248,3 +248,22 @@ alle 31 Fälle PASS (1e-17 … 1e-11, FCS-Fälle 4.9e-10 wie uniform); vorher 15
 Offen (CPU und GPU gleich): Der Massensolve läuft je 32er-Moment-Chunk über Segmente, die auch Knoten enthalten, an
 denen einzelne Momente des Chunks inaktiv sind; Einträge ungleich null an diesen Stellen der rechten Seite wirken auf
 die aktiven Ergebnisse. Bei exakten Nullen harmlos, aber kein exakter Submatrix-Solve je Moment.
+
+## Ghost-Spuren als DGEMM (20.11.2026, Branch `perf/solver-202611`)
+
+**Befund.** Bei uniformem hohem N war nicht der Volumenteil, sondern die Ghost-Projektion am Vakuumrand der Engpass:
+GBH P35 auf der A100 (Kampagne `tardis_paper_20261120`) verbringt 82 der 84 s Solverzeit mit Warten auf `k_ghost`.
+Der Kernel bildet die PN-Spur je Ghost-Paar mit einem Warp, der die ganze Harmonischen-Matrix seiner Seite liest
+(P35: ~5500 Regelpunkte × 666 Momente = 29 MB). Die Matrix wird so einmal je Paar aus dem globalen Speicher gestreamt
+(GBH: ~2300 Paare, ~67 GB je Stufe). Der Speedup des adaptiven PN auf GBQ/GBH (10–15×) kam vor allem daher, dass der
+adaptive Pfad die Ghost-Projektion auf dem Host mit Ordnungsstufen (3, 7, 15) und analytischem P1-Ghost rechnet.
+
+**Änderung.** Je Seite werden die (gefilterten) Ghost-Zeilen gesammelt und `Y_s = H_sᵀ A_s` als eine cuBLAS-DGEMM auf
+dem aux-Stream gebildet; `k_ghost` kopiert nur noch seine Spalte. Die Projektion selbst ist unverändert.
+`M1PN_GPU_GHOST_GEMM=0` stellt die alten Spuren her, `M1PN_GPU_GHOST_WHY=1` gibt aus, warum der Device-Pfad
+(nicht) gewählt wird (Verhältnis Randarbeit/Volumenarbeit, Schwelle 0.1; adaptiv und mit Interfaces immer Host).
+
+**Lokal (RTX A2000, FP64-schwach).** GBH P35 bis t = 0.4: Solver 85.4 → 39.2 s (Ghost 63 → 21 s), Masse und
+Absorptionsrate in allen Stellen gleich. Linienquelle Q1/128 P21 (FCS): 17.3 → 12.0 s, Masse 2e-13. lattice-3d 28³
+P7: gleich. Auf der A2000 ist bei 224² P21 die Host-Projektion schneller (9.2 gegen 12.4 s); die Schwelle wird auf der
+A100 neu bestimmt (`scripts/element_weno/tardis_perf_profile.sbatch`).
