@@ -226,3 +226,11 @@ Einschränkungen: 1D/2D (GPU 2D), seriell (kein MPI), offenes Gitter; Lattice-3D
   braucht aber Begrenzung gegen den Kegel.
 - Indikator-Auswertung der ungestoßenen Dichte per Raytracing auf der CPU (L4: 5 s); die Gerätetabelle könnte das
   übernehmen.
+
+## 3D (20.11.2026, Branch `feature/graded-3d`)
+
+`--amr on` ist für 3D freigegeben (CPU und GPU; Transfer, Indikator und Ebenen waren schon dimensionsgenerisch).
+CPU gegen GPU auf `lattice-3d` (Basis `1,…,1`, zwei Stufen, ein Umvernetzen 512 → 24389 Knoten) 3e-16, mit adaptiver
+PN ebenso; mit FCS (Toleranz 3e-5) 1.5e-10. Vergleich nur mit `--dt 0` auf beiden Seiten (dt wird nach jedem
+Umvernetzen neu geschätzt). Die FCS-Zeitfenster gibt es nur in 2D: in 3D wird die Tabelle nach jedem Umvernetzen für
+den ganzen Zeitbereich neu gebaut (teuer); für das Lattice sind statische Graded-Gitter vorzuziehen.

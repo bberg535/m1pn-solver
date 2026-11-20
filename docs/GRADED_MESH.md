@@ -90,3 +90,13 @@ Laufzeit A100 (`nx/tmp/graded_gpu/perf`, lattice-paul FCS, t = 3,2):
 | GA P21 | 47 s | −0,106 / +0,173 / +0,183 | 1,7e-3 | 0,49 % |
 | U896 P11 + Filter | 136 s | −0,110 / +0,199 / +0,223 | 1,6e-3 | 0,46 % |
 | GB P11 + Filter | 49 s | −0,112 / +0,202 / +0,225 | 1,6e-3 | 0,48 % |
+
+## 3D (20.11.2026, Branch `feature/graded-3d`)
+
+Der Kern war seit Stufe A dimensionsgenerisch; `fast_main` ließ `--cells-per-unit` nur in 1D/2D (GPU: 2D) zu. Jetzt
+1D–3D, GPU 2D/3D (3D über den knotenweisen Kern mit Klassentabellen; der Streifenkern bleibt 2D-Q1). Abnahme:
+konstante Liste `2,…,2` in 3D bitgleich zu `--elements 14` (CPU); CPU gegen GPU auf `lattice-3d` mit
+`1,2,4,4,4,2,1` (Q1 P3/P7, Q2, mit FCS, Broken Lines, Split-Stufe, adaptive PN, alles zusammen) 1e-16; Spiegelreduktion
+auf einem 3D-Graded-Gitter (glatter Puls) CPU+Spiegel, GPU+Spiegel und volles Gebiet 3e-14. In
+`tests/gpu_validate_adaptive.sh` (41 Fälle, alle PASS). Dynamische AMR ([DYNAMIC_AMR.md](DYNAMIC_AMR.md)) ebenfalls
+für 3D freigegeben.

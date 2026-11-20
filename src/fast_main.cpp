@@ -613,8 +613,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     if (!o.cells_per_unit.empty()) {
         // Graded mesh: every axis of the box is split into equal segments, one per entry, with the given element
         // counts (for the lattices: unit segments, so material and source boundaries stay on element boundaries).
-        require(dim <= 2 && !distributed && !o.mesh.periodic && (!o.gpu || dim == 2),
-                "--cells-per-unit: 1D/2D (GPU: 2D), serial, open mesh (docs/GRADED_MESH.md)");
+        require(!distributed && !o.mesh.periodic && (!o.gpu || dim >= 2),
+                "--cells-per-unit: 1D-3D (GPU: 2D/3D), serial, open mesh (docs/GRADED_MESH.md)");
         const std::array<int, 3> uniform_counts = counts; // the loop overwrites counts[d]; extents use the originals
         for (int d = 0; d < dim; ++d) {
             const double extent_d = length_x / uniform_counts[0] * uniform_counts[d];
@@ -650,8 +650,8 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     eo.material = material;
     if (o.amr) {
         // Dynamic AMR (docs/DYNAMIC_AMR.md): the given mesh is the base mesh; it is run as a graded mesh (planes).
-        require(dim <= 2 && !distributed && !o.mesh.periodic && (!o.gpu || dim == 2),
-                "--amr: 1D/2D (GPU: 2D), serial, open mesh (graded tensor meshes)");
+        require(!distributed && !o.mesh.periodic && (!o.gpu || dim >= 2),
+                "--amr: 1D-3D (GPU: 2D/3D), serial, open mesh (graded tensor meshes)");
         require(o.amr_levels >= 0 && o.amr_levels <= 6 && o.amr_min_level >= 0 && o.amr_min_level <= o.amr_levels &&
                     o.amr_buffer >= 0 && o.amr_tol > 0 && o.amr_hysteresis > 0 && o.amr_hysteresis <= 1,
                 "--amr-levels 0..6, 0 <= --amr-min-level <= levels, --amr-buffer >= 0, --amr-tol > 0, hysteresis in (0,1]");
@@ -1502,7 +1502,7 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     };
     auto amr_log_mesh = [&]() {
         amr_log << (amr_log.tellp() > 0 ? "," : "") << "{\"t\":" << t << ",\"nodes\":" << scheme_ptr->nodes
-                << ",\"counts\":[" << counts[0] << "," << counts[1] << "],\"dt\":" << selected << ",\"levels\":[";
+                << ",\"counts\":[" << counts[0] << "," << counts[1] << "," << counts[2] << "],\"dt\":" << selected << ",\"levels\":[";
         for (int d = 0; d < dim; ++d) {
             amr_log << (d ? "," : "") << "[";
             for (std::size_t b = 0; b < amr_axes[d].level.size(); ++b)
