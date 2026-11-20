@@ -737,11 +737,26 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
             const V3 c(i + .5, j + .5, k + .5);
             return cases::lattice3d_sigma_a(c) + cases::lattice3d_sigma_s(c);
         });
-        // EXPERIMENT (feature/fcs3d-table): M1PN_FCS3D_RULE=polar selects the adaptive polar rule of the time table.
+        // EXPERIMENT (feature/fcs3d-table): fast 3D FCS defaults (polar rule, nodal FP32 table, adaptive 1-pt/8-pt
+        // spatial quadrature) with environment overrides for ablations and legacy comparison.
+        lattice3_table->lattice.polar = true;
+        lattice3_table->nodal = true;
+        lattice3_table->nodal_fp32 = true;
+        lattice3_table->adaptive_quad = true;
         if (const char *e = std::getenv("M1PN_FCS3D_RULE"))
             lattice3_table->lattice.polar = std::string(e) == "polar";
         if (const char *e = std::getenv("M1PN_FCS3D_TOL"))
             lattice3_table->lattice.polar_tol = std::atof(e);
+        if (const char *e = std::getenv("M1PN_FCS3D_LAYOUT"))
+            lattice3_table->nodal = std::string(e) != "points";
+        if (const char *e = std::getenv("M1PN_FCS3D_FP64"))
+            lattice3_table->nodal_fp32 = std::atoi(e) == 0;
+        if (const char *e = std::getenv("M1PN_FCS3D_ADAPTIVE_QUAD"))
+            lattice3_table->adaptive_quad = std::atoi(e) != 0;
+        if (const char *e = std::getenv("M1PN_FCS3D_ADAPTIVE_TAU"))
+            lattice3_table->adaptive_quad_tau = std::atof(e);
+        if (const char *e = std::getenv("M1PN_FCS3D_ADAPTIVE_DIST"))
+            lattice3_table->adaptive_quad_dist = std::atof(e);
         material->source = [](const V3 &) { return 0.; };
         material->name += ", source uncollided (FCS)";
         const std::string from = "\"source\":1,";
@@ -1563,8 +1578,12 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
         amr_axes = next;
         amr_apply_mesh(amr_axes);
         amr_next_window(); // with the old scheme's FCS points (absorption of the closing window)
-        if (fcs_lattice)   // the time table belongs to the FCS points of a mesh
-            (lattice3d ? lattice3_table->points : lattice_table->points).clear();
+        if (fcs_lattice) { // the time table belongs to the FCS points of a mesh
+            if (lattice3d)
+                lattice3_table->reset();
+            else
+                lattice_table->points.clear();
+        }
         eo.adaptive_restart = o.amr_pn_restart; // efficiency iteration 3
         eo.adaptive_node_order.clear();
         if (o.amr_carry_pn && o.adaptive_pn) { // coupling A: node orders of the old mesh, mapped by the transfer support
@@ -1775,21 +1794,28 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
     // and the totals that compare with the kinetic reference.
     std::string lattice_fcs_json;
     if (fcs_lattice) {
-        const auto &xs = scheme_ptr->fcs_points();
-        const auto &ws = scheme_ptr->fcs_weights();
-        const int P = scheme_ptr->fcs_points_per_element();
         double mu = 0, ru = 0, au = 0, table_points = 0;
-        for (std::size_t k = 0; k < xs.size(); ++k) {
-            if (!scheme_ptr->element_owned(int(k / P)))
-                continue; // MPI: owned elements only
-            table_points += 1;
-            const double sa = material->sigma_a(xs[k]), r = table_value(k, t);
-            mu += ws[k] * r, ru += ws[k] * sa * r;
-            if (sa > 0 && !amr_windowed)
-                au += ws[k] * sa * table_integral(k, t);
+        if (lattice3d && lattice3_table->nodal_built) {
+            mu = lattice3_table->summary_mass;
+            ru = lattice3_table->summary_abs_rate;
+            au = lattice3_table->summary_absorbed;
+            table_points = lattice3_table->summary_points;
+        } else {
+            const auto &xs = scheme_ptr->fcs_points();
+            const auto &ws = scheme_ptr->fcs_weights();
+            const int P = scheme_ptr->fcs_points_per_element();
+            for (std::size_t k = 0; k < xs.size(); ++k) {
+                if (!scheme_ptr->element_owned(int(k / P)))
+                    continue; // MPI: owned elements only
+                table_points += 1;
+                const double sa = material->sigma_a(xs[k]), r = table_value(k, t);
+                mu += ws[k] * r, ru += ws[k] * sa * r;
+                if (sa > 0 && !amr_windowed)
+                    au += ws[k] * sa * table_integral(k, t);
+            }
+            if (amr_windowed)
+                au = amr_unc_absorbed + amr_window_absorbed(amr_window_start, t);
         }
-        if (amr_windowed)
-            au = amr_unc_absorbed + amr_window_absorbed(amr_window_start, t);
         mu = reduce_sum(mu) * domain_factor, ru = reduce_sum(ru) * domain_factor, au = reduce_sum(au) * domain_factor;
         table_points = reduce_sum(table_points);
         const double rc = absorption_rate(a);
@@ -1799,7 +1825,12 @@ int run_element_weno(const Options &o, const Angular &pn, double begin, const Ru
           << ",\"total_mass_final\":" << final_mass + mu << ",\"total_absorption_rate_final\":" << rc + ru
           << ",\"total_absorbed\":" << absorbed + au << ",\"table_points\":" << table_points
           << ",\"table_times\":" << (lattice3d ? lattice3_table->M : lattice_table->M) + 1
-          << ",\"table_seconds\":" << reduce_max(lattice3d ? lattice3_table->build_seconds : lattice_table->build_seconds) << "}";
+          << ",\"table_seconds\":" << reduce_max(lattice3d ? lattice3_table->build_seconds : lattice_table->build_seconds);
+        if (lattice3d && lattice3_table->nodal_built)
+            j << ",\"evaluated_points\":" << reduce_sum(double(lattice3_table->evaluated_points))
+              << ",\"nodal_fp32\":" << (lattice3_table->nodal_fp32 ? "true" : "false")
+              << ",\"adaptive_quad\":" << (lattice3_table->adaptive_quad ? "true" : "false");
+        j << "}";
         lattice_fcs_json = j.str();
     }
     const double balance_scale = std::max({std::abs(initial_mass), injected, absorbed, std::abs(outflow), 1e-300});

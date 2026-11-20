@@ -182,3 +182,33 @@ unverändert (U168 mit FCS und P15 auf 112³ passen nicht auf die A100).
 Gauß-Punkte (Tabelle 8× billiger) ergibt Absorption +41 % statt +0.24 %; ein Gauß-Punkt je Element −11.5 %. In den
 Absorbern ist ein Element 1.25 freie Weglängen dick (σ = 10, h = 1/8), ρ_u ändert sich im Element um den Faktor drei;
 die 2×2×2-Regel ist dort nötig.
+
+### 3D: Knotentabelle (FP32), schneller Polar-Kern & adaptive Raumquadratur (20.11.2026)
+
+Um 3D-FCS auf großen Gittern (G3B, U168) speicher- und laufzeittauglich zu machen, ergänzt `feature/fcs3d-table` drei
+Bausteine (Host und Device, `src/uncollided_lattice3d*.hpp`, `src/element_weno_gpu.cu`, `src/element_weno.cpp`):
+
+1. **Knoten-FCS-Tabelle + Streaming-Summary (8×–16× weniger VRAM/RAM, exakt):** `k_fcs_element` + `k_fcs_gather`
+   bilden die Gauß-Punkt-Tabelle linear und zeitunabhängig auf Knotenwerte `fcs[node](t)` ab. Statt `cells * 8 * (M+1)`
+   `double`s (U168: ~98 GB) im Speicher zu halten, werden die Zeilen batchweise direkt in `node_table[node, m]`
+   reduziert (FP32: **16× kleiner**, U168 **~6.1 GB**; FP64: 8×) und die skalaren Summen (`uncollided_mass_final`,
+   `uncollided_absorption_rate_final`, `uncollided_absorbed`) sowie eine 1D-Massentabelle `mass_table[0..M]` im selben
+   Pass aufsummiert (kein Full-Table-Copy GPU → Host). Im Zeitschritt ersetzt ein einzelner Kernel
+   (`k_fcs_nodes_lattice_f`/`d`) die drei bisherigen FCS-Kernel. Test 9 in `tests/uncollided_lattice3d.cpp`: gegen die
+   Punkt-Tabelle 2.8e-16 (FP64), 3.1e-8 (FP32), Summary 4.0e-16.
+2. **Polar-Kern optimiert (`lattice3d_row_polar`):** Horizont-Culling ($s \le M\Delta t$ pro Fläche und Strahl),
+   Compile-Time-Chebyshev-Tabellen (keine Laufzeit-`cos`), Bounding-Box- und Materialwechsel-Pruning in
+   `lattice3d_edge_breaks`, Early-Exit bei $\tau > \tau_{\max}$ in `lattice3d_depth`, 3-Ebenen-Austrittstest
+   (`lattice3d_exit_S`) und verkleinerte Break-Puffer (`192`/`96` statt `1024`; GPU-Stack `48 → 16 KB`). CPU-Kern
+   noch einmal **1.43×** schneller bei identischer Genauigkeit.
+3. **Adaptive Raumquadratur (1 vs. 8 Gauß-Punkte):** Elemente mit uniformem Material, $\sigma_t h \le 0.25$ und
+   Abstand $\ge 1.0$ zu $S$ nutzen einen Mittelpunkt-Strahl statt 8 Gauß-Punkten (Absorber und $S$-Umgebung bleiben bei
+   8 Punkten). Auf 28³ P3 (T = 3.2, 2 CPU-Kerne): Tabelle `72.47 s → 33.67 s` (**2.15×**, `127 952 → 60 333`
+   ausgewertete Punkte), QoI-Änderung Masse `+0.0082 %`, Absorption `+0.0013 %`, Rate `+0.0054 %`. Auf 14³ P3 gegen
+   kartesisch + Punkt-Tabelle: `27.15 s → 7.87 s` (**3.45×**), RSS `76.6 → 28.9 MB`, QoI-Abweichung ≤ 0.014 %.
+
+**Schalter (`src/fast_main.cpp`, Defaults auf `feature/fcs3d-table`):** `M1PN_FCS3D_RULE=polar|cartesian` (Default
+`polar`), `M1PN_FCS3D_LAYOUT=nodal|points` (Default `nodal`), `M1PN_FCS3D_FP64=0|1` (Default `0` = FP32),
+`M1PN_FCS3D_ADAPTIVE_QUAD=1|0` (Default `1`), `M1PN_FCS3D_ADAPTIVE_TAU` (Default `0.25`), `M1PN_FCS3D_ADAPTIVE_DIST`
+(Default `1.0`).
+

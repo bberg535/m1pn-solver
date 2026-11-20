@@ -182,6 +182,91 @@ int main(int argc, char **argv) {
         check(emax < 1e-3, "8a. polar rule against fine Cartesian tables (max over t, rel. to row max)", emax);
         check(eint < 2e-5, "8b. polar rule against fine Cartesian tables (time integral, relative)", eint);
     }
+    // 9. Nodal FCS table (FP64 & FP32) and streaming summary against full point-major table on a 4x4x4 Q1 mesh.
+    {
+        const int ne = 4, nn = ne + 1, cells = ne * ne * ne, nodes = nn * nn * nn, P = 8, loc = 8;
+        const double x0 = 2.0, h = 0.5, T = 3.2; // [2, 4]^3: covers S, scatterers and absorbers
+        const double g1[2] = {0.5 - 0.5 / std::sqrt(3.0), 0.5 + 0.5 / std::sqrt(3.0)};
+        std::vector<int> conn(cells * loc);
+        std::vector<V3> pts(cells * P);
+        std::vector<double> fw(cells * P, h * h * h / 8.0), fss(cells * P), fmass(nodes, 0.), shape(loc * P);
+        for (int lz = 0; lz < 2; ++lz)
+            for (int ly = 0; ly < 2; ++ly)
+                for (int lx = 0; lx < 2; ++lx) {
+                    const int l = lx + 2 * (ly + 2 * lz);
+                    for (int kz = 0; kz < 2; ++kz)
+                        for (int ky = 0; ky < 2; ++ky)
+                            for (int kx = 0; kx < 2; ++kx) {
+                                const int k = kx + 2 * (ky + 2 * kz);
+                                const double bx = lx ? g1[kx] : 1 - g1[kx];
+                                const double by = ly ? g1[ky] : 1 - g1[ky];
+                                const double bz = lz ? g1[kz] : 1 - g1[kz];
+                                shape[l * P + k] = bx * by * bz;
+                            }
+                }
+        for (int ez = 0; ez < ne; ++ez)
+            for (int ey = 0; ey < ne; ++ey)
+                for (int ex = 0; ex < ne; ++ex) {
+                    const int e = ex + ne * (ey + ne * ez);
+                    for (int lz = 0; lz < 2; ++lz)
+                        for (int ly = 0; ly < 2; ++ly)
+                            for (int lx = 0; lx < 2; ++lx) {
+                                const int l = lx + 2 * (ly + 2 * lz);
+                                const int nd = (ex + lx) + nn * ((ey + ly) + nn * (ez + lz));
+                                conn[e * loc + l] = nd;
+                                for (int k = 0; k < P; ++k)
+                                    fmass[nd] += shape[l * P + k] * (h * h * h / 8.0);
+                            }
+                    for (int kz = 0; kz < 2; ++kz)
+                        for (int ky = 0; ky < 2; ++ky)
+                            for (int kx = 0; kx < 2; ++kx) {
+                                const int k = kx + 2 * (ky + 2 * kz);
+                                const V3 p(x0 + (ex + g1[kx]) * h, x0 + (ey + g1[ky]) * h, x0 + (ez + g1[kz]) * h);
+                                pts[e * P + k] = p;
+                                fss[e * P + k] = cases::lattice3d_sigma_s(p);
+                            }
+                }
+        auto sigma_a_of = [](const V3 &p) { return cases::lattice3d_sigma_a(p); };
+        auto owned = [](int) { return true; };
+
+        uncollided::Lattice3dUncollidedTable Ref, N64, N32;
+        Ref.lattice = L, Ref.lattice.polar = true;
+        Ref.build(pts, T);
+        N64.lattice = L, N64.lattice.polar = true, N64.nodal = true, N64.nodal_fp32 = false;
+        N64.build_nodal(cells, nodes, loc, P, conn, pts, fw, fss, shape.data(), fmass.data(), owned, sigma_a_of, T);
+        N32.lattice = L, N32.lattice.polar = true, N32.nodal = true, N32.nodal_fp32 = true;
+        N32.build_nodal(cells, nodes, loc, P, conn, pts, fw, fss, shape.data(), fmass.data(), owned, sigma_a_of, T);
+
+        double e64 = 0, e32 = 0, ref_max = 0;
+        for (double t : {0.37, 1.15, 2.43, 3.2}) {
+            std::vector<double> rnode(nodes, 0.);
+            for (int e = 0; e < cells; ++e)
+                for (int k = 0; k < P; ++k) {
+                    const double q = fw[e * P + k] * fss[e * P + k] * Ref.value(std::size_t(e * P + k), t);
+                    for (int l = 0; l < loc; ++l)
+                        rnode[conn[e * loc + l]] += shape[l * P + k] * q;
+                }
+            for (int i = 0; i < nodes; ++i) {
+                rnode[i] /= fmass[i];
+                ref_max = std::max(ref_max, rnode[i]);
+                e64 = std::max(e64, std::abs(N64.nodal_value(i, t) - rnode[i]));
+                e32 = std::max(e32, std::abs(N32.nodal_value(i, t) - rnode[i]));
+            }
+        }
+        double r_mass = 0, r_rate = 0, r_abs = 0;
+        for (std::size_t k = 0; k < pts.size(); ++k) {
+            const double sa = sigma_a_of(pts[k]), r = Ref.value(k, T);
+            r_mass += fw[k] * r, r_rate += fw[k] * sa * r;
+            if (sa > 0)
+                r_abs += fw[k] * sa * Ref.time_integral(k, T);
+        }
+        const double esum = std::max({std::abs(N32.summary_mass - r_mass) / r_mass,
+                                      std::abs(N32.summary_abs_rate - r_rate) / r_rate,
+                                      std::abs(N32.summary_absorbed - r_abs) / r_abs});
+        check(e64 / ref_max < 1e-6, "9a. nodal FP64 table against point-major table (rel. to max)", e64 / ref_max);
+        check(e32 / ref_max < 2e-6, "9b. nodal FP32 table against point-major table (rel. to max)", e32 / ref_max);
+        check(esum < 1e-13, "9c. nodal streaming summary against point-major summary (rel.)", esum);
+    }
     if (full) {
         // 6. Volume integral with the lattice (kinks): the reference converges with sub and steps.
         // t = 6: all of S inside the front (exact tau, the reference converges with sub); t = 3: front through S

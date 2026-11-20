@@ -214,6 +214,16 @@ void lattice_table(Context *, const uncollided::LatticeView &host_view, int m0, 
 // lattice-3d: the same with uncollided::lattice3d_row, one thread per point (x, y, z: host arrays of the FCS points).
 void lattice3d_table(Context *, const uncollided::Lattice3dView &host_view, const double *x, const double *y,
                      const double *z, int M, double dt, double *host_out);
+struct Lattice3dNodalSummary {
+    double mass = 0, abs_rate = 0, absorbed = 0;
+};
+// lattice-3d nodal mode: evaluates only the compacted active points in batches, scatters directly into a nodal source
+// table (nodes x (M + 1), FP32 or FP64; 8x-16x less VRAM, zero full-table copy to host), and returns the exact summary.
+Lattice3dNodalSummary lattice3d_table_nodal(Context *, const uncollided::Lattice3dView &host_view, const double *px,
+                                            const double *py, const double *pz, const int *elem, const int *local_k,
+                                            const double *weight, const double *sigma_a, const int *owned,
+                                            std::size_t n_eval, int M, double dt, double final_time, bool fp32,
+                                            double *host_mass_table);
 void react_lattice(Context *, double *state, double tau, double source_time);
 // Fallback lists (device index arrays; count from counters()).
 const int *closure_fallback_list(Context *);
