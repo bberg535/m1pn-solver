@@ -824,24 +824,46 @@ constexpr int max_strip_classes = 64; // graded 2D Q1: size classes held in cons
 // 2D Q1: the gathered residual of node i only involves its 3 x 3 neighbourhood. One thread per (x, component) walks a
 // strip of SY rows in y with a sliding 3 x 3 window of a, g_0, g_1 in registers (9 loads per output); the four elements
 // around a node are visited as quadrants with compile-time local indices.
-template <int SY>
-__global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const double *a, double *result, bool want_low, double constant_gamma) {
+template <int SY, int MINB = 4>
+__global__ void __launch_bounds__(128, MINB) k_stabilization_strip(View v, const double *a, double *result, bool want_low, double constant_gamma) {
     const int q = v.q, npx = v.npa[0], npy = v.npa[1], cx = v.count[0], cy = v.count[1];
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= npx * q)
         return;
     const int ix = col / q, c = col % q;
     const int y0 = blockIdx.y * SY, y1 = min(npy, y0 + SY);
-    const double *F[3] = {a, v.gradient[0], v.gradient[1]};
+    // Row pointers (column ix, moment c) advanced by one node row per y; x neighbours at -q / +q. The element columns
+    // ex of the two quadrants depend only on ix. Same loads and the same FMA order as before (fewer integer ops:
+    // the 64-bit index products per load dominated the issued instructions).
+    const std::size_t row = std::size_t(npx) * q;
+    const bool xm = ix > 0, xp = ix + 1 < npx;
+    const double *P0 = a + std::size_t(ix) * q + c, *P1 = v.gradient[0] + std::size_t(ix) * q + c,
+                 *P2 = v.gradient[1] + std::size_t(ix) * q + c;
+    int exq[2];
+    bool exok[2];
+#pragma unroll
+    for (int qx = 0; qx < 2; ++qx) {
+        exq[qx] = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+        exok[qx] = exq[qx] >= 0 && exq[qx] < cx;
+    }
     double W[3][3][3];
     auto load_row = [&](int y, int r) {
+        if (y < 0 || y >= npy) {
 #pragma unroll
-        for (int f = 0; f < 3; ++f)
+            for (int f = 0; f < 3; ++f)
 #pragma unroll
-            for (int dx = 0; dx < 3; ++dx) {
-                const int x = ix + dx - 1;
-                W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx ? F[f][(std::size_t(y) * npx + x) * q + c] : 0.;
-            }
+                for (int dx = 0; dx < 3; ++dx)
+                    W[f][r][dx] = 0.;
+            return;
+        }
+        const std::size_t off = std::size_t(y) * row;
+        const double *B[3] = {P0 + off, P1 + off, P2 + off};
+#pragma unroll
+        for (int f = 0; f < 3; ++f) {
+            W[f][r][0] = xm ? B[f][-q] : 0.;
+            W[f][r][1] = B[f][0];
+            W[f][r][2] = xp ? B[f][q] : 0.;
+        }
     };
     load_row(y0 - 1, 0);
     load_row(y0, 1);
@@ -852,9 +874,9 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
         for (int qy = 0; qy < 2; ++qy)
 #pragma unroll
             for (int qx = 0; qx < 2; ++qx) {
-                const int ex = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+                const int ex = exq[qx];
                 const int ey = v.strip_elem[1] ? v.strip_elem[1][2 * y + qy] : y - 1 + qy;
-                if (ex < 0 || ex >= cx || ey < 0 || ey >= cy)
+                if (!exok[qx] || ey < 0 || ey >= cy)
                     continue;
                 const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
                 const int kc = 16 * klass_of(v, e);
@@ -878,7 +900,7 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip(View v, const do
                 }
                 out -= term;
             }
-        result[(std::size_t(y) * npx + ix) * q + c] = out;
+        result[std::size_t(y) * row + std::size_t(ix) * q + c] = out;
 #pragma unroll
         for (int f = 0; f < 3; ++f)
 #pragma unroll
@@ -2892,16 +2914,38 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_low4(
         return;
     const int ix = col / q4, c = col % q4;
     const int y0 = blockIdx.y * SY, y1 = min(npy, y0 + SY);
-    const double *F[3] = {a, v.gradient[0], v.gradient[1]};
+    // Row pointers (column ix, moment c) advanced by one node row per y; x neighbours at -q / +q. The element columns
+    // ex of the two quadrants depend only on ix. Same loads and the same FMA order as before (fewer integer ops:
+    // the 64-bit index products per load dominated the issued instructions).
+    const std::size_t row = std::size_t(npx) * q;
+    const bool xm = ix > 0, xp = ix + 1 < npx;
+    const double *P0 = a + std::size_t(ix) * q + c, *P1 = v.gradient[0] + std::size_t(ix) * q + c,
+                 *P2 = v.gradient[1] + std::size_t(ix) * q + c;
+    int exq[2];
+    bool exok[2];
+#pragma unroll
+    for (int qx = 0; qx < 2; ++qx) {
+        exq[qx] = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+        exok[qx] = exq[qx] >= 0 && exq[qx] < cx;
+    }
     double W[3][3][3];
     auto load_row = [&](int y, int r) {
+        if (y < 0 || y >= npy) {
 #pragma unroll
-        for (int f = 0; f < 3; ++f)
+            for (int f = 0; f < 3; ++f)
 #pragma unroll
-            for (int dx = 0; dx < 3; ++dx) {
-                const int x = ix + dx - 1;
-                W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx ? F[f][(std::size_t(y) * npx + x) * q + c] : 0.;
-            }
+                for (int dx = 0; dx < 3; ++dx)
+                    W[f][r][dx] = 0.;
+            return;
+        }
+        const std::size_t off = std::size_t(y) * row;
+        const double *B[3] = {P0 + off, P1 + off, P2 + off};
+#pragma unroll
+        for (int f = 0; f < 3; ++f) {
+            W[f][r][0] = xm ? B[f][-q] : 0.;
+            W[f][r][1] = B[f][0];
+            W[f][r][2] = xp ? B[f][q] : 0.;
+        }
     };
     load_row(y0 - 1, 0);
     load_row(y0, 1);
@@ -2912,9 +2956,9 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_low4(
         for (int qy = 0; qy < 2; ++qy)
 #pragma unroll
             for (int qx = 0; qx < 2; ++qx) {
-                const int ex = v.strip_elem[0] ? v.strip_elem[0][2 * ix + qx] : ix - 1 + qx;
+                const int ex = exq[qx];
                 const int ey = v.strip_elem[1] ? v.strip_elem[1][2 * y + qy] : y - 1 + qy;
-                if (ex < 0 || ex >= cx || ey < 0 || ey >= cy)
+                if (!exok[qx] || ey < 0 || ey >= cy)
                     continue;
                 const int e = ex + ey * cx, l = (1 - qx) + 2 * (1 - qy);
                 const int kc = 16 * klass_of(v, e);
@@ -2937,7 +2981,7 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_low4(
                 }
                 out -= term;
             }
-        result[(std::size_t(y) * npx + ix) * q + c] = out;
+        result[std::size_t(y) * row + std::size_t(ix) * q + c] = out;
 #pragma unroll
         for (int f = 0; f < 3; ++f)
 #pragma unroll
@@ -3151,7 +3195,8 @@ __global__ void k_line_solve_adaptive(View v, int d, double *field, const double
         row0[std::size_t(mi) * step] = 0.0;
 }
 
-__global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
+template <int MINB>
+__global__ void __launch_bounds__(128, MINB) k_stabilization_strip_adaptive(
     View v, const double *a, double *result, bool want_low, double constant_gamma,
     int tb0, int tb1, const AdaptiveTileChunk *chunks, int nchunks, const int *tile_q, int nt0) {
     if (blockIdx.x >= nchunks)
@@ -3165,26 +3210,48 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
     const int x0 = tc.tx * tb0, x1 = min(npx, x0 + tb0);
     const int y0 = tc.ty * tb1, y1 = min(npy, y0 + tb1);
     const bool active_c = c < tc.q_lim;
-    const double *F[3] = {a, v.gradient[0], v.gradient[1]};
+    const std::size_t row = std::size_t(npx) * q;
     for (int ix = x0 + warp; ix < x1; ix += 4) {
         if (!active_c) {
             for (int y = y0; y < y1; ++y)
-                result[(std::size_t(y) * npx + ix) * q + c] = 0.0;
+                result[std::size_t(y) * row + std::size_t(ix) * q + c] = 0.0;
             continue;
         }
+        // Row pointers as in k_stabilization_strip. As ElementWeno::stabilization_residual (cm_of): neighbour node
+        // contributions only for moments active at that node (the padded gradient segments leave nonzero inactive
+        // gradient entries); rows y0-1 .. y1 lie in the tile rows ty-1, ty, ty+1, so the activity of the three columns
+        // is looked up once per column (same values as c < tile_q[(y / tb1) * nt0 + x / tb0]).
+        bool act[3][3];
+#pragma unroll
+        for (int dx = 0; dx < 3; ++dx) {
+            const int x = ix + dx - 1;
+            const bool xin = x >= 0 && x < npx;
+            const int tx = xin ? x / tb0 : 0;
+            act[0][dx] = xin && y0 > 0 && c < tile_q[((y0 - 1) / tb1) * nt0 + tx];
+            act[1][dx] = xin && c < tile_q[tc.ty * nt0 + tx];
+            act[2][dx] = xin && y1 < npy && c < tile_q[(y1 / tb1) * nt0 + tx];
+        }
+        const double *P0 = a + std::size_t(ix) * q + c, *P1 = v.gradient[0] + std::size_t(ix) * q + c,
+                     *P2 = v.gradient[1] + std::size_t(ix) * q + c;
         double W[3][3][3];
         auto load_row = [&](int y, int r) {
+            const int band = y < y0 ? 0 : (y < y1 ? 1 : 2);
+            if (y < 0 || y >= npy) {
 #pragma unroll
-            for (int f = 0; f < 3; ++f)
+                for (int f = 0; f < 3; ++f)
 #pragma unroll
-                for (int dx = 0; dx < 3; ++dx) {
-                    const int x = ix + dx - 1;
-                    // As ElementWeno::stabilization_residual (cm_of): neighbour node contributions only for moments
-                    // active at that node; the padded gradient segments leave nonzero inactive gradient entries.
-                    W[f][r][dx] = y >= 0 && y < npy && x >= 0 && x < npx && c < tile_q[(y / tb1) * nt0 + x / tb0]
-                                      ? F[f][(std::size_t(y) * npx + x) * q + c]
-                                      : 0.;
-                }
+                    for (int dx = 0; dx < 3; ++dx)
+                        W[f][r][dx] = 0.;
+                return;
+            }
+            const std::size_t off = std::size_t(y) * row;
+            const double *B[3] = {P0 + off, P1 + off, P2 + off};
+#pragma unroll
+            for (int f = 0; f < 3; ++f) {
+                W[f][r][0] = act[band][0] ? B[f][-q] : 0.;
+                W[f][r][1] = act[band][1] ? B[f][0] : 0.;
+                W[f][r][2] = act[band][2] ? B[f][q] : 0.;
+            }
         };
         load_row(y0 - 1, 0);
         load_row(y0, 1);
@@ -3220,7 +3287,7 @@ __global__ void __launch_bounds__(128, 4) k_stabilization_strip_adaptive(
                     }
                     out -= term;
                 }
-            result[(std::size_t(y) * npx + ix) * q + c] = out;
+            result[std::size_t(y) * row + std::size_t(ix) * q + c] = out;
 #pragma unroll
             for (int f = 0; f < 3; ++f)
 #pragma unroll
@@ -3803,6 +3870,15 @@ void line_solve_adaptive_axis(Context *ctx, int d, double *f, const double *src,
         break;
     }
 }
+// Minimum resident blocks of the 2D strip stabilization kernels (__launch_bounds__): 4 (default, ~120 registers),
+// 6 or 8 trade registers for occupancy (M1PN_GPU_STRIP_MINB; measurement on the A100).
+int strip_min_blocks() {
+    static const int mb = [] {
+        const char *e = std::getenv("M1PN_GPU_STRIP_MINB");
+        return e ? std::atoi(e) : 4;
+    }();
+    return mb;
+}
 bool overlap_enabled() {
     static const bool on = [] {
         const char *e = std::getenv("M1PN_GPU_OVERLAP");
@@ -3866,10 +3942,21 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
                 fork_streams(ctx, 1);
             k_stabilization_strip_low4<16><<<g4, 128, 0, ov ? ctx->side[0] : ctx->stream>>>(v, state, out, want_low,
                                                                                             constant_gamma);
-            if (ad->tile_chunks_n > 0)
-                k_stabilization_strip_adaptive<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
-                    v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks, ad->tile_chunks_n,
-                    ad->d_tile_q, ad->nt[0]);
+            if (ad->tile_chunks_n > 0) {
+                const int mb = strip_min_blocks();
+                if (mb == 8)
+                    k_stabilization_strip_adaptive<8><<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                        v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks,
+                        ad->tile_chunks_n, ad->d_tile_q, ad->nt[0]);
+                else if (mb == 6)
+                    k_stabilization_strip_adaptive<6><<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                        v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks,
+                        ad->tile_chunks_n, ad->d_tile_q, ad->nt[0]);
+                else
+                    k_stabilization_strip_adaptive<4><<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                        v, state, out, false, constant_gamma, ad->tb[0], ad->tb[1], ad->d_tile_chunks,
+                        ad->tile_chunks_n, ad->d_tile_q, ad->nt[0]);
+            }
             if (ov)
                 join_streams(ctx, 1);
         } else {
@@ -3892,6 +3979,10 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
         const dim3 grid(blocks(std::size_t(v.npa[0]) * v.q, 128), (v.npa[1] + sy - 1) / sy);
         if (sy == 8)
             k_stabilization_strip<8><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+        else if (sy == 16 && strip_min_blocks() == 8)
+            k_stabilization_strip<16, 8><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+        else if (sy == 16 && strip_min_blocks() == 6)
+            k_stabilization_strip<16, 6><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else if (sy == 16)
             k_stabilization_strip<16><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else if (sy == 64)
