@@ -359,3 +359,33 @@ Speicher bestimmt. P15 auf U168 mit FCS bricht trotzdem weiter in `cudaDeviceSet
 Lauf braucht mehrere GPUs oder die CPU-MPI-Rechnung.
 
 Prüfjob 164526 (Standard nach f60aaad): G3H FCS Löser 90,5 s, U112 ohne FCS 58,7 s, Masse bitgleich zum alten Pfad; ctest ok.
+
+## Adaptive PN in 3D: Stabilisierung als z-Streifen (21.11.2026, Branch `perf/adaptive3d`)
+
+Auf dem gemergten Stand (709d914) brachte die dynamische adaptive PN in 3D kaum Zeitgewinn. Alle Läufe hatten FCS,
+gebrochene Linien und Split, die adaptiven zusätzlich tol 3e-4 und Tile 8 (`tardis_adaptive3d_20261121`). Die
+Löserzeit änderte sich bei G3Q P7 von 27,7 auf 30,7 s, bei G3Q P15 von 71,2 auf 68,3 s und bei G3H P7 von
+147,5 auf 135,2 s, bei nur 28–39 % aktiven Koeffizienten. Das A100-Profil (`tardis_perf_ad3d_20261121`, G3Q P15) zeigt den Grund:
+`k_stabilization_adaptive` braucht 34,2 s. Der Kernel geht über die Konnektivität und berechnet für jedes der 64
+Element-Knoten-Paare die Kachel per Division. Der volle `k_stabilization_strip3` braucht dagegen 26,4 s für alle Momente.
+Die übrigen adaptiven Kernel sind billig: Liniensolves 11,1 → rund 7 s, combine 10,9 → 2,3 s.
+
+Neue Kernel, wählbar mit `M1PN_GPU_AD3`, Standard 2:
+- `k_stabilization_adaptive3` (=1): strukturierte Indizes, 27-Punkte-Fenster pro Feld, Kachelaktivität nur für Knoten auf
+  Kachelflächen. Bitgleich zu `k_stabilization_adaptive` (=0). Auf der A100 34,2 → 27,6 s.
+- `k_stabilization_adaptive3s` (=2): die z-Streifenform von `k_stabilization_strip3` pro Kachel-Chunk. Jeder Warp läuft durch eine
+  (x, y)-Spalte der Kachel über die Ebenen z0−1 … z1. Inaktive Nachbarn haben über die Ordnung ihrer Kachel den Wert 0;
+  nachgeschlagen wird nur an Kachelflächen und in den Halo-Ebenen. Die Abweichungen liegen auf Rundungsniveau
+  (lokal Masse ≤ 4e-16), die aktiven Anteile sind identisch. Auf der A100 **34,2 → 7,6 s**.
+
+A100, T = 3.2, FCS, gebrochene Linien und Split (`tardis_ad3d_kernel_20261121`, `tardis_ad3d_kernel2_20261121`; Löserzeit):
+
+| Lauf | nicht adaptiv | adaptiv, AD3=0 | AD3=1 | AD3=2 | aktiv | Faktor zu nicht adaptiv |
+|---|---:|---:|---:|---:|---:|---:|
+| G3Q P15 | 71,2 s | 68,3 s | 61,3 s | 42,0 s | 32,1 % | 1,70 |
+| G3Q P7 | 27,7 s | 31,1 s | 28,9 s | 23,9 s | 39,4 % | 1,16 |
+| G3H P7 | 147,5 s | 135,0 s | 129,2 s | 105,4 s | 28,5 % | 1,40 |
+
+ctest und `tests/gpu_validate_adaptive.sh` (alle Fälle PASS) liefen in beiden Jobs durch. Die restliche Zeit bei G3Q P15
+adaptiv: FCS-Tabelle 15,3 s, Stabilisierung 7,6 s, adaptive Liniensolves 4,6 s, aktive Flächenspuren 3,0 s, combine
+2,3 s, Interface 2,0 s.
