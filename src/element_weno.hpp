@@ -603,7 +603,15 @@ private:
     // Kinetic inflow data at a face quadrature point (one code path for the steady cache and the per-stage call).
     Incoming face_data(int side_id, const V3 &x, double time) const;
     void face_data_into(int side_id, const V3 &x, double time, Incoming &data) const;
-    std::vector<Incoming> steady_data_; // per (face, point) when inflow.steady
+    std::vector<Incoming> steady_data_; // per (face, point) when inflow.steady; per side if steady_per_side_
+    // Steady inflow data that do not depend on x (vacuum; constant density without atoms): one entry per side
+    // instead of one per (face, point). G3Q P35 with (N+5)^2 face points: 117 s and ~200 GB otherwise.
+    bool steady_per_side_ = false;
+    std::size_t steady_points_ = 0;
+    const Incoming &steady_at(std::size_t index, std::size_t point) const {
+        return steady_per_side_ ? steady_data_[2 * faces_[index].direction + faces_[index].side]
+                                : steady_data_[index * steady_points_ + point];
+    }
     // Uniform faces (steady inflow without exterior callbacks, all point data bitwise equal, e.g. vacuum): the
     // low-order face terms and the PN datum load are point-independent per face node, so the point loop reduces to
     // the face weights W_r = sum_points w_p phi_n(x_p) (row r = face_row_[f] + n). Only the summation order changes.

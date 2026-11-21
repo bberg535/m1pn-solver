@@ -740,8 +740,12 @@ void ElementWenoGpu::fill_datum(int k) {
             face_datum_[index] = 0; // broken line / conforming interface: the partner term is not an inflow datum
             return;
         }
+        if (s.inflow.steady && s.steady_per_side_ && s.steady_at(index, 0).d.isZero(0)) {
+            face_datum_[index] = 0; // vacuum: every point adds zero (the loop below would leave datum zero)
+            return;
+        }
         for (int point = 0; point < rule.weights.size(); ++point) {
-            const Incoming &data = s.inflow.steady ? s.steady_data_[std::size_t(index) * rule.weights.size() + point]
+            const Incoming &data = s.inflow.steady ? s.steady_at(index, point)
                                                    : face_data_[k][std::size_t(index) * face_points_ + point];
             for (int n = 0; n < nf; ++n) {
                 const double weight = s.face_scale_[index] * rule.weights[point] * rule.shape(n, point);
@@ -1115,7 +1119,7 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
             return state;
         };
         if (!s.face_uniform_.empty() && s.face_uniform_[index]) { // uniform face (steady): point-independent terms
-            const Incoming &data = s.steady_data_[std::size_t(index) * rule.weights.size()];
+            const Incoming &data = s.steady_at(index, 0);
             for (int n = 0; n < nf; ++n) {
                 const double weight = s.face_weight_[r0 + n];
                 if (weight == 0)
@@ -1132,7 +1136,7 @@ void ElementWenoGpu::boundary_low(int buffer, PositivityProjectionStats *project
             }
         } else
         for (int point = 0; point < rule.weights.size(); ++point) {
-            const Incoming &data = s.inflow.steady ? s.steady_data_[std::size_t(index) * rule.weights.size() + point]
+            const Incoming &data = s.inflow.steady ? s.steady_at(index, point)
                                                    : (*fd)[std::size_t(index) * face_points_ + point];
             for (int n = 0; n < nf; ++n) {
                 const double weight = s.face_scale_[index] * rule.weights[point] * rule.shape(n, point);
