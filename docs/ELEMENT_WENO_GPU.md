@@ -449,3 +449,51 @@ P35 adaptiv sind identisch mit den Jobs 164640/164641 (Job 164652, `tardis_init3
 
 Rest der Initialisierung bei G3Q P35: GPU-Aufbau 25 s (davon FCS-Tabelle ca. 17 s) und Spektralradius 30 s
 (60 Potenziterationen mit dem vollen P35-Operator). Auf G3F dominiert die FCS-Tabelle mit 126–140 s.
+
+### Spektralradius-Startvektoren, Stack-Reserve und GPU-Speicher pro Phase (21.11.2026, Branch `perf/init3d2`)
+
+- Die zwei Zufallsstartvektoren der Potenziteration (Knoten × Q Ziehungen, mt19937) entstehen jetzt per
+  `std::async` während des GPU-Konstruktors, mit gleicher Folge und gleicher Normierung. G3Q P35 adaptiv: Init
+  62 → 58 s, Spektralradius 30 → 25 s. Bitgleich.
+- Die FCS-Tabellen (`lattice3d_table`, `lattice3d_table_nodal`) setzen das Stack-Limit auf 16/24 KB pro Thread. Die
+  Reserve (Limit × residente Threads) blieb bisher die ganze Rechnung belegt, etwa 4 GB auf dem A100. Das Limit wird
+  nach dem Bau zurückgesetzt. Bitgleich (Jobs 164654, 164657).
+- `M1PN_CTOR_TIMING=1` gibt jetzt den belegten GPU-Speicher nach jeder Phase aus (`gpu create:`, `gpu ctor:`).
+
+Belegter GPU-Speicher nach Phasen (Job 164657, ein Schritt; 168³ = 5,36 Mio. Knoten, 264³ = 20 Mio.):
+
+| Lauf | Tabellen | + Zustandspuffer | + Reaktion | + FCS | + Randphase A | Spitze (nvidia-smi) |
+|---|---:|---:|---:|---:|---:|---:|
+| G3Q P15 adaptiv | 0,5 | 7,1 | 7,3 | 7,9 | 13,4 GB | 35 GB |
+| G3Q P35 adaptiv | 0,5 | 31,7 | 31,9 | 32,5 | 60,0 GB | 57 GB |
+| 168³ P3 | 1,1 | 11,8 | 13,8 | 20,8 | 23,4 GB | 48 GB |
+| 264³ P3 | 2,9 | 43,3 | 51,2 | OOM | | |
+
+Befunde:
+- Zustandspuffer: neben den 6 Feldern Knoten × Q (Zustand, x, r, drei Gradienten) vier Arrays pro Element mit
+  4 × 8 Werten (`stab_low`, `element_limited`, `seg_ubar`, `seg_lim`), bei P3 knapp die Hälfte.
+- Reaktion: FCS-Arrays pro Quadraturpunkt (Ort, Gewicht, σ_s), nach dem nodalen Bau nicht mehr gebraucht.
+- FCS: die fp32-Knotentabelle (Knoten × 324) bleibt. Beim Bau liegt zusätzlich der double-Akkumulator gleicher Zeilenzahl
+  (doppelte Größe) plus ein Drittel des freien Speichers für die Stapel. Daran scheitert 264³.
+- Randphase A: drei Puffer Zeilen × Q (`G`, `H`, `db`) für Rand- und Bruchflächen, bei P35 27 GB. `db` (Datum)
+  bleibt bei Vakuum null.
+
+### Speicher, FCS-Kernel und Knotensummen (21.11.2026, `perf/init3d2`)
+
+- `db` (Zeilen × Q, Datum der Randphase A) wird erst beim ersten Einstrahldatum angelegt, bei Vakuum nie. Die FCS-Arrays
+  pro Quadraturpunkt (Ort, Gewicht, σ_s, q, local) werden nach dem Bau der nodalen 3D-Tabelle freigegeben. G3Q P35
+  adaptiv: 60,0 → 50,8 GB nach dem Konstruktor; G3H P21 adaptiv passt jetzt auf ein A100 (Spitze 69,6 GB, Löser
+  207 s, Init 121 s, aktiv 19 %, mittleres N 4,8; vorher OOM). Job 164664.
+- FCS-Kernel (`k_lattice3d_eval_batch`): ncu (Job 164654) zeigte 255 Register, 12,5 % theoretische und 8 % erreichte
+  Auslastung, 9 von 32 aktiven Threads pro Warp. Mit `__launch_bounds__(64, 8)` (höchstens 128 Register) ist die
+  Tabelle 27 % schneller (G3Q 15,3 → 11,1 s, 168³ P3 Init 138 → 113 s), bitgleich; jetzt Standard (`M1PN_FCS3D_LB`:
+  0 ohne Schranke, 2 höchstens 64 Register, langsamer). Sortieren der Punkte nach dem Abstand zur Quelle war langsamer
+  (G3Q 21,7 s) und wurde verworfen (Job 164672).
+- Material- und FCS-Knotensummen im Konstruktor laufen parallel über die Knoten (CSR `node_offsets_`/`node_entries_`,
+  jetzt vor den nodalen Reaktionsdaten gebaut), in derselben Summationsreihenfolge wie die frühere Elementschleife.
+  Die FCS-Knotenmasse braucht dabei ein explizites `std::fma`: die frühere Schleife wurde zu fma kontrahiert, die neue
+  vektorisierte die Produkte ungefused (2D um 1e-8 verschoben; in 3D von der fp32-Tabelle verdeckt). 312³: CPU-Phase
+  29 → 17,5 s. Bitgleich in 2D (GBQ P35, Spiegelreduktion auto/off) und 3D (Jobs 164676, 164688, 164691).
+
+Init gegen `experiment/element-weno` (Job 164676): G3Q P7 uniform 19,1 → 14,8 s, P15 adaptiv 25,4 → 20,5 s, P35 adaptiv
+62,3 → 54,3 s; 2D GBQ/GBH P35 unverändert (4–6 s).

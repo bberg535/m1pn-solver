@@ -2367,6 +2367,8 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
     const std::size_t batch = std::min<std::size_t>(points, 1 << 16);
     const std::size_t work_stride = uncollided::lattice3d_work_size(hv, M);
     double *work = dalloc<double>(batch * work_stride);
+    std::size_t stack_before = 0;
+    CK(cudaDeviceGetLimit(&stack_before, cudaLimitStackSize));
     CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
     for (std::size_t first = 0; first < points; first += batch) {
         const std::size_t count = std::min(batch, points - first);
@@ -2375,6 +2377,9 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
         CK(cudaGetLastError());
     }
     CK(cudaDeviceSynchronize());
+    // Release the stack reserve (stack size x resident threads, ~5 GB on an A100) for the rest of the run; kernels
+    // with larger static frames get the stack grown by the driver at launch.
+    CK(cudaDeviceSetLimit(cudaLimitStackSize, stack_before));
     CK(cudaFree(work));
     CK(cudaFree(dx)), CK(cudaFree(dy)), CK(cudaFree(dz));
     if (host_out)
@@ -2393,10 +2398,12 @@ __global__ void k_fcs_nodes_lattice_d(View v, ReactionView r, double time) {
         return;
     r.fcs[i] = uncollided::lattice3d_eval_row(r.lnode_d + std::size_t(i) * std::size_t(r.lM + 1), r.lM, r.ldt, time);
 }
-__global__ void k_lattice3d_eval_batch(uncollided::Lattice3dView lv, const double *px, const double *py,
-                                       const double *pz, const double *weight, const double *sigma_a, const int *owned,
-                                       std::size_t first, std::size_t count, int M, double dt, double final_time,
-                                       double *work, std::size_t work_stride, double *batch_rows, double *batch_sum) {
+// Body of the FCS eval kernel; the launch-bound variants below differ only in the register budget (M1PN_FCS3D_LB).
+__device__ __forceinline__ void lattice3d_eval_body(const uncollided::Lattice3dView &lv, const double *px,
+                                       const double *py, const double *pz, const double *weight, const double *sigma_a,
+                                       const int *owned, std::size_t first, std::size_t count, int M, double dt,
+                                       double final_time, double *work, std::size_t work_stride, double *batch_rows,
+                                       double *batch_sum) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= count)
         return;
@@ -2414,6 +2421,16 @@ __global__ void k_lattice3d_eval_batch(uncollided::Lattice3dView lv, const doubl
         batch_sum[3 * t + 0] = 0, batch_sum[3 * t + 1] = 0, batch_sum[3 * t + 2] = 0;
     }
 }
+#define M1PN_FCS3D_EVAL_ARGS                                                                                           \
+    uncollided::Lattice3dView lv, const double *px, const double *py, const double *pz, const double *weight,          \
+        const double *sigma_a, const int *owned, std::size_t first, std::size_t count, int M, double dt,               \
+        double final_time, double *work, std::size_t work_stride, double *batch_rows, double *batch_sum
+#define M1PN_FCS3D_EVAL_CALL                                                                                           \
+    lattice3d_eval_body(lv, px, py, pz, weight, sigma_a, owned, first, count, M, dt, final_time, work, work_stride,    \
+                        batch_rows, batch_sum)
+__global__ void k_lattice3d_eval_batch(M1PN_FCS3D_EVAL_ARGS) { M1PN_FCS3D_EVAL_CALL; }
+__global__ void __launch_bounds__(64, 8) k_lattice3d_eval_batch_r128(M1PN_FCS3D_EVAL_ARGS) { M1PN_FCS3D_EVAL_CALL; }
+__global__ void __launch_bounds__(64, 16) k_lattice3d_eval_batch_r64(M1PN_FCS3D_EVAL_ARGS) { M1PN_FCS3D_EVAL_CALL; }
 __global__ void k_lattice3d_scatter_batch(View v, ReactionView r, const int *elem, const int *local_k,
                                           const double *weight, const int *owned, std::size_t first, std::size_t count,
                                           int W, const double *batch_rows, double *node_acc, double *mass_acc) {
@@ -2447,6 +2464,12 @@ __global__ void k_cast_d2f(const double *src, float *dst, std::size_t n) {
     const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n)
         dst[i] = float(src[i]);
+}
+std::size_t device_used_bytes() {
+    std::size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess)
+        return 0;
+    return total_b - free_b;
 }
 Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Lattice3dView &hv, const double *px,
                                             const double *py, const double *pz, const int *elem, const int *local_k,
@@ -2485,6 +2508,8 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         // overrides (benchmarks).
         // Stack reserve first: it is taken from device memory for all resident threads, and the batch below claims a
         // third of what is free (P15 on 168^3 failed in cudaDeviceSetLimit after the batch allocation).
+        std::size_t stack_before = 0;
+        CK(cudaDeviceGetLimit(&stack_before, cudaLimitStackSize));
         CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
         std::size_t batch;
         {
@@ -2497,15 +2522,23 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
                 batch = std::max<std::size_t>(1, std::size_t(std::atoll(e)));
             batch = std::min<std::size_t>(batch, n_eval);
         }
+        // Register budget of the eval kernel (M1PN_FCS3D_LB): 1 = at most 128 registers (default; 4 instead of 2
+        // warps per scheduler, the table 27 % faster on G3Q and 168^3, bitwise the same rows), 0 = no bound (255
+        // registers), 2 = at most 64 (spills; slower). Job 164672.
+        const int lb = [] { const char *e = std::getenv("M1PN_FCS3D_LB"); return e ? std::atoi(e) : 1; }();
         double *work = dalloc<double>(batch * work_stride);
         double *batch_rows = dalloc<double>(batch * W);
         double *batch_sum = dalloc<double>(batch * 3);
         std::vector<double> h_sum(batch * 3);
         for (std::size_t first = 0; first < n_eval; first += batch) {
             const std::size_t count = std::min(batch, n_eval - first);
-            k_lattice3d_eval_batch<<<blocks(count, 64), 64, 0, ctx->stream>>>(
-                lv, d_px, d_py, d_pz, d_w, d_sa, d_own, first, count, M, dt, final_time, work, work_stride, batch_rows,
-                batch_sum);
+            {
+                auto kernel = lb == 1 ? k_lattice3d_eval_batch_r128 : lb == 2 ? k_lattice3d_eval_batch_r64
+                                                                               : k_lattice3d_eval_batch;
+                kernel<<<blocks(count, 64), 64, 0, ctx->stream>>>(lv, d_px, d_py, d_pz, d_w, d_sa, d_own, first, count,
+                                                                  M, dt, final_time, work, work_stride, batch_rows,
+                                                                  batch_sum);
+            }
             CK(cudaGetLastError());
             k_lattice3d_scatter_batch<<<blocks(count * W, 256), 256, 0, ctx->stream>>>(
                 v, r, d_elem, d_lk, d_w, d_own, first, count, int(W), batch_rows, node_acc, mass_acc);
@@ -2516,6 +2549,8 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
             for (std::size_t t = 0; t < count; ++t)
                 sum.mass += h_sum[3 * t + 0], sum.abs_rate += h_sum[3 * t + 1], sum.absorbed += h_sum[3 * t + 2];
         }
+        CK(cudaStreamSynchronize(ctx->stream));
+        CK(cudaDeviceSetLimit(cudaLimitStackSize, stack_before)); // release the stack reserve (see lattice3d_table)
         CK(cudaFree(work)), CK(cudaFree(batch_rows)), CK(cudaFree(batch_sum));
         CK(cudaFree(d_px)), CK(cudaFree(d_py)), CK(cudaFree(d_pz));
         CK(cudaFree(d_elem)), CK(cudaFree(d_lk)), CK(cudaFree(d_own)), CK(cudaFree(d_w)), CK(cudaFree(d_sa));
@@ -2544,6 +2579,17 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         r.lnode_d = node_acc, r.lnode_f = nullptr;
     }
     r.ltable = nullptr, r.lM = M, r.lm0 = 0, r.ldt = dt;
+    // The nodal table replaces the per-point FCS data (react_lattice reads lnode_f / lnode_d only): free the per-point
+    // arrays (about 50 bytes per quadrature point, 2 GB on 168^3 and 8 GB on 264^3).
+    auto release = [&](auto *&p) {
+        auto it = std::find(rd->owned.begin(), rd->owned.end(), (void *)p);
+        if (it != rd->owned.end()) {
+            rd->owned.erase(it);
+            CK(cudaFree((void *)p));
+        }
+        p = nullptr;
+    };
+    release(r.fx), release(r.fy), release(r.fw), release(r.fss), release(r.q), release(r.local);
     return sum;
 }
 void react_lattice(Context *ctx, double *state, double tau, double source_time) {
@@ -2709,6 +2755,8 @@ Context *create(const Setup &s) {
     v.weno_q = s.weno_q, v.weno_r = s.weno_r, v.weno_epsilon = s.weno_epsilon, v.weno_linear = s.weno_linear;
     v.element_theta = s.element_theta;
     v.fallback_capacity = s.fallback_capacity;
+    if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e))
+        std::fprintf(stderr, "gpu create: after mesh/operator tables %.2f GB\n", device_used_bytes() * 1e-9);
     const std::size_t N = s.nodes, Q = s.q;
     Buffers &b = ctx->b;
     b.a = own(dalloc<double>(N * Q));
@@ -2732,6 +2780,8 @@ Context *create(const Setup &s) {
     v.seg_lim = own(dalloc<double>(std::size_t(s.cells) * 4 * n));
     v.counters = own(dalloc<DeviceCounters>(1));
     ctx->norm_accumulator = own(dalloc<double>(1024)); // per-block partials of norm() (at most 1024 blocks)
+    if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e))
+        std::fprintf(stderr, "gpu create: after state buffers %.2f GB\n", device_used_bytes() * 1e-9);
     for (auto &e : ctx->events)
         CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     CK(cudaMallocHost(&ctx->pinned_counters, sizeof(DeviceCounters)));
@@ -2806,7 +2856,7 @@ void boundary_high_setup(Context *ctx, const BoundaryHighSetup &s) {
     }
     d->G = dalloc<double>(rq);
     d->H = dalloc<double>(rq);
-    d->db = dalloc<double>(rq);
+    d->db = nullptr; // allocated on the first inflow datum (vacuum: never; rows x q, 9 GB on G3Q P35)
     d->low4 = dalloc<double>(std::size_t(std::max(1, s.nb)) * 4);
     if (s.row_break) {
         d->row_break = dcopy(s.row_break, std::size_t(std::max(1, s.rows)));
@@ -2933,6 +2983,8 @@ void boundary_high(Context *ctx, const double *state, double *out, const double 
                          "dgemm");
     }
     if (pinned_db) {
+        if (!d->db)
+            d->db = dalloc<double>(rq);
         CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
         k_sub<<<blocks(rq), 256, 0, ctx->stream>>>(d->H, d->db, rq);
     }
@@ -4104,6 +4156,8 @@ bool boundary_high_adaptive_launch(Context *ctx, BoundaryHighDevice *d, const do
     }
     if (pinned_db) {
         const std::size_t rq = std::size_t(s.rows) * s.q;
+        if (!d->db)
+            d->db = dalloc<double>(rq);
         CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
         k_sub_active<<<blocks(std::size_t(s.rows) * q_bnd), 256, 0, ctx->stream>>>(s.q, q_bnd, s.rows, d->H, d->db);
     }

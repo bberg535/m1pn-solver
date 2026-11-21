@@ -76,10 +76,24 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     double glast = seconds();
     auto gmark = [&](const char *what) {
         if (gtiming)
-            std::cerr << "gpu ctor: " << what << " " << seconds() - glast << " s\n";
+            std::cerr << "gpu ctor: " << what << " " << seconds() - glast << " s, device used "
+                      << gpu::device_used_bytes() * 1e-9 << " GB\n";
         glast = seconds();
     };
     require(!s.dist_, "GPU path: serial scheme only (no MPI)");
+    radius_random_ = std::async(std::launch::async, [nodes = s.nodes, q = s.moments] {
+        std::array<Field, 2> x;
+        std::mt19937 rng(12345);
+        std::uniform_real_distribution<double> uniform(-1, 1);
+        for (Field &f : x) {
+            f.resize(nodes, q);
+            for (int i = 0; i < nodes; ++i)
+                for (int c = 0; c < q; ++c)
+                    f(i, c) = uniform(rng);
+            f /= f.norm();
+        }
+        return x;
+    });
     // Interface sides: node-by-node coupling (nodal_interface, conforming blocks) keeps the regular pipeline (partner
     // term as face datum, node-wise bar states on the host); otherwise the whole face work runs on the host.
     for (int side = 0; side < 6; ++side) {
@@ -380,6 +394,7 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
             r.fcs_sigma_s = s.fcs_sigma_s_.data(), r.fcs_shape = shape.data(), r.fcs_node_mass = s.fcs_node_mass_.data();
         }
         gpu::reaction_setup(ctx_, r);
+        gmark("reaction setup");
         if (lattice3_) {
             const double start = seconds();
             uncollided::Lattice3dUncollidedTable &T = *lattice3_;
@@ -660,6 +675,7 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
         }
         gpu::adaptive_setup(ctx_, adaptive_plan_, seg_factors);
     }
+    gmark("rest of constructor");
 }
 ElementWenoGpu::~ElementWenoGpu() {
     if (std::getenv("M1PN_SPLIT_TIMING"))
@@ -2011,14 +2027,24 @@ double ElementWenoGpu::spectral_radius(int iterations, const std::array<Field, 2
     const gpu::Buffers b = gpu::buffers(ctx_);
     std::mt19937 rng(12345);
     std::uniform_real_distribution<double> uniform(-1, 1);
+    // Precomputed start vectors (first call): the same draws in the same order as the loop below.
+    std::array<Field, 2> pre;
+    const bool have_pre = radius_random_.valid();
+    if (have_pre)
+        pre = radius_random_.get();
     double radius = 0;
     int g = 0;
     for (double gamma_value : {0., 1.}) {
-        Field x(s_.nodes, q);
-        for (int i = 0; i < s_.nodes; ++i)
-            for (int c = 0; c < q; ++c)
-                x(i, c) = uniform(rng);
-        x /= x.norm();
+        Field x;
+        if (have_pre) {
+            x = std::move(pre[g]);
+        } else {
+            x.resize(s_.nodes, q);
+            for (int i = 0; i < s_.nodes; ++i)
+                for (int c = 0; c < q; ++c)
+                    x(i, c) = uniform(rng);
+            x /= x.norm();
+        }
         if (start && (*start)[g].rows() == s_.nodes && (*start)[g].cols() == q && (*start)[g].norm() > 0)
             x = (*start)[g] / (*start)[g].norm() + 1e-2 * x;
         gpu::upload(b.x, x.data(), sizeof(double) * std::size_t(s_.nodes) * q);
