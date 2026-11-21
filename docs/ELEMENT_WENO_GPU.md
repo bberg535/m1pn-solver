@@ -418,3 +418,34 @@ Rest bei G3H P15 adaptiv:
 - Init 116 s: FCS-Tabelle ca. 54 s, Spektralradius 28 s (bestimmt dt), Schema 23 s.
 - Löser 151 s: davon 80 s Warten auf die GPU und 15 s Host-Korrektur.
 - RSS 103 GB.
+
+## Hohe Ordnungen in 3D und Einstrahldaten pro Seite (21.11.2026, Branch `perf/init3d`)
+
+Hohe Ordnungen auf einem A100 (`tardis_highpn3d_20261121`, Job 164641, und `tardis_init_fine3d_20261121`,
+Job 164646; FCS, gebrochene Linien, T = 3.2, adaptiv tol 3e-4, Tile 8):
+
+| Lauf | Löser nicht adaptiv | Löser adaptiv | Faktor | aktiv | mittleres N | GPU max. |
+|---|---:|---:|---:|---:|---:|---:|
+| G3Q P21 | 130,4 s | 41,3 s | 3,2 | 23,8 % | 6,1 | 39 GB |
+| G3Q P35 | 440,6 s | 52,0 s | 8,5 | 10,3 % | 6,4 | 64 GB |
+| G3F P7 (168³) | 420,4 s | 257,3 s | 1,6 | 22,5 % | 2,1 | 56 GB |
+| G3F P11 (168³) | 794,3 s | 343,8 s | 2,3 | 18,6 % | 2,7 | 72 GB |
+
+G3H P21 passt nicht auf die GPU (`cudaMalloc` out of memory bei etwa 74 GB). Die Masse von G3Q ändert sich zwischen
+P21 und P35 um weniger als 0,005 %.
+
+Bei P35 dauerte die Initialisierung 196 s, davon 117 s am Ende des Konstruktors, bei 345 GB RSS. Ursache war
+`steady_data_`: ein `Incoming` mit `d` der Länge ~Q/2 für jeden der (N+5)² Punkte jeder Randfläche, bei Vakuum
+alle gleich. Bei ortsunabhängiger Einstrahlung (Vakuum oder konstante Dichte ohne Atome) steht jetzt ein Eintrag
+pro Seite in `steady_data_` (`steady_per_side_`, Zugriff über `steady_at`). `fill_datum` überspringt dann
+Flächen ohne Datum. Die Ergebnisse bleiben bitgleich: Masse und Absorptionsrate von G3Q P15 uniform/adaptiv und
+P35 adaptiv sind identisch mit den Jobs 164640/164641 (Job 164652, `tardis_init3d_20261121`).
+
+| Lauf | Init vorher → nachher | RSS vorher → nachher | gesamt vorher → nachher |
+|---|---:|---:|---:|
+| G3Q P15 uniform | 31,5 → 25,3 s | 34,7 → 15,2 GB | 100,7 → 94,0 s |
+| G3Q P15 adaptiv | 33,3 → 25,5 s | 34,7 → 15,2 GB | 66,3 → 58,3 s |
+| G3Q P35 adaptiv | 195,7 → 62,2 s | 344,9 → 73,7 GB | 249,6 → 111,9 s |
+
+Rest der Initialisierung bei G3Q P35: GPU-Aufbau 25 s (davon FCS-Tabelle ca. 17 s) und Spektralradius 30 s
+(60 Potenziterationen mit dem vollen P35-Operator). Auf G3F dominiert die FCS-Tabelle mit 126–140 s.

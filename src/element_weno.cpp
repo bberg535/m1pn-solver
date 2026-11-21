@@ -1319,6 +1319,14 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     }
     if (!o.periodic && inflow.steady && !faces_.empty()) {
         const std::size_t points = rules_[2 * faces_[0].direction + faces_[0].side].weights.size();
+        steady_points_ = points;
+        // face_data is then the same at every x of a side: the vacuum datum, or the cached constant density.
+        steady_per_side_ = !inflow.atoms && (!inflow.density || cached_density_);
+        if (steady_per_side_) {
+            steady_data_.resize(6);
+            for (int k = 0; k < 2 * dimension; ++k)
+                steady_data_[k] = face_data(k, V3::Zero(), 0.);
+        } else {
         steady_data_.resize(faces_.size() * points);
         parallel_for(int(faces_.size()), [&](int index) {
             const auto &f = faces_[index];
@@ -1338,6 +1346,7 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 steady_data_[index * points + point] = face_data(side_id, x, 0.);
             }
         });
+        }
         if (!inflow.exterior_state && !inflow.exterior_m1) {
             auto same = [](const Incoming &a, const Incoming &b) {
                 return a.d.size() == b.d.size() && (a.d.array() == b.d.array()).all() &&
@@ -1347,10 +1356,12 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             face_weight_ = Vec::Zero(side_row_start_[6]);
             parallel_for(int(faces_.size()), [&](int index) {
                 const FaceRule &rule = rules_[2 * faces_[index].direction + faces_[index].side];
-                const Incoming &first = steady_data_[std::size_t(index) * points];
                 bool uniform = true;
-                for (std::size_t point = 1; point < points && uniform; ++point)
-                    uniform = same(first, steady_data_[std::size_t(index) * points + point]);
+                if (!steady_per_side_) {
+                    const Incoming &first = steady_data_[std::size_t(index) * points];
+                    for (std::size_t point = 1; point < points && uniform; ++point)
+                        uniform = same(first, steady_data_[std::size_t(index) * points + point]);
+                }
                 face_uniform_[index] = uniform && !o.interface_side[2 * faces_[index].direction + faces_[index].side] &&
                                        !face_break_[index];
                 for (int n = 0; n < int(rule.local.size()); ++n) {
@@ -1501,8 +1512,8 @@ void ElementWeno::init_adaptive_inflow_floor(AdaptivePnPlan &plan) const {
         if (!nonzero && inflow.steady && !steady_data_.empty()) {
             const auto &rule = rules_[side_id];
             const std::size_t npts = rule.weights.size();
-            for (std::size_t p = 0; p < npts; ++p)
-                if (!steady_data_[index * npts + p].d.isZero(0)) {
+            for (std::size_t p = 0; p < (steady_per_side_ ? 1 : npts); ++p)
+                if (!steady_at(index, p).d.isZero(0)) {
                     nonzero = true;
                     break;
                 }
@@ -2837,7 +2848,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
                 }
             }
         } else if (!face_uniform_.empty() && face_uniform_[index]) { // uniform face: point-independent terms
-            const Incoming &data = steady_data_[std::size_t(index) * rule.weights.size()];
+            const Incoming &data = steady_at(index, 0);
             for (int n = 0; n < nf; ++n) {
                 const double weight = face_weight_[r0 + n];
                 if (weight == 0)
@@ -2861,7 +2872,7 @@ void ElementWeno::add_boundary(double time, const Field &a, const Field &low, co
             thread_local Incoming fresh;
             if (!inflow.steady)
                 face_data_into(side_id, x, time, fresh);
-            const Incoming &data = inflow.steady ? steady_data_[std::size_t(index) * rule.weights.size() + point]
+            const Incoming &data = inflow.steady ? steady_at(index, point)
                                                  : fresh;
             for (int n = 0; n < nf; ++n) {
                 const double weight = face_scale_[index] * rule.weights[point] * rule.shape(n, point);
