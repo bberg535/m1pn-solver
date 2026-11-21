@@ -6,12 +6,12 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=240G
 #SBATCH --time=01:30:00
-#SBATCH --output=/home/user/bberg/phd/03_projects/M1PN_Solver/nx/tmp/tardis_ad3d_kernel_20261121/slurm-%j.log
-# perf/adaptive3d: structured 3D adaptive stabilization kernel (M1PN_GPU_AD3=1) against the connectivity kernel (=0).
+#SBATCH --output=/home/user/bberg/phd/03_projects/M1PN_Solver/nx/tmp/tardis_ad3d_kernel2_20261121/slurm-%j.log
+# perf/adaptive3d: z-strip 3D adaptive stabilization kernel (M1PN_GPU_AD3=2; =1 window, =0 connectivity: 164636).
 # Lattice-3d, FCS, broken lines + split, adaptive tol 3e-4 tile 8, T = 3.2: G3Q P15/P7, G3H P7; nsys of G3Q P15.
 set -uo pipefail
 REPO=/home/user/bberg/phd/03_projects/M1PN_Solver/.claude/worktrees/adaptive3d
-CAMPAIGN=/home/user/bberg/phd/03_projects/M1PN_Solver/nx/tmp/tardis_ad3d_kernel_20261121
+CAMPAIGN=/home/user/bberg/phd/03_projects/M1PN_Solver/nx/tmp/tardis_ad3d_kernel2_20261121
 RUNS=$CAMPAIGN/runs
 mkdir -p "$RUNS"
 export OMP_NUM_THREADS=32 OMP_PLACES=cores OMP_PROC_BIND=close OPENBLAS_NUM_THREADS=1
@@ -36,13 +36,13 @@ run_gpu() {
     M1PN_GPU_AD3=$s "$BIN" $COMMON "$@" --output "$RUNS/$name" > "$RUNS/$name.log" 2>&1
     echo "[done] $name rc=$? $(( $(date +%s) - t0 ))s $(date +%T)"
 }
-for s in 1 0; do
+for s in 2; do
     run_gpu $s g3q_p15_ad_s$s $L3 $G3Q --pn-order 15 $AD3
     run_gpu $s g3q_p7_ad_s$s  $L3 $G3Q --pn-order 7 $AD3
     run_gpu $s g3h_p7_ad_s$s  $L3 $G3H --pn-order 7 $AD3
 done
 NSYS=$(command -v nsys || ls -d /usr/local/cuda/bin/nsys 2>/dev/null | head -1)
-M1PN_GPU_AD3=1 "$NSYS" profile -t cuda -s none --cpuctxsw=none -o "$CAMPAIGN/p15_ad" -f true \
+M1PN_GPU_AD3=2 "$NSYS" profile -t cuda -s none --cpuctxsw=none -o "$CAMPAIGN/p15_ad" -f true \
     "$BIN" $COMMON $L3 $G3Q --pn-order 15 $AD3 --output "$RUNS/nsys_p15_ad" > "$RUNS/nsys_p15_ad.log" 2>&1
 "$NSYS" stats -r cuda_gpu_kern_sum -f column "$CAMPAIGN/p15_ad.nsys-rep" > "$CAMPAIGN/p15_ad.txt" 2>&1
 python3 - "$RUNS" <<'PY'

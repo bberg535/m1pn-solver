@@ -3781,6 +3781,145 @@ __global__ void __launch_bounds__(128) k_stabilization_adaptive3(View v, const d
     }
 }
 
+// 3D Q1 adaptive stabilization, z-strip form (as k_stabilization_strip3) per tile chunk: each warp walks a (x, y)
+// column of the tile through its planes z0 - 1 .. z1; a plane's 3 x 3 window of a, g_0..g_2 (inactive neighbours
+// masked to 0 by their tile order) is loaded once and added to the element terms of the column nodes z - 1, z, z + 1.
+// Rounding-level differences to k_stabilization_adaptive (plane-wise sums, prescaled nu K, w factored out).
+__global__ void __launch_bounds__(128) k_stabilization_adaptive3s(View v, const double *a, double *result,
+                                                                  double constant_gamma, int tb0, int tb1, int tb2,
+                                                                  const AdaptiveTileChunk *chunks, int nchunks,
+                                                                  const int *tile_q, int nt0, int nt1) {
+    if (blockIdx.x >= nchunks)
+        return;
+    const AdaptiveTileChunk tc = chunks[blockIdx.x];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = blockDim.x >> 5;
+    const int q = v.q, c = tc.c0 + lane;
+    if (c >= q)
+        return;
+    const int npx = v.npa[0], npy = v.npa[1], npz = v.npa[2], cx = v.count[0], cy = v.count[1], cz = v.count[2];
+    const int x0 = tc.tx * tb0, x1 = min(npx, x0 + tb0);
+    const int y0 = tc.ty * tb1, y1 = min(npy, y0 + tb1);
+    const int z0 = tc.tz * tb2, z1 = min(npz, z0 + tb2);
+    const int wx = x1 - x0, wy = y1 - y0;
+    const bool active_c = c < tc.q_lim;
+    const std::ptrdiff_t row = std::ptrdiff_t(npx) * q, plane = row * npy;
+    auto ez_of = [&](int k, int qz) { return v.strip_elem[2] ? v.strip_elem[2][2 * k + qz] : k - 1 + qz; };
+    for (int col = warp; col < wx * wy; col += nwarps) {
+        const int ix = x0 + col % wx, iy = y0 + col / wx;
+        const std::size_t base = std::size_t(iy) * row + std::size_t(ix) * q + c;
+        if (!active_c) {
+            for (int k = z0; k < z1; ++k)
+                result[std::size_t(k) * plane + base] = 0.0;
+            continue;
+        }
+        const bool okx[3] = {ix > 0, true, ix + 1 < npx}, oky[3] = {iy > 0, true, iy + 1 < npy};
+        const bool fx[3] = {ix == x0, false, ix == x1 - 1}, fy[3] = {iy == y0, false, iy == y1 - 1};
+        const double *F[4] = {a + base, v.gradient[0] + base, v.gradient[1] + base, v.gradient[2] + base};
+        int exq[2], eyq[2];
+        bool exok[2], eyok[2];
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            exq[s] = v.strip_elem[0] ? v.strip_elem[0][2 * ix + s] : ix - 1 + s;
+            eyq[s] = v.strip_elem[1] ? v.strip_elem[1][2 * iy + s] : iy - 1 + s;
+            exok[s] = exq[s] >= 0 && exq[s] < cx;
+            eyok[s] = eyq[s] >= 0 && eyq[s] < cy;
+        }
+        double T[3][8];
+#pragma unroll
+        for (int s = 0; s < 3; ++s)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                T[s][j] = 0;
+        for (int p = z0 - 1; p <= z1; ++p) {
+            if (p >= 0 && p < npz) {
+                const bool pin = p >= z0 && p < z1;
+                double W[4][3][3];
+                const std::ptrdiff_t off = std::ptrdiff_t(p) * plane;
+#pragma unroll
+                for (int dy = 0; dy < 3; ++dy)
+#pragma unroll
+                    for (int dx = 0; dx < 3; ++dx) {
+                        bool on = okx[dx] && oky[dy];
+                        if (on && (!pin || fx[dx] || fy[dy]))
+                            on = c < tile_q[((p / tb2) * nt1 + (iy + dy - 1) / tb1) * nt0 + (ix + dx - 1) / tb0];
+#pragma unroll
+                        for (int f = 0; f < 4; ++f)
+                            W[f][dy][dx] = on ? F[f][off + (dy - 1) * row + (dx - 1) * q] : 0.;
+                    }
+#pragma unroll
+                for (int s = 0; s < 3; ++s) {
+                    const int k = p - 1 + s;
+                    if (k < z0 || k >= z1)
+                        continue;
+#pragma unroll
+                    for (int qz = 0; qz < 2; ++qz) {
+                        const int mz = 2 - s - qz;
+                        if (mz < 0 || mz > 1)
+                            continue;
+                        const int ez = ez_of(k, qz);
+                        if (ez < 0 || ez >= cz)
+                            continue;
+#pragma unroll
+                        for (int qy = 0; qy < 2; ++qy)
+#pragma unroll
+                            for (int qx = 0; qx < 2; ++qx) {
+                                if (!exok[qx] || !eyok[qy])
+                                    continue;
+                                const int e = exq[qx] + cx * (eyq[qy] + cy * ez);
+                                const int l = (1 - qx) + 2 * (1 - qy) + 4 * (1 - qz);
+                                const int kc = klass_of(v, e);
+                                const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
+                                const std::size_t r = std::size_t(kc) * 64 + 8 * l + 4 * mz;
+                                double t = T[s][qx + 2 * qy + 4 * qz];
+#pragma unroll
+                                for (int my = 0; my < 2; ++my)
+#pragma unroll
+                                    for (int mx = 0; mx < 2; ++mx)
+                                        t += __ldg(v.stiffness_nu + r + mx + 2 * my) * W[0][qy + my][qx + mx];
+                                if (g != 0) {
+                                    double conv = 0;
+#pragma unroll
+                                    for (int d = 0; d < 3; ++d)
+#pragma unroll
+                                        for (int my = 0; my < 2; ++my)
+#pragma unroll
+                                            for (int mx = 0; mx < 2; ++mx)
+                                                conv += __ldg(v.convection_t_rows[d] + r + mx + 2 * my) *
+                                                        W[1 + d][qy + my][qx + mx];
+                                    t += (-viscosity_of(v, kc) * g) * conv;
+                                }
+                                T[s][qx + 2 * qy + 4 * qz] = t;
+                            }
+                    }
+                }
+            }
+            const int k = p - 1;
+            if (k >= z0 && k < z1) {
+                double out = 0;
+#pragma unroll
+                for (int qz = 0; qz < 2; ++qz) {
+                    const int ez = ez_of(k, qz);
+                    if (ez < 0 || ez >= cz)
+                        continue;
+#pragma unroll
+                    for (int qy = 0; qy < 2; ++qy)
+#pragma unroll
+                        for (int qx = 0; qx < 2; ++qx)
+                            if (exok[qx] && eyok[qy])
+                                out -= T[0][qx + 2 * qy + 4 * qz];
+                }
+                result[std::size_t(k) * plane + base] = out;
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                T[0][j] = T[1][j];
+                T[1][j] = T[2][j];
+                T[2][j] = 0;
+            }
+        }
+    }
+}
+
 __global__ void k_combine_adaptive(View v, double *r, const double *x, const double *a, double old, double fresh,
                                    double tau, int tb0, int tb1, int tb2, const AdaptiveTileChunk *chunks, int nchunks) {
     extern __shared__ double shared[];
@@ -4347,13 +4486,14 @@ void gradients(Context *ctx, const double *state) {
     }
     line_solve(ctx, 0, v.dimension, nullptr, state);
 }
-// 3D Q1 adaptive stabilization with structured indexing (M1PN_GPU_AD3=0: connectivity kernel).
-static bool adaptive3_enabled() {
-    static const bool on = [] {
+// 3D Q1 adaptive stabilization (M1PN_GPU_AD3): 2 z-strip kernel (default), 1 structured 27-point window (bitwise as
+// the connectivity kernel), 0 connectivity kernel.
+static int adaptive3_mode() {
+    static const int mode = [] {
         const char *e = std::getenv("M1PN_GPU_AD3");
-        return !e || std::atoi(e) != 0;
+        return e ? std::atoi(e) : 2;
     }();
-    return on;
+    return mode;
 }
 // 3D Q1 node strip kernel on graded / broken meshes instead of the per-node connectivity kernel. On the uniform mesh
 // the element kernel + gather stays faster on the A100 (U112 P7 solver 58.8 vs 67.4 s; graded G3H 123.4 -> 91.1 s,
@@ -4400,8 +4540,13 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
             const int q4 = std::min(4, v.q);
             k_stabilization_low4<<<blocks(std::size_t(v.nodes) * q4), 256, 0, ctx->stream>>>(
                 v, state, out, want_low, constant_gamma);
-            if (ad->tile_chunks_n > 0 && adaptive3_enabled() && v.dimension == 3 && v.degree == 1 && v.local == 8 &&
-                v.strip3_ok && (v.structured || (v.strip_elem[0] && v.strip_elem[1] && v.strip_elem[2])))
+            const bool s3 = v.dimension == 3 && v.degree == 1 && v.local == 8 && v.strip3_ok &&
+                            (v.structured || (v.strip_elem[0] && v.strip_elem[1] && v.strip_elem[2]));
+            if (ad->tile_chunks_n > 0 && s3 && adaptive3_mode() == 2)
+                k_stabilization_adaptive3s<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
+                    v, state, out, constant_gamma, ad->tb[0], ad->tb[1], ad->tb[2], ad->d_tile_chunks,
+                    ad->tile_chunks_n, ad->d_tile_q, ad->nt[0], ad->nt[1]);
+            else if (ad->tile_chunks_n > 0 && s3 && adaptive3_mode() == 1)
                 k_stabilization_adaptive3<<<ad->tile_chunks_n, 128, 0, ctx->stream>>>(
                     v, state, out, constant_gamma, ad->tb[0], ad->tb[1], ad->tb[2], ad->d_tile_chunks,
                     ad->tile_chunks_n, ad->d_tile_q, ad->nt[0], ad->nt[1]);
