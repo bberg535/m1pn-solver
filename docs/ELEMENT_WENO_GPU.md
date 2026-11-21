@@ -497,3 +497,8 @@ Befunde:
 
 Init gegen `experiment/element-weno` (Job 164676): G3Q P7 uniform 19,1 → 14,8 s, P15 adaptiv 25,4 → 20,5 s, P35 adaptiv
 62,3 → 54,3 s; 2D GBQ/GBH P35 unverändert (4–6 s).
+- Verworfen (Branch `perf/fcs3d`, nicht gemergt): verschränkte Arbeits-Arrays des FCS-Kernels (Element k von Thread t
+  an `work[k * count + t]`). Laut ncu-Quellprofil (Job 164654) fallen rund 37 % der Stall-Samples auf `Acc`/`Tmp`/`work`
+  (Akkumulation über die Zeiten, Nullsetzen), mit 8 von 32 genutzten Bytes pro Sektor. Verschränkt bitgleich, aber
+  langsamer (G3Q P7 Tabelle 11,1 → 12,9 s, 168³ P3 113 → 121 s; Job 164700): die Lanes eines Warps arbeiten auf
+  verschiedenen Zeitfenstern, und die L1-Trefferquote der zusammenhängenden Arrays (94 %) geht verloren.
