@@ -477,3 +477,23 @@ Befunde:
   (doppelte Größe) plus ein Drittel des freien Speichers für die Stapel. Daran scheitert 264³.
 - Randphase A: drei Puffer Zeilen × Q (`G`, `H`, `db`) für Rand- und Bruchflächen, bei P35 27 GB. `db` (Datum)
   bleibt bei Vakuum null.
+
+### Speicher, FCS-Kernel und Knotensummen (21.11.2026, `perf/init3d2`)
+
+- `db` (Zeilen × Q, Datum der Randphase A) wird erst beim ersten Einstrahldatum angelegt, bei Vakuum nie. Die FCS-Arrays
+  pro Quadraturpunkt (Ort, Gewicht, σ_s, q, local) werden nach dem Bau der nodalen 3D-Tabelle freigegeben. G3Q P35
+  adaptiv: 60,0 → 50,8 GB nach dem Konstruktor; G3H P21 adaptiv passt jetzt auf ein A100 (Spitze 69,6 GB, Löser
+  207 s, Init 121 s, aktiv 19 %, mittleres N 4,8; vorher OOM). Job 164664.
+- FCS-Kernel (`k_lattice3d_eval_batch`): ncu (Job 164654) zeigte 255 Register, 12,5 % theoretische und 8 % erreichte
+  Auslastung, 9 von 32 aktiven Threads pro Warp. Mit `__launch_bounds__(64, 8)` (höchstens 128 Register) ist die
+  Tabelle 27 % schneller (G3Q 15,3 → 11,1 s, 168³ P3 Init 138 → 113 s), bitgleich; jetzt Standard (`M1PN_FCS3D_LB`:
+  0 ohne Schranke, 2 höchstens 64 Register, langsamer). Sortieren der Punkte nach dem Abstand zur Quelle war langsamer
+  (G3Q 21,7 s) und wurde verworfen (Job 164672).
+- Material- und FCS-Knotensummen im Konstruktor laufen parallel über die Knoten (CSR `node_offsets_`/`node_entries_`,
+  jetzt vor den nodalen Reaktionsdaten gebaut), in derselben Summationsreihenfolge wie die frühere Elementschleife.
+  Die FCS-Knotenmasse braucht dabei ein explizites `std::fma`: die frühere Schleife wurde zu fma kontrahiert, die neue
+  vektorisierte die Produkte ungefused (2D um 1e-8 verschoben; in 3D von der fp32-Tabelle verdeckt). 312³: CPU-Phase
+  29 → 17,5 s. Bitgleich in 2D (GBQ P35, Spiegelreduktion auto/off) und 3D (Jobs 164676, 164688, 164691).
+
+Init gegen `experiment/element-weno` (Job 164676): G3Q P7 uniform 19,1 → 14,8 s, P15 adaptiv 25,4 → 20,5 s, P35 adaptiv
+62,3 → 54,3 s; 2D GBQ/GBH P35 unverändert (4–6 s).

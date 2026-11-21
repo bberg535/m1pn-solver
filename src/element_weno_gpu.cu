@@ -2398,10 +2398,12 @@ __global__ void k_fcs_nodes_lattice_d(View v, ReactionView r, double time) {
         return;
     r.fcs[i] = uncollided::lattice3d_eval_row(r.lnode_d + std::size_t(i) * std::size_t(r.lM + 1), r.lM, r.ldt, time);
 }
-__global__ void k_lattice3d_eval_batch(uncollided::Lattice3dView lv, const double *px, const double *py,
-                                       const double *pz, const double *weight, const double *sigma_a, const int *owned,
-                                       std::size_t first, std::size_t count, int M, double dt, double final_time,
-                                       double *work, std::size_t work_stride, double *batch_rows, double *batch_sum) {
+// Body of the FCS eval kernel; the launch-bound variants below differ only in the register budget (M1PN_FCS3D_LB).
+__device__ __forceinline__ void lattice3d_eval_body(const uncollided::Lattice3dView &lv, const double *px,
+                                       const double *py, const double *pz, const double *weight, const double *sigma_a,
+                                       const int *owned, std::size_t first, std::size_t count, int M, double dt,
+                                       double final_time, double *work, std::size_t work_stride, double *batch_rows,
+                                       double *batch_sum) {
     const std::size_t t = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (t >= count)
         return;
@@ -2419,6 +2421,16 @@ __global__ void k_lattice3d_eval_batch(uncollided::Lattice3dView lv, const doubl
         batch_sum[3 * t + 0] = 0, batch_sum[3 * t + 1] = 0, batch_sum[3 * t + 2] = 0;
     }
 }
+#define M1PN_FCS3D_EVAL_ARGS                                                                                           \
+    uncollided::Lattice3dView lv, const double *px, const double *py, const double *pz, const double *weight,          \
+        const double *sigma_a, const int *owned, std::size_t first, std::size_t count, int M, double dt,               \
+        double final_time, double *work, std::size_t work_stride, double *batch_rows, double *batch_sum
+#define M1PN_FCS3D_EVAL_CALL                                                                                           \
+    lattice3d_eval_body(lv, px, py, pz, weight, sigma_a, owned, first, count, M, dt, final_time, work, work_stride,    \
+                        batch_rows, batch_sum)
+__global__ void k_lattice3d_eval_batch(M1PN_FCS3D_EVAL_ARGS) { M1PN_FCS3D_EVAL_CALL; }
+__global__ void __launch_bounds__(64, 8) k_lattice3d_eval_batch_r128(M1PN_FCS3D_EVAL_ARGS) { M1PN_FCS3D_EVAL_CALL; }
+__global__ void __launch_bounds__(64, 16) k_lattice3d_eval_batch_r64(M1PN_FCS3D_EVAL_ARGS) { M1PN_FCS3D_EVAL_CALL; }
 __global__ void k_lattice3d_scatter_batch(View v, ReactionView r, const int *elem, const int *local_k,
                                           const double *weight, const int *owned, std::size_t first, std::size_t count,
                                           int W, const double *batch_rows, double *node_acc, double *mass_acc) {
@@ -2510,15 +2522,23 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
                 batch = std::max<std::size_t>(1, std::size_t(std::atoll(e)));
             batch = std::min<std::size_t>(batch, n_eval);
         }
+        // Register budget of the eval kernel (M1PN_FCS3D_LB): 1 = at most 128 registers (default; 4 instead of 2
+        // warps per scheduler, the table 27 % faster on G3Q and 168^3, bitwise the same rows), 0 = no bound (255
+        // registers), 2 = at most 64 (spills; slower). Job 164672.
+        const int lb = [] { const char *e = std::getenv("M1PN_FCS3D_LB"); return e ? std::atoi(e) : 1; }();
         double *work = dalloc<double>(batch * work_stride);
         double *batch_rows = dalloc<double>(batch * W);
         double *batch_sum = dalloc<double>(batch * 3);
         std::vector<double> h_sum(batch * 3);
         for (std::size_t first = 0; first < n_eval; first += batch) {
             const std::size_t count = std::min(batch, n_eval - first);
-            k_lattice3d_eval_batch<<<blocks(count, 64), 64, 0, ctx->stream>>>(
-                lv, d_px, d_py, d_pz, d_w, d_sa, d_own, first, count, M, dt, final_time, work, work_stride, batch_rows,
-                batch_sum);
+            {
+                auto kernel = lb == 1 ? k_lattice3d_eval_batch_r128 : lb == 2 ? k_lattice3d_eval_batch_r64
+                                                                               : k_lattice3d_eval_batch;
+                kernel<<<blocks(count, 64), 64, 0, ctx->stream>>>(lv, d_px, d_py, d_pz, d_w, d_sa, d_own, first, count,
+                                                                  M, dt, final_time, work, work_stride, batch_rows,
+                                                                  batch_sum);
+            }
             CK(cudaGetLastError());
             k_lattice3d_scatter_batch<<<blocks(count * W, 256), 256, 0, ctx->stream>>>(
                 v, r, d_elem, d_lk, d_w, d_own, first, count, int(W), batch_rows, node_acc, mass_acc);

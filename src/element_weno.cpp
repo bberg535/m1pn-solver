@@ -822,6 +822,19 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 mirror_nodes_[d].push_back(i);
     }
     ctor_mark("before nodal reaction data");
+    // Node -> (element, local) entries in ascending entry order: per-node gathers below and later sum in exactly the
+    // order of a loop over elements (bitwise as the former serial loops), in parallel over nodes.
+    node_offsets_.assign(nodes + 1, 0);
+    for (int entry = 0; entry < cells * local_nodes; ++entry)
+        ++node_offsets_[connectivity_[entry] + 1];
+    for (int i = 0; i < nodes; ++i)
+        node_offsets_[i + 1] += node_offsets_[i];
+    node_entries_.resize(cells * local_nodes);
+    {
+        std::vector<int> fill(node_offsets_.begin(), node_offsets_.end() - 1);
+        for (int entry = 0; entry < cells * local_nodes; ++entry)
+            node_entries_[fill[connectivity_[entry]]++] = entry;
+    }
     // Nodal reaction data: positive averages int c phi_i / int phi_i by composite Gauss quadrature.
     node_sigma_a = node_sigma_s = node_source = Vec::Zero(nodes);
     if (o.material) {
@@ -873,22 +886,23 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 }
             }
         });
-        std::vector<double> sa(nodes, 0.), ss(nodes, 0.), sq(nodes, 0.), sm(nodes, 0.);
+        ctor_mark("  material quadrature");
         double ia = 0, is = 0, iq = 0, iv = 0;
         for (int e = 0; e < cells; ++e) {
             const double *ints = &element_integrals[std::size_t(e) * 4];
             ia += ints[0], is += ints[1], iq += ints[2], iv += ints[3];
-            for (int l = 0; l < local_nodes; ++l) {
-                const int i = connectivity_[e * local_nodes + l];
-                const double *c = &local[(std::size_t(e) * local_nodes + l) * 4];
-                sa[i] += c[0], ss[i] += c[1], sq[i] += c[2], sm[i] += c[3];
+        }
+        parallel_for(nodes, [&](int i) {
+            double sa = 0, ss = 0, sq = 0, sm = 0;
+            for (int k = node_offsets_[i]; k < node_offsets_[i + 1]; ++k) {
+                const double *c = &local[std::size_t(node_entries_[k]) * 4];
+                sa += c[0], ss += c[1], sq += c[2], sm += c[3];
             }
-        }
-        for (int i = 0; i < nodes; ++i) {
-            node_sigma_a[i] = sa[i] / sm[i];
-            node_sigma_s[i] = ss[i] / sm[i];
-            node_source[i] = sq[i] / sm[i];
-        }
+            node_sigma_a[i] = sa / sm;
+            node_sigma_s[i] = ss / sm;
+            node_source[i] = sq / sm;
+        });
+        ctor_mark("  material gather");
         integral_sigma_a = ia, integral_sigma_s = is, integral_source = iq, integral_volume = iv;
     }
     if (o.uncollided_density) {
@@ -940,17 +954,24 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
                 fcs_sigma_s_[at] = ss;
             }
         });
+        ctor_mark("  fcs points");
         fcs_node_mass_ = Vec::Zero(nodes);
-        if (graded_)
-            for (int e = 0; e < cells; ++e)
-                for (int l = 0; l < local_nodes; ++l)
+        parallel_for(nodes, [&](int i) {
+            double m = 0;
+            for (int j = node_offsets_[i]; j < node_offsets_[i + 1]; ++j) {
+                const int e = node_entries_[j] / local_nodes, l = node_entries_[j] % local_nodes;
+                // Explicit fma: the former serial loop accumulated in memory and was contracted to fma((w vol), phi, m)
+                // (-ffp-contract=fast); here the products would be vectorized unfused (2D results moved by 1e-8).
+                if (graded_)
                     for (int k = 0; k < points; ++k)
-                        fcs_node_mass_[connectivity_[e * local_nodes + l]] += wref[k] * this->volume(e) * fcs_shape_(l, k);
-        else
-            for (int e = 0; e < cells; ++e)
-                for (int l = 0; l < local_nodes; ++l)
+                        m = std::fma(wref[k] * this->volume(e), fcs_shape_(l, k), m);
+                else
                     for (int k = 0; k < points; ++k)
-                        fcs_node_mass_[connectivity_[e * local_nodes + l]] += wref[k] * fcs_shape_(l, k);
+                        m = std::fma(wref[k], fcs_shape_(l, k), m);
+            }
+            fcs_node_mass_[i] = m;
+        });
+        ctor_mark("  fcs node mass");
     }
     if (!o.periodic) {
         const auto [fx, fw] = unit_gauss(p + pn.order + 3);
@@ -1287,17 +1308,6 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
     total_viscosity_ = viscosity_ij_.rowwise().sum();
     if (!graded_)
         classes_[0].total_viscosity = total_viscosity_;
-    node_offsets_.assign(nodes + 1, 0);
-    for (int entry = 0; entry < cells * local_nodes; ++entry)
-        ++node_offsets_[connectivity_[entry] + 1];
-    for (int i = 0; i < nodes; ++i)
-        node_offsets_[i + 1] += node_offsets_[i];
-    node_entries_.resize(cells * local_nodes);
-    {
-        std::vector<int> fill(node_offsets_.begin(), node_offsets_.end() - 1);
-        for (int entry = 0; entry < cells * local_nodes; ++entry)
-            node_entries_[fill[connectivity_[entry]]++] = entry;
-    }
     // nodal_face_low: lumped weights sum_point w_p phi_n(x_p) of each side's face rule (same summation order as the
     // former per-call loop).
     for (int side = 0; side < 2 * dimension; ++side) {
