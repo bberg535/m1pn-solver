@@ -605,6 +605,7 @@ private:
     // the face weights W_r = sum_points w_p phi_n(x_p) (row r = face_row_[f] + n). Only the summation order changes.
     std::vector<char> face_uniform_;
     Vec face_weight_;
+    std::array<std::vector<double>, 6> nodal_rule_weight_; // nodal_face_low: lumped rule weights per side (ctor)
     std::vector<int> boundary_nodes_sorted_;
     struct PairEntry {
         int j;

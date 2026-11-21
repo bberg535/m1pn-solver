@@ -69,6 +69,9 @@ public:
     long ghost_flagged = 0; // ghost pairs solved by the host (device projection flagged them)
     double t_wait_ghost = 0;
     double t_ghost = 0; // host phase B: ghost moments (part of t_boundary)
+    // host correction parts (M1PN_SPLIT_TIMING): copy, boundary_correction, split prep, split_compute_y, split_apply,
+    // finish total, final copy + scatter
+    double t_split_parts_[7] = {};
     double t_diag_device = 0; // M1PN_GPU_DIAG_SERIAL=1: device work overlapped by phase B
 
 private:

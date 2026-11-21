@@ -662,6 +662,11 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     }
 }
 ElementWenoGpu::~ElementWenoGpu() {
+    if (std::getenv("M1PN_SPLIT_TIMING"))
+        std::fprintf(stderr, "split timing: copy %.3f boundary_correction %.3f split prep %.3f split_compute_y %.3f "
+                             "split_apply %.3f finish (to copy) %.3f copy+scatter %.3f s\n", t_split_parts_[0],
+                     t_split_parts_[1], t_split_parts_[2], t_split_parts_[3], t_split_parts_[4], t_split_parts_[5],
+                     t_split_parts_[6]);
     gpu::host_free(pin_fetch_);
     gpu::host_free(pin_high_);
     gpu::host_free(pin_load_);
@@ -1620,7 +1625,10 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
     {
         const double t0 = seconds();
         std::copy_n(pin_load_, std::size_t(nb_) * 4, load_b_.data());
+        const double tc0 = seconds();
         boundary_correction(stats);
+        const double tc1 = seconds();
+        t_split_parts_[0] += tc0 - t0, t_split_parts_[1] += tc1 - tc0;
         if (split_) { // split_breaks: the broken-line face terms as the second convex step (ElementWeno::split_second_step)
             const auto &nodes = s_.split_nodes_;
             const int K = int(nodes.size());
@@ -1639,7 +1647,9 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
                 rate[k] = Four(load_b_.row(slot).transpose()) / s_.lumped[i];
             });
             split_u_h_ = std::move(u), split_rate_h_ = std::move(rate);
+            const double tc2 = seconds();
             s_.split_compute_y(split_u_h_, split_rate_h_, tau);
+            t_split_parts_[2] += tc2 - tc1, t_split_parts_[3] += seconds() - tc2;
         }
         t_correction += seconds() - t0;
     }
@@ -1659,13 +1669,17 @@ void ElementWenoGpu::stage_end_finish(const double *x, double *out, double *u, d
             const auto &nodes = s_.split_nodes_;
             const int K = int(nodes.size());
             s_.split_apply(split_u_h_, split_rate_h_, split_term_h_, brk_area_, tau, &stats);
+            const double ta1 = seconds();
+            t_split_parts_[4] += ta1 - t0;
             parallel_for(K, [&](int k) {
                 const int i = nodes[k];
                 load_b_.row(s_.boundary_slot_[i]) = (s_.lumped[i] * split_rate_h_[k]).transpose();
             });
         }
+        const double ta2 = seconds();
         std::copy_n(load_b_.data(), std::size_t(nb_) * 4, pin_load_up_);
         gpu::scatter_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_up_, false, 6);
+        t_split_parts_[5] += ta2 - t0, t_split_parts_[6] += seconds() - ta2;
         t_correction += seconds() - t0;
     }
     stats.boundary_outflow -= dt * weight * stats.last_boundary_mass_rate;

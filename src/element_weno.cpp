@@ -1298,6 +1298,15 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int entry = 0; entry < cells * local_nodes; ++entry)
             node_entries_[fill[connectivity_[entry]]++] = entry;
     }
+    // nodal_face_low: lumped weights sum_point w_p phi_n(x_p) of each side's face rule (same summation order as the
+    // former per-call loop).
+    for (int side = 0; side < 2 * dimension; ++side) {
+        const FaceRule &rule = rules_[side];
+        nodal_rule_weight_[side].assign(rule.local.size(), 0.);
+        for (std::size_t n = 0; n < rule.local.size(); ++n)
+            for (int point = 0; point < rule.weights.size(); ++point)
+                nodal_rule_weight_[side][n] += rule.weights[point] * rule.shape(int(n), point);
+    }
     ctor_mark("before inflow data");
     // A constant inflow density gives the same angular data at every boundary
     // point of one normal; evaluate that part once instead of per point and stage.
@@ -3031,10 +3040,9 @@ void ElementWeno::nodal_face_low(int index, const Field &low, const Field &low_f
     const FaceRule &rule = rules_[side_id];
     const Boundary &b = *boundaries_[side_id];
     const int nf = int(rule.local.size()), r0 = face_row_[index];
+    const double *rule_weight = nodal_rule_weight_[side_id].data(); // sum_p w_p phi_n(x_p), set in the ctor
     for (int n = 0; n < nf; ++n) {
-        double weight = 0;
-        for (int point = 0; point < rule.weights.size(); ++point)
-            weight += rule.weights[point] * rule.shape(n, point);
+        double weight = rule_weight[n];
         weight *= face_scale_[index];
         if (weight == 0)
             continue;
