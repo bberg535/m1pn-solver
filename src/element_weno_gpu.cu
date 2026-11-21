@@ -2367,6 +2367,8 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
     const std::size_t batch = std::min<std::size_t>(points, 1 << 16);
     const std::size_t work_stride = uncollided::lattice3d_work_size(hv, M);
     double *work = dalloc<double>(batch * work_stride);
+    std::size_t stack_before = 0;
+    CK(cudaDeviceGetLimit(&stack_before, cudaLimitStackSize));
     CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
     for (std::size_t first = 0; first < points; first += batch) {
         const std::size_t count = std::min(batch, points - first);
@@ -2375,6 +2377,9 @@ void lattice3d_table(Context *ctx, const uncollided::Lattice3dView &hv, const do
         CK(cudaGetLastError());
     }
     CK(cudaDeviceSynchronize());
+    // Release the stack reserve (stack size x resident threads, ~5 GB on an A100) for the rest of the run; kernels
+    // with larger static frames get the stack grown by the driver at launch.
+    CK(cudaDeviceSetLimit(cudaLimitStackSize, stack_before));
     CK(cudaFree(work));
     CK(cudaFree(dx)), CK(cudaFree(dy)), CK(cudaFree(dz));
     if (host_out)
@@ -2448,6 +2453,12 @@ __global__ void k_cast_d2f(const double *src, float *dst, std::size_t n) {
     if (i < n)
         dst[i] = float(src[i]);
 }
+std::size_t device_used_bytes() {
+    std::size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess)
+        return 0;
+    return total_b - free_b;
+}
 Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Lattice3dView &hv, const double *px,
                                             const double *py, const double *pz, const int *elem, const int *local_k,
                                             const double *weight, const double *sigma_a, const int *owned,
@@ -2485,6 +2496,8 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         // overrides (benchmarks).
         // Stack reserve first: it is taken from device memory for all resident threads, and the batch below claims a
         // third of what is free (P15 on 168^3 failed in cudaDeviceSetLimit after the batch allocation).
+        std::size_t stack_before = 0;
+        CK(cudaDeviceGetLimit(&stack_before, cudaLimitStackSize));
         CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
         std::size_t batch;
         {
@@ -2516,6 +2529,8 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
             for (std::size_t t = 0; t < count; ++t)
                 sum.mass += h_sum[3 * t + 0], sum.abs_rate += h_sum[3 * t + 1], sum.absorbed += h_sum[3 * t + 2];
         }
+        CK(cudaStreamSynchronize(ctx->stream));
+        CK(cudaDeviceSetLimit(cudaLimitStackSize, stack_before)); // release the stack reserve (see lattice3d_table)
         CK(cudaFree(work)), CK(cudaFree(batch_rows)), CK(cudaFree(batch_sum));
         CK(cudaFree(d_px)), CK(cudaFree(d_py)), CK(cudaFree(d_pz));
         CK(cudaFree(d_elem)), CK(cudaFree(d_lk)), CK(cudaFree(d_own)), CK(cudaFree(d_w)), CK(cudaFree(d_sa));
@@ -2709,6 +2724,8 @@ Context *create(const Setup &s) {
     v.weno_q = s.weno_q, v.weno_r = s.weno_r, v.weno_epsilon = s.weno_epsilon, v.weno_linear = s.weno_linear;
     v.element_theta = s.element_theta;
     v.fallback_capacity = s.fallback_capacity;
+    if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e))
+        std::fprintf(stderr, "gpu create: after mesh/operator tables %.2f GB\n", device_used_bytes() * 1e-9);
     const std::size_t N = s.nodes, Q = s.q;
     Buffers &b = ctx->b;
     b.a = own(dalloc<double>(N * Q));
@@ -2732,6 +2749,8 @@ Context *create(const Setup &s) {
     v.seg_lim = own(dalloc<double>(std::size_t(s.cells) * 4 * n));
     v.counters = own(dalloc<DeviceCounters>(1));
     ctx->norm_accumulator = own(dalloc<double>(1024)); // per-block partials of norm() (at most 1024 blocks)
+    if (const char *e = std::getenv("M1PN_CTOR_TIMING"); e && std::atoi(e))
+        std::fprintf(stderr, "gpu create: after state buffers %.2f GB\n", device_used_bytes() * 1e-9);
     for (auto &e : ctx->events)
         CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     CK(cudaMallocHost(&ctx->pinned_counters, sizeof(DeviceCounters)));

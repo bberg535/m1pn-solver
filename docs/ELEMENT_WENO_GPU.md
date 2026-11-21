@@ -449,3 +449,31 @@ P35 adaptiv sind identisch mit den Jobs 164640/164641 (Job 164652, `tardis_init3
 
 Rest der Initialisierung bei G3Q P35: GPU-Aufbau 25 s (davon FCS-Tabelle ca. 17 s) und Spektralradius 30 s
 (60 Potenziterationen mit dem vollen P35-Operator). Auf G3F dominiert die FCS-Tabelle mit 126–140 s.
+
+### Spektralradius-Startvektoren, Stack-Reserve und GPU-Speicher pro Phase (21.11.2026, Branch `perf/init3d2`)
+
+- Die zwei Zufallsstartvektoren der Potenziteration (Knoten × Q Ziehungen, mt19937) entstehen jetzt per
+  `std::async` während des GPU-Konstruktors, mit gleicher Folge und gleicher Normierung. G3Q P35 adaptiv: Init
+  62 → 58 s, Spektralradius 30 → 25 s. Bitgleich.
+- Die FCS-Tabellen (`lattice3d_table`, `lattice3d_table_nodal`) setzen das Stack-Limit auf 16/24 KB pro Thread. Die
+  Reserve (Limit × residente Threads) blieb bisher die ganze Rechnung belegt, etwa 4 GB auf dem A100. Das Limit wird
+  nach dem Bau zurückgesetzt. Bitgleich (Jobs 164654, 164657).
+- `M1PN_CTOR_TIMING=1` gibt jetzt den belegten GPU-Speicher nach jeder Phase aus (`gpu create:`, `gpu ctor:`).
+
+Belegter GPU-Speicher nach Phasen (Job 164657, ein Schritt; 168³ = 5,36 Mio. Knoten, 264³ = 20 Mio.):
+
+| Lauf | Tabellen | + Zustandspuffer | + Reaktion | + FCS | + Randphase A | Spitze (nvidia-smi) |
+|---|---:|---:|---:|---:|---:|---:|
+| G3Q P15 adaptiv | 0,5 | 7,1 | 7,3 | 7,9 | 13,4 GB | 35 GB |
+| G3Q P35 adaptiv | 0,5 | 31,7 | 31,9 | 32,5 | 60,0 GB | 57 GB |
+| 168³ P3 | 1,1 | 11,8 | 13,8 | 20,8 | 23,4 GB | 48 GB |
+| 264³ P3 | 2,9 | 43,3 | 51,2 | OOM | | |
+
+Befunde:
+- Zustandspuffer: neben den 6 Feldern Knoten × Q (Zustand, x, r, drei Gradienten) vier Arrays pro Element mit
+  4 × 8 Werten (`stab_low`, `element_limited`, `seg_ubar`, `seg_lim`), bei P3 knapp die Hälfte.
+- Reaktion: FCS-Arrays pro Quadraturpunkt (Ort, Gewicht, σ_s), nach dem nodalen Bau nicht mehr gebraucht.
+- FCS: die fp32-Knotentabelle (Knoten × 324) bleibt. Beim Bau liegt zusätzlich der double-Akkumulator gleicher Zeilenzahl
+  (doppelte Größe) plus ein Drittel des freien Speichers für die Stapel. Daran scheitert 264³.
+- Randphase A: drei Puffer Zeilen × Q (`G`, `H`, `db`) für Rand- und Bruchflächen, bei P35 27 GB. `db` (Datum)
+  bleibt bei Vakuum null.

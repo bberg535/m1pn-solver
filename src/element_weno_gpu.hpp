@@ -4,6 +4,7 @@
 // runs on the host on the boundary rows only, overlapped with the device work. Same scheme as ElementWeno::advance up
 // to rounding (summation order, fused multiply-adds, natural-order line factors).
 #include "element_weno.hpp"
+#include <future>
 #include "element_weno_gpu_device.hpp"
 namespace m1pn {
 namespace gpu {
@@ -59,6 +60,9 @@ public:
     // Spectral radius of high_order_step() (same power iteration, on the device).
     double spectral_radius();
     double spectral_radius(int iterations, const std::array<Field, 2> *start, std::array<Field, 2> *end);
+    // Random start vectors of spectral_radius (gamma = 0, 1; same rng sequence), drawn on a host thread while the
+    // constructor's device work (FCS table) runs; taken by the first spectral_radius call.
+    std::future<std::array<Field, 2>> radius_random_;
     // Lattice FCS: (re)build the device time table for the window of the shared table object (dynamic AMR).
     void build_lattice_table();
     const AdaptivePnPlan *adaptive_plan() const { return adaptive_enabled_ ? &adaptive_plan_ : nullptr; }

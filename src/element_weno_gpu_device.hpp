@@ -211,6 +211,8 @@ Ledger ledger(Context *); // cumulative (synchronous)
 // t_m = m dt, m = 0..M, built on the device with uncollided::lattice_density (view with host arrays; copied);
 // host_out (points x (M + 1)) receives a copy. react_lattice() then interpolates it at source_time.
 // Rows hold the times m dt, m = m0..M (m0 = 0: full table); a previous lattice table of the context is freed.
+// Used device memory in bytes (cudaMemGetInfo: total - free), for the M1PN_CTOR_TIMING diagnostics.
+std::size_t device_used_bytes();
 void lattice_table(Context *, const uncollided::LatticeView &host_view, int m0, int M, double dt, double *host_out);
 // lattice-3d: the same with uncollided::lattice3d_row, one thread per point (x, y, z: host arrays of the FCS points).
 void lattice3d_table(Context *, const uncollided::Lattice3dView &host_view, const double *x, const double *y,
