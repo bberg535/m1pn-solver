@@ -354,4 +354,8 @@ gleichmäßigen Gitter bleibt Element + Gather. `M1PN_GPU_STRIP3=0` schaltet ihn
 Gittern. `M1PN_GPU_STRIP3_SZ` ist 8, 16 oder 32.
 
 FCS-Tabelle 3D: Den Stack (`cudaLimitStackSize`) reserviert der Code jetzt, bevor er die Batchgröße aus dem freien
-Speicher bestimmt. P15 auf U168 mit FCS brach bisher in `cudaDeviceSetLimit` mit „out of memory“ ab (164362, 164516).
+Speicher bestimmt. P15 auf U168 mit FCS bricht trotzdem weiter in `cudaDeviceSetLimit` mit „out of memory“ ab (164362, 164516,
+164526): Die Löserfelder (169³ Knoten × 256 Momente, rund 10 GB pro Feld) belegen die A100 schon vorher fast ganz. Dieser
+Lauf braucht mehrere GPUs oder die CPU-MPI-Rechnung.
+
+Prüfjob 164526 (Standard nach f60aaad): G3H FCS Löser 90,5 s, U112 ohne FCS 58,7 s, Masse bitgleich zum alten Pfad; ctest ok.
