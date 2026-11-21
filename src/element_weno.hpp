@@ -538,6 +538,8 @@ private:
     }
     mutable std::vector<Four> split_y_of_, split_u_, split_rate_; // between the two stage halves
     mutable std::vector<Four> split_bstar_;                      // split_apply buffers (reused)
+    mutable std::vector<int> split_row_face_, split_row_n_;      // per split_rows_ entry: face index and face node
+    mutable bool split_all_broken_ = false;                      // all split faces are broken lines (fused split_apply)
     mutable std::vector<double> split_astar_, split_theta_, split_defect_;
     std::array<Sparse, 3> mass_1d_; // assembled 1D consistent masses (h m1) per axis
     // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state. With the positivity
