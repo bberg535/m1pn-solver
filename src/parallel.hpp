@@ -1,4 +1,6 @@
 #pragma once
+#include <algorithm>
+#include <vector>
 #include "common.hpp"
 #include <atomic>
 #include <exception>
@@ -106,5 +108,25 @@ template <class F> void parallel_for(int n, F f) {
     }
     if (error)
         std::rethrow_exception(error);
+}
+// Deterministic chunked reduction: f(begin, end, part) on fixed chunks of `chunk` items, parts combined in chunk order
+// (the result does not depend on the thread count).
+template <class P, class F, class C> P parallel_chunks(int n, int chunk, P init, F f, C combine) {
+    const int nc = (n + chunk - 1) / chunk;
+    std::vector<P> part(nc, init);
+    parallel_for(nc, [&](int c) { f(c * chunk, std::min(n, (c + 1) * chunk), part[c]); });
+    P r = init;
+    for (const P &q : part)
+        r = combine(r, q);
+    return r;
+}
+// Parallel copy of n doubles in chunks of 64 Ki (pinned host buffers of the boundary rows).
+inline void parallel_copy(const double *src, std::size_t n, double *dst) {
+    constexpr std::size_t chunk = std::size_t(1) << 16;
+    const int nc = int((n + chunk - 1) / chunk);
+    parallel_for(nc, [&](int c) {
+        const std::size_t b = std::size_t(c) * chunk;
+        std::copy_n(src + b, std::min(chunk, n - b), dst + b);
+    });
 }
 } // namespace m1pn

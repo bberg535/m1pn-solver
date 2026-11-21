@@ -662,6 +662,11 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     }
 }
 ElementWenoGpu::~ElementWenoGpu() {
+    if (std::getenv("M1PN_SPLIT_TIMING"))
+        std::fprintf(stderr, "split timing: copy %.3f boundary_correction %.3f split prep %.3f split_compute_y %.3f "
+                             "split_apply %.3f finish (to copy) %.3f copy+scatter %.3f s\n", t_split_parts_[0],
+                     t_split_parts_[1], t_split_parts_[2], t_split_parts_[3], t_split_parts_[4], t_split_parts_[5],
+                     t_split_parts_[6]);
     gpu::host_free(pin_fetch_);
     gpu::host_free(pin_high_);
     gpu::host_free(pin_load_);
@@ -1360,14 +1365,17 @@ void ElementWenoGpu::boundary_correction(ElementWenoStats &stats) {
     const int dimension = s_.dimension;
     const auto &sorted = s_.boundary_nodes_sorted_;
     const int nb = int(sorted.size());
-    std::vector<double> node_theta(nb, 1.), node_sign(nb, 1.), node_mass(nb, 0.);
-    std::vector<char> node_signed(nb, 0);
+    // Per-node results in reused buffers (reset in the node loop), reduced in fixed chunks below.
+    std::vector<double> &node_theta = bc_theta_, &node_sign = bc_sign_, &node_mass = bc_mass_;
+    std::vector<char> &node_signed = bc_signed_;
+    node_theta.resize(nb), node_sign.resize(nb), node_mass.resize(nb), node_signed.resize(nb);
     const Field &low = low_h_, &low_flux = low_flux_h_, &closure = closure_h_;
     auto block = [](const Field &f, int row, int d) {
         return Four(f(row, 4 * d), f(row, 4 * d + 1), f(row, 4 * d + 2), f(row, 4 * d + 3));
     };
     parallel_for(nb, [&](int k) {
         const int i = sorted[k];
+        node_theta[k] = 1., node_sign[k] = 1., node_mass[k] = 0., node_signed[k] = 0;
         if (boundary_area_[i] <= 0)
             return;
         const int slot = s_.boundary_slot_[i];
@@ -1410,21 +1418,33 @@ void ElementWenoGpu::boundary_correction(ElementWenoStats &stats) {
             m -= flux_area_(i, d) * low_flux(i, 4 * d);
         node_mass[k] = m;
     });
-    double min_boundary = 1, min_sign = 1, boundary_mass_rate = 0;
-    long limited_boundary = 0, sign_limited = 0;
-    for (int k = 0; k < nb; ++k) {
-        if (boundary_area_[sorted[k]] <= 0)
-            continue;
-        boundary_mass_rate += node_mass[k];
-        if (options.limit) {
-            min_boundary = std::min(min_boundary, node_theta[k]);
-            limited_boundary += node_theta[k] < 1;
-            if (node_signed[k]) {
-                min_sign = std::min(min_sign, node_sign[k]);
-                ++sign_limited;
+    struct Part {
+        double min_boundary = 1, min_sign = 1, mass = 0;
+        long limited = 0, signed_count = 0;
+    };
+    const bool limit = options.limit;
+    const Part tot = parallel_chunks(nb, 1 << 14, Part{}, [&](int b0, int b1, Part &p) {
+        for (int k = b0; k < b1; ++k) {
+            if (boundary_area_[sorted[k]] <= 0)
+                continue;
+            p.mass += node_mass[k];
+            if (limit) {
+                p.min_boundary = std::min(p.min_boundary, node_theta[k]);
+                p.limited += node_theta[k] < 1;
+                if (node_signed[k]) {
+                    p.min_sign = std::min(p.min_sign, node_sign[k]);
+                    ++p.signed_count;
+                }
             }
         }
-    }
+    }, [](Part a, const Part &b) {
+        a.min_boundary = std::min(a.min_boundary, b.min_boundary), a.min_sign = std::min(a.min_sign, b.min_sign);
+        a.mass += b.mass, a.limited += b.limited, a.signed_count += b.signed_count;
+        return a;
+    });
+    // Diagnostics only (mass rate in chunk order: rounding-level differences to the former serial sum).
+    const double min_boundary = tot.min_boundary, min_sign = tot.min_sign, boundary_mass_rate = tot.mass;
+    const long limited_boundary = tot.limited, sign_limited = tot.signed_count;
     stats.min_boundary_limiter = std::min(stats.min_boundary_limiter, min_boundary);
     stats.last_boundary_mass_rate = boundary_mass_rate;
     stats.sign_limited_nodes += sign_limited;
@@ -1619,12 +1639,16 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
     }
     {
         const double t0 = seconds();
-        std::copy_n(pin_load_, std::size_t(nb_) * 4, load_b_.data());
+        parallel_copy(pin_load_, std::size_t(nb_) * 4, load_b_.data());
+        const double tc0 = seconds();
         boundary_correction(stats);
+        const double tc1 = seconds();
+        t_split_parts_[0] += tc0 - t0, t_split_parts_[1] += tc1 - tc0;
         if (split_) { // split_breaks: the broken-line face terms as the second convex step (ElementWeno::split_second_step)
             const auto &nodes = s_.split_nodes_;
             const int K = int(nodes.size());
-            std::vector<Four> u(K), rate(K);
+            std::vector<Four> &u = split_u_h_, &rate = split_rate_h_; // reused (every entry written below)
+            u.resize(K), rate.resize(K);
             const int dimension = s_.dimension;
             parallel_for(K, [&](int k) {
                 const int i = nodes[k], slot = s_.boundary_slot_[i];
@@ -1638,8 +1662,9 @@ void ElementWenoGpu::stage_end(int buffer, double time, const double *x, double 
                 u[k] = Four(low_h_(i, 0), low_h_(i, 1), low_h_(i, 2), low_h_(i, 3));
                 rate[k] = Four(load_b_.row(slot).transpose()) / s_.lumped[i];
             });
-            split_u_h_ = std::move(u), split_rate_h_ = std::move(rate);
+            const double tc2 = seconds();
             s_.split_compute_y(split_u_h_, split_rate_h_, tau);
+            t_split_parts_[2] += tc2 - tc1, t_split_parts_[3] += seconds() - tc2;
         }
         t_correction += seconds() - t0;
     }
@@ -1659,13 +1684,17 @@ void ElementWenoGpu::stage_end_finish(const double *x, double *out, double *u, d
             const auto &nodes = s_.split_nodes_;
             const int K = int(nodes.size());
             s_.split_apply(split_u_h_, split_rate_h_, split_term_h_, brk_area_, tau, &stats);
+            const double ta1 = seconds();
+            t_split_parts_[4] += ta1 - t0;
             parallel_for(K, [&](int k) {
                 const int i = nodes[k];
                 load_b_.row(s_.boundary_slot_[i]) = (s_.lumped[i] * split_rate_h_[k]).transpose();
             });
         }
-        std::copy_n(load_b_.data(), std::size_t(nb_) * 4, pin_load_up_);
+        const double ta2 = seconds();
+        parallel_copy(load_b_.data(), std::size_t(nb_) * 4, pin_load_up_);
         gpu::scatter_async(ctx_, b.load, 4, d_bnodes_, nb_, pin_load_up_, false, 6);
+        t_split_parts_[5] += ta2 - t0, t_split_parts_[6] += seconds() - ta2;
         t_correction += seconds() - t0;
     }
     stats.boundary_outflow -= dt * weight * stats.last_boundary_mass_rate;

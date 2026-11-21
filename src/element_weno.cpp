@@ -1298,6 +1298,15 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
         for (int entry = 0; entry < cells * local_nodes; ++entry)
             node_entries_[fill[connectivity_[entry]]++] = entry;
     }
+    // nodal_face_low: lumped weights sum_point w_p phi_n(x_p) of each side's face rule (same summation order as the
+    // former per-call loop).
+    for (int side = 0; side < 2 * dimension; ++side) {
+        const FaceRule &rule = rules_[side];
+        nodal_rule_weight_[side].assign(rule.local.size(), 0.);
+        for (std::size_t n = 0; n < rule.local.size(); ++n)
+            for (int point = 0; point < rule.weights.size(); ++point)
+                nodal_rule_weight_[side][n] += rule.weights[point] * rule.shape(int(n), point);
+    }
     ctor_mark("before inflow data");
     // A constant inflow density gives the same angular data at every boundary
     // point of one normal; evaluate that part once instead of per point and stage.
@@ -1316,6 +1325,10 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             const int side_id = 2 * f.direction + f.side;
             const FaceRule &rule = rules_[side_id];
             require(std::size_t(rule.weights.size()) == points, "Face rules of different size");
+            // Broken-line faces never read steady_data_ (partner traces instead; every use branches on face_break_
+            // first): leave their entries empty. P15 on G3Q with broken lines: 101 GB host memory and 44 s otherwise.
+            if (broken_ && face_break_[index])
+                return;
             V3 origin;
             element_origin(f.element, origin);
             for (std::size_t point = 0; point < points; ++point) {
@@ -3027,10 +3040,9 @@ void ElementWeno::nodal_face_low(int index, const Field &low, const Field &low_f
     const FaceRule &rule = rules_[side_id];
     const Boundary &b = *boundaries_[side_id];
     const int nf = int(rule.local.size()), r0 = face_row_[index];
+    const double *rule_weight = nodal_rule_weight_[side_id].data(); // sum_p w_p phi_n(x_p), set in the ctor
     for (int n = 0; n < nf; ++n) {
-        double weight = 0;
-        for (int point = 0; point < rule.weights.size(); ++point)
-            weight += rule.weights[point] * rule.shape(n, point);
+        double weight = rule_weight[n];
         weight *= face_scale_[index];
         if (weight == 0)
             continue;
@@ -4138,22 +4150,27 @@ void ElementWeno::split_compute_y(const std::vector<Four> &u, const std::vector<
         std::vector<int> slot(nodes, -1);
         for (int k = 0; k < K; ++k)
             slot[split_nodes_[k]] = k;
-        std::vector<std::vector<int>> rows(K);
+        std::vector<std::vector<int>> rows(K), row_face(K), row_n(K);
+        self.split_all_broken_ = true;
         for (std::size_t index = 0; index < faces_.size(); ++index) {
             if (!split_face(index))
                 continue;
             self.split_faces_.push_back(int(index));
+            self.split_all_broken_ = self.split_all_broken_ && face_break_[index];
             const auto &f = faces_[index];
             const auto &rule = rules_[2 * f.direction + f.side];
             for (std::size_t n = 0; n < rule.local.size(); ++n) {
                 const int i = connectivity_[f.element * local_nodes + rule.local[n]];
                 require(slot[i] >= 0, "split_breaks: broken-line face node without split slot");
                 rows[slot[i]].push_back(face_row_[index] + int(n));
+                row_face[slot[i]].push_back(int(index)), row_n[slot[i]].push_back(int(n));
             }
         }
         self.split_row_offsets_.assign(1, 0);
         for (int k = 0; k < K; ++k) {
             self.split_rows_.insert(self.split_rows_.end(), rows[k].begin(), rows[k].end());
+            self.split_row_face_.insert(self.split_row_face_.end(), row_face[k].begin(), row_face[k].end());
+            self.split_row_n_.insert(self.split_row_n_.end(), row_n[k].begin(), row_n[k].end());
             self.split_row_offsets_.push_back(int(self.split_rows_.size()));
         }
         const int face_rows = side_row_start_[6];
@@ -4164,7 +4181,7 @@ void ElementWeno::split_compute_y(const std::vector<Four> &u, const std::vector<
     // Step-1 states y (and their Levermore fluxes) at all broken-line nodes; partners are broken-line nodes too.
     Field &ylow = split_ylow_, &yflux = split_yflux_;
     std::vector<Four> &y_of = split_y_of_;
-    y_of.assign(K, Four::Zero());
+    y_of.resize(K); // every entry written below
     parallel_for(K, [&](int k) {
         const int i = split_nodes_[k];
         Four y = u[k] + tau * rate[k];
@@ -4185,6 +4202,49 @@ void ElementWeno::split_apply(const std::vector<Four> &u, std::vector<Four> &rat
                               double tau, ElementWenoStats *stats) const {
     const int K = int(split_nodes_.size());
     const Field &ylow = split_ylow_, &yflux = split_yflux_;
+    std::vector<Four> &bstar = split_bstar_;
+    std::vector<double> &astar = split_astar_;
+    bstar.resize(K), astar.resize(K);
+    if (split_all_broken_) {
+        // Only broken-line faces: the bar-state rows of broken_face_low (BR, AR) summed per node directly, in the same
+        // row order and with the same arithmetic (each row is written once from zero), without the row arrays.
+        parallel_for(K, [&](int k) {
+            Four bs = Four::Zero();
+            double as = 0.;
+            for (int e = split_row_offsets_[k]; e < split_row_offsets_[k + 1]; ++e) {
+                const int index = split_row_face_[e], n = split_row_n_[e];
+                const auto &f = faces_[index];
+                const int side_id = 2 * f.direction + f.side;
+                const double weight = nodal_rule_weight_[side_id][n] * face_scale_[index];
+                if (weight == 0)
+                    continue;
+                const V3 normal = boundaries_[side_id]->n;
+                const int i = connectivity_[f.element * local_nodes + rules_[side_id].local[n]];
+                const int j = broken_partner_node(index, n);
+                const Four ui(ylow(i, 0), ylow(i, 1), ylow(i, 2), ylow(i, 3));
+                const Four ext(ylow(j, 0), ylow(j, 1), ylow(j, 2), ylow(j, 3));
+                Four own = Four::Zero(), outer = Four::Zero();
+                for (int d = 0; d < dimension; ++d)
+                    own += normal[d] * block(yflux, i, d);
+                for (int d = 0; d < dimension; ++d)
+                    outer += normal[d] * block(yflux, j, d);
+                Four state = .5 * (ui + own) + .5 * (ext - outer);
+                if (options.outward_bar_rounding && !exact::cone(state)) {
+                    const double size = std::abs(ui[0]) + std::abs(own[0]) + std::abs(ext[0]) + std::abs(outer[0]);
+                    if (state.tail<3>().norm() - state[0] <= 64 * std::numeric_limits<double>::epsilon() * size)
+                        state[0] = norm_up(state);
+                }
+                // As the row path (row = 0 + weight state, then bstar += row): the product rounded on its own, not
+                // contracted into an FMA with the running sum.
+                Four ws = weight * state;
+                for (int c = 0; c < 4; ++c)
+                    asm("" : "+x"(ws[c]));
+                bs += ws;
+                as += weight;
+            }
+            bstar[k] = bs, astar[k] = as;
+        });
+    } else {
     // Bar states of the broken-line faces with the step-1 states (rows as in add_boundary): rows zeroed, then filled.
     parallel_for(int(split_faces_.size()), [&](int m) {
         const int index = split_faces_[m];
@@ -4206,17 +4266,19 @@ void ElementWeno::split_apply(const std::vector<Four> &u, std::vector<Four> &rat
         }
     });
     // Per node: sum of its rows in ascending face index (fixed order, parallel over the nodes).
-    std::vector<Four> bstar(K, Four::Zero());
-    std::vector<double> astar(K, 0.);
     parallel_for(K, [&](int k) {
+        bstar[k] = Four::Zero(), astar[k] = 0.;
         for (int e = split_row_offsets_[k]; e < split_row_offsets_[k + 1]; ++e) {
             const int r = split_rows_[e];
             bstar[k] += Four(split_BR_.row(r).transpose());
             astar[k] += split_AR_[r];
         }
     });
-    std::vector<double> theta_of(K, 1.), defect(K, 0.);
+    }
+    std::vector<double> &theta_of = split_theta_, &defect = split_defect_;
+    theta_of.resize(K), defect.resize(K);
     parallel_for(K, [&](int k) {
+        theta_of[k] = 1., defect[k] = 0.;
         const int i = split_nodes_[k];
         const double A = area[i];
         if (!(A > 0) || !(astar[k] > 0)) {
@@ -4236,12 +4298,25 @@ void ElementWeno::split_apply(const std::vector<Four> &u, std::vector<Four> &rat
         defect[k] = tau * (theta - 1) * c[0];
         rate[k] = (z - u[k]) / tau;
     });
-    if (stats)
-        for (int k = 0; k < K; ++k) {
-            stats->split_limited += theta_of[k] < 1;
-            stats->min_split_theta = std::min(stats->min_split_theta, theta_of[k]);
-            stats->split_mass += defect[k];
-        }
+    if (stats) { // diagnostics, fixed chunks (split_mass: rounding-level differences to the former serial sum)
+        struct Part {
+            long limited = 0;
+            double min_theta = 1, mass = 0;
+        };
+        const Part tot = parallel_chunks(K, 1 << 14, Part{}, [&](int b0, int b1, Part &p) {
+            for (int k = b0; k < b1; ++k) {
+                p.limited += theta_of[k] < 1;
+                p.min_theta = std::min(p.min_theta, theta_of[k]);
+                p.mass += defect[k];
+            }
+        }, [](Part a, const Part &b) {
+            a.limited += b.limited, a.min_theta = std::min(a.min_theta, b.min_theta), a.mass += b.mass;
+            return a;
+        });
+        stats->split_limited += tot.limited;
+        stats->min_split_theta = std::min(stats->min_split_theta, tot.min_theta);
+        stats->split_mass += tot.mass;
+    }
 }
 Field ElementWeno::admissible_rows_public(Field x, ElementWenoStats *stats) const {
     return admissible_rows(std::move(x), nodes, stats, lumped, owned_);

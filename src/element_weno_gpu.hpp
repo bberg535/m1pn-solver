@@ -69,6 +69,9 @@ public:
     long ghost_flagged = 0; // ghost pairs solved by the host (device projection flagged them)
     double t_wait_ghost = 0;
     double t_ghost = 0; // host phase B: ghost moments (part of t_boundary)
+    // host correction parts (M1PN_SPLIT_TIMING): copy, boundary_correction, split prep, split_compute_y, split_apply,
+    // finish total, final copy + scatter
+    double t_split_parts_[7] = {};
     double t_diag_device = 0; // M1PN_GPU_DIAG_SERIAL=1: device work overlapped by phase B
 
 private:
@@ -147,6 +150,8 @@ private:
     void stage_end_finish(const double *x, double *out, double *u, double old, double fresh, double tau, double weight,
                           double dt, ElementWenoStats &stats);
     std::vector<Four> split_u_h_, split_rate_h_;
+    std::vector<double> bc_theta_, bc_sign_, bc_mass_; // boundary_correction per-node buffers (reused)
+    std::vector<char> bc_signed_;
     bool finish_pending_ = false;
     int lockstep_stage_ = 0;
     double lockstep_time_ = 0, lockstep_dt_ = 0;

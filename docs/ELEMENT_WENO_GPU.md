@@ -359,3 +359,62 @@ Speicher bestimmt. P15 auf U168 mit FCS bricht trotzdem weiter in `cudaDeviceSet
 Lauf braucht mehrere GPUs oder die CPU-MPI-Rechnung.
 
 Prüfjob 164526 (Standard nach f60aaad): G3H FCS Löser 90,5 s, U112 ohne FCS 58,7 s, Masse bitgleich zum alten Pfad; ctest ok.
+
+## Adaptive PN in 3D: Stabilisierung als z-Streifen (21.11.2026, Branch `perf/adaptive3d`)
+
+Auf dem gemergten Stand (709d914) brachte die dynamische adaptive PN in 3D kaum Zeitgewinn. Alle Läufe hatten FCS,
+gebrochene Linien und Split, die adaptiven zusätzlich tol 3e-4 und Tile 8 (`tardis_adaptive3d_20261121`). Die
+Löserzeit änderte sich bei G3Q P7 von 27,7 auf 30,7 s, bei G3Q P15 von 71,2 auf 68,3 s und bei G3H P7 von
+147,5 auf 135,2 s, bei nur 28–39 % aktiven Koeffizienten. Das A100-Profil (`tardis_perf_ad3d_20261121`, G3Q P15) zeigt den Grund:
+`k_stabilization_adaptive` braucht 34,2 s. Der Kernel geht über die Konnektivität und berechnet für jedes der 64
+Element-Knoten-Paare die Kachel per Division. Der volle `k_stabilization_strip3` braucht dagegen 26,4 s für alle Momente.
+Die übrigen adaptiven Kernel sind billig: Liniensolves 11,1 → rund 7 s, combine 10,9 → 2,3 s.
+
+Neue Kernel, wählbar mit `M1PN_GPU_AD3`, Standard 2:
+- `k_stabilization_adaptive3` (=1): strukturierte Indizes, 27-Punkte-Fenster pro Feld, Kachelaktivität nur für Knoten auf
+  Kachelflächen. Bitgleich zu `k_stabilization_adaptive` (=0). Auf der A100 34,2 → 27,6 s.
+- `k_stabilization_adaptive3s` (=2): die z-Streifenform von `k_stabilization_strip3` pro Kachel-Chunk. Jeder Warp läuft durch eine
+  (x, y)-Spalte der Kachel über die Ebenen z0−1 … z1. Inaktive Nachbarn haben über die Ordnung ihrer Kachel den Wert 0;
+  nachgeschlagen wird nur an Kachelflächen und in den Halo-Ebenen. Die Abweichungen liegen auf Rundungsniveau
+  (lokal Masse ≤ 4e-16), die aktiven Anteile sind identisch. Auf der A100 **34,2 → 7,6 s**.
+
+A100, T = 3.2, FCS, gebrochene Linien und Split (`tardis_ad3d_kernel_20261121`, `tardis_ad3d_kernel2_20261121`; Löserzeit):
+
+| Lauf | nicht adaptiv | adaptiv, AD3=0 | AD3=1 | AD3=2 | aktiv | Faktor zu nicht adaptiv |
+|---|---:|---:|---:|---:|---:|---:|
+| G3Q P15 | 71,2 s | 68,3 s | 61,3 s | 42,0 s | 32,1 % | 1,70 |
+| G3Q P7 | 27,7 s | 31,1 s | 28,9 s | 23,9 s | 39,4 % | 1,16 |
+| G3H P7 | 147,5 s | 135,0 s | 129,2 s | 105,4 s | 28,5 % | 1,40 |
+
+ctest und `tests/gpu_validate_adaptive.sh` (alle Fälle PASS) liefen in beiden Jobs durch. Die restliche Zeit bei G3Q P15
+adaptiv: FCS-Tabelle 15,3 s, Stabilisierung 7,6 s, adaptive Liniensolves 4,6 s, aktive Flächenspuren 3,0 s, combine
+2,3 s, Interface 2,0 s.
+
+### Initialisierung und Host-Korrektur bei gebrochenen Linien (21.11.2026, `perf/adaptive3d`)
+
+- **Zuflussdaten** (be0f1ca): `steady_data_` (ein `Incoming` mit Vektoren der Länge q pro Fläche und Randpunkt) wird für
+  Bruchflächen nicht mehr ausgewertet, dort liest sie keine Stelle. G3Q P15 mit gebrochenen Linien: Init 69,9 → 32,8 s,
+  RSS 101 → 35 GB. G3H P15 mit gebrochenen Linien lief vorher wegen Speichermangel nicht.
+- **Host-Korrektur** (`host_correction`; liegt nach dem Warten auf die GPU auf dem kritischen Pfad; Teilzeiten mit
+  `M1PN_SPLIT_TIMING=1`):
+  - d673618: Die Gewichte der Flächenregel berechnet der Konstruktor einmal pro Seite, statt sie in jeder Stufe und an
+    jedem Flächenknoten neu zu summieren.
+  - 7dcd983: Kopien parallel, wiederverwendete Puffer, Diagnosesummen in festen Blöcken.
+  - 1e2f4df: `split_apply` bildet die Bar-Zustände pro Knoten direkt, ohne die Zeilenfelder.
+  - Die Lösung bleibt bitgleich; nur die Diagnosegrößen `split_mass` und Rand-Massenrate ändern sich auf Rundungsniveau.
+  - Thread-Skalierung auf tardis (164639): 8/16/32 Threads → 12,4/8,2/7,2 s. Die Arbeit ist speichergebunden.
+
+A100, FCS, gebrochene Linien und Split, T = 3.2 (`tardis_ad3d_final_20261121`; adaptiv: tol 3e-4, Tile 8). Die
+Spalte „vorher“ zeigt den Stand 709d914 (164631/164625/164638):
+
+| Lauf | Löser nicht adaptiv | Löser adaptiv (vorher) | aktiv | Faktor | gesamt nicht adaptiv / adaptiv | Init |
+|---|---:|---:|---:|---:|---:|---:|
+| G3Q P7 | 22,6 s | 18,2 s (30,7 s) | 39,4 % | 1,24 | 42,1 / 38,0 s | 19 s |
+| G3Q P15 | 68,5 s | 32,4 s (68,3 s) | 32,1 % | 2,11 | 100,7 / 66,3 s | 32 s |
+| G3H P7 | 127,5 s | 85,1 s (135,2 s) | 28,5 % | 1,50 | 195,9 / 154,1 s | 68 s |
+| G3H P15 | 438,1 s | 150,7 s (189,6 s) | 22,4 % | 2,91 | 550,8 / 268,1 s | 116 s |
+
+Rest bei G3H P15 adaptiv:
+- Init 116 s: FCS-Tabelle ca. 54 s, Spektralradius 28 s (bestimmt dt), Schema 23 s.
+- Löser 151 s: davon 80 s Warten auf die GPU und 15 s Host-Korrektur.
+- RSS 103 GB.
