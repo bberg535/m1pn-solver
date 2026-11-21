@@ -112,20 +112,38 @@ ElementWenoGpu::ElementWenoGpu(const ElementWeno &s) : s_(s) {
     std::array<std::vector<double>, 3> class_convection;
     g.classes = classes;
     g.structured = !s.broken_;
-    std::array<std::vector<int>, 2> strip_elem;
-    if (s.broken_ && s.dimension == 2 && s.degree == 1 && !s.options.periodic) {
-        const int npx = s.nodes_per_axis[0];
-        for (int d = 0; d < 2; ++d)
+    std::array<std::vector<int>, 3> strip_elem;
+    if (s.broken_ && s.degree == 1 && !s.options.periodic && (s.dimension == 2 || s.dimension == 3)) {
+        const int dim = s.dimension, npx = s.nodes_per_axis[0], npy = s.nodes_per_axis[1];
+        for (int d = 0; d < dim; ++d)
             strip_elem[d].assign(2 * std::size_t(s.nodes_per_axis[d]), -1);
         for (int e = 0; e < s.cells; ++e) {
-            const int corner = s.connectivity_[std::size_t(e) * s.local_nodes]; // local node 0 = (0, 0)
-            const int line[2] = {corner % npx, corner / npx}, id[2] = {e % s.count[0], e / s.count[0]};
-            for (int d = 0; d < 2; ++d) {
+            const int corner = s.connectivity_[std::size_t(e) * s.local_nodes]; // local node 0 = (0, 0[, 0])
+            const int line[3] = {corner % npx, (corner / npx) % npy, corner / (npx * npy)};
+            const int id[3] = {e % s.count[0], (e / s.count[0]) % s.count[1], e / (s.count[0] * s.count[1])};
+            for (int d = 0; d < dim; ++d) {
                 strip_elem[d][2 * line[d] + 1] = id[d]; // right of its first node line
                 strip_elem[d][2 * (line[d] + 1)] = id[d]; // left of its second
             }
         }
-        g.strip_elem[0] = strip_elem[0].data(), g.strip_elem[1] = strip_elem[1].data();
+        for (int d = 0; d < dim; ++d)
+            g.strip_elem[d] = strip_elem[d].data();
+    }
+    // The 3D strip kernel assumes e = ex + cx (ey + cy ez) and local node l = lx + 2 ly + 4 lz at corner + offsets.
+    if (s.dimension == 3 && s.degree == 1) {
+        const int npx = s.nodes_per_axis[0], npy = s.nodes_per_axis[1];
+        bool ok = s.local_nodes == 8;
+        for (int e = 0; ok && e < s.cells; ++e) {
+            const int *m = s.connectivity_.data() + std::size_t(e) * 8;
+            for (int l = 0; l < 8; ++l)
+                ok = ok && m[l] == m[0] + (l & 1) + ((l >> 1) & 1) * npx + (l >> 2) * npx * npy;
+            if (!g.strip_elem[0] && ok) {
+                const int ex = e % s.count[0], ey = (e / s.count[0]) % s.count[1], ez = e / (s.count[0] * s.count[1]);
+                ok = m[0] == ex + npx * (ey + npy * ez);
+            }
+        }
+        if (!ok)
+            g.strip3_ok = false;
     }
     if (s.graded_) {
         for (const auto &c : s.classes_) {

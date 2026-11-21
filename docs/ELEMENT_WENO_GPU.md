@@ -325,3 +325,37 @@ min(h_x, h_y[, h_z]) begrenzt; jedes Element, das in *einer* Achse im feinen Zen
 Schritt. Ideales LTS (Stufen 2^k) brächte als Arbeitsanteil: GB/GBH/GBQ 2D 0.941, 3D 0.981 (gleiche Grading-Muster),
 also 6 % bzw. 2 % – den Aufwand (Positivität und Realisierbarkeit an Stufengrenzen) nicht wert. Lohnend nur auf
 hierarchischen (Quadtree-)Gittern.
+
+## 3D-Profil und Streifen-Stabilisierung in 3D (20.11.2026, Branch `perf/stab3d`)
+
+A100-Profil (nsys/ncu, `tardis_perf3d_20261120`) von lattice-3d U112 P7 mit FCS, T = 3.2, Gesamtlaufzeit 97 s: Die
+FCS-Tabelle (`k_lattice3d_eval_batch`) braucht 28 s, der Löser rund 60 s. Davon entfallen 15,0 s auf `k_stab_element<8,3>`, 12,9 s auf
+`k_line_solve`, 8,1 s auf `k_limiter_group`, 5,7 s auf `k_combine`, 5,7 s auf `k_gather_stab` und 3,4 s auf `k_ghost`. Auf der A100 sind
+alle 3D-Hauptkernel speicherbandbreitenbegrenzt (DRAM 76–80 %, SM 21–56 %), anders als auf der FP64-schwachen
+A2000.
+
+`k_stabilization_strip3<SZ>` (3D Q1): ein Thread pro (x, y, Komponente) läuft über einen z-Streifen. Das 3×3-Fenster
+von a, g_0, g_1, g_2 jeder Ebene wird einmal geladen und zu den Elementtermen der drei Knoten z−1, z, z+1 addiert.
+Der Element-Zwischenpuffer (Zellen × 8 × q, auf U112 P7 5,8 GB) entfällt. Die Größenklassen graduierter Gitter
+verwendet der Kernel mit vorskalierten nu·K-Tabellen (`stiffness_nu`), gebrochene Linien über `strip_elem` für drei
+Achsen. Die Nummerierung prüft `GpuSetup` (`strip3_ok`).
+
+A100, P7, T = 3.2 (`tardis_stab3d_20261120`, Löserzeit; Ergebnisse gleich bis auf Rundung, Masse relativ ≤ 2e-16):
+
+| Lauf | bisher | Streifen | |
+|---|---:|---:|---:|
+| G3H FCS (bisher Knotenkernel) | 123,4 s | 91,1 s | −26 % |
+| G3H FCS + gebrochene Linien (bisher Knotenkernel) | 177,4 s | 148,6 s | −16 % |
+| U112 ohne FCS (bisher Element + Gather) | 58,8 s | 67,4 s | +15 % |
+| U168 ohne FCS (bisher Element + Gather) | 286,5 s | 348,8 s | +22 % |
+
+Standard ist deshalb `M1PN_GPU_STRIP3=1`: Der Streifenkernel läuft nur auf graduierten und gebrochenen 3D-Gittern, auf dem
+gleichmäßigen Gitter bleibt Element + Gather. `M1PN_GPU_STRIP3=0` schaltet ihn ganz ab, `=2` erzwingt ihn auch auf gleichmäßigen
+Gittern. `M1PN_GPU_STRIP3_SZ` ist 8, 16 oder 32.
+
+FCS-Tabelle 3D: Den Stack (`cudaLimitStackSize`) reserviert der Code jetzt, bevor er die Batchgröße aus dem freien
+Speicher bestimmt. P15 auf U168 mit FCS bricht trotzdem weiter in `cudaDeviceSetLimit` mit „out of memory“ ab (164362, 164516,
+164526): Die Löserfelder (169³ Knoten × 256 Momente, rund 10 GB pro Feld) belegen die A100 schon vorher fast ganz. Dieser
+Lauf braucht mehrere GPUs oder die CPU-MPI-Rechnung.
+
+Prüfjob 164526 (Standard nach f60aaad): G3H FCS Löser 90,5 s, U112 ohne FCS 58,7 s, Masse bitgleich zum alten Pfad; ctest ok.

@@ -55,10 +55,11 @@ struct View {
     double viscosity, s0, s1; // sqrt(4 pi), sqrt(4 pi / 3)
     const int *connectivity, *neighbors, *node_offsets, *node_entries;
     const double *stiffness_rows, *convection_t_rows[3], *seminorm, *extension[3][2];
+    const double *stiffness_nu;       // classes x local^2: viscosity_of(c) * stiffness_rows (3D Q1 strip kernel)
     const int *klass;                 // cells: size class of an element (nullptr: one class, uniform mesh)
     int classes;
-    bool structured;
-    const int *strip_elem[2];         // broken 2D Q1: element line left/right of a node line (see GpuSetup)
+    bool structured, strip3_ok;
+    const int *strip_elem[3];         // broken Q1 (2D, 3D): element line left/right of a node line (see GpuSetup)
     // 2D Q1 strip kernel tables per size class (16 per class: nu K rows, C_0^T, C_1^T rows; one nu per class), per
     // context in global memory. They were in __constant__ memory, which is shared by all contexts: with several graded
     // blocks (m1pn_blocks) the last block's classes overwrote the others' (wrong results, cone failures).
@@ -908,6 +909,134 @@ __global__ void __launch_bounds__(128, MINB) k_stabilization_strip(View v, const
                 W[f][0][dx] = W[f][1][dx];
                 W[f][1][dx] = W[f][2][dx];
             }
+    }
+}
+// 3D Q1: the gathered residual of node i only involves its 3 x 3 x 3 neighbourhood. One thread per (x, y, component)
+// walks a strip of SZ node planes in z. Each plane's 3 x 3 window of a, g_0, g_1, g_2 is loaded once and added to the
+// element terms of the (up to) three nodes z - 1, z, z + 1 of the thread's column that it touches; a node's eight
+// element terms are complete after plane z + 1. Replaces k_stab_element + k_gather_stab on 3D Q1 meshes (no element
+// buffer of cells x 8 x q doubles: 5.8 GB on 112^3 at P7). Per element and plane (nu K) a + w (C_d^T g_d) with
+// w = -nu gamma, summed plane by plane (rounding-level differences to the element path).
+template <int SZ>
+__global__ void __launch_bounds__(128) k_stabilization_strip3(View v, const double *a, double *result, bool want_low,
+                                                              double constant_gamma) {
+    const int q = v.q, npx = v.npa[0], npy = v.npa[1], npz = v.npa[2];
+    const int cx = v.count[0], cy = v.count[1], cz = v.count[2];
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= npx * q)
+        return;
+    const int ix = col / q, c = col % q, iy = blockIdx.y;
+    const int z0 = blockIdx.z * SZ, z1 = min(npz, z0 + SZ);
+    const std::ptrdiff_t row = std::ptrdiff_t(npx) * q, plane = row * npy;
+    const bool okx[3] = {ix > 0, true, ix + 1 < npx}, oky[3] = {iy > 0, true, iy + 1 < npy};
+    const std::size_t base = std::size_t(iy) * row + std::size_t(ix) * q + c;
+    const double *F[4] = {a + base, v.gradient[0] + base, v.gradient[1] + base, v.gradient[2] + base};
+    int exq[2], eyq[2];
+    bool exok[2], eyok[2];
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        exq[s] = v.strip_elem[0] ? v.strip_elem[0][2 * ix + s] : ix - 1 + s;
+        eyq[s] = v.strip_elem[1] ? v.strip_elem[1][2 * iy + s] : iy - 1 + s;
+        exok[s] = exq[s] >= 0 && exq[s] < cx;
+        eyok[s] = eyq[s] >= 0 && eyq[s] < cy;
+    }
+    auto ez_of = [&](int k, int qz) { return v.strip_elem[2] ? v.strip_elem[2][2 * k + qz] : k - 1 + qz; };
+    // T[s][qx + 2 qy + 4 qz]: element terms of node k = p - 1 + s (s = 0 completes after plane p).
+    double T[3][8];
+#pragma unroll
+    for (int s = 0; s < 3; ++s)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            T[s][j] = 0;
+    for (int p = z0 - 1; p <= z1; ++p) {
+        if (p >= 0 && p < npz) {
+            double W[4][3][3];
+            const std::ptrdiff_t off = std::ptrdiff_t(p) * plane;
+#pragma unroll
+            for (int f = 0; f < 4; ++f)
+#pragma unroll
+                for (int dy = 0; dy < 3; ++dy)
+#pragma unroll
+                    for (int dx = 0; dx < 3; ++dx)
+                        W[f][dy][dx] = okx[dx] && oky[dy] ? F[f][off + (dy - 1) * row + (dx - 1) * q] : 0.;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int k = p - 1 + s;
+                if (k < z0 || k >= z1)
+                    continue;
+#pragma unroll
+                for (int qz = 0; qz < 2; ++qz) {
+                    const int mz = 2 - s - qz; // plane p is the element's node layer mz
+                    if (mz < 0 || mz > 1)
+                        continue;
+                    const int ez = ez_of(k, qz);
+                    if (ez < 0 || ez >= cz)
+                        continue;
+#pragma unroll
+                    for (int qy = 0; qy < 2; ++qy)
+#pragma unroll
+                        for (int qx = 0; qx < 2; ++qx) {
+                            if (!exok[qx] || !eyok[qy])
+                                continue;
+                            const int e = exq[qx] + cx * (eyq[qy] + cy * ez);
+                            const int l = (1 - qx) + 2 * (1 - qy) + 4 * (1 - qz);
+                            const int kc = klass_of(v, e);
+                            const double g = constant_gamma >= 0 ? constant_gamma : v.gamma[e];
+                            const std::size_t r = std::size_t(kc) * 64 + 8 * l + 4 * mz;
+                            double t = T[s][qx + 2 * qy + 4 * qz];
+#pragma unroll
+                            for (int my = 0; my < 2; ++my)
+#pragma unroll
+                                for (int mx = 0; mx < 2; ++mx)
+                                    t += __ldg(v.stiffness_nu + r + mx + 2 * my) * W[0][qy + my][qx + mx];
+                            if (g != 0) {
+                                double conv = 0;
+#pragma unroll
+                                for (int d = 0; d < 3; ++d)
+#pragma unroll
+                                    for (int my = 0; my < 2; ++my)
+#pragma unroll
+                                        for (int mx = 0; mx < 2; ++mx)
+                                            conv += __ldg(v.convection_t_rows[d] + r + mx + 2 * my) * W[1 + d][qy + my][qx + mx];
+                                t += (-viscosity_of(v, kc) * g) * conv;
+                            }
+                            T[s][qx + 2 * qy + 4 * qz] = t;
+                        }
+                }
+            }
+        }
+        const int k = p - 1;
+        if (k >= z0 && k < z1) {
+            double out = 0;
+#pragma unroll
+            for (int qz = 0; qz < 2; ++qz) {
+                const int ez = ez_of(k, qz);
+                if (ez < 0 || ez >= cz)
+                    continue;
+#pragma unroll
+                for (int qy = 0; qy < 2; ++qy)
+#pragma unroll
+                    for (int qx = 0; qx < 2; ++qx) {
+                        if (!exok[qx] || !eyok[qy])
+                            continue;
+                        const double term = T[0][qx + 2 * qy + 4 * qz];
+                        if (want_low && c < 4) {
+                            const int e = exq[qx] + cx * (eyq[qy] + cy * ez);
+                            const int l = (1 - qx) + 2 * (1 - qy) + 4 * (1 - qz);
+                            const int slot = c == 0 ? 0 : (c == 1 ? 2 : (c == 2 ? 3 : 1));
+                            v.stab_low[std::size_t(4 * l + slot) * v.cells + e] = (c == 0 ? v.s0 : v.s1) * term;
+                        }
+                        out -= term;
+                    }
+            }
+            result[std::size_t(k) * plane + base] = out;
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            T[0][j] = T[1][j];
+            T[1][j] = T[2][j];
+            T[2][j] = 0;
+        }
     }
 }
 __global__ void k_add_rows(int q, double *field, const int *index, const double *rows, int count) {
@@ -2354,6 +2483,9 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         // Batch size: as many points as fit in about a third of the free device memory (work + rows per point), so
         // that one launch fills the GPU and the slow points near S overlap with the cheap ones. M1PN_FCS3D_BATCH
         // overrides (benchmarks).
+        // Stack reserve first: it is taken from device memory for all resident threads, and the batch below claims a
+        // third of what is free (P15 on 168^3 failed in cudaDeviceSetLimit after the batch allocation).
+        CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
         std::size_t batch;
         {
             std::size_t free_b = 0, total_b = 0;
@@ -2369,7 +2501,6 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         double *batch_rows = dalloc<double>(batch * W);
         double *batch_sum = dalloc<double>(batch * 3);
         std::vector<double> h_sum(batch * 3);
-        CK(cudaDeviceSetLimit(cudaLimitStackSize, (hv.polar ? 16 : 24) * 1024));
         for (std::size_t first = 0; first < n_eval; first += batch) {
             const std::size_t count = std::min(batch, n_eval - first);
             k_lattice3d_eval_batch<<<blocks(count, 64), 64, 0, ctx->stream>>>(
@@ -2477,12 +2608,20 @@ Context *create(const Setup &s) {
     v.klass = s.element_class ? own(dcopy(s.element_class, std::size_t(s.cells))) : nullptr;
     v.classes = s.classes;
     v.structured = s.structured;
-    for (int d = 0; d < 2; ++d)
+    v.strip3_ok = s.strip3_ok;
+    for (int d = 0; d < 3; ++d)
         v.strip_elem[d] = s.strip_elem[d] ? own(dcopy(s.strip_elem[d], 2 * std::size_t(s.nodes_per_axis[d]))) : nullptr;
     v.class_viscosity = s.class_viscosity ? own(dcopy(s.class_viscosity, C)) : nullptr;
     v.ext_index = s.ext_index ? own(dcopy(s.ext_index, std::size_t(s.cells) * 2 * s.dimension)) : nullptr;
     v.ext_list = s.ext_index ? own(dcopy(s.ext_list, std::size_t(s.ext_count) * n * n)) : nullptr;
     v.stiffness_rows = own(dcopy(s.stiffness_rows, C * n * n));
+    { // nu_c K_c per class (3D Q1 strip kernel)
+        std::vector<double> kv(C * n * n);
+        for (std::size_t c = 0; c < C; ++c)
+            for (int k = 0; k < n * n; ++k)
+                kv[c * n * n + k] = (s.class_viscosity ? s.class_viscosity[c] : s.viscosity) * s.stiffness_rows[c * n * n + k];
+        v.stiffness_nu = own(dcopy(kv.data(), kv.size()));
+    }
     v.seminorm = own(dcopy(s.seminorm, std::size_t(n) * n));
     for (int d = 0; d < 3; ++d) {
         v.convection_t_rows[d] = d < s.dimension ? own(dcopy(s.convection_t_rows[d], C * n * n)) : nullptr;
@@ -4102,6 +4241,16 @@ void gradients(Context *ctx, const double *state) {
     }
     line_solve(ctx, 0, v.dimension, nullptr, state);
 }
+// 3D Q1 node strip kernel on graded / broken meshes instead of the per-node connectivity kernel. On the uniform mesh
+// the element kernel + gather stays faster on the A100 (U112 P7 solver 58.8 vs 67.4 s; graded G3H 123.4 -> 91.1 s,
+// broken 177.4 -> 148.6 s). M1PN_GPU_STRIP3=0: never, 2: also on uniform meshes.
+static bool strip3_enabled(const View &v) {
+    static const int mode = [] {
+        const char *e = std::getenv("M1PN_GPU_STRIP3");
+        return e ? std::atoi(e) : 1;
+    }();
+    return mode == 2 || (mode == 1 && (v.klass || !v.structured));
+}
 void stabilization(Context *ctx, const double *state, double *out, bool want_low, double constant_gamma) {
     const View &v = ctx->v;
     if (ctx->adaptive && ctx->adaptive->active && constant_gamma < 0 && !v.periodic) {
@@ -4163,6 +4312,19 @@ void stabilization(Context *ctx, const double *state, double *out, bool want_low
             k_stabilization_strip<64><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
         else
             k_stabilization_strip<32><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+    } else if (v.dimension == 3 && v.degree == 1 && !v.periodic && v.local == 8 && v.strip3_ok && strip3_enabled(v) &&
+               (v.structured || (v.strip_elem[0] && v.strip_elem[1] && v.strip_elem[2]))) {
+        static const int sz = [] {
+            const char *e = std::getenv("M1PN_GPU_STRIP3_SZ");
+            return e ? std::atoi(e) : 16;
+        }();
+        const dim3 grid(blocks(std::size_t(v.npa[0]) * v.q, 128), v.npa[1], (v.npa[2] + sz - 1) / sz);
+        if (sz == 8)
+            k_stabilization_strip3<8><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+        else if (sz == 32)
+            k_stabilization_strip3<32><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
+        else
+            k_stabilization_strip3<16><<<grid, 128, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
     } else if (v.klass || !v.structured) { // graded / broken: per node (connectivity) instead of the element kernels
         k_stabilization<<<blocks(std::size_t(v.nodes) * v.q), 256, 0, ctx->stream>>>(v, state, out, want_low, constant_gamma);
     } else {

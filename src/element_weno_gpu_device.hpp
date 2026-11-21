@@ -24,10 +24,11 @@ struct Setup {
     // local x local) indexed by ext_index[e * 2 dimension + 2 d + side] (null: extension[d][side]).
     int classes = 1;
     bool structured = true; // node grid = element grid (false with broken lines)
-    // Broken lines, 2D Q1 strip kernel: per axis d and node line k, strip_elem[d][2 k + side] = element line on the
+    bool strip3_ok = true;  // 3D Q1: element/node numbering as the 3D strip kernel assumes (checked in GpuSetup)
+    // Broken lines, Q1 strip kernels (2D, 3D): per axis d and node line k, strip_elem[d][2 k + side] = element line on the
     // left (side 0) / right (side 1) of node line k that contains it, -1 if none (a node copy on a broken line has
     // only one side). nullptr: structured mesh (element lines k - 1 and k).
-    const int *strip_elem[2] = {};
+    const int *strip_elem[3] = {};
     const int *element_class = nullptr;
     const double *class_viscosity = nullptr;
     int ext_count = 0;
