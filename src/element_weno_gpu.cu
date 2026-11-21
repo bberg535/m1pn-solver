@@ -2559,6 +2559,17 @@ Lattice3dNodalSummary lattice3d_table_nodal(Context *ctx, const uncollided::Latt
         r.lnode_d = node_acc, r.lnode_f = nullptr;
     }
     r.ltable = nullptr, r.lM = M, r.lm0 = 0, r.ldt = dt;
+    // The nodal table replaces the per-point FCS data (react_lattice reads lnode_f / lnode_d only): free the per-point
+    // arrays (about 50 bytes per quadrature point, 2 GB on 168^3 and 8 GB on 264^3).
+    auto release = [&](auto *&p) {
+        auto it = std::find(rd->owned.begin(), rd->owned.end(), (void *)p);
+        if (it != rd->owned.end()) {
+            rd->owned.erase(it);
+            CK(cudaFree((void *)p));
+        }
+        p = nullptr;
+    };
+    release(r.fx), release(r.fy), release(r.fw), release(r.fss), release(r.q), release(r.local);
     return sum;
 }
 void react_lattice(Context *ctx, double *state, double tau, double source_time) {
@@ -2825,7 +2836,7 @@ void boundary_high_setup(Context *ctx, const BoundaryHighSetup &s) {
     }
     d->G = dalloc<double>(rq);
     d->H = dalloc<double>(rq);
-    d->db = dalloc<double>(rq);
+    d->db = nullptr; // allocated on the first inflow datum (vacuum: never; rows x q, 9 GB on G3Q P35)
     d->low4 = dalloc<double>(std::size_t(std::max(1, s.nb)) * 4);
     if (s.row_break) {
         d->row_break = dcopy(s.row_break, std::size_t(std::max(1, s.rows)));
@@ -2952,6 +2963,8 @@ void boundary_high(Context *ctx, const double *state, double *out, const double 
                          "dgemm");
     }
     if (pinned_db) {
+        if (!d->db)
+            d->db = dalloc<double>(rq);
         CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
         k_sub<<<blocks(rq), 256, 0, ctx->stream>>>(d->H, d->db, rq);
     }
@@ -4123,6 +4136,8 @@ bool boundary_high_adaptive_launch(Context *ctx, BoundaryHighDevice *d, const do
     }
     if (pinned_db) {
         const std::size_t rq = std::size_t(s.rows) * s.q;
+        if (!d->db)
+            d->db = dalloc<double>(rq);
         CK(cudaMemcpyAsync(d->db, pinned_db, rq * sizeof(double), cudaMemcpyHostToDevice, ctx->stream));
         k_sub_active<<<blocks(std::size_t(s.rows) * q_bnd), 256, 0, ctx->stream>>>(s.q, q_bnd, s.rows, d->H, d->db);
     }
