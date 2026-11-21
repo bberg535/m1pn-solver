@@ -4176,7 +4176,7 @@ void ElementWeno::split_compute_y(const std::vector<Four> &u, const std::vector<
     // Step-1 states y (and their Levermore fluxes) at all broken-line nodes; partners are broken-line nodes too.
     Field &ylow = split_ylow_, &yflux = split_yflux_;
     std::vector<Four> &y_of = split_y_of_;
-    y_of.assign(K, Four::Zero());
+    y_of.resize(K); // every entry written below
     parallel_for(K, [&](int k) {
         const int i = split_nodes_[k];
         Four y = u[k] + tau * rate[k];
@@ -4218,17 +4218,21 @@ void ElementWeno::split_apply(const std::vector<Four> &u, std::vector<Four> &rat
         }
     });
     // Per node: sum of its rows in ascending face index (fixed order, parallel over the nodes).
-    std::vector<Four> bstar(K, Four::Zero());
-    std::vector<double> astar(K, 0.);
+    std::vector<Four> &bstar = split_bstar_;
+    std::vector<double> &astar = split_astar_;
+    bstar.resize(K), astar.resize(K);
     parallel_for(K, [&](int k) {
+        bstar[k] = Four::Zero(), astar[k] = 0.;
         for (int e = split_row_offsets_[k]; e < split_row_offsets_[k + 1]; ++e) {
             const int r = split_rows_[e];
             bstar[k] += Four(split_BR_.row(r).transpose());
             astar[k] += split_AR_[r];
         }
     });
-    std::vector<double> theta_of(K, 1.), defect(K, 0.);
+    std::vector<double> &theta_of = split_theta_, &defect = split_defect_;
+    theta_of.resize(K), defect.resize(K);
     parallel_for(K, [&](int k) {
+        theta_of[k] = 1., defect[k] = 0.;
         const int i = split_nodes_[k];
         const double A = area[i];
         if (!(A > 0) || !(astar[k] > 0)) {
@@ -4248,12 +4252,25 @@ void ElementWeno::split_apply(const std::vector<Four> &u, std::vector<Four> &rat
         defect[k] = tau * (theta - 1) * c[0];
         rate[k] = (z - u[k]) / tau;
     });
-    if (stats)
-        for (int k = 0; k < K; ++k) {
-            stats->split_limited += theta_of[k] < 1;
-            stats->min_split_theta = std::min(stats->min_split_theta, theta_of[k]);
-            stats->split_mass += defect[k];
-        }
+    if (stats) { // diagnostics, fixed chunks (split_mass: rounding-level differences to the former serial sum)
+        struct Part {
+            long limited = 0;
+            double min_theta = 1, mass = 0;
+        };
+        const Part tot = parallel_chunks(K, 1 << 14, Part{}, [&](int b0, int b1, Part &p) {
+            for (int k = b0; k < b1; ++k) {
+                p.limited += theta_of[k] < 1;
+                p.min_theta = std::min(p.min_theta, theta_of[k]);
+                p.mass += defect[k];
+            }
+        }, [](Part a, const Part &b) {
+            a.limited += b.limited, a.min_theta = std::min(a.min_theta, b.min_theta), a.mass += b.mass;
+            return a;
+        });
+        stats->split_limited += tot.limited;
+        stats->min_split_theta = std::min(stats->min_split_theta, tot.min_theta);
+        stats->split_mass += tot.mass;
+    }
 }
 Field ElementWeno::admissible_rows_public(Field x, ElementWenoStats *stats) const {
     return admissible_rows(std::move(x), nodes, stats, lumped, owned_);

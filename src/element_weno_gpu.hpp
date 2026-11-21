@@ -150,6 +150,8 @@ private:
     void stage_end_finish(const double *x, double *out, double *u, double old, double fresh, double tau, double weight,
                           double dt, ElementWenoStats &stats);
     std::vector<Four> split_u_h_, split_rate_h_;
+    std::vector<double> bc_theta_, bc_sign_, bc_mass_; // boundary_correction per-node buffers (reused)
+    std::vector<char> bc_signed_;
     bool finish_pending_ = false;
     int lockstep_stage_ = 0;
     double lockstep_time_ = 0, lockstep_dt_ = 0;

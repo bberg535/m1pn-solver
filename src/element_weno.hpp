@@ -537,6 +537,8 @@ private:
         return r >= break_row_start_[side] || nodal_interface(side);
     }
     mutable std::vector<Four> split_y_of_, split_u_, split_rate_; // between the two stage halves
+    mutable std::vector<Four> split_bstar_;                      // split_apply buffers (reused)
+    mutable std::vector<double> split_astar_, split_theta_, split_defect_;
     std::array<Sparse, 3> mass_1d_; // assembled 1D consistent masses (h m1) per axis
     // Outgoing hemisphere (omega, weight, harmonics) per face side, for the C6 ghost state. With the positivity
     // projection the incoming hemisphere follows as rows [outgoing, points) (full sphere); the C6 sums only use the
