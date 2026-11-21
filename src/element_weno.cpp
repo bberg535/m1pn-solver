@@ -1316,6 +1316,10 @@ ElementWeno::ElementWeno(const Angular &angular, const ElementWenoOptions &o, In
             const int side_id = 2 * f.direction + f.side;
             const FaceRule &rule = rules_[side_id];
             require(std::size_t(rule.weights.size()) == points, "Face rules of different size");
+            // Broken-line faces never read steady_data_ (partner traces instead; every use branches on face_break_
+            // first): leave their entries empty. P15 on G3Q with broken lines: 101 GB host memory and 44 s otherwise.
+            if (broken_ && face_break_[index])
+                return;
             V3 origin;
             element_origin(f.element, origin);
             for (std::size_t point = 0; point < points; ++point) {
